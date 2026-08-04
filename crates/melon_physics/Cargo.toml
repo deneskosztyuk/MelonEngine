@@ -1,0 +1,15 @@
+[package]
+name = "melon_physics"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+melon_core.workspace = true
+bevy_ecs.workspace = true
+rapier3d.workspace = true
+glam.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

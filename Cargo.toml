@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/melon_core",
+    "crates/melon_render",
+    "crates/melon_physics",
+    "crates/melon_editor",
+    "crates/melon_host",
+    "crates/melon_game",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/denes/melonengine"
+
+[workspace.dependencies]
+melon_core = { path = "crates/melon_core" }
+melon_render = { path = "crates/melon_render" }
+melon_physics = { path = "crates/melon_physics" }
+melon_editor = { path = "crates/melon_editor" }
+melon_game = { path = "crates/melon_game" }
+
+bevy_ecs = "0.19"
+glam = { version = "0.33", features = ["bytemuck", "serde"] }
+wgpu = "29"
+winit = "0.30"
+bytemuck = { version = "1.25", features = ["derive"] }
+pollster = "0.4"
+anyhow = "1"
+log = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = "0.2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr"] }
+gltf = { version = "1.4", features = ["import", "utils", "image", "allow_empty_texture"] }
+rapier3d = "0.34"
+egui = "0.35"
+egui-wgpu = { version = "0.35", default-features = false }
+egui-winit = { version = "0.35", default-features = false }
+hot-lib-reloader = "0.8"
+serde = { version = "1", features = ["derive"] }
+ron = "0.8"
+rfd = "0.14"
+
+[workspace.lints.clippy]
+# clippy::all = correctness + style + complexity + perf lints.
+# Warn in the lint table (visible during dev), deny at the gate (just check / CI).
+all = { level = "warn" }
+
+[workspace.lints.rust]
+# Keep the engine unsafe-free. Any unsafe must be explicitly justified + reviewed.
+unsafe_code = { level = "deny" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

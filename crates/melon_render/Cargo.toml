@@ -1,0 +1,20 @@
+[package]
+name = "melon_render"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+melon_core.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+pollster.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+image.workspace = true
+gltf.workspace = true
+
+[lints]
+workspace = true

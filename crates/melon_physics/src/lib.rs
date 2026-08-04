@@ -1,0 +1,502 @@
+use bevy_ecs::component::Component;
+use bevy_ecs::entity::Entity;
+use bevy_ecs::query::With;
+use bevy_ecs::resource::Resource;
+use bevy_ecs::system::{Commands, Query, Res, ResMut};
+use glam::{Quat, Vec3};
+
+pub use rapier3d;
+pub use rapier3d::dynamics::RigidBodyType;
+use rapier3d::dynamics::{
+    CCDSolver, ImpulseJointSet, IslandManager, MultibodyJointSet, RigidBodyHandle, RigidBodySet,
+};
+use rapier3d::geometry::{
+    BroadPhaseBvh, ColliderBuilder, ColliderHandle, ColliderSet, NarrowPhase,
+};
+use rapier3d::math::Vector;
+use rapier3d::pipeline::PhysicsPipeline;
+use rapier3d::prelude::IntegrationParameters;
+use tracing::instrument;
+
+use melon_core::{PendingDelete, Transform};
+
+/// Gravity vector in m/s^2. Default is Earth gravity pointing down (-Y).
+const GRAVITY: Vector = Vector::new(0.0, -9.81, 0.0);
+
+/// ECS component storing a handle to a rapier rigid body.
+/// Paired with a `Transform` component on the same entity.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct RigidBodyComponent {
+    pub body_handle: RigidBodyHandle,
+    pub body_type: RigidBodyType,
+}
+
+/// ECS component storing a handle to a rapier collider.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct ColliderComponent {
+    pub collider_handle: ColliderHandle,
+}
+
+/// Resource holding the rapier physics world state.
+/// One instance per `Core` world, stepped once per frame.
+#[derive(Resource)]
+pub struct PhysicsWorld {
+    pub pipeline: PhysicsPipeline,
+    pub islands: IslandManager,
+    pub broad_phase: BroadPhaseBvh,
+    pub narrow_phase: NarrowPhase,
+    pub bodies: RigidBodySet,
+    pub colliders: ColliderSet,
+    pub impulse_joints: ImpulseJointSet,
+    pub multibody_joints: MultibodyJointSet,
+    pub ccd_solver: CCDSolver,
+    pub integration_parameters: IntegrationParameters,
+    pub gravity: Vector,
+}
+
+impl Default for PhysicsWorld {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PhysicsWorld {
+    #[instrument(skip_all, level = "info")]
+    pub fn new() -> Self {
+        Self {
+            pipeline: PhysicsPipeline::new(),
+            islands: IslandManager::new(),
+            broad_phase: BroadPhaseBvh::new(),
+            narrow_phase: NarrowPhase::new(),
+            bodies: RigidBodySet::new(),
+            colliders: ColliderSet::new(),
+            impulse_joints: ImpulseJointSet::new(),
+            multibody_joints: MultibodyJointSet::new(),
+            ccd_solver: CCDSolver::new(),
+            integration_parameters: IntegrationParameters::default(),
+            gravity: GRAVITY,
+        }
+    }
+
+    /// Spawn a dynamic rigid body with a cuboid collider at the given position.
+    /// Returns the handles for attaching to an ECS entity.
+    #[instrument(skip(self), level = "debug")]
+    pub fn spawn_dynamic_cuboid(
+        &mut self,
+        translation: Vec3,
+        half_extents: Vec3,
+    ) -> (RigidBodyHandle, ColliderHandle) {
+        use rapier3d::dynamics::RigidBodyBuilder;
+        let body = RigidBodyBuilder::dynamic().translation(translation).build();
+        let body_handle = self.bodies.insert(body);
+        let collider =
+            ColliderBuilder::cuboid(half_extents.x, half_extents.y, half_extents.z).build();
+        let collider_handle =
+            self.colliders
+                .insert_with_parent(collider, body_handle, &mut self.bodies);
+        (body_handle, collider_handle)
+    }
+
+    /// Spawn a fixed rigid body (static geometry like a floor) with a cuboid collider.
+    #[instrument(skip(self), level = "debug")]
+    pub fn spawn_fixed_cuboid(
+        &mut self,
+        translation: Vec3,
+        half_extents: Vec3,
+    ) -> (RigidBodyHandle, ColliderHandle) {
+        use rapier3d::dynamics::RigidBodyBuilder;
+        let body = RigidBodyBuilder::fixed().translation(translation).build();
+        let body_handle = self.bodies.insert(body);
+        let collider =
+            ColliderBuilder::cuboid(half_extents.x, half_extents.y, half_extents.z).build();
+        let collider_handle =
+            self.colliders
+                .insert_with_parent(collider, body_handle, &mut self.bodies);
+        (body_handle, collider_handle)
+    }
+
+    /// Step the physics simulation by one fixed timestep (1/60s by default).
+    pub fn step(&mut self) {
+        self.pipeline.step(
+            self.gravity,
+            &self.integration_parameters,
+            &mut self.islands,
+            &mut self.broad_phase,
+            &mut self.narrow_phase,
+            &mut self.bodies,
+            &mut self.colliders,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+            &mut self.ccd_solver,
+            &(),
+            &(),
+        );
+    }
+
+    /// Get the world-space translation of a rigid body.
+    pub fn body_translation(&self, handle: RigidBodyHandle) -> Option<Vec3> {
+        self.bodies.get(handle).map(|b| b.translation())
+    }
+
+    /// Get the world-space rotation of a rigid body.
+    pub fn body_rotation(&self, handle: RigidBodyHandle) -> Option<Quat> {
+        self.bodies.get(handle).map(|b| *b.rotation())
+    }
+
+    /// Clear all bodies, colliders, joints, and pipeline state.
+    /// Preserves gravity and integration parameters (engine configuration,
+    /// not scene data). Used during scene reload.
+    #[instrument(skip(self), level = "debug")]
+    pub fn clear(&mut self) {
+        self.pipeline = PhysicsPipeline::new();
+        self.islands = IslandManager::new();
+        self.broad_phase = BroadPhaseBvh::new();
+        self.narrow_phase = NarrowPhase::new();
+        self.bodies = RigidBodySet::new();
+        self.colliders = ColliderSet::new();
+        self.impulse_joints = ImpulseJointSet::new();
+        self.multibody_joints = MultibodyJointSet::new();
+        self.ccd_solver = CCDSolver::new();
+    }
+
+    /// Remove a rigid body and all its attached colliders from the physics world.
+    /// Uses remove_attached_colliders=true to clean up colliders automatically.
+    #[instrument(skip(self), level = "debug")]
+    pub fn remove_body(&mut self, handle: RigidBodyHandle) {
+        self.bodies.remove(
+            handle,
+            &mut self.islands,
+            &mut self.colliders,
+            &mut self.impulse_joints,
+            &mut self.multibody_joints,
+            true,
+        );
+    }
+
+    /// Remove a standalone collider (not attached to a rigid body).
+    /// Wakes up the parent body if one exists.
+    #[instrument(skip(self), level = "debug")]
+    pub fn remove_collider(&mut self, handle: ColliderHandle) {
+        self.colliders
+            .remove(handle, &mut self.islands, &mut self.bodies, true);
+    }
+}
+
+/// System: step the physics world once per frame.
+/// Run this before sync_from_physics_system.
+pub fn step_system(mut world: ResMut<PhysicsWorld>) {
+    world.step();
+}
+
+/// System: sync rapier body transforms back into ECS Transform components.
+/// Only updates dynamic bodies (body_type == Dynamic). Fixed/kinematic bodies
+/// keep their ECS transform as the source of truth.
+pub fn sync_from_physics_system(
+    physics: Res<PhysicsWorld>,
+    mut query: Query<(&RigidBodyComponent, &mut Transform)>,
+) {
+    for (rb, mut transform) in &mut query {
+        if rb.body_type != RigidBodyType::Dynamic {
+            continue;
+        }
+        if let Some(body) = physics.bodies.get(rb.body_handle) {
+            transform.translation = body.translation();
+            transform.rotation = *body.rotation();
+        }
+    }
+}
+
+/// System: sync ECS Transform into rapier for fixed/kinematic bodies.
+/// Dynamic bodies are controlled by physics, so their ECS transform is NOT
+/// written back to rapier.
+pub fn sync_to_physics_system(
+    mut physics: ResMut<PhysicsWorld>,
+    query: Query<(&RigidBodyComponent, &Transform)>,
+) {
+    for (rb, transform) in &query {
+        if rb.body_type == RigidBodyType::Dynamic {
+            continue;
+        }
+        if let Some(body) = physics.bodies.get_mut(rb.body_handle) {
+            body.set_translation(transform.translation, true);
+            body.set_rotation(transform.rotation, true);
+        }
+    }
+}
+
+/// System: cleanup entities marked with PendingDelete.
+/// Removes rapier rigid bodies and colliders before despawning the ECS entity.
+/// Uses RigidBodySet::remove with remove_attached_colliders=true to clean up
+/// colliders automatically (rapier3d 0.34 API).
+/// Run this after editor operations, before render.
+#[allow(clippy::type_complexity)]
+pub fn cleanup_deleted_system(
+    mut commands: Commands,
+    mut physics: ResMut<PhysicsWorld>,
+    query: Query<
+        (
+            Entity,
+            Option<&RigidBodyComponent>,
+            Option<&ColliderComponent>,
+        ),
+        With<PendingDelete>,
+    >,
+) {
+    for (entity, rb_opt, collider_opt) in &query {
+        if let Some(rb) = rb_opt {
+            physics.remove_body(rb.body_handle);
+        } else if let Some(col) = collider_opt {
+            physics.remove_collider(col.collider_handle);
+        }
+        commands.entity(entity).despawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::schedule::Schedule;
+    use bevy_ecs::world::World;
+    use melon_core::Name;
+
+    #[test]
+    fn physics_world_default_has_no_bodies() {
+        let world = PhysicsWorld::new();
+        assert!(world.bodies.is_empty());
+        assert!(world.colliders.is_empty());
+        assert!((world.gravity.y + 9.81).abs() < 1e-6);
+    }
+
+    #[test]
+    fn spawn_dynamic_cuboid_creates_body_and_collider() {
+        let mut pw = PhysicsWorld::new();
+        let (body_h, collider_h) =
+            pw.spawn_dynamic_cuboid(Vec3::new(0.0, 5.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
+        assert!(pw.bodies.get(body_h).is_some());
+        assert!(pw.colliders.get(collider_h).is_some());
+        assert_eq!(pw.bodies.len(), 1);
+        assert_eq!(pw.colliders.len(), 1);
+    }
+
+    #[test]
+    fn spawn_fixed_cuboid_is_fixed_type() {
+        let mut pw = PhysicsWorld::new();
+        let (body_h, _) =
+            pw.spawn_fixed_cuboid(Vec3::new(0.0, -1.0, 0.0), Vec3::new(10.0, 0.5, 10.0));
+        let body = pw.bodies.get(body_h).unwrap();
+        assert_eq!(body.body_type(), RigidBodyType::Fixed);
+    }
+
+    #[test]
+    fn step_makes_dynamic_body_fall() {
+        let mut pw = PhysicsWorld::new();
+        let (body_h, _) =
+            pw.spawn_dynamic_cuboid(Vec3::new(0.0, 10.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
+        let y_before = pw.bodies.get(body_h).unwrap().translation().y;
+        pw.step();
+        let y_after = pw.bodies.get(body_h).unwrap().translation().y;
+        assert!(
+            y_after < y_before,
+            "dynamic body should fall (y_before={y_before}, y_after={y_after})"
+        );
+    }
+
+    #[test]
+    fn fixed_body_does_not_fall() {
+        let mut pw = PhysicsWorld::new();
+        let (body_h, _) =
+            pw.spawn_fixed_cuboid(Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 0.5, 10.0));
+        let y_before = pw.bodies.get(body_h).unwrap().translation().y;
+        pw.step();
+        let y_after = pw.bodies.get(body_h).unwrap().translation().y;
+        assert!(
+            (y_after - y_before).abs() < 1e-6,
+            "fixed body should not move"
+        );
+    }
+
+    #[test]
+    fn dynamic_body_lands_on_floor() {
+        let mut pw = PhysicsWorld::new();
+        // Floor at y=0, half-extent 0.5 thick, so top surface at y=0.5
+        let _ = pw.spawn_fixed_cuboid(Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 0.5, 10.0));
+        // Cube at y=5, half-extent 0.5, so bottom at y=4.5
+        let (body_h, _) =
+            pw.spawn_dynamic_cuboid(Vec3::new(0.0, 5.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
+
+        // Step many times to let it fall and settle
+        for _ in 0..300 {
+            pw.step();
+        }
+
+        let y_final = pw.bodies.get(body_h).unwrap().translation().y;
+        // Cube should rest on floor: cube center at y=1.0 (floor top 0.5 + cube half 0.5)
+        assert!(
+            (y_final - 1.0).abs() < 0.1,
+            "cube should rest on floor at y~1.0, got y={y_final}"
+        );
+    }
+
+    #[test]
+    fn sync_from_physics_updates_transform() {
+        let mut pw = PhysicsWorld::new();
+        let (body_h, _) =
+            pw.spawn_dynamic_cuboid(Vec3::new(0.0, 10.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
+        pw.step();
+
+        let mut world = World::new();
+        world.insert_resource(pw);
+        let entity = world
+            .spawn((
+                RigidBodyComponent {
+                    body_handle: body_h,
+                    body_type: RigidBodyType::Dynamic,
+                },
+                Transform::default(),
+            ))
+            .id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(sync_from_physics_system);
+        schedule.run(&mut world);
+
+        let transform = world.get::<Transform>(entity).unwrap();
+        let physics = world.get_resource::<PhysicsWorld>().unwrap();
+        let body_y = physics.body_translation(body_h).unwrap().y;
+        assert!(
+            (transform.translation.y - body_y).abs() < 1e-6,
+            "transform should match physics body y={body_y}, got {}",
+            transform.translation.y
+        );
+    }
+
+    #[test]
+    fn sync_to_physics_updates_kinematic_body() {
+        let mut pw = PhysicsWorld::new();
+        let (body_h, _) = pw.spawn_fixed_cuboid(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0));
+
+        let mut world = World::new();
+        world.insert_resource(pw);
+        world.spawn((
+            RigidBodyComponent {
+                body_handle: body_h,
+                body_type: RigidBodyType::Fixed,
+            },
+            Transform {
+                translation: Vec3::new(5.0, 5.0, 5.0),
+                ..Default::default()
+            },
+        ));
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(sync_to_physics_system);
+        schedule.run(&mut world);
+
+        let physics = world.get_resource::<PhysicsWorld>().unwrap();
+        let body = physics.bodies.get(body_h).unwrap();
+        assert!(
+            (body.translation().y - 5.0).abs() < 1e-6,
+            "fixed body should be moved to y=5.0, got y={}",
+            body.translation().y
+        );
+    }
+
+    #[test]
+    fn clear_empties_all_sets() {
+        let mut pw = PhysicsWorld::new();
+        pw.spawn_dynamic_cuboid(Vec3::new(0.0, 5.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
+        pw.spawn_fixed_cuboid(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0));
+        assert!(!pw.bodies.is_empty());
+        assert!(!pw.colliders.is_empty());
+
+        pw.clear();
+
+        assert!(pw.bodies.is_empty(), "bodies should be empty after clear");
+        assert!(
+            pw.colliders.is_empty(),
+            "colliders should be empty after clear"
+        );
+        assert!(
+            pw.impulse_joints.is_empty(),
+            "impulse joints should be empty after clear"
+        );
+    }
+
+    #[test]
+    fn clear_preserves_gravity() {
+        let mut pw = PhysicsWorld::new();
+        pw.gravity = Vector::new(1.0, -20.0, 0.0);
+        pw.spawn_dynamic_cuboid(Vec3::new(0.0, 5.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
+
+        pw.clear();
+
+        assert!(
+            (pw.gravity.y - (-20.0)).abs() < 1e-6,
+            "gravity should be preserved after clear, got y={}",
+            pw.gravity.y
+        );
+        assert!(
+            (pw.gravity.x - 1.0).abs() < 1e-6,
+            "gravity x should be preserved after clear, got x={}",
+            pw.gravity.x
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_physics_body() {
+        let mut pw = PhysicsWorld::new();
+        let (body_h, collider_h) =
+            pw.spawn_dynamic_cuboid(Vec3::new(0.0, 5.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
+
+        let mut world = World::new();
+        world.insert_resource(pw);
+        let entity = world
+            .spawn((
+                RigidBodyComponent {
+                    body_handle: body_h,
+                    body_type: RigidBodyType::Dynamic,
+                },
+                ColliderComponent {
+                    collider_handle: collider_h,
+                },
+                Transform::default(),
+                PendingDelete,
+            ))
+            .id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(cleanup_deleted_system);
+        schedule.run(&mut world);
+
+        let physics = world.get_resource::<PhysicsWorld>().unwrap();
+        assert!(
+            physics.bodies.get(body_h).is_none(),
+            "body should be removed from physics world"
+        );
+        assert!(
+            physics.colliders.get(collider_h).is_none(),
+            "collider should be removed from physics world"
+        );
+        assert!(
+            world.get_entity(entity).is_err(),
+            "entity should be despawned"
+        );
+    }
+
+    #[test]
+    fn cleanup_handles_entity_without_physics() {
+        let pw = PhysicsWorld::new();
+        let mut world = World::new();
+        world.insert_resource(pw);
+        let entity = world.spawn((Name("Test".to_string()), PendingDelete)).id();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(cleanup_deleted_system);
+        schedule.run(&mut world);
+
+        assert!(
+            world.get_entity(entity).is_err(),
+            "entity without physics should still be despawned"
+        );
+    }
+}

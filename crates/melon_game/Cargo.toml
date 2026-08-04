@@ -1,0 +1,15 @@
+[package]
+name = "melon_game"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["rlib", "dylib"]
+
+[dependencies]
+melon_core.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

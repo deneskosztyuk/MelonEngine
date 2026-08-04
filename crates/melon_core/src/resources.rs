@@ -1,0 +1,325 @@
+use bevy_ecs::resource::Resource;
+use glam::camera::rh::proj::directx;
+use glam::camera::rh::view;
+use glam::{Mat4, Vec2, Vec3, Vec4};
+
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct Camera {
+    pub eye: Vec3,
+    pub center: Vec3,
+    pub up: Vec3,
+    pub fov_y_radians: f32,
+    pub aspect: f32,
+    pub near: f32,
+    pub far: f32,
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        let eye = Vec3::new(0.0, 0.0, 4.0);
+        let (yaw, pitch) = (-std::f32::consts::FRAC_PI_2, 0.0f32);
+        let center = look_target(eye, yaw, pitch);
+        Self {
+            eye,
+            center,
+            up: Vec3::Y,
+            fov_y_radians: std::f32::consts::FRAC_PI_4,
+            aspect: 16.0 / 9.0,
+            near: 0.1,
+            far: 100.0,
+            yaw,
+            pitch,
+        }
+    }
+}
+
+pub fn look_target(eye: Vec3, yaw: f32, pitch: f32) -> Vec3 {
+    let dir = Vec3::new(
+        yaw.cos() * pitch.cos(),
+        pitch.sin(),
+        yaw.sin() * pitch.cos(),
+    )
+    .normalize();
+    eye + dir
+}
+
+impl Camera {
+    pub fn view_proj(&self) -> Mat4 {
+        let view = view::look_at_mat4(self.eye, self.center, self.up);
+        let proj = directx::perspective(self.fov_y_radians, self.aspect, self.near, self.far);
+        proj * view
+    }
+
+    pub fn set_aspect(&mut self, aspect: f32) {
+        self.aspect = aspect;
+    }
+
+    pub fn forward(&self) -> Vec3 {
+        (self.center - self.eye).normalize_or_zero()
+    }
+
+    pub fn right(&self) -> Vec3 {
+        self.forward().cross(self.up).normalize_or_zero()
+    }
+
+    /// Project a world-space position to screen-space pixels.
+    /// `screen_size` is in logical points (matches egui's coordinate space).
+    /// Returns `None` if the point is behind the camera (clip.w <= 0).
+    pub fn world_to_screen(&self, world_pos: Vec3, screen_size: Vec2) -> Option<Vec2> {
+        let clip = self.view_proj() * Vec4::new(world_pos.x, world_pos.y, world_pos.z, 1.0);
+        if clip.w <= 0.0 {
+            return None;
+        }
+        let ndc = Vec3::new(clip.x, clip.y, clip.z) / clip.w;
+        let screen = Vec2::new(
+            (ndc.x + 1.0) * 0.5 * screen_size.x,
+            (1.0 - ndc.y) * 0.5 * screen_size.y,
+        );
+        Some(screen)
+    }
+
+    /// Unproject a screen-space point to a world-space ray.
+    /// `screen_pos` and `screen_size` are in logical points.
+    /// Uses DirectX depth convention: near plane z=0, far plane z=1.
+    /// Returns (origin, direction) where direction is normalized.
+    pub fn screen_to_world_ray(&self, screen_pos: Vec2, screen_size: Vec2) -> (Vec3, Vec3) {
+        let inv_vp = self.view_proj().inverse();
+        let x_ndc = 2.0 * screen_pos.x / screen_size.x - 1.0;
+        let y_ndc = 1.0 - 2.0 * screen_pos.y / screen_size.y;
+
+        let near = inv_vp * Vec4::new(x_ndc, y_ndc, 0.0, 1.0);
+        let far = inv_vp * Vec4::new(x_ndc, y_ndc, 1.0, 1.0);
+
+        let near_world = Vec3::new(near.x, near.y, near.z) / near.w;
+        let far_world = Vec3::new(far.x, far.y, far.z) / far.w;
+
+        let dir = (far_world - near_world).normalize_or_zero();
+        (near_world, dir)
+    }
+}
+
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct Light {
+    pub direction: Vec3,
+    pub ambient: f32,
+    pub color: Vec3,
+}
+
+/// Engine time state. `delta_seconds` is the time elapsed since the last
+/// update; `elapsed_seconds` is the total time since the engine started.
+/// Systems that need frame-rate-independent movement read `delta_seconds`
+/// instead of assuming a fixed 1/60 step.
+#[derive(Resource, Debug, Clone, Copy)]
+pub struct Time {
+    pub delta_seconds: f32,
+    pub elapsed_seconds: f32,
+}
+
+impl Default for Time {
+    fn default() -> Self {
+        Self {
+            delta_seconds: 1.0 / 60.0,
+            elapsed_seconds: 0.0,
+        }
+    }
+}
+
+impl Time {
+    pub fn update(&mut self, delta: f32) {
+        self.delta_seconds = delta;
+        self.elapsed_seconds += delta;
+    }
+}
+
+impl Default for Light {
+    fn default() -> Self {
+        Self {
+            direction: Vec3::new(0.5, -1.0, 0.5).normalize(),
+            ambient: 0.2,
+            color: Vec3::ONE,
+        }
+    }
+}
+
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SimulationState {
+    #[default]
+    Playing,
+    Paused,
+}
+
+#[derive(Resource, Debug, Clone, Copy, Default)]
+pub struct NameCounter(pub u32);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn camera_default_looks_at_negz() {
+        let c = Camera::default();
+        assert_eq!(c.eye, Vec3::new(0.0, 0.0, 4.0));
+        assert!((c.yaw - (-std::f32::consts::FRAC_PI_2)).abs() < 1e-6);
+        assert!(
+            c.center.x.abs() < 1e-6,
+            "center.x should be ~0, got {}",
+            c.center.x
+        );
+        assert!(c.center.y.abs() < 1e-6);
+        assert!((c.center.z - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn look_target_yaw_zero_is_posx() {
+        let target = look_target(Vec3::ZERO, 0.0, 0.0);
+        assert!((target.x - 1.0).abs() < 1e-6);
+        assert!(target.y.abs() < 1e-6);
+        assert!(target.z.abs() < 1e-6);
+    }
+
+    #[test]
+    fn look_target_yaw_neg_half_pi_is_negz() {
+        let target = look_target(Vec3::ZERO, -std::f32::consts::FRAC_PI_2, 0.0);
+        assert!(target.x.abs() < 1e-6);
+        assert!(target.y.abs() < 1e-6);
+        assert!((target.z + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn look_target_pitch_half_pi_is_up() {
+        let target = look_target(Vec3::ZERO, 0.0, std::f32::consts::FRAC_PI_2);
+        assert!(target.x.abs() < 1e-6);
+        assert!((target.y - 1.0).abs() < 1e-6);
+        assert!(target.z.abs() < 1e-6);
+    }
+
+    #[test]
+    fn camera_view_proj_is_finite() {
+        let c = Camera::default();
+        let m = c.view_proj();
+        for col in &m.to_cols_array_2d() {
+            for &v in col {
+                assert!(v.is_finite(), "view_proj contains non-finite value: {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn camera_set_aspect_updates() {
+        let mut c = Camera::default();
+        c.set_aspect(2.0);
+        assert!((c.aspect - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn camera_forward_is_normalized() {
+        let c = Camera::default();
+        let f = c.forward();
+        assert!((f.length() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn camera_right_perpendicular_to_forward() {
+        let c = Camera::default();
+        let f = c.forward();
+        let r = c.right();
+        assert!(
+            f.dot(r).abs() < 1e-6,
+            "forward and right are not perpendicular"
+        );
+    }
+
+    #[test]
+    fn world_to_screen_center_is_screen_center() {
+        let c = Camera::default();
+        let screen = Vec2::new(800.0, 600.0);
+        // Camera looks down -Z from (0,0,4), so a point at (0,0,3) is directly ahead
+        let result = c.world_to_screen(Vec3::new(0.0, 0.0, 3.0), screen);
+        assert!(result.is_some(), "point in front of camera should project");
+        let p = result.unwrap();
+        assert!(
+            (p.x - 400.0).abs() < 1.0,
+            "x should be ~400 (center), got {}",
+            p.x
+        );
+        assert!(
+            (p.y - 300.0).abs() < 1.0,
+            "y should be ~300 (center), got {}",
+            p.y
+        );
+    }
+
+    #[test]
+    fn world_to_screen_behind_camera_returns_none() {
+        let c = Camera::default();
+        let screen = Vec2::new(800.0, 600.0);
+        // Point at z=5 is behind the camera (camera at z=4 looking -Z)
+        let result = c.world_to_screen(Vec3::new(0.0, 0.0, 5.0), screen);
+        assert!(result.is_none(), "point behind camera should return None");
+    }
+
+    #[test]
+    fn screen_to_world_ray_direction_is_normalized() {
+        let c = Camera::default();
+        let screen = Vec2::new(800.0, 600.0);
+        let (_origin, dir) = c.screen_to_world_ray(Vec2::new(400.0, 300.0), screen);
+        assert!(
+            (dir.length() - 1.0).abs() < 1e-5,
+            "ray direction should be normalized, got length {}",
+            dir.length()
+        );
+    }
+
+    #[test]
+    fn screen_to_world_ray_center_points_forward() {
+        let c = Camera::default();
+        let screen = Vec2::new(800.0, 600.0);
+        let (_origin, dir) = c.screen_to_world_ray(Vec2::new(400.0, 300.0), screen);
+        let forward = c.forward();
+        assert!(
+            dir.dot(forward) > 0.99,
+            "center ray should point along camera forward, dot={}",
+            dir.dot(forward)
+        );
+    }
+
+    #[test]
+    fn screen_to_world_ray_origin_is_near_camera() {
+        let c = Camera::default();
+        let screen = Vec2::new(800.0, 600.0);
+        let (origin, _dir) = c.screen_to_world_ray(Vec2::new(400.0, 300.0), screen);
+        let dist = (origin - c.eye).length();
+        assert!(
+            dist < 1.0,
+            "ray origin should be near camera eye, dist={dist}"
+        );
+    }
+
+    #[test]
+    fn light_default_direction_normalized() {
+        let l = Light::default();
+        assert!((l.direction.length() - 1.0).abs() < 1e-6);
+        assert!((l.ambient - 0.2).abs() < 1e-6);
+        assert_eq!(l.color, Vec3::ONE);
+    }
+
+    #[test]
+    fn time_default_is_one_over_60() {
+        let t = Time::default();
+        assert!((t.delta_seconds - 1.0 / 60.0).abs() < 1e-6);
+        assert_eq!(t.elapsed_seconds, 0.0);
+    }
+
+    #[test]
+    fn time_update_accumulates_elapsed() {
+        let mut t = Time::default();
+        t.update(0.1);
+        assert!((t.delta_seconds - 0.1).abs() < 1e-6);
+        assert!((t.elapsed_seconds - 0.1).abs() < 1e-6);
+        t.update(0.2);
+        assert!((t.delta_seconds - 0.2).abs() < 1e-6);
+        assert!((t.elapsed_seconds - 0.3).abs() < 1e-6);
+    }
+}

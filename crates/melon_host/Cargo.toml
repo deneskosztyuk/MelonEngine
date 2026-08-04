@@ -1,0 +1,28 @@
+[package]
+name = "melon_host"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+melon_core.workspace = true
+melon_render.workspace = true
+melon_physics.workspace = true
+melon_editor.workspace = true
+melon_game.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+pollster.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-log.workspace = true
+egui.workspace = true
+hot-lib-reloader.workspace = true
+
+[features]
+default = ["hot-reload"]
+hot-reload = []
+
+[lints]
+workspace = true

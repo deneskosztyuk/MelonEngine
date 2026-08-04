@@ -1,0 +1,16 @@
+# Cargo build artifacts and compiler-generated coverage data.
+/target/
+*.profraw
+
+# Rust source backups.
+**/*.rs.bk
+
+# Editor and IDE workspace state.
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Operating-system metadata.
+.DS_Store
+Thumbs.db
