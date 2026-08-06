@@ -39,6 +39,19 @@ rapier3d = "0.34"
 egui = "0.35"
 egui-wgpu = { version = "0.35", default-features = false }
 egui-winit = { version = "0.35", default-features = false }
+imgui = { version = "0.12", features = ["docking"] }
+imgui-wgpu = "0.28"
+imgui-winit-support = "0.13"
+slint = { version = "=1.17.1", default-features = false, features = [
+    "accessibility",
+    "backend-winit",
+    "compat-1-2",
+    "renderer-skia",
+    "std",
+    "unstable-wgpu-29",
+    "unstable-winit-030",
+] }
+slint-build = "=1.17.1"
 hot-lib-reloader = "0.8"
 serde = { version = "1", features = ["derive"] }
 ron = "0.8"

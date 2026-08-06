@@ -138,14 +138,10 @@ fn image_from_gltf_data(data: &gltf::image::Data) -> image::DynamicImage {
     }
 }
 
-pub struct Renderer {
-    instance: wgpu::Instance,
+pub struct SceneRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    surface: wgpu::Surface<'static>,
     surface_format: wgpu::TextureFormat,
-    size: winit::dpi::PhysicalSize<u32>,
-    window: Arc<Window>,
     mesh_pipeline: wgpu::RenderPipeline,
     #[allow(dead_code)]
     model_bind_group_layout: wgpu::BindGroupLayout,
@@ -162,8 +158,6 @@ pub struct Renderer {
     #[allow(dead_code)]
     albedo_texture: wgpu::Texture,
     albedo_bind_group: wgpu::BindGroup,
-    depth_texture: wgpu::Texture,
-    depth_view: wgpu::TextureView,
     line_pipeline: wgpu::RenderPipeline,
     line_vertex_buffer: Option<wgpu::Buffer>,
     line_buffer_capacity: wgpu::BufferAddress,
@@ -171,6 +165,30 @@ pub struct Renderer {
     model_bind_group: wgpu::BindGroup,
     model_uniform_stride: wgpu::BufferAddress,
     model_staging: Vec<u8>,
+}
+
+pub struct Renderer {
+    instance: wgpu::Instance,
+    surface: wgpu::Surface<'static>,
+    size: winit::dpi::PhysicalSize<u32>,
+    window: Arc<Window>,
+    scene: SceneRenderer,
+    depth_texture: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+}
+
+impl std::ops::Deref for Renderer {
+    type Target = SceneRenderer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.scene
+    }
+}
+
+impl std::ops::DerefMut for Renderer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.scene
+    }
 }
 
 fn uniform_buffer_layout(device: &wgpu::Device, label: &str) -> wgpu::BindGroupLayout {
@@ -235,6 +253,37 @@ impl Renderer {
             .copied()
             .context("surface reported no usable formats")?;
 
+        let scene = SceneRenderer::new(device, queue, surface_format);
+        let (depth_texture, depth_view) = Self::create_depth_target(&scene.device, size);
+
+        let renderer = Self {
+            instance,
+            surface,
+            size,
+            window,
+            scene,
+            depth_texture,
+            depth_view,
+        };
+        renderer.configure_surface();
+        Ok(renderer)
+    }
+
+    pub fn scene(&self) -> &SceneRenderer {
+        &self.scene
+    }
+
+    pub fn scene_mut(&mut self) -> &mut SceneRenderer {
+        &mut self.scene
+    }
+}
+
+impl SceneRenderer {
+    pub fn new(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        surface_format: wgpu::TextureFormat,
+    ) -> Self {
         let camera_layout = uniform_buffer_layout(&device, "camera bind group layout");
         let model_layout = dynamic_uniform_buffer_layout(&device, "model bind group layout");
         let light_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -272,7 +321,7 @@ impl Renderer {
             ],
         });
 
-        let mesh_pipeline = Self::build_mesh_pipeline(
+        let mesh_pipeline = Renderer::build_mesh_pipeline(
             &device,
             surface_format,
             &camera_layout,
@@ -312,11 +361,9 @@ impl Renderer {
         });
 
         let (albedo_texture, albedo_bind_group) =
-            Self::create_checkerboard_texture(&device, &queue, &texture_layout);
+            Renderer::create_checkerboard_texture(&device, &queue, &texture_layout);
 
-        let (depth_texture, depth_view) = Self::create_depth_target(&device, size);
-
-        let line_pipeline = Self::build_line_pipeline(&device, surface_format, &camera_layout);
+        let line_pipeline = Renderer::build_line_pipeline(&device, surface_format, &camera_layout);
 
         // Reusable model uniform buffer with dynamic offsets.
         // Stride = max(ModelUniform size, min_uniform_buffer_offset_alignment).
@@ -337,18 +384,18 @@ impl Renderer {
             layout: &model_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: model_uniform_buffer.as_entire_binding(),
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &model_uniform_buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(model_uniform_size),
+                }),
             }],
         });
 
-        let renderer = Self {
-            instance,
+        Self {
             device,
             queue,
-            surface,
             surface_format,
-            size,
-            window,
             mesh_pipeline,
             model_bind_group_layout: model_layout,
             light_bind_group_layout: light_layout,
@@ -359,8 +406,6 @@ impl Renderer {
             light_bind_group,
             albedo_texture,
             albedo_bind_group,
-            depth_texture,
-            depth_view,
             line_pipeline,
             line_vertex_buffer: None,
             line_buffer_capacity: 0,
@@ -368,11 +413,11 @@ impl Renderer {
             model_bind_group,
             model_uniform_stride,
             model_staging: Vec::new(),
-        };
-        renderer.configure_surface();
-        Ok(renderer)
+        }
     }
+}
 
+impl Renderer {
     fn build_mesh_pipeline(
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
@@ -604,7 +649,9 @@ impl Renderer {
 
         (texture, bind_group)
     }
+}
 
+impl SceneRenderer {
     #[instrument(skip(self), level = "debug")]
     pub fn cube_mesh(&self) -> Mesh {
         // 24 vertices (6 faces x 4), 36 indices. Each face has a normal + UVs.
@@ -802,16 +849,22 @@ impl Renderer {
         self.surface_format
     }
 
+    pub fn create_viewport_target(&self, size: winit::dpi::PhysicalSize<u32>) -> ViewportTarget {
+        ViewportTarget::new(&self.device, self.surface_format.add_srgb_suffix(), size)
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+}
+
+impl Renderer {
     pub fn size(&self) -> winit::dpi::PhysicalSize<u32> {
         self.size
     }
 
     pub fn depth_view(&self) -> &wgpu::TextureView {
         &self.depth_view
-    }
-
-    pub fn queue(&self) -> &wgpu::Queue {
-        &self.queue
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -839,7 +892,9 @@ impl Renderer {
         };
         self.surface.configure(&self.device, &config);
     }
+}
 
+impl SceneRenderer {
     pub fn update_camera(&self, view_proj: glam::Mat4) {
         let uniform = CameraUniform {
             view_proj: view_proj.to_cols_array_2d(),
@@ -1073,7 +1128,9 @@ impl Renderer {
             albedo_bind_groups,
         })
     }
+}
 
+impl Renderer {
     /// Acquire the surface texture and begin a new frame.
     /// Returns `None` if the surface is lost/outdated/occluded.
     pub fn begin_frame(&mut self) -> Option<Frame> {
@@ -1122,7 +1179,9 @@ impl Renderer {
             encoder,
         })
     }
+}
 
+impl SceneRenderer {
     /// Draw 3D meshes into an existing render pass.
     /// Each draw call is `(entity_index, mesh)` where `entity_index` is the index
     /// into the model uniform buffer (see `update_model_uniforms`).
@@ -1204,7 +1263,9 @@ impl Renderer {
         pass.set_vertex_buffer(0, buffer.slice(..needed));
         pass.draw(0..vertices.len() as u32, 0..1);
     }
+}
 
+impl Renderer {
     /// Submit the frame's command encoder and present the surface texture.
     /// Calls `device.poll` after submit to force wgpu to GC completed buffers
     /// (workaround for wgpu #5397 — short-lived buffers leak without poll).
@@ -1256,6 +1317,69 @@ impl Renderer {
             self.draw_meshes(&mut pass, draw_calls);
         }
         self.end_frame(frame);
+    }
+}
+
+pub struct ViewportTarget {
+    color_texture: Arc<wgpu::Texture>,
+    color_view: Arc<wgpu::TextureView>,
+    _depth_texture: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+    size: winit::dpi::PhysicalSize<u32>,
+}
+
+impl ViewportTarget {
+    fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        size: winit::dpi::PhysicalSize<u32>,
+    ) -> Self {
+        let size = winit::dpi::PhysicalSize::new(size.width.max(1), size.height.max(1));
+        let color_texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("editor viewport color texture"),
+            size: wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        }));
+        let color_view =
+            Arc::new(color_texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        let (depth_texture, depth_view) = Renderer::create_depth_target(device, size);
+
+        Self {
+            color_texture,
+            color_view,
+            _depth_texture: depth_texture,
+            depth_view,
+            size,
+        }
+    }
+
+    pub fn color_texture(&self) -> Arc<wgpu::Texture> {
+        self.color_texture.clone()
+    }
+
+    pub fn color_texture_handle(&self) -> wgpu::Texture {
+        self.color_texture.as_ref().clone()
+    }
+
+    pub fn color_view(&self) -> Arc<wgpu::TextureView> {
+        self.color_view.clone()
+    }
+
+    pub fn depth_view(&self) -> &wgpu::TextureView {
+        &self.depth_view
+    }
+
+    pub fn size(&self) -> winit::dpi::PhysicalSize<u32> {
+        self.size
     }
 }
 

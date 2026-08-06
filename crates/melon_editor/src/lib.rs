@@ -12,7 +12,11 @@ use winit::event::WindowEvent;
 use winit::window::Window;
 
 pub mod gizmo;
+#[cfg(feature = "imgui-poc")]
+pub mod imgui_poc;
 pub mod scene;
+#[cfg(feature = "slint-poc")]
+pub mod slint_poc;
 
 use gizmo::{
     AXIS_X, AXIS_Y, AXIS_Z, CIRCLE_SEGMENTS, DEGENERATE_CIRCLE_PX, GIZMO_SIZE_PX, PICK_THRESHOLD,
