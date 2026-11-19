@@ -56,6 +56,13 @@ pub fn pause(world: &mut World) {
     }
 }
 
+/// Advance one fixed step while `Paused`. Does nothing in other states.
+pub fn step(world: &mut World) {
+    if state(world) == SimulationState::Paused {
+        world.insert_resource(melon_core::StepOnce);
+    }
+}
+
 /// Restore the scene from the Play snapshot and return to `Editing`, with play
 /// time reset. Does nothing without a snapshot.
 pub fn stop(world: &mut World) -> Result<()> {
@@ -212,6 +219,19 @@ mod tests {
         assert_eq!(state(&world), SimulationState::Editing);
         assert!(world.get_resource::<PlaySnapshot>().is_none());
         assert_eq!(box_transform(&mut world).scale, Vec3::ZERO);
+    }
+
+    #[test]
+    fn step_only_when_paused() {
+        let mut world = edit_world();
+        step(&mut world);
+        assert!(!world.contains_resource::<melon_core::StepOnce>());
+        play(&mut world).unwrap();
+        step(&mut world);
+        assert!(!world.contains_resource::<melon_core::StepOnce>());
+        pause(&mut world);
+        step(&mut world);
+        assert!(world.contains_resource::<melon_core::StepOnce>());
     }
 
     #[test]

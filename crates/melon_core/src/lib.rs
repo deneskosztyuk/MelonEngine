@@ -31,6 +31,11 @@ pub struct FrameCounter {
     pub frame: u64,
 }
 
+/// Request one fixed step while `Paused` (the editor's Step button).
+/// `Core::update` consumes it.
+#[derive(Resource, Default)]
+pub struct StepOnce;
+
 #[derive(Resource, Default)]
 pub struct LogInterval {
     pub frames_per_log: u64,
@@ -105,6 +110,13 @@ impl Core {
                 SimulationState::Paused => {}
                 SimulationState::Editing => time.overstep = 0.0,
             }
+        }
+        // Step button: exactly one fixed step while paused.
+        if state == SimulationState::Paused && self.world.remove_resource::<StepOnce>().is_some() {
+            if let Some(mut time) = self.world.get_resource_mut::<Time>() {
+                time.elapsed_seconds += time.fixed_delta;
+            }
+            self.run_stage(FixedUpdate);
         }
         // Time is borrowed only for the check, so the stage can borrow the world.
         while let Some(mut time) = self.world.get_resource_mut::<Time>()
@@ -223,6 +235,27 @@ mod tests {
 
     fn set_state(core: &mut Core, state: SimulationState) {
         core.world.insert_resource(state);
+    }
+
+    #[test]
+    fn step_once_runs_one_fixed_step_while_paused() {
+        let mut core = counting_core();
+        set_state(&mut core, SimulationState::Paused);
+        core.world.insert_resource(StepOnce);
+        run_frames(&mut core, 1.0 / 60.0, 3);
+        assert_eq!(steps(&core), 1);
+        let elapsed = core.world.resource::<Time>().elapsed_seconds;
+        assert!((elapsed - 1.0 / 60.0).abs() < 1e-6, "elapsed {elapsed}");
+        assert!(!core.world.contains_resource::<StepOnce>());
+    }
+
+    #[test]
+    fn step_once_ignored_while_editing() {
+        let mut core = counting_core();
+        set_state(&mut core, SimulationState::Editing);
+        core.world.insert_resource(StepOnce);
+        run_frames(&mut core, 1.0 / 60.0, 3);
+        assert_eq!(steps(&core), 0);
     }
 
     #[test]
