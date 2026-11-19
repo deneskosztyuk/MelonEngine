@@ -204,13 +204,14 @@ impl Editor {
                             if path.extension().is_none() {
                                 path = path.with_extension("ron");
                             }
-                            match dialog {
-                                DialogChannel::Save(_) => {
-                                    self.pending_operation = Some(PendingOperation::Save(path));
-                                }
-                                DialogChannel::Load(_) => {
-                                    self.pending_operation = Some(PendingOperation::Load(path));
-                                }
+                            let is_save = matches!(dialog, DialogChannel::Save(_));
+                            let state = world
+                                .get_resource::<SimulationState>()
+                                .copied()
+                                .unwrap_or_default();
+                            self.pending_operation = dialog_operation(is_save, path, state);
+                            if self.pending_operation.is_none() {
+                                self.set_status("Stop the game before saving or loading".into());
                             }
                         }
                         Ok(None) => {
@@ -268,8 +269,8 @@ impl Editor {
             .copied()
             .unwrap_or_default();
         let (mut want_play, mut want_pause, mut want_stop) = (false, false, false);
-        // Shortcuts are ignored while a widget (e.g. an inspector field) has focus.
-        if !ui.ctx().egui_wants_keyboard_input() {
+        // Shortcuts are ignored while typing in a text field.
+        if !ui.ctx().text_edit_focused() {
             ui.input(|i| {
                 if i.key_pressed(egui::Key::F5) {
                     if i.modifiers.shift {
@@ -369,6 +370,7 @@ impl Editor {
 
     fn build_inspector(&mut self, world: &mut World, ui: &mut egui::Ui) {
         if let Some(entity) = self.selected {
+            let mut transform_edited = false;
             if let Ok(mut entity_mut) = world.get_entity_mut(entity) {
                 ui.heading("Inspector");
 
@@ -434,6 +436,7 @@ impl Editor {
                     if scale_changed {
                         transform.scale = glam::Vec3::from_array(s);
                     }
+                    transform_edited = pos_changed || rot_changed || scale_changed;
                     ui.separator();
                 }
 
@@ -457,7 +460,20 @@ impl Editor {
             } else {
                 self.clear_selection();
             }
+            if transform_edited {
+                self.after_transform_edit(world, entity);
+            }
         }
+    }
+
+    /// After an inspector edit of `Transform`: push it into rapier and snap
+    /// `PreviousTransform`, like the gizmo does, so paused edits survive resume.
+    fn after_transform_edit(&self, world: &mut World, entity: Entity) {
+        let Some(t) = world.get::<Transform>(entity).copied() else {
+            return;
+        };
+        self.write_to_physics_body(world, entity, Some(t.translation), Some(t.rotation));
+        snap_previous_transform(world, entity);
     }
 
     fn build_gizmo(&mut self, world: &mut World, ui: &mut egui::Ui) {
@@ -954,6 +970,23 @@ impl EditorOverlay {
     }
 }
 
+/// Turn a finished Save/Load file dialog into an operation. Dropped unless in
+/// edit mode: the dialog runs on its own thread, so Play can start while it is open.
+fn dialog_operation(
+    is_save: bool,
+    path: std::path::PathBuf,
+    state: SimulationState,
+) -> Option<PendingOperation> {
+    if state != SimulationState::Editing {
+        return None;
+    }
+    Some(if is_save {
+        PendingOperation::Save(path)
+    } else {
+        PendingOperation::Load(path)
+    })
+}
+
 /// After a gizmo edit, make `PreviousTransform` match the new pose, so the
 /// interpolated draw shows the drag directly instead of trailing one step behind.
 fn snap_previous_transform(world: &mut World, entity: Entity) {
@@ -1011,6 +1044,45 @@ mod tests {
             .unwrap()
             .x;
         assert!((x - 4.0).abs() < 1e-6, "rapier x {x}");
+    }
+
+    #[test]
+    fn inspector_edit_while_paused_reaches_physics_and_prev() {
+        let mut world = World::new();
+        let mut physics = melon_physics::PhysicsWorld::new();
+        let (body, _) = physics.spawn_dynamic_cuboid(glam::Vec3::ZERO, glam::Vec3::splat(0.5));
+        world.insert_resource(physics);
+        world.insert_resource(SimulationState::Paused);
+        let e = world
+            .spawn((
+                Transform::from_translation(glam::Vec3::new(4.0, 0.0, 0.0)),
+                melon_core::PreviousTransform(Transform::default()),
+                melon_physics::RigidBodyComponent {
+                    body_handle: body,
+                    body_type: melon_physics::RigidBodyType::Dynamic,
+                },
+            ))
+            .id();
+        Editor::new().after_transform_edit(&mut world, e);
+        let x = world
+            .resource::<melon_physics::PhysicsWorld>()
+            .body_translation(body)
+            .unwrap()
+            .x;
+        assert!((x - 4.0).abs() < 1e-6, "rapier x {x}");
+        let prev = world.get::<melon_core::PreviousTransform>(e).unwrap();
+        assert_eq!(prev.0.translation.x, 4.0);
+    }
+
+    #[test]
+    fn scene_dialog_result_dropped_unless_editing() {
+        let path = std::path::PathBuf::from("a.ron");
+        assert!(dialog_operation(true, path.clone(), SimulationState::Playing).is_none());
+        assert!(dialog_operation(false, path.clone(), SimulationState::Paused).is_none());
+        assert!(matches!(
+            dialog_operation(true, path, SimulationState::Editing),
+            Some(PendingOperation::Save(_))
+        ));
     }
 
     #[test]
