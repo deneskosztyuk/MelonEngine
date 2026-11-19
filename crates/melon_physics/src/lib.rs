@@ -622,4 +622,15 @@ mod tests {
         run_frames(&mut core, 1.0 / 60.0, 2);
         assert!(core.world.get::<PreviousTransform>(fixed).is_none());
     }
+
+    #[test]
+    fn deleting_new_dynamic_body_does_not_panic() {
+        let (mut core, e, _) = drop_test_core();
+        core.world.entity_mut(e).insert(PendingDelete);
+        run_frames(&mut core, 0.001, 2);
+        assert!(
+            core.world.get_entity(e).is_err(),
+            "entity should be despawned"
+        );
+    }
 }

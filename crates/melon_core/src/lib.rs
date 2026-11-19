@@ -46,8 +46,9 @@ fn log_frame_system(counter: Res<FrameCounter>, interval: Res<LogInterval>) {
     }
 }
 
-/// The ECS world plus its frame stages. Schedules live here, not as a
-/// `World` resource, so scene load (which swaps in a fresh `World`) keeps them.
+/// The ECS world plus its frame stages.
+/// Known limit (ROADMAP bug 10): bevy systems are bound to the first `World`
+/// they run on, so replacing `world` after a frame panics in `update`.
 pub struct Core {
     pub world: World,
     pub schedules: Schedules,
@@ -225,9 +226,13 @@ mod tests {
         assert!(steps(&core) <= 1, "got {}", steps(&core));
     }
 
+    /// Pins ROADMAP bug 10. When scene load stops swapping the World (or
+    /// Core can rebuild its schedules), flip this to assert the stages run.
     #[test]
-    fn stages_survive_world_swap() {
+    #[should_panic(expected = "mismatched World")]
+    fn world_swap_after_first_frame_panics() {
         let mut core = counting_core();
+        run_frames(&mut core, 1.0 / 60.0, 1); // systems initialize on the first World
         let mut fresh = World::new();
         fresh.insert_resource(Time::default());
         fresh.init_resource::<FixedCount>();

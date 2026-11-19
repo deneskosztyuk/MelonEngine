@@ -497,6 +497,7 @@ impl Editor {
                             if let Some(mut t) = world.get_mut::<Transform>(entity) {
                                 t.translation = new_translation;
                             }
+                            snap_previous_transform(world, entity);
                             self.write_to_physics_body(world, entity, Some(new_translation), None);
                         }
                     }
@@ -523,6 +524,7 @@ impl Editor {
                             if let Some(mut t) = world.get_mut::<Transform>(entity) {
                                 t.rotation = new_rotation;
                             }
+                            snap_previous_transform(world, entity);
                             self.write_to_physics_body(world, entity, None, Some(new_rotation));
                         }
                     }
@@ -553,6 +555,7 @@ impl Editor {
                                 if let Some(mut t) = world.get_mut::<Transform>(entity) {
                                     t.scale = new_scale;
                                 }
+                                snap_previous_transform(world, entity);
                             }
                         }
                     }
@@ -897,5 +900,43 @@ impl EditorOverlay {
     pub fn render(&self, pass: &mut wgpu::RenderPass<'static>) {
         self.renderer
             .render(pass, &self.paint_jobs, &self.screen_descriptor);
+    }
+}
+
+/// After a gizmo edit, make `PreviousTransform` match the new pose, so the
+/// interpolated draw shows the drag directly instead of trailing one step behind.
+fn snap_previous_transform(world: &mut World, entity: Entity) {
+    let Some(current) = world.get::<Transform>(entity).copied() else {
+        return;
+    };
+    if let Some(mut prev) = world.get_mut::<melon_core::PreviousTransform>(entity) {
+        prev.0 = current;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snap_previous_transform_matches_current() {
+        let mut world = World::new();
+        let e = world
+            .spawn((
+                Transform::from_translation(glam::Vec3::new(5.0, 0.0, 0.0)),
+                melon_core::PreviousTransform(Transform::default()),
+            ))
+            .id();
+        snap_previous_transform(&mut world, e);
+        let prev = world.get::<melon_core::PreviousTransform>(e).unwrap();
+        assert_eq!(prev.0.translation, glam::Vec3::new(5.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn snap_previous_transform_ignores_entity_without_it() {
+        let mut world = World::new();
+        let e = world.spawn(Transform::default()).id();
+        snap_previous_transform(&mut world, e);
+        assert!(world.get::<melon_core::PreviousTransform>(e).is_none());
     }
 }

@@ -52,8 +52,10 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   `App::new`.
 - **Stages.** Register systems with `core.add_systems(Stage, ...)`:
   `FixedUpdate` (1/60 s, 0..N times per frame, not while paused), `Update`
-  (once per frame, read `Time::delta_seconds`), `PostUpdate`. Schedules live
-  in `Core::schedules`, not in the `World`, so scene load keeps them.
+  (once per frame, read `Time::delta_seconds`), `PostUpdate`.
+- **Never replace `core.world` after the first frame.** bevy systems are bound
+  to the first `World` they run on and panic on another one. `load_scene`
+  does this today (ROADMAP bug 10).
 - **Interpolation.** Add `PreviousTransform` to entities moved in
   `FixedUpdate` so they render smoothly. Dynamic physics bodies get it
   automatically. Do not add it to entities moved in `Update`.
