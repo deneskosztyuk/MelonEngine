@@ -8,6 +8,8 @@ use melon_core::{Camera, Handle, Light, Model, SimulationState, Time};
 /// Everything one view needs to draw a frame.
 pub struct FrameData {
     pub view_proj: Mat4,
+    /// Camera position (overlay shading).
+    pub eye: glam::Vec3,
     pub light: Light,
     /// World matrix and model of every entity with a `Handle<Model>`.
     pub models: Vec<(Mat4, Handle<Model>)>,
@@ -26,6 +28,9 @@ pub fn extract(world: &mut World) -> FrameData {
         .get_resource::<Camera>()
         .map(Camera::view_proj)
         .unwrap_or_default();
+    let eye = world
+        .get_resource::<Camera>()
+        .map_or(glam::Vec3::ZERO, |c| c.eye);
     let light = world.get_resource::<Light>().copied().unwrap_or_default();
     let alpha = world.get_resource::<Time>().map_or(1.0, Time::alpha);
     let state = world
@@ -40,6 +45,7 @@ pub fn extract(world: &mut World) -> FrameData {
         .collect();
     FrameData {
         view_proj,
+        eye,
         light,
         models,
     }

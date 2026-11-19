@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 mod extract;
 mod models;
+mod overlay;
 
 pub use extract::{FrameData, blends, extract};
+pub use overlay::{OverlayDepth, OverlayDraw, OverlayShape};
 
 /// Model uniform slots: at most this many entities with a model are drawn.
 pub const MAX_ENTITIES: usize = 1024;
@@ -316,8 +318,6 @@ pub struct SceneRenderer {
     #[allow(dead_code)]
     albedo_texture: wgpu::Texture,
     albedo_bind_group: wgpu::BindGroup,
-    line_pipeline: wgpu::RenderPipeline,
-    lines: LineBuffer,
     /// Depth-tested lines inside the 3D pass (grid, axes, selection box).
     world_line_pipeline: wgpu::RenderPipeline,
     world_lines: LineBuffer,
@@ -335,6 +335,8 @@ pub struct Renderer {
     scene: SceneRenderer,
     /// GPU models per asset handle, used by `render_scene`.
     model_cache: ModelCache,
+    /// Solid editor shapes drawn after tonemapping.
+    overlay: overlay::OverlayRenderer,
 }
 
 /// Background of the scene and of the window behind the editor UI.
@@ -412,6 +414,11 @@ impl Renderer {
 
         let scene = SceneRenderer::new(device, queue, surface_format);
         let model_cache = ModelCache::new(&scene);
+        let overlay = overlay::OverlayRenderer::new(
+            &scene.device,
+            surface_format.add_srgb_suffix(),
+            MSAA_SAMPLES,
+        );
 
         let renderer = Self {
             instance,
@@ -420,6 +427,7 @@ impl Renderer {
             window,
             scene,
             model_cache,
+            overlay,
         };
         renderer.configure_surface();
         Ok(renderer)
@@ -430,8 +438,8 @@ impl Renderer {
     }
 
     /// Record one view of `frame` into `target`: shadow pass, 3D pass (HDR,
-    /// MSAA) with the meshes and depth-tested `world_lines`, then the tonemap
-    /// pass onto the target's display image with `overlay_lines` on top.
+    /// MSAA) with the meshes and depth-tested `world_lines`, the tonemap pass
+    /// onto the target's display image, then the `overlay` shapes.
     /// Models load (or hot-reload) here on first use.
     pub fn render_scene(
         &mut self,
@@ -440,7 +448,7 @@ impl Renderer {
         server: &mut melon_core::AssetServer,
         target: &ViewportTarget,
         world_lines: &[LineVertex],
-        overlay_lines: &[LineVertex],
+        overlay: &[OverlayDraw],
     ) {
         let scene = &mut self.scene;
         scene.update_camera(frame.view_proj);
@@ -501,10 +509,18 @@ impl Renderer {
             scene.draw_world_lines(&mut pass, world_lines, frame.view_proj);
         }
         let color_view = target.color_view();
-        let mut pass = scene.tonemap_pass(encoder, hdr, &color_view);
-        if !overlay_lines.is_empty() {
-            scene.draw_lines(&mut pass, overlay_lines, frame.view_proj);
-        }
+        drop(scene.tonemap_pass(encoder, hdr, &color_view));
+        self.overlay.render(
+            &self.scene.device,
+            &self.scene.queue,
+            encoder,
+            &target.overlay,
+            target.depth_view(),
+            &color_view,
+            frame.view_proj,
+            frame.eye,
+            overlay,
+        );
     }
 
     /// The pass the editor UI draws into: the swapchain image cleared to
@@ -704,7 +720,6 @@ impl SceneRenderer {
         let (albedo_texture, albedo_bind_group) =
             Renderer::create_checkerboard_texture(&device, &queue, &texture_layout);
 
-        let line_pipeline = Renderer::build_line_pipeline(&device, surface_format, &frame_layout);
         let world_line_pipeline = Renderer::build_world_line_pipeline(&device, &frame_layout);
 
         // Reusable model uniform buffer with dynamic offsets.
@@ -752,8 +767,6 @@ impl SceneRenderer {
             shadow_view,
             albedo_texture,
             albedo_bind_group,
-            line_pipeline,
-            lines: LineBuffer::default(),
             world_line_pipeline,
             world_lines: LineBuffer::default(),
             model_uniform_buffer,
@@ -912,61 +925,6 @@ impl Renderer {
             }),
             multisample: wgpu::MultisampleState::default(),
             fragment: None,
-            multiview_mask: None,
-            cache: None,
-        })
-    }
-
-    fn build_line_pipeline(
-        device: &wgpu::Device,
-        surface_format: wgpu::TextureFormat,
-        frame_layout: &wgpu::BindGroupLayout,
-    ) -> wgpu::RenderPipeline {
-        let shader =
-            device.create_shader_module(wgpu::include_wgsl!("../../../assets/shaders/line.wgsl"));
-        let target_format = surface_format.add_srgb_suffix();
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("line pipeline layout"),
-            bind_group_layouts: &[Some(frame_layout)],
-            immediate_size: 0,
-        });
-
-        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("melon_render line pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<LineVertex>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![
-                        0 => Float32x3,
-                        1 => Float32x3,
-                    ],
-                }],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::LineList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            // Gizmo lines always draw on top, in the tonemap pass, which has
-            // no depth attachment.
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: target_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
             multiview_mask: None,
             cache: None,
         })
@@ -1927,29 +1885,8 @@ impl SceneRenderer {
         }
     }
 
-    /// Draw colored line segments for gizmo/debug visualization.
-    /// Uses a reusable vertex buffer with 2x growth — no per-frame allocation.
-    /// `vertices` must be in pairs (LineList topology).
-    /// The camera uniform is updated with `view_proj` before drawing.
-    pub fn draw_lines(
-        &mut self,
-        pass: &mut wgpu::RenderPass<'_>,
-        vertices: &[LineVertex],
-        view_proj: glam::Mat4,
-    ) {
-        if vertices.is_empty() {
-            return;
-        }
-        self.write_line_camera(view_proj);
-        let (buffer, len) = self.lines.upload(&self.device, &self.queue, vertices);
-        pass.set_pipeline(&self.line_pipeline);
-        pass.set_bind_group(0, &self.frame_bind_group, &[]);
-        pass.set_vertex_buffer(0, buffer.slice(..len));
-        pass.draw(0..vertices.len() as u32, 0..1);
-    }
-
     /// Depth-tested lines in the 3D (HDR, multisampled) pass: grid, axes,
-    /// selection box. Hidden behind geometry, unlike `draw_lines`.
+    /// selection box. Hidden behind geometry.
     pub fn draw_world_lines(
         &mut self,
         pass: &mut wgpu::RenderPass<'_>,
@@ -1999,6 +1936,7 @@ pub struct ViewportTarget {
     _depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
     hdr_target: HdrTarget,
+    overlay: overlay::OverlayTargets,
     size: winit::dpi::PhysicalSize<u32>,
 }
 
@@ -2035,6 +1973,7 @@ impl ViewportTarget {
             ..Default::default()
         });
         let (depth_texture, depth_view) = Renderer::create_depth_target(device, size);
+        let overlay = overlay::OverlayTargets::new(device, size, MSAA_SAMPLES);
 
         Self {
             color_texture,
@@ -2044,6 +1983,7 @@ impl ViewportTarget {
             _depth_texture: depth_texture,
             depth_view,
             hdr_target,
+            overlay,
             size,
         }
     }
@@ -2457,6 +2397,65 @@ mod tests {
         assert_eq!(nodes[1].translation, glam::Vec3::new(3.0, 0.0, 0.0));
     }
 
+    /// A quad facing the default camera (normal +Z), 2x2 m, centred at `z`.
+    fn facing_quad(z: f32, color: [f32; 4], depth: OverlayDepth) -> OverlayDraw {
+        OverlayDraw {
+            shape: OverlayShape::Quad,
+            transform: glam::Mat4::from_translation(glam::Vec3::new(-1.0, 1.0, z))
+                * glam::Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2)
+                * glam::Mat4::from_scale(glam::Vec3::splat(2.0)),
+            color,
+            depth,
+        }
+    }
+
+    /// Render a `size` target with optional cube at the origin and the given
+    /// overlay; returns the RGBA of the centre pixel.
+    fn overlay_centre(
+        renderer: &mut Renderer,
+        size: (u32, u32),
+        cube: bool,
+        overlay: &[OverlayDraw],
+    ) -> [u8; 4] {
+        use melon_core::{AssetServer, Handle, Model};
+        let mut server = AssetServer::new(".".into());
+        let h: Handle<Model> = server.load("builtin:cube");
+        let camera = melon_core::Camera::default();
+        let frame = FrameData {
+            view_proj: camera.view_proj(),
+            eye: camera.eye,
+            light: melon_core::Light::default(),
+            models: if cube {
+                vec![(glam::Mat4::IDENTITY, h)]
+            } else {
+                vec![]
+            },
+        };
+        let target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(size.0, size.1));
+        let mut encoder = renderer
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        renderer.render_scene(&mut encoder, &frame, &mut server, &target, &[], overlay);
+        if size != (TEST_SIZE, TEST_SIZE) {
+            renderer.queue().submit([encoder.finish()]);
+            return [0; 4];
+        }
+        let pixels = read_back(
+            renderer.device(),
+            renderer.queue(),
+            encoder,
+            &target.color_texture,
+        );
+        let i = (((TEST_SIZE / 2) * TEST_SIZE + TEST_SIZE / 2) * 4) as usize;
+        let px = [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]];
+        // The display texture may be BGRA: report as RGBA.
+        if renderer.surface_format().remove_srgb_suffix() == wgpu::TextureFormat::Bgra8Unorm {
+            [px[2], px[1], px[0], px[3]]
+        } else {
+            px
+        }
+    }
+
     fn temp_project(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("melon_models_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2670,6 +2669,66 @@ mod tests {
                 }
             }),
             Box::new(|renderer| {
+                let px = overlay_centre(
+                    renderer,
+                    (TEST_SIZE, TEST_SIZE),
+                    false,
+                    &[facing_quad(0.0, [1.0, 0.0, 0.0, 1.0], OverlayDepth::OnTop)],
+                );
+                if px[0] >= 250 && px[1] <= 5 && px[2] <= 5 {
+                    Ok(())
+                } else {
+                    Err(format!("overlay_on_top_exact_colour: centre {px:?}"))
+                }
+            }),
+            Box::new(|renderer| {
+                let plain = overlay_centre(renderer, (TEST_SIZE, TEST_SIZE), true, &[]);
+                let red = [1.0, 0.0, 0.0, 1.0];
+                let tested = overlay_centre(
+                    renderer,
+                    (TEST_SIZE, TEST_SIZE),
+                    true,
+                    &[facing_quad(-2.0, red, OverlayDepth::SceneTested)],
+                );
+                let on_top = overlay_centre(
+                    renderer,
+                    (TEST_SIZE, TEST_SIZE),
+                    true,
+                    &[facing_quad(-2.0, red, OverlayDepth::OnTop)],
+                );
+                if tested == plain && on_top != plain {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "overlay_scene_tested_hidden_behind_cube: plain {plain:?} tested {tested:?} on_top {on_top:?}"
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
+                let px = overlay_centre(
+                    renderer,
+                    (TEST_SIZE, TEST_SIZE),
+                    false,
+                    &[
+                        facing_quad(0.0, [1.0, 0.0, 0.0, 0.5], OverlayDepth::OnTop),
+                        facing_quad(-1.0, [0.0, 0.0, 1.0, 1.0], OverlayDepth::OnTop),
+                    ],
+                );
+                if px[2] > 60 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "overlay_transparent_does_not_hide_opaque_behind: centre {px:?}"
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
+                let quad = [facing_quad(0.0, [1.0, 0.0, 0.0, 1.0], OverlayDepth::OnTop)];
+                overlay_centre(renderer, (TEST_SIZE, TEST_SIZE), false, &quad);
+                overlay_centre(renderer, (32, 16), false, &quad);
+                Ok(())
+            }),
+            Box::new(|renderer| {
                 use melon_core::{AssetServer, Handle, Model};
                 let mut server = AssetServer::new(".".into());
                 let cube: Handle<Model> = server.load("builtin:cube");
@@ -2679,6 +2738,7 @@ mod tests {
                     ));
                     let frame = FrameData {
                         view_proj: melon_core::Camera::default().view_proj(),
+                        eye: melon_core::Camera::default().eye,
                         light: melon_core::Light::default(),
                         models,
                     };
