@@ -5,7 +5,9 @@ use bevy_ecs::world::World;
 use egui::ViewportId;
 use egui_wgpu::ScreenDescriptor;
 use melon_core::glam;
-use melon_core::hierarchy::{mark_for_delete, set_world_transform, world_matrix};
+use melon_core::hierarchy::{
+    depth_first, mark_for_delete, set_parent_keep_world, set_world_transform, world_matrix,
+};
 use melon_core::{
     Aabb, AssetServer, BodyInfo, Camera, Handle, Model, Name, SimulationState, Spin, Transform,
 };
@@ -101,6 +103,8 @@ pub struct Editor {
     /// Project folder: asset paths are relative to it.
     project_root: std::path::PathBuf,
     hierarchy_query: String,
+    /// Hierarchy rows whose children are hidden.
+    collapsed: std::collections::HashSet<Entity>,
     /// Scene file last saved or loaded; File > Save writes here.
     current_scene: Option<std::path::PathBuf>,
     /// Right mouse held over the viewport (fly mode): W/E/R are fly keys then.
@@ -131,6 +135,7 @@ impl Default for Editor {
             layout_file: layout::layout_path(),
             project_root: ".".into(),
             hierarchy_query: String::new(),
+            collapsed: std::collections::HashSet::new(),
             current_scene: None,
             flying: false,
             show_about: false,
@@ -701,22 +706,70 @@ impl Editor {
 
         ui.separator();
 
-        // Entity list (also a drop zone: a dragged model spawns at the origin)
+        // Entity tree. Rows are drag sources (reparent) and drop targets for
+        // entities and models; the space below the rows makes roots.
         let mut to_delete: Option<Entity> = None;
-        let entities: Vec<(Entity, Name)> = world
-            .query::<(Entity, &Name)>()
-            .iter(world)
-            .map(|(e, n)| (e, n.clone()))
+        let mut reparent: Option<(Entity, Option<Entity>)> = None;
+        let mut model_drop: Option<(String, Option<Entity>)> = None;
+        let searching = !self.hierarchy_query.trim().is_empty();
+        let rows: Vec<(Entity, usize, String, bool)> = depth_first(world)
+            .into_iter()
+            .map(|(e, depth)| {
+                let name = world
+                    .get::<Name>(e)
+                    .map(|n| n.0.clone())
+                    .unwrap_or_default();
+                let has_children = world
+                    .get::<melon_core::Children>(e)
+                    .is_some_and(|c| !c.is_empty());
+                (e, depth, name, has_children)
+            })
             .collect();
 
-        let (_, dropped) = ui.dnd_drop_zone::<String, _>(egui::Frame::new(), |ui| {
-            ui.set_min_size(ui.available_size());
-            for (entity, name) in entities {
-                if !layout::hierarchy_matches(&name.0, &self.hierarchy_query) {
-                    continue;
+        let (zone, dropped_model) = ui.dnd_drop_zone::<String, _>(egui::Frame::new(), |ui| {
+            // Rows below a collapsed row are hidden.
+            let mut hide_below: Option<usize> = None;
+            for (entity, depth, name, has_children) in rows {
+                if searching {
+                    if !layout::hierarchy_matches(&name, &self.hierarchy_query) {
+                        continue;
+                    }
+                } else {
+                    if hide_below.is_some_and(|d| depth > d) {
+                        continue;
+                    }
+                    hide_below = self.collapsed.contains(&entity).then_some(depth);
                 }
                 let is_selected = self.selected == Some(entity);
-                let response = ui.selectable_label(is_selected, &name.0);
+                let row = ui.horizontal(|ui| {
+                    if !searching {
+                        ui.add_space(depth as f32 * theme::sizes::SPACING * 2.0);
+                        if has_children {
+                            let open = !self.collapsed.contains(&entity);
+                            if ui
+                                .small_button(if open { "\u{25be}" } else { "\u{25b8}" })
+                                .clicked()
+                            {
+                                if open {
+                                    self.collapsed.insert(entity);
+                                } else {
+                                    self.collapsed.remove(&entity);
+                                }
+                            }
+                        } else {
+                            ui.add_space(theme::sizes::SPACING * 3.0);
+                        }
+                    }
+                    if searching {
+                        ui.selectable_label(is_selected, &name)
+                    } else {
+                        ui.dnd_drag_source(egui::Id::new(("hierarchy_row", entity)), entity, |ui| {
+                            ui.selectable_label(is_selected, &name)
+                        })
+                        .inner
+                    }
+                });
+                let response = row.inner;
                 if response.clicked() {
                     self.selected = if is_selected { None } else { Some(entity) };
                     self.gizmo_drag = None;
@@ -724,12 +777,46 @@ impl Editor {
                 if response.secondary_clicked() {
                     to_delete = Some(entity);
                 }
+                if !searching {
+                    let row_rect = row.response.rect;
+                    if response.dnd_hover_payload::<Entity>().is_some()
+                        || response.dnd_hover_payload::<String>().is_some()
+                    {
+                        ui.painter().rect_stroke(
+                            row_rect,
+                            theme::sizes::RADIUS,
+                            egui::Stroke::new(1.0, theme::colors::ACCENT),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    if let Some(dragged) = response.dnd_release_payload::<Entity>() {
+                        reparent = Some((*dragged, Some(entity)));
+                    }
+                    if let Some(path) = response.dnd_release_payload::<String>() {
+                        model_drop = Some(((*path).clone(), Some(entity)));
+                    }
+                }
             }
+            // Fill the rest of the panel so empty space below the rows is a target.
+            ui.allocate_space(ui.available_size());
         });
-        if let Some(path) = dropped
+        if let Some(dragged) = zone.response.dnd_release_payload::<Entity>() {
+            reparent = Some((*dragged, None));
+        }
+        if let Some(path) = dropped_model {
+            model_drop = Some(((*path).clone(), None));
+        }
+
+        if let Some((dragged, target)) = reparent
+            && target != Some(dragged)
+            && let Err(message) = hierarchy_drop(world, dragged, target)
+        {
+            self.set_status_warning(message);
+        }
+        if let Some((path, parent)) = model_drop
             && content::is_model_path(&path)
         {
-            match spawn_model(world, &self.project_root, &path, glam::Vec3::ZERO, None) {
+            match spawn_model(world, &self.project_root, &path, glam::Vec3::ZERO, parent) {
                 Ok(e) => self.selected = Some(e),
                 Err(message) => self.set_status_warning(message),
             }
@@ -1558,6 +1645,29 @@ pub fn spawn_model(
     Ok(root)
 }
 
+/// Hierarchy drag-and-drop: put `dragged` under `target` (or make it a root)
+/// without moving it in the world, and move its physics body to match.
+/// `Err` is a status-bar warning; nothing changes then.
+pub fn hierarchy_drop(
+    world: &mut World,
+    dragged: Entity,
+    target: Option<Entity>,
+) -> Result<(), String> {
+    set_parent_keep_world(world, dragged, target)?;
+    snap_previous_transform(world, dragged);
+    let pose = Transform::from_mat4(world_matrix(world, dragged));
+    if let Some(handle) = world
+        .get::<melon_physics::RigidBodyComponent>(dragged)
+        .map(|c| c.body_handle)
+        && let Some(mut physics) = world.get_resource_mut::<melon_physics::PhysicsWorld>()
+        && let Some(body) = physics.bodies.get_mut(handle)
+    {
+        body.set_translation(pose.translation, true);
+        body.set_rotation(pose.rotation, true);
+    }
+    Ok(())
+}
+
 /// Short label for a model path in the Inspector: the file name, plus the
 /// mesh for `#mesh<N>` paths.
 fn model_label(path: &str) -> String {
@@ -1757,6 +1867,94 @@ fn snap_previous_transform(world: &mut World, entity: Entity) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn world_pos(world: &World, e: Entity) -> glam::Vec3 {
+        world_matrix(world, e).transform_point3(glam::Vec3::ZERO)
+    }
+
+    #[test]
+    fn hierarchy_drop_onto_entity_reparents_keeping_world() {
+        let mut world = World::new();
+        let target = world
+            .spawn(Transform::from_translation(glam::Vec3::new(3.0, 0.0, 0.0)))
+            .id();
+        let dragged = world
+            .spawn(Transform::from_translation(glam::Vec3::new(1.0, 2.0, 0.0)))
+            .id();
+        hierarchy_drop(&mut world, dragged, Some(target)).unwrap();
+        assert_eq!(
+            world.get::<melon_core::ChildOf>(dragged).unwrap().parent(),
+            target
+        );
+        assert!((world_pos(&world, dragged) - glam::Vec3::new(1.0, 2.0, 0.0)).length() < 1e-4);
+    }
+
+    #[test]
+    fn hierarchy_drop_onto_empty_space_makes_root() {
+        let mut world = World::new();
+        let parent = world.spawn(Transform::from_translation(glam::Vec3::X)).id();
+        let child = world
+            .spawn((
+                Transform::from_translation(glam::Vec3::Y),
+                melon_core::ChildOf(parent),
+            ))
+            .id();
+        hierarchy_drop(&mut world, child, None).unwrap();
+        assert!(world.get::<melon_core::ChildOf>(child).is_none());
+        assert!((world_pos(&world, child) - glam::Vec3::new(1.0, 1.0, 0.0)).length() < 1e-4);
+    }
+
+    #[test]
+    fn hierarchy_drop_onto_descendant_is_refused() {
+        let mut world = World::new();
+        let parent = world.spawn(Transform::default()).id();
+        let child = world
+            .spawn((Transform::default(), melon_core::ChildOf(parent)))
+            .id();
+        assert!(hierarchy_drop(&mut world, parent, Some(child)).is_err());
+        assert!(world.get::<melon_core::ChildOf>(parent).is_none());
+        assert_eq!(
+            world.get::<melon_core::ChildOf>(child).unwrap().parent(),
+            parent
+        );
+    }
+
+    #[test]
+    fn hierarchy_drop_moves_fixed_body_to_world_pose() {
+        let mut world = World::new();
+        let mut physics = melon_physics::PhysicsWorld::new();
+        let (body, _) = physics.spawn_fixed_cuboid(
+            glam::Vec3::new(2.0, 0.0, 0.0),
+            glam::Quat::IDENTITY,
+            glam::Vec3::splat(0.5),
+        );
+        world.insert_resource(physics);
+        let target = world
+            .spawn(Transform {
+                translation: glam::Vec3::new(5.0, 0.0, 0.0),
+                rotation: glam::Quat::from_rotation_y(1.0),
+                ..Default::default()
+            })
+            .id();
+        let dragged = world
+            .spawn((
+                Transform::from_translation(glam::Vec3::new(2.0, 0.0, 0.0)),
+                melon_physics::RigidBodyComponent {
+                    body_handle: body,
+                    body_type: melon_physics::RigidBodyType::Fixed,
+                },
+            ))
+            .id();
+        // Move the dragged entity first so the body is stale, then drop.
+        world.get_mut::<Transform>(dragged).unwrap().translation = glam::Vec3::new(4.0, 0.0, 0.0);
+        hierarchy_drop(&mut world, dragged, Some(target)).unwrap();
+        let physics = world.resource::<melon_physics::PhysicsWorld>();
+        let at = physics.bodies.get(body).unwrap().translation();
+        assert!(
+            (at - glam::Vec3::new(4.0, 0.0, 0.0)).length() < 1e-4,
+            "{at}"
+        );
+    }
 
     #[test]
     fn delete_selected_marks_subtree() {
