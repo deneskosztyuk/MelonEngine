@@ -4,6 +4,59 @@ mod models;
 
 /// Model uniform slots: at most this many entities with a model are drawn.
 pub const MAX_ENTITIES: usize = 1024;
+
+/// One node of a glTF file's scene, as the editor spawns it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GltfNode {
+    pub name: Option<String>,
+    /// Index into the returned list; `None` for the scene's root nodes.
+    pub parent: Option<usize>,
+    pub translation: glam::Vec3,
+    pub rotation: glam::Quat,
+    pub scale: glam::Vec3,
+    /// glTF mesh index, drawn as `<file>#mesh<N>`.
+    pub mesh: Option<usize>,
+}
+
+/// The node tree of a glTF / GLB file's default scene (or first scene),
+/// depth-first, parents before children. Reads no buffers or images.
+pub fn gltf_nodes(path: &std::path::Path) -> Result<Vec<GltfNode>> {
+    let gltf = gltf::Gltf::open(path)
+        .with_context(|| format!("failed to read glTF file: {}", path.display()))?;
+    nodes_of(&gltf.document)
+}
+
+/// `gltf_nodes` for a file already in memory.
+pub fn gltf_nodes_from_slice(bytes: &[u8]) -> Result<Vec<GltfNode>> {
+    let gltf = gltf::Gltf::from_slice(bytes).context("failed to read glTF data")?;
+    nodes_of(&gltf.document)
+}
+
+fn nodes_of(document: &gltf::Document) -> Result<Vec<GltfNode>> {
+    let scene = document
+        .default_scene()
+        .or_else(|| document.scenes().next())
+        .context("glTF file has no scene")?;
+    let mut out = Vec::new();
+    let mut stack: Vec<(gltf::Node, Option<usize>)> =
+        scene.nodes().map(|n| (n, None)).collect::<Vec<_>>();
+    stack.reverse();
+    while let Some((node, parent)) = stack.pop() {
+        let (t, r, s) = node.transform().decomposed();
+        let index = out.len();
+        out.push(GltfNode {
+            name: node.name().map(str::to_string),
+            parent,
+            translation: glam::Vec3::from_array(t),
+            rotation: glam::Quat::from_array(r),
+            scale: glam::Vec3::from_array(s),
+            mesh: node.mesh().map(|m| m.index()),
+        });
+        let children: Vec<_> = node.children().collect();
+        stack.extend(children.into_iter().rev().map(|c| (c, Some(index))));
+    }
+    Ok(out)
+}
 pub use models::ModelCache;
 
 use anyhow::{Context, Result};
@@ -1458,6 +1511,36 @@ impl SceneRenderer {
         Ok(model)
     }
 
+    /// Load one glTF mesh (`<file>#mesh<N>`): its primitives in mesh-local
+    /// space, no node transform baked in. Errors if the index doesn't exist.
+    #[instrument(skip(self), level = "info")]
+    pub fn load_gltf_mesh(&self, path: &str, mesh: usize) -> Result<LoadedModel> {
+        let (document, buffers, images) =
+            gltf::import(path).with_context(|| format!("failed to import glTF file: {path}"))?;
+        let gltf_mesh = document
+            .meshes()
+            .nth(mesh)
+            .with_context(|| format!("{path} has no mesh {mesh}"))?;
+        let mut model = LoadedModel {
+            meshes: Vec::new(),
+            albedo_bind_groups: Vec::new(),
+            bounds: (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)),
+        };
+        for primitive in gltf_mesh.primitives() {
+            self.add_primitive(
+                &primitive,
+                glam::Mat4::IDENTITY,
+                &buffers,
+                &images,
+                &mut model,
+            )?;
+        }
+        if model.meshes.is_empty() {
+            anyhow::bail!("{path} mesh {mesh} has no primitives");
+        }
+        Ok(model)
+    }
+
     /// Load a glTF / GLB from memory (embedded or data-URI buffers only).
     pub fn load_gltf_bytes(&self, bytes: &[u8]) -> Result<LoadedModel> {
         let (document, buffers, images) =
@@ -2227,6 +2310,19 @@ mod tests {
             "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0]}]
     }"#;
 
+    #[test]
+    fn gltf_nodes_reads_two_node_tree() {
+        let nodes = gltf_nodes_from_slice(TWO_NODE_GLTF.as_bytes()).unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert!(
+            nodes
+                .iter()
+                .all(|n| n.parent.is_none() && n.mesh == Some(0))
+        );
+        assert_eq!(nodes[0].translation, glam::Vec3::new(-2.0, 0.0, 0.0));
+        assert_eq!(nodes[1].translation, glam::Vec3::new(3.0, 0.0, 0.0));
+    }
+
     fn temp_project(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("melon_models_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2328,6 +2424,43 @@ mod tests {
                         "gltf_two_nodes_load_whole: {} meshes, bounds {min} .. {max}",
                         model.meshes.len()
                     ))
+                }
+            }),
+            Box::new(|renderer| {
+                let root = temp_project("mesh");
+                let file = root.join("assets/models/m.gltf");
+                std::fs::write(&file, TWO_NODE_GLTF).unwrap();
+                let result = renderer.scene().load_gltf_mesh(&file.to_string_lossy(), 0);
+                let _ = std::fs::remove_dir_all(&root);
+                let model = result.map_err(|e| format!("load_gltf_mesh_unbaked: {e:?}"))?;
+                let (min, max) = model.bounds;
+                if model.meshes.len() == 1
+                    && min == glam::Vec3::ZERO
+                    && max == glam::Vec3::new(1.0, 1.0, 0.0)
+                {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "load_gltf_mesh_unbaked: {} meshes, bounds {min} .. {max}",
+                        model.meshes.len()
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
+                use melon_core::{AssetServer, Handle, Model};
+                let root = temp_project("fragment");
+                std::fs::write(root.join("assets/models/m.gltf"), TWO_NODE_GLTF).unwrap();
+                let mut server = AssetServer::new(root.clone());
+                let h: Handle<Model> = server.load("assets/models/m.gltf#mesh5");
+                let mut cache = ModelCache::new(renderer.scene());
+                let model = cache.get(renderer.scene(), &mut server, h);
+                let ok = model.meshes.len() == 1
+                    && model.bounds == (glam::Vec3::splat(-0.5), glam::Vec3::splat(0.5));
+                let _ = std::fs::remove_dir_all(&root);
+                if ok {
+                    Ok(())
+                } else {
+                    Err("cache_missing_mesh_fragment_gives_placeholder".into())
                 }
             }),
             Box::new(|renderer| {

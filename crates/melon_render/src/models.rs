@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use melon_core::assets::BUILTIN_PREFIX;
+use melon_core::assets::{BUILTIN_PREFIX, split_mesh_fragment};
 use melon_core::{AssetServer, Handle, Model};
 
 use crate::{LoadedModel, SceneRenderer};
@@ -75,7 +75,10 @@ impl ModelCache {
         let stale = self.models.get(&id).is_none_or(|m| m.version != version);
         if stale && !self.failed.contains(&(id, version)) {
             let result = match server.full_path(handle) {
-                Some(file) => scene.load_gltf(&file.to_string_lossy()),
+                Some(file) => match split_mesh_fragment(&path).1 {
+                    Some(mesh) => scene.load_gltf_mesh(&file.to_string_lossy(), mesh),
+                    None => scene.load_gltf(&file.to_string_lossy()),
+                },
                 None => Err(anyhow::anyhow!(
                     "unknown built-in asset (expected {BUILTIN_PREFIX}cube)"
                 )),

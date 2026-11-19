@@ -78,6 +78,18 @@ pub struct AssetServer {
 /// Seconds between hot-reload checks.
 const POLL_INTERVAL: f32 = 0.5;
 
+/// Split `<file>#mesh<N>` into the file and the glTF mesh index. Any other
+/// path (no fragment, or not a `#mesh<N>` one) comes back whole with `None`.
+pub fn split_mesh_fragment(path: &str) -> (&str, Option<usize>) {
+    if let Some((file, fragment)) = path.rsplit_once('#')
+        && let Some(index) = fragment.strip_prefix("mesh")
+        && let Ok(index) = index.parse()
+    {
+        return (file, Some(index));
+    }
+    (path, None)
+}
+
 /// Forward slashes, no leading `./`, so one file always maps to one handle.
 fn normalise(path: &str) -> String {
     let path = path.replace('\\', "/");
@@ -124,10 +136,11 @@ impl AssetServer {
         &self.entries[handle.id as usize].path
     }
 
-    /// File on disk, or `None` for built-in assets.
+    /// File on disk (without any `#mesh<N>` fragment), or `None` for
+    /// built-in assets.
     pub fn full_path<T: Send + Sync + 'static>(&self, handle: Handle<T>) -> Option<PathBuf> {
         let path = self.path(handle);
-        (!path.starts_with(BUILTIN_PREFIX)).then(|| self.root.join(path))
+        (!path.starts_with(BUILTIN_PREFIX)).then(|| self.root.join(split_mesh_fragment(path).0))
     }
 
     /// Bumped every time the file changes on disk.
@@ -158,7 +171,7 @@ impl AssetServer {
         if path.starts_with(BUILTIN_PREFIX) {
             return None;
         }
-        std::fs::metadata(self.root.join(path))
+        std::fs::metadata(self.root.join(split_mesh_fragment(path).0))
             .and_then(|m| m.modified())
             .ok()
     }
@@ -301,6 +314,37 @@ mod tests {
         server.poll_changes();
         assert_eq!(server.version(h), 1);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn split_mesh_fragment_parses_only_mesh_fragments() {
+        assert_eq!(split_mesh_fragment("a.glb#mesh2"), ("a.glb", Some(2)));
+        assert_eq!(split_mesh_fragment("a.glb"), ("a.glb", None));
+        assert_eq!(split_mesh_fragment("a.glb#meshX"), ("a.glb#meshX", None));
+    }
+
+    #[test]
+    fn fragments_bump_with_their_file() {
+        let root = temp_root("fragments");
+        let file = root.join("assets/models/a.glb");
+        std::fs::write(&file, "v1").unwrap();
+        let mut server = AssetServer::new(root.clone());
+        let m0: Handle<Model> = server.load("assets/models/a.glb#mesh0");
+        let m1: Handle<Model> = server.load("assets/models/a.glb#mesh1");
+        touch_later(&file);
+        server.poll_changes();
+        assert_eq!((server.version(m0), server.version(m1)), (1, 1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn full_path_drops_fragment() {
+        let mut server = AssetServer::new(PathBuf::from("project"));
+        let h: Handle<Model> = server.load("assets/models/a.glb#mesh3");
+        assert_eq!(
+            server.full_path(h),
+            Some(PathBuf::from("project").join("assets/models/a.glb"))
+        );
     }
 
     #[test]
