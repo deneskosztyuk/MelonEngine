@@ -1112,6 +1112,7 @@ impl Editor {
             center: transform.translation,
             rotation: transform.rotation,
             size: GIZMO_SIZE_PX * world_per_pixel,
+            view: (transform.translation - camera.eye).normalize_or_zero(),
         };
 
         let pointer = vp.pointer;

@@ -93,6 +93,9 @@ pub struct GizmoPose {
     pub center: Vec3,
     pub rotation: Quat,
     pub size: f32,
+    /// Unit direction from the camera to `center`; handles seen end-on or
+    /// edge-on along it are hidden (Unreal style).
+    pub view: Vec3,
 }
 
 impl GizmoPose {
@@ -147,7 +150,27 @@ fn flat(corner: Vec3, a: Vec3, b: Vec3) -> Mat4 {
     )
 }
 
-/// Every shape of the gizmo with the handle it belongs to.
+/// An axis this close to the view direction (|cos|) is hidden: dragging it
+/// would throw the entity around.
+pub const AXIS_HIDE_DOT: f32 = 0.98;
+/// A plane handle whose normal is this close to perpendicular to the view
+/// (seen edge-on) is hidden.
+pub const PLANE_HIDE_DOT: f32 = 0.15;
+
+/// Whether `handle` is usable from this view (Unreal hides the others).
+/// Rotate rings and the centre are always usable.
+pub fn handle_visible(mode: GizmoMode, pose: &GizmoPose, handle: GizmoHandle) -> bool {
+    if mode == GizmoMode::Rotate || pose.view == Vec3::ZERO {
+        return true;
+    }
+    match handle {
+        GizmoHandle::Axis(i) => pose.axis(i).dot(pose.view).abs() < AXIS_HIDE_DOT,
+        GizmoHandle::Plane(i) => pose.axis(i).dot(pose.view).abs() > PLANE_HIDE_DOT,
+        GizmoHandle::Center => true,
+    }
+}
+
+/// Every visible shape of the gizmo with the handle it belongs to.
 pub fn gizmo_parts(mode: GizmoMode, pose: &GizmoPose) -> Vec<(GizmoHandle, OverlayShape, Mat4)> {
     let s = pose.size;
     let c = pose.center;
@@ -227,6 +250,7 @@ pub fn gizmo_parts(mode: GizmoMode, pose: &GizmoPose) -> Vec<(GizmoHandle, Overl
             }
         }
     }
+    parts.retain(|(handle, _, _)| handle_visible(mode, pose, *handle));
     parts
 }
 
@@ -308,7 +332,7 @@ pub fn pick_handle(
     let (s, c) = (pose.size, pose.center);
     let mut best: Option<(f32, GizmoHandle)> = None;
     let mut consider = |t: f32, handle: GizmoHandle| {
-        if best.is_none_or(|(bt, _)| t < bt) {
+        if handle_visible(mode, pose, handle) && best.is_none_or(|(bt, _)| t < bt) {
             best = Some((t, handle));
         }
     };
@@ -519,6 +543,28 @@ mod tests {
             center: Vec3::ZERO,
             rotation: melon_core::glam::Quat::IDENTITY,
             size: 1.0,
+            view: (Vec3::ZERO - EYE).normalize(),
+        }
+    }
+
+    #[test]
+    fn handles_seen_end_on_or_edge_on_are_hidden_and_unpickable() {
+        // Looking almost straight down -Z: the Z arrow points at the camera,
+        // and the YZ / XZ plane handles are seen edge-on.
+        let view = Vec3::new(0.1, 0.0, -1.0).normalize();
+        let p = GizmoPose { view, ..pose() };
+        let d = gizmo_draws(GizmoMode::Move, &p, None);
+        assert_eq!(count(&d, OverlayShape::Cone), 2, "Z arrow hidden");
+        assert_eq!(count(&d, OverlayShape::Quad), 1, "only the XY square");
+        let eye = -view * 5.0;
+        for k in 3..=10 {
+            let target = Vec3::Z * (k as f32 * 0.1);
+            let hit = pick_handle(GizmoMode::Move, &p, eye, (target - eye).normalize(), 0.02);
+            assert_ne!(
+                hit,
+                Some(GizmoHandle::Axis(2)),
+                "picked the hidden Z arrow at {k}"
+            );
         }
     }
 
