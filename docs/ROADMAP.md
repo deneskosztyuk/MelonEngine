@@ -1,6 +1,6 @@
 # MelonEngine Roadmap
 
-State of the engine as of 2026-11-19 (commit `ddeb4c7`), and what is still
+State of the engine as of 2026-11-19 (commit `d16cea2`), and what is still
 missing for a core 3D engine. Update this file when an item lands.
 
 ## Done
@@ -8,14 +8,14 @@ missing for a core 3D engine. Update this file when an item lands.
 | Crate | What exists |
 |---|---|
 | `melon_core` | `Core` wraps a bevy_ecs `World` + `Schedule`. Components: `Transform`, `Name`, `MeshRef`, `Aabb`, `BodyInfo`, `Spin`, `Bob`, `PendingDelete`. Resources: `Camera` (fly camera, `world_to_screen`, `screen_to_world_ray`), one directional `Light`, `Time`, `SimulationState`, `Input`, `NameCounter`. |
-| `melon_render` | wgpu forward renderer: textured Lambert + ambient mesh pipeline, line pipeline (gizmos), depth buffer, dynamic-offset model uniforms, checkerboard fallback texture, glTF loader (positions, normals, uv0, indices, base color texture), offscreen `ViewportTarget`, surface lost/outdated recovery. |
+| `melon_render` | wgpu forward renderer. Frame: sun shadow pass (directional shadow map, 3x3 PCF), 3D pass into an HDR target, ACES tonemap pass onto the display. Textured Lambert + ambient mesh pipeline, line pipeline (gizmos), depth buffer, dynamic-offset model uniforms, checkerboard fallback texture, glTF loader (positions, normals, uv0, indices, base color texture), offscreen `ViewportTarget`, surface lost/outdated recovery. |
 | `melon_physics` | rapier3d wrapper: dynamic and fixed cuboids, ECS to rapier sync both ways, `PendingDelete` cleanup. |
 | `melon_editor` | egui overlay: hierarchy, add/delete entity, inspector, Move/Rotate/Scale gizmos with snapping, RON scene save/load (versioned, atomic write, validated). Experiments: `imgui-poc`, `slint-poc` features. |
 | `melon_game` | Hot-reloadable dylib with two demo systems. |
 | `melon_host` | winit event loop that wires all crates together. |
 
 Tooling: `just gate` (fmt + clippy `-D warnings` + check), `unsafe_code` denied
-workspace-wide, 82 passing tests including GPU tests.
+workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
 
 ## Known bugs
 
@@ -58,8 +58,10 @@ workspace-wide, 82 passing tests including GPU tests.
 ### Tier 1: looks like a 3D game
 
 - [ ] PBR metallic-roughness materials, normal maps.
-- [ ] Point and spot lights, shadow maps.
-- [ ] HDR target + tonemapping, MSAA, skybox.
+- [x] Directional (sun) shadow map with 3x3 PCF.
+- [ ] Point and spot lights, their shadows, cascaded sun shadows.
+- [x] HDR target + ACES tonemap pass.
+- [ ] MSAA, skybox.
 - [ ] Instancing or storage buffers (removes the 1024 cap, bug 4), frustum culling.
 - [ ] `Camera` as a component; multiple cameras.
 - [ ] glTF: node tree, multiple meshes, materials, skinning, animation. Fixes bug 6.

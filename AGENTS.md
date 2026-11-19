@@ -8,7 +8,7 @@ Current state and planned work: `docs/ROADMAP.md`.
 | Path | Role |
 |---|---|
 | `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera. No GPU or window code. |
-| `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. |
+| `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. Frame order: sun shadow pass, 3D pass into HDR target, tonemap pass onto the display. |
 | `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource) and ECS sync systems. |
 | `crates/melon_editor` | egui editor overlay, gizmo math (`gizmo.rs`), RON scene save/load (`scene.rs`). `imgui_poc.rs` / `slint_poc.rs` are feature-gated experiments. |
 | `crates/melon_game` | Game logic as an `rlib` + `dylib`, hot-reloaded in dev builds. |
@@ -60,6 +60,9 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 - **Scene format.** RON, `SCENE_VERSION = 1` in `melon_editor/src/scene.rs`.
   Adding a saved component means changing `SceneEntity`, `save_scene` and
   `spawn_scene_entity`. Bump the version on breaking changes.
+- **Light direction sign.** `Light::direction` is the direction light travels
+  (from the light into the scene). Shaders want the opposite; pass
+  `Light::to_light()`.
 - **Camera conventions.** Right-handed, DirectX depth (near = 0, far = 1).
   Screen helpers take logical points.
 - **GPU tests** open a window, so they need a display and adapter.
