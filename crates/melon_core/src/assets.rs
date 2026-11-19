@@ -95,18 +95,19 @@ impl AssetServer {
         }
     }
 
-    /// Handle for `path`, registering it on first use. No file I/O: the
-    /// renderer loads it when first drawn.
+    /// Handle for `path`, registering it on first use. Only reads the file's
+    /// modified time: the renderer loads the file when first drawn.
     pub fn load<T: Send + Sync + 'static>(&mut self, path: &str) -> Handle<T> {
         let path = normalise(path);
         let id = match self.by_path.get(&path) {
             Some(id) => *id,
             None => {
                 let id = self.entries.len() as u32;
+                let modified = self.modified_time(&path);
                 self.entries.push(AssetEntry {
                     path: path.clone(),
                     version: 0,
-                    modified: None,
+                    modified,
                     bounds: None,
                 });
                 self.by_path.insert(path, id);
@@ -152,22 +153,29 @@ impl AssetServer {
         &self.root
     }
 
-    /// Check every file-backed asset's modified time; a change bumps its
-    /// version. A missing file is not a change (the last load stays in use).
+    /// Modified time of a file-backed asset, `None` if built-in or missing.
+    fn modified_time(&self, path: &str) -> Option<SystemTime> {
+        if path.starts_with(BUILTIN_PREFIX) {
+            return None;
+        }
+        std::fs::metadata(self.root.join(path))
+            .and_then(|m| m.modified())
+            .ok()
+    }
+
+    /// Check every file-backed asset's modified time; a change (or a file
+    /// appearing) bumps its version. A missing file is not a change (the last
+    /// load stays in use).
     pub fn poll_changes(&mut self) {
-        for entry in &mut self.entries {
-            if entry.path.starts_with(BUILTIN_PREFIX) {
-                continue;
-            }
-            let Ok(modified) =
-                std::fs::metadata(self.root.join(&entry.path)).and_then(|m| m.modified())
-            else {
+        for i in 0..self.entries.len() {
+            let Some(modified) = self.modified_time(&self.entries[i].path) else {
                 continue;
             };
-            if entry.modified.is_some_and(|seen| seen != modified) {
+            let entry = &mut self.entries[i];
+            if entry.modified != Some(modified) {
                 entry.version += 1;
+                entry.modified = Some(modified);
             }
-            entry.modified = Some(modified);
         }
     }
 }
@@ -267,6 +275,31 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
         server.poll_changes();
         assert_eq!(server.version(h), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_appearing_after_load_bumps_version() {
+        let root = temp_root("appears");
+        let mut server = AssetServer::new(root.clone());
+        let h: Handle<Model> = server.load("assets/models/a.glb");
+        server.poll_changes();
+        std::fs::write(root.join("assets/models/a.glb"), "v1").unwrap();
+        server.poll_changes();
+        assert_eq!(server.version(h), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn change_before_first_poll_bumps_version() {
+        let root = temp_root("early");
+        let file = root.join("assets/models/a.glb");
+        std::fs::write(&file, "v1").unwrap();
+        let mut server = AssetServer::new(root.clone());
+        let h: Handle<Model> = server.load("assets/models/a.glb");
+        touch_later(&file);
+        server.poll_changes();
+        assert_eq!(server.version(h), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
