@@ -1632,7 +1632,9 @@ pub fn spawn_model(
                 Transform {
                     translation: node.translation,
                     rotation: node.rotation,
-                    scale: node.scale,
+                    // Scenes reject zero scale; a hidden (scale 0) node stays
+                    // practically invisible at 1e-4.
+                    scale: node.scale.map(|c| if c.abs() < 1e-4 { 1e-4 } else { c }),
                 },
                 melon_core::ChildOf(parent),
             ))
@@ -2349,6 +2351,29 @@ mod tests {
                 Some("assets/models/two.gltf#mesh0")
             );
         }
+        let _ = std::fs::remove_dir_all(&root_dir);
+    }
+
+    #[test]
+    fn zero_scale_node_still_saves_and_loads() {
+        let root_dir = two_node_project("zero_scale");
+        let flat = TWO_NODE_GLTF.replace(
+            r#"{"mesh": 0, "translation": [3, 0, 0]}"#,
+            r#"{"mesh": 0, "translation": [3, 0, 0], "scale": [0, 1, 1]}"#,
+        );
+        std::fs::write(root_dir.join("assets/models/flat.gltf"), flat).unwrap();
+        let mut world = World::new();
+        spawn_model(
+            &mut world,
+            &root_dir,
+            "assets/models/flat.gltf",
+            glam::Vec3::ZERO,
+            None,
+        )
+        .unwrap();
+        let data = scene::scene_to_data(&mut world);
+        let mut physics = melon_physics::PhysicsWorld::new();
+        scene::apply_scene(&mut world, &mut physics, &data).unwrap();
         let _ = std::fs::remove_dir_all(&root_dir);
     }
 
