@@ -1488,8 +1488,12 @@ fn viewport_input(
     rect: egui::Rect,
 ) -> viewport::ViewportInput {
     use egui::{Key, PointerButton};
+    // Read everything that touches the egui context *before* `ctx.input`:
+    // `input` holds the context's write lock, and `Response::clicked()` takes
+    // it again, which deadlocks on the frame a click lands.
     let down_on = response.is_pointer_button_down_on();
     let hovered = response.hovered();
+    let clicked = response.clicked();
     let typing = ctx.text_edit_focused();
     ctx.input(|i| viewport::ViewportInput {
         size: glam::Vec2::new(rect.width(), rect.height()),
@@ -1502,7 +1506,7 @@ fn viewport_input(
         left_down: down_on && i.pointer.button_down(PointerButton::Primary),
         right_down: down_on && i.pointer.button_down(PointerButton::Secondary),
         middle_down: down_on && i.pointer.button_down(PointerButton::Middle),
-        left_clicked: response.clicked(),
+        left_clicked: clicked,
         // Wheel notches: positive = wheel away from the user.
         scroll: if hovered {
             i.raw
@@ -1728,6 +1732,40 @@ mod tests {
         };
         assert!(!tabs.is_closeable(&layout::EditorTab::Inspector));
         assert!(tabs.is_closeable(&layout::EditorTab::Console));
+    }
+
+    /// Regression: `Response::clicked()` takes the egui context lock, so it
+    /// must not be called inside `ctx.input(..)` (deadlock on a viewport click).
+    #[test]
+    fn viewport_input_on_click_does_not_deadlock() {
+        let ctx = egui::Context::default();
+        let pos = egui::pos2(50.0, 50.0);
+        let press = |pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let frames = [
+            vec![egui::Event::PointerMoved(pos)],
+            vec![press(true)],
+            vec![press(false)],
+        ];
+        let mut clicked = false;
+        for events in frames {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                let rect =
+                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+                let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+                let vp = viewport_input(ui.ctx(), &response, rect);
+                clicked |= vp.left_clicked;
+            });
+        }
+        assert!(clicked, "the click reached the viewport input");
     }
 
     #[test]
