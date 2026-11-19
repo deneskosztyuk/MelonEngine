@@ -370,7 +370,7 @@ impl ApplicationHandler for App {
                     .get_resource::<Light>()
                     .copied()
                     .unwrap_or_default();
-                renderer.update_light(light.direction, light.ambient, light.color);
+                renderer.update_light(light.to_light(), light.ambient, light.color);
 
                 // Collect model matrices from all entities with Transform and MeshRef
                 let entities: Vec<(Entity, Mat4, MeshRef)> = self

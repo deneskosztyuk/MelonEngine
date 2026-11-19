@@ -145,15 +145,11 @@ pub struct SceneRenderer {
     mesh_pipeline: wgpu::RenderPipeline,
     #[allow(dead_code)]
     model_bind_group_layout: wgpu::BindGroupLayout,
-    // Layout stored but not read after construction; kept for future
-    // renderer extensions that need to rebind the light uniform.
-    #[allow(dead_code)]
-    light_bind_group_layout: wgpu::BindGroupLayout,
     texture_bind_group_layout: wgpu::BindGroupLayout,
     camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
     light_buffer: wgpu::Buffer,
-    light_bind_group: wgpu::BindGroup,
+    /// Group 0: per-frame data shared by every pipeline (camera, light).
+    frame_bind_group: wgpu::BindGroup,
     // Kept to keep the texture alive for the lifetime of the renderer.
     #[allow(dead_code)]
     albedo_texture: wgpu::Texture,
@@ -189,22 +185,6 @@ impl std::ops::DerefMut for Renderer {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.scene
     }
-}
-
-fn uniform_buffer_layout(device: &wgpu::Device, label: &str) -> wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some(label),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    })
 }
 
 fn dynamic_uniform_buffer_layout(device: &wgpu::Device, label: &str) -> wgpu::BindGroupLayout {
@@ -284,21 +264,26 @@ impl SceneRenderer {
         queue: wgpu::Queue,
         surface_format: wgpu::TextureFormat,
     ) -> Self {
-        let camera_layout = uniform_buffer_layout(&device, "camera bind group layout");
-        let model_layout = dynamic_uniform_buffer_layout(&device, "model bind group layout");
-        let light_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("light bind group layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
+        let uniform_entry = |binding, visibility| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        // Group 0 holds everything that changes once per frame, so group 3
+        // stays free for GI data.
+        let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("frame bind group layout"),
+            entries: &[
+                uniform_entry(0, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+                uniform_entry(1, wgpu::ShaderStages::FRAGMENT),
+            ],
         });
+        let model_layout = dynamic_uniform_buffer_layout(&device, "model bind group layout");
         let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("texture bind group layout"),
             entries: &[
@@ -324,9 +309,8 @@ impl SceneRenderer {
         let mesh_pipeline = Renderer::build_mesh_pipeline(
             &device,
             surface_format,
-            &camera_layout,
+            &frame_layout,
             &model_layout,
-            &light_layout,
             &texture_layout,
         );
 
@@ -336,34 +320,31 @@ impl SceneRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera bind group"),
-            layout: &camera_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-        });
-
         let light_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("light uniform buffer"),
             size: std::mem::size_of::<LightUniform>() as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let light_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("light bind group"),
-            layout: &light_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: light_buffer.as_entire_binding(),
-            }],
+        let frame_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("frame bind group"),
+            layout: &frame_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: light_buffer.as_entire_binding(),
+                },
+            ],
         });
 
         let (albedo_texture, albedo_bind_group) =
             Renderer::create_checkerboard_texture(&device, &queue, &texture_layout);
 
-        let line_pipeline = Renderer::build_line_pipeline(&device, surface_format, &camera_layout);
+        let line_pipeline = Renderer::build_line_pipeline(&device, surface_format, &frame_layout);
 
         // Reusable model uniform buffer with dynamic offsets.
         // Stride = max(ModelUniform size, min_uniform_buffer_offset_alignment).
@@ -398,12 +379,10 @@ impl SceneRenderer {
             surface_format,
             mesh_pipeline,
             model_bind_group_layout: model_layout,
-            light_bind_group_layout: light_layout,
             texture_bind_group_layout: texture_layout,
             camera_buffer,
-            camera_bind_group,
             light_buffer,
-            light_bind_group,
+            frame_bind_group,
             albedo_texture,
             albedo_bind_group,
             line_pipeline,
@@ -421,9 +400,8 @@ impl Renderer {
     fn build_mesh_pipeline(
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
-        camera_layout: &wgpu::BindGroupLayout,
+        frame_layout: &wgpu::BindGroupLayout,
         model_layout: &wgpu::BindGroupLayout,
-        light_layout: &wgpu::BindGroupLayout,
         texture_layout: &wgpu::BindGroupLayout,
     ) -> wgpu::RenderPipeline {
         let shader =
@@ -432,12 +410,7 @@ impl Renderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh pipeline layout"),
-            bind_group_layouts: &[
-                Some(camera_layout),
-                Some(model_layout),
-                Some(light_layout),
-                Some(texture_layout),
-            ],
+            bind_group_layouts: &[Some(frame_layout), Some(model_layout), Some(texture_layout)],
             immediate_size: 0,
         });
 
@@ -488,7 +461,7 @@ impl Renderer {
     fn build_line_pipeline(
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
-        camera_layout: &wgpu::BindGroupLayout,
+        frame_layout: &wgpu::BindGroupLayout,
     ) -> wgpu::RenderPipeline {
         let shader =
             device.create_shader_module(wgpu::include_wgsl!("../../../assets/shaders/line.wgsl"));
@@ -496,7 +469,7 @@ impl Renderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("line pipeline layout"),
-            bind_group_layouts: &[Some(camera_layout)],
+            bind_group_layouts: &[Some(frame_layout)],
             immediate_size: 0,
         });
 
@@ -903,9 +876,10 @@ impl SceneRenderer {
             .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[uniform]));
     }
 
-    pub fn update_light(&self, direction: glam::Vec3, ambient: f32, color: glam::Vec3) {
+    /// `to_light` points from the scene toward the light (world space, normalized).
+    pub fn update_light(&self, to_light: glam::Vec3, ambient: f32, color: glam::Vec3) {
         let uniform = LightUniform {
-            direction: direction.to_array(),
+            direction: to_light.to_array(),
             ambient,
             color: color.to_array(),
             _pad: 0.0,
@@ -1187,9 +1161,8 @@ impl SceneRenderer {
     /// into the model uniform buffer (see `update_model_uniforms`).
     pub fn draw_meshes(&self, pass: &mut wgpu::RenderPass<'_>, draw_calls: &[(usize, &Mesh)]) {
         pass.set_pipeline(&self.mesh_pipeline);
-        pass.set_bind_group(0, &self.camera_bind_group, &[]);
-        pass.set_bind_group(2, &self.light_bind_group, &[]);
-        pass.set_bind_group(3, &self.albedo_bind_group, &[]);
+        pass.set_bind_group(0, &self.frame_bind_group, &[]);
+        pass.set_bind_group(2, &self.albedo_bind_group, &[]);
         for (entity_index, mesh) in draw_calls {
             let offset = self.model_uniform_offset(*entity_index);
             pass.set_bind_group(1, &self.model_bind_group, &[offset]);
@@ -1207,14 +1180,13 @@ impl SceneRenderer {
         draw_calls: &[(usize, &Mesh, Option<&wgpu::BindGroup>)],
     ) {
         pass.set_pipeline(&self.mesh_pipeline);
-        pass.set_bind_group(0, &self.camera_bind_group, &[]);
-        pass.set_bind_group(2, &self.light_bind_group, &[]);
+        pass.set_bind_group(0, &self.frame_bind_group, &[]);
         for (entity_index, mesh, albedo) in draw_calls {
             let offset = self.model_uniform_offset(*entity_index);
             pass.set_bind_group(1, &self.model_bind_group, &[offset]);
             match albedo {
-                Some(bg) => pass.set_bind_group(3, *bg, &[]),
-                None => pass.set_bind_group(3, &self.albedo_bind_group, &[]),
+                Some(bg) => pass.set_bind_group(2, *bg, &[]),
+                None => pass.set_bind_group(2, &self.albedo_bind_group, &[]),
             }
             pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -1259,7 +1231,7 @@ impl SceneRenderer {
             .write_buffer(buffer, 0, bytemuck::cast_slice(vertices));
 
         pass.set_pipeline(&self.line_pipeline);
-        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(0, &self.frame_bind_group, &[]);
         pass.set_vertex_buffer(0, buffer.slice(..needed));
         pass.draw(0..vertices.len() as u32, 0..1);
     }
@@ -1455,11 +1427,153 @@ mod tests {
         assert_eq!(std::mem::size_of::<LightUniform>(), 32);
     }
 
+    // --- Shared GPU test scene ---
+    // Floor + small occluder seen from straight above, sun at 45 degrees from +X.
+    // White light on white albedo, so every colour channel holds the same value.
+
+    const TEST_SIZE: u32 = 64;
+    /// World (-2, 0, 0): on the floor, inside the occluder's shadow.
+    #[allow(dead_code)] // read by the shadow test in Task 3
+    const SHADOW_PX: (u32, u32) = (16, 32);
+    /// World (2, 0, 0): on the floor, in the open.
+    const LIT_PX: (u32, u32) = (48, 32);
+
+    /// Renders the test scene and returns TEST_SIZE x TEST_SIZE RGBA8 sRGB pixels.
+    /// `_shadow_radius` sizes the shadow box once shadows exist.
+    fn render_test_scene(r: &mut Renderer, _shadow_radius: f32) -> Vec<u8> {
+        use glam::camera::rh::{proj::directx, view};
+        use glam::{Mat4, Quat, Vec3};
+
+        let device = r.device().clone();
+        let size = winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE);
+        let color = test_color_texture(&device, r.surface_format().add_srgb_suffix());
+        let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let (_depth, depth_view) = Renderer::create_depth_target(&device, size);
+
+        r.update_camera(
+            directx::orthographic(-4.0, 4.0, -4.0, 4.0, 0.1, 20.0)
+                * view::look_at_mat4(Vec3::new(0.0, 10.0, 0.0), Vec3::ZERO, Vec3::NEG_Z),
+        );
+        r.update_light(Vec3::new(1.0, 1.0, 0.0).normalize(), 0.2, Vec3::ONE);
+        r.update_model_uniforms(&[
+            Mat4::from_scale_rotation_translation(
+                Vec3::new(8.0, 0.2, 8.0),
+                Quat::IDENTITY,
+                Vec3::new(0.0, -0.1, 0.0),
+            ),
+            Mat4::from_scale_rotation_translation(
+                Vec3::splat(0.5),
+                Quat::IDENTITY,
+                Vec3::new(0.0, 2.0, 0.0),
+            ),
+        ]);
+        let white =
+            r.create_texture_from_bytes(&[255; 4], 1, 1, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let white_bg = r.create_texture_bind_group(&white);
+        let cube = r.cube_mesh();
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("test scene pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            r.draw_meshes_textured(
+                &mut pass,
+                &[(0, &cube, Some(&white_bg)), (1, &cube, Some(&white_bg))],
+            );
+        }
+        read_back(&device, r.queue(), encoder, &color)
+    }
+
+    fn test_color_texture(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::Texture {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test color texture"),
+            size: wgpu::Extent3d {
+                width: TEST_SIZE,
+                height: TEST_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    }
+
+    /// Submits `encoder` with a copy of `texture` appended and returns its
+    /// tightly packed RGBA8 rows.
+    fn read_back(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mut encoder: wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+    ) -> Vec<u8> {
+        let row = TEST_SIZE * 4;
+        let padded = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test readback buffer"),
+            size: (padded * TEST_SIZE) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: None,
+                },
+            },
+            texture.size(),
+        );
+        queue.submit([encoder.finish()]);
+        buffer.map_async(wgpu::MapMode::Read, .., |res| {
+            res.expect("readback map failed")
+        });
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("readback poll failed");
+        let data = buffer.get_mapped_range(..);
+        data.chunks(padded as usize)
+            .flat_map(|r| &r[..row as usize])
+            .copied()
+            .collect()
+    }
+
+    /// First channel at pixel `(x, y)`; all channels match in the test scene.
+    fn value_at(pixels: &[u8], (x, y): (u32, u32)) -> u8 {
+        pixels[((y * TEST_SIZE + x) * 4) as usize]
+    }
+
     // --- GPU tests via headless event loop harness ---
     // winit allows only ONE EventLoop per process, so all GPU assertions run
     // inside a single test that creates one loop + one renderer.
 
-    type GpuAssertion = Box<dyn FnOnce(&Renderer) -> Result<(), String> + Send>;
+    type GpuAssertion = Box<dyn FnOnce(&mut Renderer) -> Result<(), String> + Send>;
 
     struct GpuTestRunner {
         assertions: Vec<GpuAssertion>,
@@ -1520,9 +1634,9 @@ mod tests {
                 event_loop.exit();
                 return;
             }
-            if let Some(renderer) = self.renderer.take() {
+            if let Some(mut renderer) = self.renderer.take() {
                 while let Some(assertion) = self.assertions.pop() {
-                    self.results.push(assertion(&renderer));
+                    self.results.push(assertion(&mut renderer));
                 }
                 self.done = true;
             }
@@ -1533,6 +1647,17 @@ mod tests {
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
+            Box::new(|renderer| {
+                let pixels = render_test_scene(renderer, 20.0);
+                let v = value_at(&pixels, LIT_PX);
+                if v > 200 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "lit_floor_is_bright: expected > 200 at LIT_PX, got {v}"
+                    ))
+                }
+            }),
             Box::new(|renderer| {
                 let mesh = renderer.cube_mesh();
                 if mesh.index_count == 36 {

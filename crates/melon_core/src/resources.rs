@@ -102,9 +102,17 @@ impl Camera {
 
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct Light {
+    /// Direction the light travels (from the light into the scene).
     pub direction: Vec3,
     pub ambient: f32,
     pub color: Vec3,
+}
+
+impl Light {
+    /// Direction from the scene toward the light, as shaders expect it.
+    pub fn to_light(&self) -> Vec3 {
+        -self.direction
+    }
 }
 
 /// Engine time state. `delta_seconds` is the time elapsed since the last
@@ -303,6 +311,11 @@ mod tests {
         assert!((l.direction.length() - 1.0).abs() < 1e-6);
         assert!((l.ambient - 0.2).abs() < 1e-6);
         assert_eq!(l.color, Vec3::ONE);
+    }
+
+    #[test]
+    fn light_default_to_light_points_up() {
+        assert!(Light::default().to_light().y > 0.0);
     }
 
     #[test]

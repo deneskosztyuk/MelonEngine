@@ -73,7 +73,7 @@ impl SlintScene {
 
         self.renderer.update_camera(self.camera.view_proj());
         self.renderer
-            .update_light(Vec3::new(0.5, -1.0, 0.5).normalize(), 0.22, Vec3::ONE);
+            .update_light(Vec3::new(-0.5, 1.0, -0.5).normalize(), 0.22, Vec3::ONE);
         self.renderer.update_model_uniforms(&matrices);
 
         let color_view = self.target.color_view();

@@ -34,9 +34,9 @@ struct VsOut {
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 @group(1) @binding(0) var<uniform> model: ModelUniform;
-@group(2) @binding(0) var<uniform> light: LightUniform;
-@group(3) @binding(0) var albedo_tex: texture_2d<f32>;
-@group(3) @binding(1) var albedo_sampler: sampler;
+@group(0) @binding(1) var<uniform> light: LightUniform;
+@group(2) @binding(0) var albedo_tex: texture_2d<f32>;
+@group(2) @binding(1) var albedo_sampler: sampler;
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
