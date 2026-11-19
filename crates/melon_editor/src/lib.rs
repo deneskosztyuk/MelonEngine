@@ -144,13 +144,7 @@ impl Editor {
                     .unwrap_or(0);
                 ui.label(format!("Frame {}", frame));
                 ui.separator();
-                if let Some(state) = world.get_resource::<SimulationState>() {
-                    if *state == SimulationState::Paused {
-                        ui.colored_label(egui::Color32::YELLOW, "⏸ PAUSED");
-                    } else {
-                        ui.colored_label(egui::Color32::GREEN, "▶ PLAYING");
-                    }
-                }
+                self.play_controls(world, ui);
                 ui.separator();
                 ui.label("Gizmo:");
                 ui.radio_value(&mut self.gizmo_mode, GizmoMode::Move, "Move");
@@ -164,9 +158,15 @@ impl Editor {
                     ui.colored_label(egui::Color32::CYAN, " SNAP");
                 }
                 ui.separator();
+                // Save/Load only in edit mode, so a play session is never saved by accident.
+                let editing = world
+                    .get_resource::<SimulationState>()
+                    .copied()
+                    .unwrap_or_default()
+                    == SimulationState::Editing;
                 let dialog_open = self.pending_dialog.is_some();
                 if ui
-                    .add_enabled(!dialog_open, egui::Button::new("Save"))
+                    .add_enabled(!dialog_open && editing, egui::Button::new("Save"))
                     .clicked()
                 {
                     let (tx, rx) = std::sync::mpsc::channel();
@@ -180,7 +180,7 @@ impl Editor {
                     self.pending_dialog = Some(DialogChannel::Save(rx));
                 }
                 if ui
-                    .add_enabled(!dialog_open, egui::Button::new("Load"))
+                    .add_enabled(!dialog_open && editing, egui::Button::new("Load"))
                     .clicked()
                 {
                     let (tx, rx) = std::sync::mpsc::channel();
@@ -259,6 +259,63 @@ impl Editor {
             .show(ui, |ui| {
                 self.build_gizmo(world, ui);
             });
+    }
+
+    /// Play / Pause / Stop buttons, state label and F5 / F6 / Shift+F5 shortcuts.
+    fn play_controls(&mut self, world: &mut World, ui: &mut egui::Ui) {
+        let state = world
+            .get_resource::<SimulationState>()
+            .copied()
+            .unwrap_or_default();
+        let (mut want_play, mut want_pause, mut want_stop) = (false, false, false);
+        // Shortcuts are ignored while a widget (e.g. an inspector field) has focus.
+        if !ui.ctx().egui_wants_keyboard_input() {
+            ui.input(|i| {
+                if i.key_pressed(egui::Key::F5) {
+                    if i.modifiers.shift {
+                        want_stop = true;
+                    } else {
+                        want_play = true;
+                    }
+                }
+                want_pause |= i.key_pressed(egui::Key::F6);
+            });
+        }
+        let can_play = state != SimulationState::Playing;
+        let can_pause = state == SimulationState::Playing;
+        let can_stop = state != SimulationState::Editing;
+        want_play |= ui
+            .add_enabled(can_play, egui::Button::new("▶ Play"))
+            .clicked();
+        want_pause |= ui
+            .add_enabled(can_pause, egui::Button::new("⏸ Pause"))
+            .clicked();
+        want_stop |= ui
+            .add_enabled(can_stop, egui::Button::new("⏹ Stop"))
+            .clicked();
+
+        if want_play && can_play {
+            match play::play(world) {
+                // Play from edit mode rebuilds the scene, so entity ids change.
+                Ok(()) if state == SimulationState::Editing => self.clear_selection(),
+                Ok(()) => {}
+                Err(e) => self.set_status(format!("Play failed: {e}")),
+            }
+        } else if want_pause && can_pause {
+            play::pause(world);
+        } else if want_stop && can_stop {
+            match play::stop(world) {
+                Ok(()) => self.clear_selection(),
+                Err(e) => self.set_status(format!("Stop failed: {e}")),
+            }
+        }
+
+        let (color, label) = match state {
+            SimulationState::Editing => (egui::Color32::GRAY, "EDITING"),
+            SimulationState::Playing => (egui::Color32::GREEN, "PLAYING"),
+            SimulationState::Paused => (egui::Color32::YELLOW, "PAUSED"),
+        };
+        ui.colored_label(color, label);
     }
 
     fn build_hierarchy(&mut self, world: &mut World, ui: &mut egui::Ui) {
@@ -670,14 +727,7 @@ impl Editor {
             return;
         }
         let handle = handle.unwrap();
-
-        let sim_state = world
-            .get_resource::<SimulationState>()
-            .copied()
-            .unwrap_or(SimulationState::Playing);
-        if sim_state != SimulationState::Playing {
-            return;
-        }
+        // Write in every state, so paused edits are not undone on resume.
 
         if let Some(mut physics) = world.get_resource_mut::<melon_physics::PhysicsWorld>()
             && let Some(body) = physics.bodies.get_mut(handle)
@@ -931,6 +981,36 @@ mod tests {
         snap_previous_transform(&mut world, e);
         let prev = world.get::<melon_core::PreviousTransform>(e).unwrap();
         assert_eq!(prev.0.translation, glam::Vec3::new(5.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn gizmo_physics_write_works_while_paused() {
+        let mut world = World::new();
+        let mut physics = melon_physics::PhysicsWorld::new();
+        let (body, _) = physics.spawn_dynamic_cuboid(glam::Vec3::ZERO, glam::Vec3::splat(0.5));
+        world.insert_resource(physics);
+        world.insert_resource(SimulationState::Paused);
+        let e = world
+            .spawn((
+                Transform::default(),
+                melon_physics::RigidBodyComponent {
+                    body_handle: body,
+                    body_type: melon_physics::RigidBodyType::Dynamic,
+                },
+            ))
+            .id();
+        Editor::new().write_to_physics_body(
+            &mut world,
+            e,
+            Some(glam::Vec3::new(4.0, 0.0, 0.0)),
+            None,
+        );
+        let x = world
+            .resource::<melon_physics::PhysicsWorld>()
+            .body_translation(body)
+            .unwrap()
+            .x;
+        assert!((x - 4.0).abs() < 1e-6, "rapier x {x}");
     }
 
     #[test]
