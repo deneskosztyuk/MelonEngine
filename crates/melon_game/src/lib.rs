@@ -45,8 +45,10 @@ mod tests {
 
     fn world_with_time(dt: f32) -> World {
         let mut world = World::new();
-        let mut time = Time::default();
-        time.update(dt);
+        let time = Time {
+            delta_seconds: dt,
+            ..Time::default()
+        };
         world.insert_resource(time);
         world
     }
@@ -80,11 +82,35 @@ mod tests {
         let mut schedule = Schedule::default();
         schedule.add_systems(bob_system);
         for _ in 0..600 {
-            world.resource_mut::<Time>().update(1.0 / 60.0);
+            let mut time = world.resource_mut::<Time>();
+            time.delta_seconds = 1.0 / 60.0;
+            time.elapsed_seconds += 1.0 / 60.0;
             schedule.run(&mut world);
         }
         let y = world.get::<Transform>(e).unwrap().translation.y;
         // Offsets telescope to A * sin(w * 10 s); a drifting bob would not match.
+        assert!((y - 2.0 * (0.6f32 * 10.0).sin()).abs() < 1e-3, "y = {y}");
+    }
+
+    #[test]
+    fn bob_has_no_drift_across_pause() {
+        use melon_core::bevy_ecs::schedule::IntoScheduleConfigs;
+        use melon_core::{Core, SimulationState, Update};
+        let mut core = Core::new();
+        let playing = |s: Res<SimulationState>| *s == SimulationState::Playing;
+        core.add_systems(Update, bob_system.run_if(playing));
+        let e = core.world.spawn((Transform::default(), Bob)).id();
+        let run = |core: &mut Core, state: SimulationState, n: u32| {
+            core.world.insert_resource(state);
+            for _ in 0..n {
+                core.world.resource_mut::<Time>().update(1.0 / 60.0);
+                core.update();
+            }
+        };
+        run(&mut core, SimulationState::Playing, 300);
+        run(&mut core, SimulationState::Paused, 120);
+        run(&mut core, SimulationState::Playing, 300);
+        let y = core.world.get::<Transform>(e).unwrap().translation.y;
         assert!((y - 2.0 * (0.6f32 * 10.0).sin()).abs() < 1e-3, "y = {y}");
     }
 

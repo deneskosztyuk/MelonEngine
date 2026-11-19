@@ -116,7 +116,7 @@ impl Light {
 }
 
 /// Engine time state. `delta_seconds` is the time elapsed since the last
-/// update; `elapsed_seconds` is the total time since the engine started.
+/// update; `elapsed_seconds` is play time (advances only while `Playing`).
 /// Systems that need frame-rate-independent movement read `delta_seconds`
 /// instead of assuming a fixed 1/60 step.
 ///
@@ -148,10 +148,10 @@ impl Time {
     /// is slower still.
     pub const MAX_FRAME_DELTA: f32 = 0.25;
 
+    /// Record this frame's wall-clock delta. Play time (`elapsed_seconds`)
+    /// is advanced by `Core::update`, and only while `Playing`.
     pub fn update(&mut self, delta: f32) {
-        let delta = delta.min(Self::MAX_FRAME_DELTA);
-        self.delta_seconds = delta;
-        self.elapsed_seconds += delta;
+        self.delta_seconds = delta.min(Self::MAX_FRAME_DELTA);
     }
 
     /// Blend factor between the previous and current fixed step, in 0..1.
@@ -172,8 +172,11 @@ impl Default for Light {
 
 #[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SimulationState {
+    /// Editor edit mode: nothing simulates, play time is 0.
     #[default]
+    Editing,
     Playing,
+    /// Frozen mid-play: play time and the fixed-step remainder hold still.
     Paused,
 }
 
@@ -360,13 +363,16 @@ mod tests {
     }
 
     #[test]
-    fn time_update_accumulates_elapsed() {
+    fn time_update_sets_delta_only() {
         let mut t = Time::default();
         t.update(0.1);
-        assert!((t.delta_seconds - 0.1).abs() < 1e-6);
-        assert!((t.elapsed_seconds - 0.1).abs() < 1e-6);
         t.update(0.2);
         assert!((t.delta_seconds - 0.2).abs() < 1e-6);
-        assert!((t.elapsed_seconds - 0.3).abs() < 1e-6);
+        assert_eq!(t.elapsed_seconds, 0.0, "Core::update owns play time");
+    }
+
+    #[test]
+    fn simulation_state_default_is_editing() {
+        assert_eq!(SimulationState::default(), SimulationState::Editing);
     }
 }

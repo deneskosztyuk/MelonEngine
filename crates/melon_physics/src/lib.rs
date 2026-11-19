@@ -567,6 +567,8 @@ mod tests {
                 },
             ))
             .id();
+        core.world
+            .insert_resource(melon_core::SimulationState::Playing);
         add_physics_systems(&mut core);
         (core, dynamic, fixed)
     }

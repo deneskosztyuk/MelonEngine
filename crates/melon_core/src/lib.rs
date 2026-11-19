@@ -85,21 +85,26 @@ impl Core {
     }
 
     /// Run one frame: `FixedUpdate` once per whole `Time::fixed_delta` of
-    /// accumulated time (none while paused), then `Update`, then `PostUpdate`.
+    /// accumulated time (only while `Playing`), then `Update`, then `PostUpdate`.
     /// Call `Time::update(frame_delta)` before this.
     #[instrument(skip(self), level = "debug")]
     pub fn update(&mut self) {
-        let playing = self
+        let state = self
             .world
             .get_resource::<SimulationState>()
-            .is_none_or(|state| *state == SimulationState::Playing);
+            .copied()
+            .unwrap_or(SimulationState::Playing);
 
         if let Some(mut time) = self.world.get_resource_mut::<Time>() {
-            time.overstep = if playing {
-                time.overstep + time.delta_seconds
-            } else {
-                0.0
-            };
+            match state {
+                SimulationState::Playing => {
+                    time.elapsed_seconds += time.delta_seconds;
+                    time.overstep += time.delta_seconds;
+                }
+                // Frozen: the blended pose holds still and resume is smooth.
+                SimulationState::Paused => {}
+                SimulationState::Editing => time.overstep = 0.0,
+            }
         }
         // Time is borrowed only for the check, so the stage can borrow the world.
         while let Some(mut time) = self.world.get_resource_mut::<Time>()
@@ -161,6 +166,7 @@ mod tests {
 
     fn counting_core() -> Core {
         let mut core = Core::new();
+        core.world.insert_resource(SimulationState::Playing);
         core.world.init_resource::<FixedCount>();
         core.add_systems(FixedUpdate, count_fixed_system);
         core
@@ -213,6 +219,41 @@ mod tests {
         core.world.insert_resource(SimulationState::Paused);
         run_frames(&mut core, 1.0 / 60.0, 60);
         assert_eq!(steps(&core), 0);
+    }
+
+    fn set_state(core: &mut Core, state: SimulationState) {
+        core.world.insert_resource(state);
+    }
+
+    #[test]
+    fn elapsed_advances_only_while_playing() {
+        let mut core = counting_core();
+        run_frames(&mut core, 1.0 / 60.0, 60);
+        set_state(&mut core, SimulationState::Paused);
+        run_frames(&mut core, 1.0 / 60.0, 60);
+        set_state(&mut core, SimulationState::Editing);
+        run_frames(&mut core, 1.0 / 60.0, 60);
+        let elapsed = core.world.resource::<Time>().elapsed_seconds;
+        assert!((elapsed - 1.0).abs() < 1e-3, "elapsed {elapsed}");
+    }
+
+    #[test]
+    fn paused_keeps_overstep() {
+        let mut core = counting_core();
+        run_frames(&mut core, 0.025, 1);
+        let o = core.world.resource::<Time>().overstep;
+        set_state(&mut core, SimulationState::Paused);
+        run_frames(&mut core, 1.0 / 60.0, 10);
+        assert_eq!(core.world.resource::<Time>().overstep, o);
+        assert_eq!(steps(&core), 1);
+    }
+
+    #[test]
+    fn editing_zeroes_overstep() {
+        let mut core = counting_core();
+        run_frames(&mut core, 0.025, 1);
+        set_state(&mut core, SimulationState::Editing);
+        run_frames(&mut core, 1.0 / 60.0, 1);
         assert_eq!(core.world.resource::<Time>().overstep, 0.0);
     }
 
