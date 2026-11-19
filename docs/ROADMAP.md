@@ -27,11 +27,11 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
    longer drifts.
 4. **1024 entity cap.** `MAX_ENTITIES` in `melon_render` sizes the model uniform
    buffer. More entities overflow `write_buffer` and wgpu panics. No guard.
-5. **No asset system.** `MeshRef` is a hardcoded enum (`Cube | GltfModel`).
-   Only `assets/models/cube.glb` is loaded and only `meshes.first()` is drawn.
-   Scene `model_path` is always `None`.
-6. **glTF node tree ignored.** The loader walks `document.meshes()`, so node
-   transforms and hierarchy are lost.
+5. ~~**No asset system.**~~ Fixed: `Handle<Model>` + `AssetServer`; any glTF
+   in `assets/models` draws whole.
+6. **glTF node tree flattened.** Node transforms are now baked into each part
+   (models draw correctly), but nodes don't become child entities until the
+   transform hierarchy exists.
 7. **`melon_host/src/main.rs` does too much.** It builds draw lists, render
    passes and scene I/O, with three editor UI stacks behind `cfg` branches.
 8. **Game systems hardcoded in host.** `melon_game` cannot register its own
@@ -50,8 +50,9 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
       `PostUpdate`) with interpolated rendering. Fixes bugs 2–3. `PreUpdate`
       and `Extract` get added with their first system.
 - [x] Play / Pause / Stop with scene snapshot and restore. Fixes bug 1.
-- [ ] Asset handles (`Handle<Mesh>`, `Handle<Texture>`, `Handle<Material>`) and
-      an asset server; replace the `MeshRef` enum. Fixes bug 5.
+- [x] Asset handles (`Handle<Model>`) and an `AssetServer`, hot reload,
+      editor drag-in and Inspector mesh field. Fixes bug 5. (`Handle<Texture>` /
+      `Handle<Material>` come with PBR materials.)
 - [ ] Transform hierarchy: `Parent` / `Children` + `GlobalTransform` propagation.
 - [ ] Render extraction moved from `melon_host` into `melon_render`. Fixes bug 7.
 - [ ] Full input: all keys, `just_pressed` / `just_released`, mouse buttons and

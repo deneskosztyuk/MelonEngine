@@ -64,6 +64,10 @@ Editor:
 - **W / E / R** — Move / Rotate / Scale tool
 - **Delete** — delete the selected entity
 - **Ctrl+S** — save the scene (File ▸ Save As… the first time)
+- **Models:** drag a `.glb` / `.gltf` from the Content Browser into the Scene
+  (lands on the ground under the cursor) or the Hierarchy (at the origin), or
+  pick one in the Inspector's **Mesh** field. Edit and re-export a model and
+  the editor reloads it within about a second.
 - Panels (Hierarchy, Scene, Inspector, Content Browser, Console) dock and tab
   by dragging their tabs; the arrangement is saved to `.melon/editor_layout.ron`.
   **Window** reopens closed panels; **Window ▸ Reset Layout** restores the default.

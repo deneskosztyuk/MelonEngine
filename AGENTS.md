@@ -80,9 +80,15 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 - **Deleting entities.** Insert `PendingDelete`; `cleanup_deleted_system`
   removes the rapier body and despawns. Do not despawn physics entities
   directly.
-- **Scene format.** RON, `SCENE_VERSION = 1` in `melon_editor/src/scene.rs`.
-  Adding a saved component means changing `SceneEntity`, `save_scene` and
-  `spawn_scene_entity`. Bump the version on breaking changes.
+- **Assets.** Reference files through `AssetServer::load::<Model>(path)` →
+  `Handle<Model>`; paths are project-relative with forward slashes
+  (`assets/models/x.glb`), plus `builtin:cube`. Never store handle ids in
+  files. `melon_render::ModelCache` turns handles into GPU models; changed
+  files hot-reload (poll every 0.5 s); a broken file keeps the last good model.
+- **Scene format.** RON, `SCENE_VERSION = 2` in `melon_editor/src/scene.rs`
+  (version 1 `mesh_ref` still loads). Adding a saved component means changing
+  `SceneEntity`, `scene_to_data` and `spawn_scene_entity`. Bump the version on
+  breaking changes and keep reading the old one.
 - **Light direction sign.** `Light::direction` is the direction light travels
   (from the light into the scene). Shaders want the opposite; pass
   `Light::to_light()`.
