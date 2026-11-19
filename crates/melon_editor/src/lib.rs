@@ -93,6 +93,8 @@ pub struct Editor {
     /// Dockable panel arrangement (saved between runs).
     dock: egui_dock::DockState<layout::EditorTab>,
     content: content::ContentBrowser,
+    /// Where the dock layout is saved (under the project root).
+    layout_file: std::path::PathBuf,
     hierarchy_query: String,
     /// Scene file last saved or loaded; File > Save writes here.
     current_scene: Option<std::path::PathBuf>,
@@ -121,6 +123,7 @@ impl Default for Editor {
             console_filter: console::ConsoleFilter::default(),
             dock: layout::default_layout(),
             content: content::ContentBrowser::new("assets".into()),
+            layout_file: layout::layout_path(),
             hierarchy_query: String::new(),
             current_scene: None,
             flying: false,
@@ -130,17 +133,22 @@ impl Default for Editor {
 }
 
 impl Editor {
-    /// Editor with the layout saved by the last run (or the default one).
     pub fn new() -> Self {
-        Self {
-            dock: layout::load_layout(&layout::layout_path()),
-            ..Self::default()
-        }
+        Self::default()
+    }
+
+    /// Point the editor at a project: the Content Browser shows
+    /// `<root>/assets` and the dock layout is loaded from and saved to
+    /// `<root>/.melon/editor_layout.ron`, whatever the working directory.
+    pub fn set_project_root(&mut self, root: &std::path::Path) {
+        self.content = content::ContentBrowser::new(root.join("assets"));
+        self.layout_file = root.join(layout::layout_path());
+        self.dock = layout::load_layout(&self.layout_file);
     }
 
     /// Save the panel arrangement; the host calls this when the window closes.
     pub fn save_layout(&self) {
-        if let Err(error) = layout::save_layout(&self.dock, &layout::layout_path()) {
+        if let Err(error) = layout::save_layout(&self.dock, &self.layout_file) {
             tracing::warn!(?error, "could not save the editor layout");
         }
     }
@@ -384,11 +392,6 @@ impl Editor {
                 ui.label("A Rust 3D game engine.");
                 ui.weak("bevy_ecs · wgpu · rapier3d · egui");
             });
-    }
-
-    /// Folder the Content Browser shows (the project's `assets/`).
-    pub fn set_assets_root(&mut self, root: std::path::PathBuf) {
-        self.content = content::ContentBrowser::new(root);
     }
 
     pub fn selected_entity(&self) -> Option<Entity> {
@@ -1658,6 +1661,26 @@ mod tests {
             "frame_ms {}",
             editor.frame_ms
         );
+    }
+
+    #[test]
+    fn project_root_sets_layout_file_and_assets() {
+        let root = std::env::temp_dir().join(format!("melon_root_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let mut saved = layout::default_layout();
+        let console = saved.find_tab(&layout::EditorTab::Console).unwrap();
+        saved.remove_tab(console);
+        layout::save_layout(&saved, &root.join(".melon/editor_layout.ron")).unwrap();
+
+        let mut editor = Editor::default();
+        editor.set_project_root(&root);
+        assert!(
+            editor.dock.find_tab(&layout::EditorTab::Console).is_none(),
+            "layout loaded from the root"
+        );
+        assert_eq!(editor.content.current(), root.join("assets"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

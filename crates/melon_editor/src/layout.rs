@@ -68,7 +68,7 @@ pub fn default_layout() -> DockState<EditorTab> {
     state
 }
 
-/// Default location of the saved layout (git-ignored).
+/// Saved-layout location, relative to the project root (git-ignored).
 pub fn layout_path() -> PathBuf {
     PathBuf::from(".melon/editor_layout.ron")
 }
@@ -167,6 +167,18 @@ mod tests {
         let path = temp_file("missing");
         let _ = std::fs::remove_file(&path);
         assert_eq!(open_tabs(&load_layout(&path)), EditorTab::ALL.to_vec());
+    }
+
+    #[test]
+    fn unknown_tab_variant_falls_back_to_default() {
+        // A layout saved by a build with a panel this build doesn't know.
+        let path = temp_file("unknown");
+        let text = ron::ser::to_string(&default_layout())
+            .unwrap()
+            .replace("Console", "Profiler");
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(open_tabs(&load_layout(&path)), EditorTab::ALL.to_vec());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

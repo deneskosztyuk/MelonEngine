@@ -201,7 +201,12 @@ impl ApplicationHandler for App {
         editor.set_viewport_target(renderer.device(), &viewport_target);
         let mut editor_ui = Editor::new();
         editor_ui.set_console(self.console.clone());
-        editor_ui.set_assets_root(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets").into());
+        // shortcut: the project root is the source tree, fixed at compile time;
+        // ship builds need a real project path (CLI argument or project file).
+        editor_ui.set_project_root(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../.."
+        )));
 
         let size = renderer.size();
         let aspect = size.width as f32 / size.height.max(1) as f32;
