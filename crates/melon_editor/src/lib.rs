@@ -12,6 +12,7 @@ use winit::event::WindowEvent;
 use winit::window::Window;
 
 pub mod console;
+pub mod content;
 pub mod gizmo;
 pub mod play;
 pub mod scene;
