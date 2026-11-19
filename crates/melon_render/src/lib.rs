@@ -276,9 +276,6 @@ pub struct Renderer {
     size: winit::dpi::PhysicalSize<u32>,
     window: Arc<Window>,
     scene: SceneRenderer,
-    depth_texture: wgpu::Texture,
-    depth_view: wgpu::TextureView,
-    hdr_target: HdrTarget,
 }
 
 impl std::ops::Deref for Renderer {
@@ -342,8 +339,6 @@ impl Renderer {
             .context("surface reported no usable formats")?;
 
         let scene = SceneRenderer::new(device, queue, surface_format);
-        let (depth_texture, depth_view) = Self::create_depth_target(&scene.device, size);
-        let hdr_target = scene.create_hdr_target(size);
 
         let renderer = Self {
             instance,
@@ -351,9 +346,6 @@ impl Renderer {
             size,
             window,
             scene,
-            depth_texture,
-            depth_view,
-            hdr_target,
         };
         renderer.configure_surface();
         Ok(renderer)
@@ -1267,15 +1259,6 @@ impl Renderer {
         self.size
     }
 
-    pub fn depth_view(&self) -> &wgpu::TextureView {
-        &self.depth_view
-    }
-
-    /// Scene colour target matching the window size.
-    pub fn hdr_target(&self) -> &HdrTarget {
-        &self.hdr_target
-    }
-
     #[instrument(skip(self), level = "debug")]
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width == 0 || new_size.height == 0 {
@@ -1283,10 +1266,6 @@ impl Renderer {
         }
         self.size = new_size;
         self.configure_surface();
-        let (depth_texture, depth_view) = Self::create_depth_target(&self.device, new_size);
-        self.depth_texture = depth_texture;
-        self.depth_view = depth_view;
-        self.hdr_target = self.scene.create_hdr_target(new_size);
     }
 
     fn configure_surface(&self) {
