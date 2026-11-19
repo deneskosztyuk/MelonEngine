@@ -1,7 +1,8 @@
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
-use bevy_ecs::query::With;
+use bevy_ecs::query::{With, Without};
 use bevy_ecs::resource::Resource;
+use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_ecs::system::{Commands, Query, Res, ResMut};
 use glam::{Quat, Vec3};
 
@@ -18,7 +19,10 @@ use rapier3d::pipeline::PhysicsPipeline;
 use rapier3d::prelude::IntegrationParameters;
 use tracing::instrument;
 
-use melon_core::{PendingDelete, Transform};
+use melon_core::{
+    Core, FixedUpdate, PendingDelete, PostUpdate, PreviousTransform, Time, Transform,
+    store_previous_transforms_system,
+};
 
 /// Gravity vector in m/s^2. Default is Earth gravity pointing down (-Y).
 const GRAVITY: Vector = Vector::new(0.0, -9.81, 0.0);
@@ -182,10 +186,46 @@ impl PhysicsWorld {
     }
 }
 
-/// System: step the physics world once per frame.
-/// Run this before sync_from_physics_system.
-pub fn step_system(mut world: ResMut<PhysicsWorld>) {
+/// System: step the physics world by one `Time::fixed_delta`.
+/// Runs in `FixedUpdate`, before sync_from_physics_system.
+pub fn step_system(mut world: ResMut<PhysicsWorld>, time: Res<Time>) {
+    world.integration_parameters.dt = time.fixed_delta;
     world.step();
+}
+
+/// System: give every dynamic body a `PreviousTransform` (equal to its
+/// current `Transform`, so it never blends from the origin). One system
+/// covers all spawn paths: default scene, scene load, editor.
+pub fn add_previous_transforms_system(
+    mut commands: Commands,
+    query: Query<(Entity, &RigidBodyComponent, &Transform), Without<PreviousTransform>>,
+) {
+    for (entity, rb, transform) in &query {
+        if rb.body_type == RigidBodyType::Dynamic {
+            commands
+                .entity(entity)
+                .insert(PreviousTransform(*transform));
+        }
+    }
+}
+
+/// Register the physics systems into their frame stages. Fixed-step order:
+/// remember previous transforms, push ECS edits into rapier, step, pull results back.
+pub fn add_physics_systems(core: &mut Core) {
+    core.add_systems(
+        FixedUpdate,
+        (
+            store_previous_transforms_system,
+            sync_to_physics_system,
+            step_system,
+            sync_from_physics_system,
+        )
+            .chain(),
+    );
+    core.add_systems(
+        PostUpdate,
+        (cleanup_deleted_system, add_previous_transforms_system),
+    );
 }
 
 /// System: sync rapier body transforms back into ECS Transform components.
@@ -498,5 +538,88 @@ mod tests {
             world.get_entity(entity).is_err(),
             "entity without physics should still be despawned"
         );
+    }
+
+    fn drop_test_core() -> (melon_core::Core, Entity, Entity) {
+        let mut core = melon_core::Core::new();
+        let mut pw = PhysicsWorld::new();
+        let start = Vec3::new(0.0, 10.0, 0.0);
+        let (body, _) = pw.spawn_dynamic_cuboid(start, Vec3::splat(0.5));
+        let (fixed_body, _) = pw.spawn_fixed_cuboid(Vec3::new(0.0, -50.0, 0.0), Vec3::splat(1.0));
+        core.world.insert_resource(pw);
+        let dynamic = core
+            .world
+            .spawn((
+                Transform::from_translation(start),
+                RigidBodyComponent {
+                    body_handle: body,
+                    body_type: RigidBodyType::Dynamic,
+                },
+            ))
+            .id();
+        let fixed = core
+            .world
+            .spawn((
+                Transform::from_translation(Vec3::new(0.0, -50.0, 0.0)),
+                RigidBodyComponent {
+                    body_handle: fixed_body,
+                    body_type: RigidBodyType::Fixed,
+                },
+            ))
+            .id();
+        add_physics_systems(&mut core);
+        (core, dynamic, fixed)
+    }
+
+    fn run_frames(core: &mut melon_core::Core, dt: f32, n: u32) {
+        for _ in 0..n {
+            core.world.resource_mut::<melon_core::Time>().update(dt);
+            core.update();
+        }
+    }
+
+    fn height(core: &melon_core::Core, e: Entity) -> f32 {
+        core.world.get::<Transform>(e).unwrap().translation.y
+    }
+
+    #[test]
+    fn fall_height_independent_of_frame_rate() {
+        let (mut core30, e30, _) = drop_test_core();
+        run_frames(&mut core30, 1.0 / 30.0, 30);
+        let (mut core144, e144, _) = drop_test_core();
+        run_frames(&mut core144, 1.0 / 144.0, 144);
+        let (y30, y144) = (height(&core30, e30), height(&core144, e144));
+        // 0.2 m is about one fixed step of fall after 1 s.
+        assert!((y30 - y144).abs() < 0.2, "{y30} vs {y144}");
+        // Free fall for 1 s is ~4.9 m, not 2.4x that.
+        assert!(y30 < 6.0 && y30 > 4.0, "y30 = {y30}");
+    }
+
+    #[test]
+    fn paused_body_does_not_fall() {
+        let (mut core, e, _) = drop_test_core();
+        core.world
+            .insert_resource(melon_core::SimulationState::Paused);
+        run_frames(&mut core, 1.0 / 60.0, 60);
+        assert_eq!(height(&core, e), 10.0);
+    }
+
+    #[test]
+    fn dynamic_body_gets_previous_transform_equal_to_current() {
+        let (mut core, e, _) = drop_test_core();
+        run_frames(&mut core, 0.001, 1);
+        let prev = core
+            .world
+            .get::<PreviousTransform>(e)
+            .expect("no PreviousTransform");
+        let cur = core.world.get::<Transform>(e).unwrap();
+        assert_eq!(prev.0.translation, cur.translation);
+    }
+
+    #[test]
+    fn fixed_body_gets_no_previous_transform() {
+        let (mut core, _, fixed) = drop_test_core();
+        run_frames(&mut core, 1.0 / 60.0, 2);
+        assert!(core.world.get::<PreviousTransform>(fixed).is_none());
     }
 }
