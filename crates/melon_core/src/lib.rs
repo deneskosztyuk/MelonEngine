@@ -6,6 +6,7 @@ use bevy_ecs::{
 };
 use tracing::instrument;
 
+pub mod actions;
 pub mod assets;
 pub mod components;
 pub mod hierarchy;
@@ -13,6 +14,9 @@ pub mod input;
 pub mod resources;
 pub mod stages;
 
+pub use actions::{
+    Action, ActionKind, Actions, AxisBinding, InputMap, LoadOutcome, update_actions_system,
+};
 pub use assets::{AssetServer, Handle, Model};
 pub use bevy_ecs;
 pub use bevy_ecs::query::With;
@@ -81,6 +85,9 @@ impl Core {
         world.init_resource::<Time>();
         world.init_resource::<SimulationState>();
         world.insert_resource(AssetServer::new(".".into()));
+        world.init_resource::<Input>();
+        world.init_resource::<InputMap>();
+        world.init_resource::<Actions>();
 
         let mut schedules = Schedules::new();
         schedules.insert(Schedule::new(PreUpdate));
@@ -89,6 +96,7 @@ impl Core {
         schedules.insert(Schedule::new(PostUpdate));
 
         let mut core = Self { world, schedules };
+        core.add_systems(PreUpdate, update_actions_system);
         core.add_systems(Update, (frame_counter_system, log_frame_system));
         core.add_systems(
             PostUpdate,

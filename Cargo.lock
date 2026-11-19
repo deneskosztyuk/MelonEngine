@@ -2182,8 +2182,10 @@ dependencies = [
 name = "melon_core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bevy_ecs",
  "glam 0.33.2",
+ "ron",
  "serde",
  "tracing",
 ]
