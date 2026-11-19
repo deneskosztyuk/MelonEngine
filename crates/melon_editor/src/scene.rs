@@ -36,9 +36,10 @@ pub struct SceneEntity {
     model_path: Option<String>,
 }
 
-/// Capture all entities with Name + Transform.
+/// Capture all entities with Name + Transform, except ones marked for deletion
+/// (deleted this frame but not yet despawned).
 pub fn scene_to_data(world: &mut World) -> SceneData {
-    let mut query = world.query::<(
+    let mut query = world.query_filtered::<(
         &Name,
         &Transform,
         Option<&MeshRef>,
@@ -46,7 +47,7 @@ pub fn scene_to_data(world: &mut World) -> SceneData {
         Option<&BodyInfo>,
         Option<&Spin>,
         Option<&Bob>,
-    )>();
+    ), bevy_ecs::query::Without<melon_core::PendingDelete>>();
 
     let entities: Vec<SceneEntity> = query
         .iter(world)
@@ -459,6 +460,27 @@ mod tests {
         world.get_mut::<Transform>(floor).unwrap().translation.y = 5.0;
         apply_scene(&mut world, &mut physics, &data).unwrap();
         assert!((floor_y(&mut world) - (-1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn scene_to_data_skips_entities_being_deleted() {
+        let mut world = world_with_entities();
+        let floor = world
+            .query::<(Entity, &Name)>()
+            .iter(&world)
+            .find(|(_, n)| n.0 == "Floor")
+            .map(|(e, _)| e)
+            .unwrap();
+        world.entity_mut(floor).insert(melon_core::PendingDelete);
+        let mut physics = PhysicsWorld::new();
+        let data = scene_to_data(&mut world);
+        apply_scene(&mut world, &mut physics, &data).unwrap();
+        let names: Vec<String> = world
+            .query::<&Name>()
+            .iter(&world)
+            .map(|n| n.0.clone())
+            .collect();
+        assert_eq!(names, ["Cube"]);
     }
 
     #[test]
