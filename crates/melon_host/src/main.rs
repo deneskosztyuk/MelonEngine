@@ -92,7 +92,7 @@ struct App {
     editor_ui: Option<Editor>,
     #[cfg(feature = "imgui-poc")]
     imgui_poc: Option<ImguiEditorOverlay>,
-    #[cfg(feature = "imgui-poc")]
+    /// Offscreen image the scene renders into; the editor shows it in its viewport panel.
     viewport_target: Option<melon_render::ViewportTarget>,
     core: melon_core::Core,
     cube_mesh: Option<melon_render::Mesh>,
@@ -164,7 +164,6 @@ impl App {
             editor_ui: None,
             #[cfg(feature = "imgui-poc")]
             imgui_poc: None,
-            #[cfg(feature = "imgui-poc")]
             viewport_target: None,
             core,
             cube_mesh: None,
@@ -201,14 +200,17 @@ impl ApplicationHandler for App {
             }
         };
 
+        let viewport_target = renderer.create_viewport_target(renderer.size());
+
         #[cfg(not(feature = "imgui-poc"))]
-        let editor = EditorOverlay::new(&window, renderer.device(), renderer.surface_format());
+        let mut editor = EditorOverlay::new(&window, renderer.device(), renderer.surface_format());
+        #[cfg(not(feature = "imgui-poc"))]
+        editor.set_viewport_target(renderer.device(), &viewport_target);
         #[cfg(not(feature = "imgui-poc"))]
         let editor_ui = Editor::new();
 
         #[cfg(feature = "imgui-poc")]
-        let (imgui_poc, viewport_target) = {
-            let viewport_target = renderer.create_viewport_target(renderer.size());
+        let imgui_poc = {
             let mut imgui_poc = ImguiEditorOverlay::new(
                 &window,
                 renderer.device(),
@@ -216,7 +218,7 @@ impl ApplicationHandler for App {
                 renderer.surface_format(),
             );
             imgui_poc.set_viewport_target(renderer.device(), &viewport_target);
-            (imgui_poc, viewport_target)
+            imgui_poc
         };
 
         let size = renderer.size();
@@ -259,8 +261,8 @@ impl ApplicationHandler for App {
         #[cfg(feature = "imgui-poc")]
         {
             self.imgui_poc = Some(imgui_poc);
-            self.viewport_target = Some(viewport_target);
         }
+        self.viewport_target = Some(viewport_target);
         window.focus_window();
         window.request_redraw();
     }
@@ -296,10 +298,6 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
-                    let aspect = size.width as f32 / size.height.max(1) as f32;
-                    if let Some(mut camera) = self.core.world.get_resource_mut::<Camera>() {
-                        camera.set_aspect(aspect);
-                    }
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -530,20 +528,11 @@ impl ApplicationHandler for App {
 
                 // Pass 1: clear + draw 3D meshes into the HDR target.
                 // Pass 2: tonemap HDR onto the display image + gizmo lines.
-                #[cfg(feature = "imgui-poc")]
-                let viewport_color_view = self.viewport_target.as_ref().unwrap().color_view();
-                #[cfg(feature = "imgui-poc")]
+                let viewport_target = self.viewport_target.as_ref().unwrap();
+                let viewport_color_view = viewport_target.color_view();
                 let scene_color_view = viewport_color_view.as_ref();
-                #[cfg(feature = "imgui-poc")]
-                let scene_depth_view = self.viewport_target.as_ref().unwrap().depth_view();
-                #[cfg(feature = "imgui-poc")]
-                let scene_hdr = self.viewport_target.as_ref().unwrap().hdr_target();
-                #[cfg(not(feature = "imgui-poc"))]
-                let scene_color_view = &frame.view;
-                #[cfg(not(feature = "imgui-poc"))]
-                let scene_depth_view = renderer.depth_view();
-                #[cfg(not(feature = "imgui-poc"))]
-                let scene_hdr = renderer.hdr_target();
+                let scene_depth_view = viewport_target.depth_view();
+                let scene_hdr = viewport_target.hdr_target();
 
                 let shadow_draw_calls: Vec<(usize, &melon_render::Mesh)> = textured_draw_calls
                     .iter()
@@ -602,11 +591,7 @@ impl ApplicationHandler for App {
                                 depth_slice: None,
                                 resolve_target: None,
                                 ops: wgpu::Operations {
-                                    load: if cfg!(feature = "imgui-poc") {
-                                        wgpu::LoadOp::Clear(CLEAR_COLOR)
-                                    } else {
-                                        wgpu::LoadOp::Load
-                                    },
+                                    load: wgpu::LoadOp::Clear(CLEAR_COLOR),
                                     store: wgpu::StoreOp::Store,
                                 },
                             })],
@@ -630,22 +615,29 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // Follow the viewport panel's size: recreate the target, hand it
+                // to the editor UI, and match the camera aspect.
                 #[cfg(feature = "imgui-poc")]
-                {
-                    let requested_size = self.imgui_poc.as_ref().unwrap().requested_viewport_size();
-                    let current_size = self.viewport_target.as_ref().unwrap().size();
-                    if requested_size != current_size {
-                        let viewport_target = renderer.create_viewport_target(requested_size);
-                        self.imgui_poc
-                            .as_mut()
-                            .unwrap()
-                            .set_viewport_target(renderer.device(), &viewport_target);
-                        self.viewport_target = Some(viewport_target);
+                let requested_size = self.imgui_poc.as_ref().unwrap().requested_viewport_size();
+                #[cfg(not(feature = "imgui-poc"))]
+                let requested_size = self.editor_ui.as_ref().unwrap().requested_viewport_size();
+                if requested_size != self.viewport_target.as_ref().unwrap().size() {
+                    let viewport_target = renderer.create_viewport_target(requested_size);
+                    #[cfg(feature = "imgui-poc")]
+                    self.imgui_poc
+                        .as_mut()
+                        .unwrap()
+                        .set_viewport_target(renderer.device(), &viewport_target);
+                    #[cfg(not(feature = "imgui-poc"))]
+                    self.editor
+                        .as_mut()
+                        .unwrap()
+                        .set_viewport_target(renderer.device(), &viewport_target);
+                    self.viewport_target = Some(viewport_target);
 
-                        let aspect = requested_size.width as f32 / requested_size.height as f32;
-                        if let Some(mut camera) = self.core.world.get_resource_mut::<Camera>() {
-                            camera.set_aspect(aspect);
-                        }
+                    let aspect = requested_size.width as f32 / requested_size.height as f32;
+                    if let Some(mut camera) = self.core.world.get_resource_mut::<Camera>() {
+                        camera.set_aspect(aspect);
                     }
                 }
 

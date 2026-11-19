@@ -75,6 +75,10 @@ pub struct Editor {
     pending_dialog: Option<DialogChannel>,
     pending_operation: Option<PendingOperation>,
     status_message: Option<(String, std::time::Instant)>,
+    /// egui texture showing the scene (set by `EditorOverlay`).
+    viewport_texture: Option<egui::TextureId>,
+    /// Pixel size the viewport panel wants its render target to be.
+    viewport_size: winit::dpi::PhysicalSize<u32>,
 }
 
 impl Default for Editor {
@@ -88,6 +92,8 @@ impl Default for Editor {
             pending_dialog: None,
             pending_operation: None,
             status_message: None,
+            viewport_texture: None,
+            viewport_size: winit::dpi::PhysicalSize::new(1, 1),
         }
     }
 }
@@ -127,6 +133,12 @@ impl Editor {
 
     pub fn take_pending_operation(&mut self) -> Option<PendingOperation> {
         std::mem::take(&mut self.pending_operation)
+    }
+
+    /// Pixel size of the viewport panel. The host resizes the
+    /// `ViewportTarget` to this when it changes.
+    pub fn requested_viewport_size(&self) -> winit::dpi::PhysicalSize<u32> {
+        self.viewport_size
     }
 
     pub fn set_status(&mut self, message: String) {
@@ -250,15 +262,23 @@ impl Editor {
                 });
             });
 
-        // Central area: gizmo interaction + rendering.
-        // Uses a transparent frame so the 3D scene shows through.
+        // Central area: the scene viewport image, plus gizmo interaction.
         self.gizmo_vertices.clear();
-        let central_frame = egui::Frame::new()
-            .fill(egui::Color32::TRANSPARENT)
-            .stroke(egui::Stroke::NONE);
         egui::CentralPanel::default()
-            .frame(central_frame)
+            .frame(egui::Frame::new())
             .show(ui, |ui| {
+                let rect = ui.available_rect_before_wrap();
+                self.viewport_size = viewport::viewport_pixel_size(
+                    glam::Vec2::new(rect.width(), rect.height()),
+                    ui.ctx().pixels_per_point(),
+                );
+                if let Some(texture) = self.viewport_texture {
+                    ui.put(
+                        rect,
+                        egui::Image::new((texture, rect.size()))
+                            .sense(egui::Sense::click_and_drag()),
+                    );
+                }
                 self.build_gizmo(world, ui);
             });
     }
@@ -878,6 +898,7 @@ pub struct EditorOverlay {
     renderer: egui_wgpu::Renderer,
     paint_jobs: Vec<egui::ClippedPrimitive>,
     screen_descriptor: ScreenDescriptor,
+    viewport_texture: Option<egui::TextureId>,
 }
 
 impl EditorOverlay {
@@ -909,6 +930,32 @@ impl EditorOverlay {
             renderer,
             paint_jobs: Vec::new(),
             screen_descriptor,
+            viewport_texture: None,
+        }
+    }
+
+    /// Show `target`'s colour texture in the viewport panel. Call again after
+    /// the target is recreated (resize).
+    pub fn set_viewport_target(
+        &mut self,
+        device: &wgpu::Device,
+        target: &melon_render::ViewportTarget,
+    ) {
+        let view = target.ui_view();
+        match self.viewport_texture {
+            Some(id) => self.renderer.update_egui_texture_from_wgpu_texture(
+                device,
+                view,
+                wgpu::FilterMode::Linear,
+                id,
+            ),
+            None => {
+                self.viewport_texture = Some(self.renderer.register_native_texture(
+                    device,
+                    view,
+                    wgpu::FilterMode::Linear,
+                ))
+            }
         }
     }
 
@@ -931,6 +978,7 @@ impl EditorOverlay {
         world: &mut World,
         editor: &mut Editor,
     ) {
+        editor.viewport_texture = self.viewport_texture;
         let raw_input = self.state.take_egui_input(window);
         let full_output = self.ctx.run_ui(raw_input, |ui| {
             editor.build_ui(world, ui);

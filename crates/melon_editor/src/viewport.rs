@@ -211,6 +211,16 @@ pub fn frame_target(world: &World, entity: Entity) -> Option<(Vec3, f32)> {
     ))
 }
 
+/// Texture size for a viewport of `size_points` UI points: rounded to pixels,
+/// never 0 on either side (a 0-sized wgpu texture is invalid).
+pub fn viewport_pixel_size(
+    size_points: Vec2,
+    pixels_per_point: f32,
+) -> winit::dpi::PhysicalSize<u32> {
+    let px = (size_points * pixels_per_point).round().max(Vec2::ONE);
+    winit::dpi::PhysicalSize::new(px.x as u32, px.y as u32)
+}
+
 fn line(a: Vec3, b: Vec3, color: [f32; 3]) -> [LineVertex; 2] {
     [
         LineVertex {
@@ -549,6 +559,18 @@ mod tests {
             .find(|v| v.color == AXIS_Z_COLOR)
             .expect("z axis line");
         assert!(blue.position[0].abs() < 1e-6);
+    }
+
+    #[test]
+    fn viewport_pixel_size_never_zero() {
+        let size = viewport_pixel_size(Vec2::ZERO, 2.0);
+        assert_eq!((size.width, size.height), (1, 1));
+    }
+
+    #[test]
+    fn viewport_pixel_size_scales_by_ppp() {
+        let size = viewport_pixel_size(Vec2::new(400.5, 300.0), 2.0);
+        assert_eq!((size.width, size.height), (801, 600));
     }
 
     #[test]

@@ -1744,6 +1744,8 @@ impl Renderer {
 pub struct ViewportTarget {
     color_texture: Arc<wgpu::Texture>,
     color_view: Arc<wgpu::TextureView>,
+    ui_view: wgpu::TextureView,
+    ui_view_format: wgpu::TextureFormat,
     _depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
     hdr_target: HdrTarget,
@@ -1770,15 +1772,23 @@ impl ViewportTarget {
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
+            view_formats: &[format.remove_srgb_suffix()],
         }));
         let color_view =
             Arc::new(color_texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        let ui_view_format = format.remove_srgb_suffix();
+        let ui_view = color_texture.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("editor viewport ui view"),
+            format: Some(ui_view_format),
+            ..Default::default()
+        });
         let (depth_texture, depth_view) = Renderer::create_depth_target(device, size);
 
         Self {
             color_texture,
             color_view,
+            ui_view,
+            ui_view_format,
             _depth_texture: depth_texture,
             depth_view,
             hdr_target,
@@ -1801,6 +1811,17 @@ impl ViewportTarget {
 
     pub fn color_view(&self) -> Arc<wgpu::TextureView> {
         self.color_view.clone()
+    }
+
+    /// Non-sRGB view of the colour texture for UI libraries that treat texture
+    /// samples as gamma-encoded (egui). Sampling the sRGB view would decode
+    /// the image twice and darken it.
+    pub fn ui_view(&self) -> &wgpu::TextureView {
+        &self.ui_view
+    }
+
+    pub fn ui_view_format(&self) -> wgpu::TextureFormat {
+        self.ui_view_format
     }
 
     pub fn depth_view(&self) -> &wgpu::TextureView {
@@ -2236,6 +2257,14 @@ mod tests {
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
+            Box::new(|renderer| {
+                let target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(8, 8));
+                if target.ui_view_format().is_srgb() {
+                    Err("viewport_ui_view_is_not_srgb: egui would decode it twice".into())
+                } else {
+                    Ok(())
+                }
+            }),
             Box::new(|renderer| {
                 // Line at depth ~0.5: visible over a far-cleared depth buffer,
                 // hidden behind a near-cleared one (depth test on).
