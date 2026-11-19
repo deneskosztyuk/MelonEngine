@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+mod models;
+pub use models::ModelCache;
+
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 use tracing::instrument;
@@ -60,13 +63,8 @@ pub struct LoadedModel {
     /// Per-primitive albedo bind group. `None` if the primitive had no
     /// base color texture; the caller should bind the renderer's default.
     pub albedo_bind_groups: Vec<Option<wgpu::BindGroup>>,
-}
-
-fn index_format_size(format: wgpu::IndexFormat) -> usize {
-    match format {
-        wgpu::IndexFormat::Uint16 => 2,
-        wgpu::IndexFormat::Uint32 => 4,
-    }
+    /// Local-space bounds (min, max) of every part, node transforms included.
+    pub bounds: (glam::Vec3, glam::Vec3),
 }
 
 /// Convert a decoded glTF image (`gltf::image::Data`) into an
@@ -1446,126 +1444,179 @@ impl SceneRenderer {
         &self.texture_bind_group_layout
     }
 
-    /// Load a glTF (.glb or .gltf) file from disk and upload all primitives
-    /// to the GPU. Each primitive becomes one entry in `LoadedModel::meshes`
-    /// with a matching albedo bind group (or `None` if untextured).
+    /// Load a glTF / GLB file. Every primitive reachable from the default
+    /// scene's node tree becomes one `Mesh`, with its node's world transform
+    /// baked into the vertices, plus its base colour texture (or `None`).
     #[instrument(skip(self), level = "info")]
     pub fn load_gltf(&self, path: &str) -> Result<LoadedModel> {
         let (document, buffers, images) =
             gltf::import(path).with_context(|| format!("failed to import glTF file: {path}"))?;
+        let model = self.build_model(&document, &buffers, &images)?;
+        tracing::info!("loaded glTF {}: {} part(s)", path, model.meshes.len());
+        Ok(model)
+    }
 
-        let mut meshes = Vec::new();
-        let mut albedo_bind_groups = Vec::new();
+    /// Load a glTF / GLB from memory (embedded or data-URI buffers only).
+    pub fn load_gltf_bytes(&self, bytes: &[u8]) -> Result<LoadedModel> {
+        let (document, buffers, images) =
+            gltf::import_slice(bytes).context("failed to import glTF data")?;
+        self.build_model(&document, &buffers, &images)
+    }
 
-        for mesh in document.meshes() {
+    /// The procedural unit cube with the checkerboard (`builtin:cube`).
+    pub fn builtin_cube_model(&self) -> LoadedModel {
+        LoadedModel {
+            meshes: vec![self.cube_mesh()],
+            albedo_bind_groups: vec![None],
+            bounds: (glam::Vec3::splat(-0.5), glam::Vec3::splat(0.5)),
+        }
+    }
+
+    fn build_model(
+        &self,
+        document: &gltf::Document,
+        buffers: &[gltf::buffer::Data],
+        images: &[gltf::image::Data],
+    ) -> Result<LoadedModel> {
+        let mut model = LoadedModel {
+            meshes: Vec::new(),
+            albedo_bind_groups: Vec::new(),
+            bounds: (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)),
+        };
+        let scene = document
+            .default_scene()
+            .or_else(|| document.scenes().next())
+            .context("glTF file has no scene")?;
+        for node in scene.nodes() {
+            self.add_node(&node, glam::Mat4::IDENTITY, buffers, images, &mut model)?;
+        }
+        if model.meshes.is_empty() {
+            anyhow::bail!("glTF scene contains no meshes");
+        }
+        Ok(model)
+    }
+
+    fn add_node(
+        &self,
+        node: &gltf::Node,
+        parent: glam::Mat4,
+        buffers: &[gltf::buffer::Data],
+        images: &[gltf::image::Data],
+        model: &mut LoadedModel,
+    ) -> Result<()> {
+        let world = parent * glam::Mat4::from_cols_array_2d(&node.transform().matrix());
+        if let Some(mesh) = node.mesh() {
             for primitive in mesh.primitives() {
-                let reader =
-                    primitive.reader(|buffer| buffers.get(buffer.index()).map(|d| d.as_ref()));
+                self.add_primitive(&primitive, world, buffers, images, model)?;
+            }
+        }
+        for child in node.children() {
+            self.add_node(&child, world, buffers, images, model)?;
+        }
+        Ok(())
+    }
 
-                let positions: Vec<[f32; 3]> = reader
-                    .read_positions()
-                    .map(|it| it.collect())
-                    .unwrap_or_default();
-                if positions.is_empty() {
-                    anyhow::bail!("primitive {} has no positions", primitive.index());
+    fn add_primitive(
+        &self,
+        primitive: &gltf::Primitive,
+        world: glam::Mat4,
+        buffers: &[gltf::buffer::Data],
+        images: &[gltf::image::Data],
+        model: &mut LoadedModel,
+    ) -> Result<()> {
+        let reader = primitive.reader(|buffer| buffers.get(buffer.index()).map(|d| d.as_ref()));
+
+        let positions: Vec<[f32; 3]> = reader
+            .read_positions()
+            .map(|it| it.collect())
+            .unwrap_or_default();
+        if positions.is_empty() {
+            anyhow::bail!("primitive {} has no positions", primitive.index());
+        }
+        let normals: Vec<[f32; 3]> = reader
+            .read_normals()
+            .map(|it| it.collect())
+            .unwrap_or_else(|| vec![[0.0, 0.0, 1.0]; positions.len()]);
+        let uvs: Vec<[f32; 2]> = reader
+            .read_tex_coords(0)
+            .map(|it| it.into_f32().collect())
+            .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
+        if positions.len() != normals.len() || positions.len() != uvs.len() {
+            anyhow::bail!(
+                "primitive {} attribute length mismatch: {} positions, {} normals, {} uvs",
+                primitive.index(),
+                positions.len(),
+                normals.len(),
+                uvs.len()
+            );
+        }
+
+        // Bake the node transform; normals use the inverse transpose.
+        let normal_matrix = world.inverse().transpose();
+        let vertices: Vec<Vertex> = positions
+            .iter()
+            .zip(&normals)
+            .zip(&uvs)
+            .map(|((&pos, &norm), &uv)| {
+                let p = world.transform_point3(glam::Vec3::from_array(pos));
+                model.bounds.0 = model.bounds.0.min(p);
+                model.bounds.1 = model.bounds.1.max(p);
+                let n = normal_matrix
+                    .transform_vector3(glam::Vec3::from_array(norm))
+                    .normalize_or_zero();
+                Vertex {
+                    position: p.to_array(),
+                    normal: n.to_array(),
+                    uv,
                 }
+            })
+            .collect();
 
-                let normals: Vec<[f32; 3]> = reader
-                    .read_normals()
-                    .map(|it| it.collect())
-                    .unwrap_or_else(|| vec![[0.0, 0.0, 1.0]; positions.len()]);
-
-                let uvs: Vec<[f32; 2]> = reader
-                    .read_tex_coords(0)
-                    .map(|it| it.into_f32().collect())
-                    .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
-
-                if positions.len() != normals.len() || positions.len() != uvs.len() {
-                    anyhow::bail!(
-                        "primitive {} attribute length mismatch: {} positions, {} normals, {} uvs",
-                        primitive.index(),
-                        positions.len(),
-                        normals.len(),
-                        uvs.len()
-                    );
-                }
-
-                let vertices: Vec<Vertex> = positions
-                    .iter()
-                    .zip(normals.iter())
-                    .zip(uvs.iter())
-                    .map(|((&pos, &norm), &uv)| Vertex {
-                        position: pos,
-                        normal: norm,
-                        uv,
-                    })
-                    .collect();
-
-                let (index_bytes, index_format): (Vec<u8>, wgpu::IndexFormat) =
-                    match reader.read_indices() {
-                        Some(indices) => {
-                            let u32_indices: Vec<u32> = indices.into_u32().collect();
-                            (
-                                bytemuck::cast_slice(&u32_indices).to_vec(),
-                                wgpu::IndexFormat::Uint32,
-                            )
-                        }
-                        None => {
-                            let u32_indices: Vec<u32> = (0..positions.len() as u32).collect();
-                            (
-                                bytemuck::cast_slice(&u32_indices).to_vec(),
-                                wgpu::IndexFormat::Uint32,
-                            )
-                        }
-                    };
-
-                let vertex_buffer =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("gltf vertex buffer"),
-                            contents: bytemuck::cast_slice(&vertices),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        });
-                let index_buffer =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("gltf index buffer"),
-                            contents: &index_bytes,
-                            usage: wgpu::BufferUsages::INDEX,
-                        });
-
-                meshes.push(Mesh {
-                    vertex_buffer,
-                    index_buffer,
-                    index_count: (index_bytes.len() / index_format_size(index_format)) as u32,
-                    index_format,
-                });
-
-                let albedo_bg = primitive
-                    .material()
-                    .pbr_metallic_roughness()
-                    .base_color_texture()
-                    .and_then(|info| info.texture().source())
-                    .and_then(|image| images.get(image.index()))
-                    .map(|img_data| {
-                        let dyn_img = image_from_gltf_data(img_data);
-                        let texture = self.create_texture_from_image(&dyn_img);
-                        self.create_texture_bind_group(&texture)
-                    });
-                albedo_bind_groups.push(albedo_bg);
+        let mut indices: Vec<u32> = match reader.read_indices() {
+            Some(indices) => indices.into_u32().collect(),
+            None => (0..positions.len() as u32).collect(),
+        };
+        // A mirroring transform flips triangle winding; flip it back so back-face
+        // culling keeps the outside.
+        if world.determinant() < 0.0 {
+            for tri in indices.chunks_exact_mut(3) {
+                tri.swap(1, 2);
             }
         }
 
-        if meshes.is_empty() {
-            anyhow::bail!("glTF file {path} contained no meshes");
-        }
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gltf vertex buffer"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gltf index buffer"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        model.meshes.push(Mesh {
+            vertex_buffer,
+            index_buffer,
+            index_count: indices.len() as u32,
+            index_format: wgpu::IndexFormat::Uint32,
+        });
 
-        tracing::info!("loaded glTF {}: {} primitive(s)", path, meshes.len());
-
-        Ok(LoadedModel {
-            meshes,
-            albedo_bind_groups,
-        })
+        let albedo = primitive
+            .material()
+            .pbr_metallic_roughness()
+            .base_color_texture()
+            .and_then(|info| info.texture().source())
+            .and_then(|image| images.get(image.index()))
+            .map(|img_data| {
+                let texture = self.create_texture_from_image(&image_from_gltf_data(img_data));
+                self.create_texture_bind_group(&texture)
+            });
+        model.albedo_bind_groups.push(albedo);
+        Ok(())
     }
 }
 
@@ -2157,6 +2208,30 @@ mod tests {
         read_back(&device, r.queue(), encoder, &color)
     }
 
+    /// One triangle (0,0,0)-(1,0,0)-(0,1,0) used by two nodes at x = -2 and x = +3.
+    const TWO_NODE_GLTF: &str = r#"{
+        "asset": {"version": "2.0"},
+        "scene": 0,
+        "scenes": [{"nodes": [0, 1]}],
+        "nodes": [
+            {"mesh": 0, "translation": [-2, 0, 0]},
+            {"mesh": 0, "translation": [3, 0, 0]}
+        ],
+        "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
+        "buffers": [{"byteLength": 36,
+            "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAA"}],
+        "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 36}],
+        "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3,
+            "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0]}]
+    }"#;
+
+    fn temp_project(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("melon_models_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("assets/models")).unwrap();
+        dir
+    }
+
     fn value_at(pixels: &[u8], (x, y): (u32, u32)) -> u8 {
         pixels[((y * TEST_SIZE + x) * 4) as usize]
     }
@@ -2239,6 +2314,65 @@ mod tests {
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
+            Box::new(|renderer| {
+                let model = renderer
+                    .load_gltf_bytes(TWO_NODE_GLTF.as_bytes())
+                    .map_err(|e| format!("gltf_two_nodes_load_whole: {e:?}"))?;
+                let (min, max) = model.bounds;
+                if model.meshes.len() == 2 && min.x <= -2.0 && max.x >= 3.0 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "gltf_two_nodes_load_whole: {} meshes, bounds {min} .. {max}",
+                        model.meshes.len()
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
+                use melon_core::{AssetServer, Handle, Model};
+                let root = temp_project("missing");
+                let mut server = AssetServer::new(root.clone());
+                let h: Handle<Model> = server.load("assets/models/nope.glb");
+                let mut cache = ModelCache::new(renderer.scene());
+                let model = cache.get(renderer.scene(), &mut server, h);
+                let ok = model.meshes.len() == 1
+                    && model.bounds == (glam::Vec3::splat(-0.5), glam::Vec3::splat(0.5));
+                let _ = std::fs::remove_dir_all(&root);
+                if ok {
+                    Ok(())
+                } else {
+                    Err("cache_missing_file_gives_placeholder".into())
+                }
+            }),
+            Box::new(|renderer| {
+                use melon_core::{AssetServer, Handle, Model};
+                let root = temp_project("reload");
+                let file = root.join("assets/models/m.gltf");
+                std::fs::write(&file, TWO_NODE_GLTF).unwrap();
+                let mut server = AssetServer::new(root.clone());
+                let h: Handle<Model> = server.load("assets/models/m.gltf");
+                server.poll_changes();
+                let mut cache = ModelCache::new(renderer.scene());
+                let first = cache.get(renderer.scene(), &mut server, h).meshes.len();
+                std::fs::write(&file, "garbage").unwrap();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&file)
+                    .unwrap()
+                    .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+                    .unwrap();
+                server.poll_changes();
+                let version = server.version(h);
+                let after = cache.get(renderer.scene(), &mut server, h).meshes.len();
+                let _ = std::fs::remove_dir_all(&root);
+                if first == 2 && version == 1 && after == 2 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "cache_keeps_previous_on_broken_reload: first {first}, version {version}, after {after}"
+                    ))
+                }
+            }),
             Box::new(|renderer| {
                 let target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(8, 8));
                 if target.ui_view_format().is_srgb() {

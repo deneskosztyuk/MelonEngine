@@ -295,7 +295,7 @@ mod tests {
             .load("assets/models/a.glb");
         core.world.resource_mut::<AssetServer>().poll_changes();
         touch_later(&file);
-        let mut frame = |core: &mut crate::Core| {
+        let frame = |core: &mut crate::Core| {
             core.world.resource_mut::<crate::Time>().update(0.25);
             core.update();
         };
