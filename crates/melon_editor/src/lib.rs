@@ -18,6 +18,7 @@ pub mod play;
 pub mod scene;
 #[cfg(feature = "slint-poc")]
 pub mod slint_poc;
+pub mod viewport;
 
 use gizmo::{
     AXIS_X, AXIS_Y, AXIS_Z, CIRCLE_SEGMENTS, DEGENERATE_CIRCLE_PX, GIZMO_SIZE_PX, PICK_THRESHOLD,
