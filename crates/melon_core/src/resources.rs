@@ -119,10 +119,16 @@ impl Light {
 /// update; `elapsed_seconds` is the total time since the engine started.
 /// Systems that need frame-rate-independent movement read `delta_seconds`
 /// instead of assuming a fixed 1/60 step.
+///
+/// `fixed_delta` is the `FixedUpdate` step. `overstep` is frame time
+/// accumulated but not yet consumed by a fixed step; `alpha()` turns it into
+/// the 0..1 blend factor between the last two fixed steps.
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct Time {
     pub delta_seconds: f32,
     pub elapsed_seconds: f32,
+    pub fixed_delta: f32,
+    pub overstep: f32,
 }
 
 impl Default for Time {
@@ -130,14 +136,27 @@ impl Default for Time {
         Self {
             delta_seconds: 1.0 / 60.0,
             elapsed_seconds: 0.0,
+            fixed_delta: 1.0 / 60.0,
+            overstep: 0.0,
         }
     }
 }
 
 impl Time {
+    /// Longest frame the simulation will catch up on (at most 15 fixed steps).
+    /// Prevents a long hitch from queueing so many steps that the next frame
+    /// is slower still.
+    pub const MAX_FRAME_DELTA: f32 = 0.25;
+
     pub fn update(&mut self, delta: f32) {
+        let delta = delta.min(Self::MAX_FRAME_DELTA);
         self.delta_seconds = delta;
         self.elapsed_seconds += delta;
+    }
+
+    /// Blend factor between the previous and current fixed step, in 0..1.
+    pub fn alpha(&self) -> f32 {
+        self.overstep / self.fixed_delta
     }
 }
 
@@ -316,6 +335,21 @@ mod tests {
     #[test]
     fn light_default_to_light_points_up() {
         assert!(Light::default().to_light().y > 0.0);
+    }
+
+    #[test]
+    fn time_update_clamps_delta() {
+        let mut t = Time::default();
+        t.update(1.0);
+        assert_eq!(t.delta_seconds, Time::MAX_FRAME_DELTA);
+        assert_eq!(t.delta_seconds, 0.25);
+    }
+
+    #[test]
+    fn time_default_fixed_delta() {
+        let t = Time::default();
+        assert!((t.fixed_delta - 1.0 / 60.0).abs() < 1e-9);
+        assert_eq!(t.overstep, 0.0);
     }
 
     #[test]

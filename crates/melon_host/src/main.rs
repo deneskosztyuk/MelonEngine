@@ -9,7 +9,7 @@ use melon_core::glam::{Mat4, Quat, Vec2, Vec3};
 use melon_core::input::fly_camera_system;
 use melon_core::{
     Aabb, BodyInfo, BodyKind, Camera, FrameCounter, Input, KeyCode, Light, MeshRef, Name,
-    SimulationState, Time, Transform,
+    SimulationState, Time, Transform, Update,
 };
 use melon_editor::Editor;
 #[cfg(not(feature = "imgui-poc"))]
@@ -130,18 +130,15 @@ impl App {
         spawn_default_scene(&mut core.world, &mut physics);
         core.world.insert_resource(physics);
         // Always-running systems
-        core.schedule.add_systems(fly_camera_system);
-        core.schedule.add_systems(sync_to_physics_system);
-        core.schedule.add_systems(cleanup_deleted_system);
+        core.add_systems(Update, fly_camera_system);
+        core.add_systems(Update, sync_to_physics_system);
+        core.add_systems(Update, cleanup_deleted_system);
         // Game systems that run only when playing
         let is_playing = |state: Res<SimulationState>| *state == SimulationState::Playing;
-        core.schedule
-            .add_systems(hot_game::rotation_system.run_if(is_playing));
-        core.schedule
-            .add_systems(hot_game::bob_system.run_if(is_playing));
-        core.schedule.add_systems(step_system.run_if(is_playing));
-        core.schedule
-            .add_systems(sync_from_physics_system.run_if(is_playing));
+        core.add_systems(Update, hot_game::rotation_system.run_if(is_playing));
+        core.add_systems(Update, hot_game::bob_system.run_if(is_playing));
+        core.add_systems(Update, step_system.run_if(is_playing));
+        core.add_systems(Update, sync_from_physics_system.run_if(is_playing));
 
         Self {
             window: None,
