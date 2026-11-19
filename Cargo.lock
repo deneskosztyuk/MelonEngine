@@ -2142,6 +2142,7 @@ dependencies = [
  "ron",
  "serde",
  "tracing",
+ "tracing-subscriber",
  "wgpu",
  "winit",
 ]

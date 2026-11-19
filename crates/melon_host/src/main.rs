@@ -81,6 +81,8 @@ fn map_key(code: &WinitKeyCode) -> Option<KeyCode> {
 }
 
 struct App {
+    /// Log buffer shown in the editor's Console panel.
+    console: melon_editor::console::ConsoleLog,
     window: Option<Arc<Window>>,
     renderer: Option<melon_render::Renderer>,
     editor: Option<EditorOverlay>,
@@ -125,8 +127,11 @@ fn spawn_default_scene(world: &mut World, physics: &mut PhysicsWorld) {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(console: melon_editor::console::ConsoleLog) -> Self {
         let mut core = melon_core::Core::new();
+        // The Console shows engine logs; a per-second "frame N" line would drown them.
+        core.world
+            .insert_resource(melon_core::LogInterval { frames_per_log: 0 });
         core.world.insert_resource(Camera::default());
         core.world.insert_resource(Light::default());
         core.world.insert_resource(Input::default());
@@ -149,6 +154,7 @@ impl App {
         }
 
         Self {
+            console,
             window: None,
             renderer: None,
             editor: None,
@@ -193,7 +199,8 @@ impl ApplicationHandler for App {
 
         let mut editor = EditorOverlay::new(&window, renderer.device(), renderer.surface_format());
         editor.set_viewport_target(renderer.device(), &viewport_target);
-        let editor_ui = Editor::new();
+        let mut editor_ui = Editor::new();
+        editor_ui.set_console(self.console.clone());
 
         let size = renderer.size();
         let aspect = size.width as f32 / size.height.max(1) as f32;
@@ -597,8 +604,15 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+    use tracing_subscriber::prelude::*;
+    let console = melon_editor::console::ConsoleLog::default();
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(EnvFilter::from_default_env()))
+        .with(
+            console
+                .layer()
+                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+        )
         .init();
     tracing_log::LogTracer::init().ok();
     tracing::info!("MelonEngine v{} starting up", melon_core::version());
@@ -606,7 +620,7 @@ fn main() {
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new();
+    let mut app = App::new(console);
     if let Err(e) = event_loop.run_app(&mut app) {
         tracing::error!("event loop exited with error: {e:?}");
     }

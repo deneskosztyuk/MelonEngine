@@ -11,6 +11,7 @@ use tracing::instrument;
 use winit::event::WindowEvent;
 use winit::window::Window;
 
+pub mod console;
 pub mod gizmo;
 pub mod play;
 pub mod scene;
@@ -82,6 +83,8 @@ pub struct Editor {
     world_line_vertices: Vec<LineVertex>,
     /// Smoothed frame time in milliseconds, for the FPS readout.
     frame_ms: f32,
+    /// Engine log shown in the Console panel.
+    console: console::ConsoleLog,
 }
 
 impl Default for Editor {
@@ -100,6 +103,7 @@ impl Default for Editor {
             camera: viewport::EditorCamera::default(),
             world_line_vertices: Vec::new(),
             frame_ms: 16.7,
+            console: console::ConsoleLog::default(),
         }
     }
 }
@@ -144,6 +148,11 @@ impl Editor {
 
     pub fn take_pending_operation(&mut self) -> Option<PendingOperation> {
         std::mem::take(&mut self.pending_operation)
+    }
+
+    /// Share the engine's log buffer with the Console panel.
+    pub fn set_console(&mut self, log: console::ConsoleLog) {
+        self.console = log;
     }
 
     /// Pixel size of the viewport panel. The host resizes the
