@@ -4,6 +4,7 @@ use bevy_ecs::query::{With, Without};
 use bevy_ecs::resource::Resource;
 use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_ecs::system::{Commands, Query, Res, ResMut};
+use bevy_ecs::world::World;
 use glam::{Quat, Vec3};
 
 pub use rapier3d;
@@ -19,10 +20,10 @@ use rapier3d::pipeline::PhysicsPipeline;
 use rapier3d::prelude::IntegrationParameters;
 use tracing::instrument;
 
-use melon_core::hierarchy::{propagate_transforms_system, safe_inverse};
+use melon_core::hierarchy::{propagate_transforms_system, safe_inverse, world_matrix};
 use melon_core::{
     ChildOf, Core, FixedUpdate, GlobalTransform, PendingDelete, PostUpdate, PreviousTransform,
-    Time, Transform, store_previous_transforms_system,
+    SimulationState, Time, Transform, store_previous_transforms_system,
 };
 
 /// Gravity vector in m/s^2. Default is Earth gravity pointing down (-Y).
@@ -239,45 +240,79 @@ pub fn add_physics_systems(core: &mut Core) {
     );
     core.add_systems(
         PostUpdate,
-        (cleanup_deleted_system, add_previous_transforms_system),
+        (
+            cleanup_deleted_system,
+            add_previous_transforms_system,
+            // Keep dynamic children on their bodies every frame, even when a
+            // parent moved outside the fixed step (gizmo, Update, paused).
+            sync_from_physics_system
+                .run_if(simulating)
+                .before(propagate_transforms_system),
+        ),
     );
 }
 
 /// System: sync rapier body poses back into ECS Transform components.
 /// Only updates dynamic bodies, which physics owns in world space: a child's
 /// local transform is rewritten so its world pose matches the body (it does
-/// not follow its parent). Fixed bodies keep their ECS transform as the
-/// source of truth.
-pub fn sync_from_physics_system(
-    physics: Res<PhysicsWorld>,
-    parents: Query<&GlobalTransform>,
-    mut query: Query<(&RigidBodyComponent, &mut Transform, Option<&ChildOf>)>,
-) {
-    for (rb, mut transform, child_of) in &mut query {
-        if rb.body_type != RigidBodyType::Dynamic {
-            continue;
+/// not follow its parent). Parents are written before their children, so a
+/// dynamic child of a dynamic parent uses the parent's new pose. Fixed bodies
+/// keep their ECS transform as the source of truth.
+pub fn sync_from_physics_system(world: &mut World) {
+    let dynamic: Vec<(Entity, RigidBodyHandle)> = world
+        .query::<(Entity, &RigidBodyComponent)>()
+        .iter(world)
+        .filter(|(_, rb)| rb.body_type == RigidBodyType::Dynamic)
+        .map(|(e, rb)| (e, rb.body_handle))
+        .collect();
+    let Some(physics) = world.get_resource::<PhysicsWorld>() else {
+        return;
+    };
+    let depth = |e: Entity| {
+        let mut depth = 0;
+        let mut current = e;
+        while let Some(c) = world.get::<ChildOf>(current) {
+            depth += 1;
+            current = c.parent();
+            if depth > 1024 {
+                break;
+            }
         }
-        let Some(body) = physics.bodies.get(rb.body_handle) else {
-            continue;
-        };
-        let (translation, rotation) = (body.translation(), *body.rotation());
-        match child_of.and_then(|c| parents.get(c.parent()).ok()) {
+        depth
+    };
+    let mut poses: Vec<(usize, Entity, Vec3, Quat)> = dynamic
+        .into_iter()
+        .filter_map(|(e, h)| {
+            let body = physics.bodies.get(h)?;
+            Some((depth(e), e, body.translation(), *body.rotation()))
+        })
+        .collect();
+    poses.sort_by_key(|(depth, ..)| *depth);
+
+    for (_, e, translation, rotation) in poses {
+        let (translation, rotation) = match world.get::<ChildOf>(e).map(ChildOf::parent) {
             Some(parent) => {
-                let inv = safe_inverse(parent.0);
                 let local = Transform::from_mat4(
-                    inv * glam::Mat4::from_rotation_translation(rotation, translation),
+                    safe_inverse(world_matrix(world, parent))
+                        * glam::Mat4::from_rotation_translation(rotation, translation),
                 );
-                if local.translation.is_finite() && local.rotation.is_finite() {
-                    transform.translation = local.translation;
-                    transform.rotation = local.rotation;
+                if !(local.translation.is_finite() && local.rotation.is_finite()) {
+                    continue;
                 }
+                (local.translation, local.rotation)
             }
-            None => {
-                transform.translation = translation;
-                transform.rotation = rotation;
-            }
+            None => (translation, rotation),
+        };
+        if let Some(mut t) = world.get_mut::<Transform>(e) {
+            t.translation = translation;
+            t.rotation = rotation;
         }
     }
+}
+
+/// Run condition: playing or paused (not editing).
+fn simulating(state: Option<Res<SimulationState>>) -> bool {
+    state.is_some_and(|s| *s != SimulationState::Editing)
 }
 
 /// System: sync ECS world poses into rapier for fixed bodies (they follow
@@ -791,6 +826,59 @@ mod tests {
         run_frames(&mut core, 0.001, 1);
         assert_eq!(core.world.resource::<PhysicsWorld>().bodies.len(), 0);
         assert!(core.world.get_entity(child).is_err());
+    }
+
+    fn world_pos(core: &melon_core::Core, e: Entity) -> Vec3 {
+        melon_core::hierarchy::world_matrix(&core.world, e).transform_point3(Vec3::ZERO)
+    }
+
+    #[test]
+    fn dynamic_child_of_dynamic_parent_draws_at_its_body() {
+        let mut core = melon_core::Core::new();
+        let mut pw = PhysicsWorld::new();
+        let (parent_body, _) =
+            pw.spawn_dynamic_cuboid(Vec3::ZERO, Quat::IDENTITY, Vec3::splat(0.5));
+        let (child_body, _) =
+            pw.spawn_dynamic_cuboid(Vec3::X * 3.0, Quat::IDENTITY, Vec3::splat(0.5));
+        core.world.insert_resource(pw);
+        let parent = core
+            .world
+            .spawn((
+                Transform::default(),
+                RigidBodyComponent {
+                    body_handle: parent_body,
+                    body_type: RigidBodyType::Dynamic,
+                },
+            ))
+            .id();
+        let child = core
+            .world
+            .spawn((
+                Transform::from_translation(Vec3::X * 3.0),
+                RigidBodyComponent {
+                    body_handle: child_body,
+                    body_type: RigidBodyType::Dynamic,
+                },
+                melon_core::ChildOf(parent),
+            ))
+            .id();
+        core.world
+            .insert_resource(melon_core::SimulationState::Playing);
+        add_physics_systems(&mut core);
+        run_frames(&mut core, 1.0 / 60.0, 30);
+        let (drawn, body) = (world_pos(&core, child), body_pos(&core, child));
+        assert!((drawn - body).length() < 1e-4, "drawn {drawn}, body {body}");
+    }
+
+    #[test]
+    fn paused_dynamic_child_stays_put_when_parent_moves() {
+        let (mut core, parent, child) = parented_core(RigidBodyType::Dynamic);
+        core.world
+            .insert_resource(melon_core::SimulationState::Paused);
+        core.world.get_mut::<Transform>(parent).unwrap().translation = Vec3::new(5.0, 0.0, 0.0);
+        run_frames(&mut core, 1.0 / 60.0, 1);
+        let drawn = world_pos(&core, child);
+        assert!((drawn - Vec3::X).length() < 1e-4, "drawn {drawn}");
     }
 
     #[test]
