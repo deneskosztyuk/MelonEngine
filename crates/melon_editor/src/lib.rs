@@ -26,11 +26,10 @@ pub mod theme;
 pub mod viewport;
 
 use gizmo::{
-    AXIS_X, AXIS_Y, AXIS_Z, CIRCLE_SEGMENTS, DEGENERATE_CIRCLE_PX, GIZMO_SIZE_PX, PICK_THRESHOLD,
-    SCALE_MAX, SCALE_MIN, SNAP_MOVE, SNAP_ROTATE_RAD, SNAP_SCALE, axis_color, circle_lines,
-    compute_drag_plane, cube_handle_lines, hovered_color, plane_basis, point_to_segment_dist_2d,
-    project_onto_axis, ray_plane_intersect, rotate_angle_in_plane, snap_angle, snap_value,
-    wrap_angle_delta,
+    AXIS_X, AXIS_Y, AXIS_Z, GIZMO_SIZE_PX, GizmoHandle, GizmoPose, PICK_TOLERANCE_PX,
+    compute_drag_plane, drag_move_axis, drag_move_center, drag_move_plane, drag_rotate, drag_scale,
+    gizmo_draws, pick_handle, project_onto_axis, ray_plane_intersect, rotate_angle,
+    screen_drag_angle, uniform_scale_factor, wrap_angle_delta,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -43,20 +42,19 @@ pub enum GizmoMode {
 
 #[derive(Debug, Clone, Copy)]
 struct GizmoDrag {
-    axis: glam::Vec3,
-    axis_index: usize,
+    handle: GizmoHandle,
     mode: GizmoMode,
-    initial_translation: glam::Vec3,
-    initial_rotation: glam::Quat,
-    initial_scale: glam::Vec3,
-    initial_hit_point: glam::Vec3,
-    initial_angle: f32,
-    initial_projection: f32,
-    plane_point: glam::Vec3,
+    /// World pose at the press.
+    start: Transform,
+    /// Plane the pointer's hits are measured on (through the gizmo centre).
     plane_normal: glam::Vec3,
-    plane_tangent: glam::Vec3,
-    plane_bitangent: glam::Vec3,
-    snap: bool,
+    press_hit: glam::Vec3,
+    press_pointer: glam::Vec2,
+    /// Rotate: angle at the press (`None` = ring edge-on, screen drag).
+    press_angle: Option<f32>,
+    last_angle: Option<f32>,
+    angle_sum: f32,
+    ring_tangent_px: glam::Vec2,
 }
 
 /// Pending scene operation for the host to execute.
@@ -84,8 +82,9 @@ pub struct Editor {
     selected: Option<Entity>,
     gizmo_mode: GizmoMode,
     gizmo_drag: Option<GizmoDrag>,
-    hovered_axis: Option<usize>,
-    gizmo_vertices: Vec<LineVertex>,
+    hovered: Option<GizmoHandle>,
+    /// The gizmo's shapes this frame (drawn by the overlay pass).
+    overlay_draws: Vec<melon_render::OverlayDraw>,
     pending_dialog: Option<DialogChannel>,
     pending_operation: Option<PendingOperation>,
     status_message: Option<(String, StatusKind, std::time::Instant)>,
@@ -126,8 +125,8 @@ impl Default for Editor {
             selected: None,
             gizmo_mode: GizmoMode::Move,
             gizmo_drag: None,
-            hovered_axis: None,
-            gizmo_vertices: Vec::new(),
+            hovered: None,
+            overlay_draws: Vec::new(),
             pending_dialog: None,
             pending_operation: None,
             status_message: None,
@@ -453,7 +452,7 @@ impl Editor {
     pub fn clear_selection(&mut self) {
         self.selected = None;
         self.gizmo_drag = None;
-        self.hovered_axis = None;
+        self.hovered = None;
     }
 
     /// Grid + selection box for this frame, drawn with `draw_world_lines`.
@@ -461,8 +460,8 @@ impl Editor {
         std::mem::take(&mut self.world_line_vertices)
     }
 
-    pub fn take_gizmo_vertices(&mut self) -> Vec<LineVertex> {
-        std::mem::take(&mut self.gizmo_vertices)
+    pub fn take_overlay_draws(&mut self) -> Vec<melon_render::OverlayDraw> {
+        std::mem::take(&mut self.overlay_draws)
     }
 
     pub fn take_pending_operation(&mut self) -> Option<PendingOperation> {
@@ -581,7 +580,7 @@ impl Editor {
         self.about_window(ui);
 
         // Dockable panels fill the rest of the window.
-        self.gizmo_vertices.clear();
+        self.overlay_draws.clear();
         let mut dock = std::mem::replace(&mut self.dock, egui_dock::DockState::new(Vec::new()));
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::colors::CHROME))
@@ -653,7 +652,7 @@ impl Editor {
 
         self.build_gizmo(world, ui, &vp);
 
-        let on_gizmo = self.hovered_axis.is_some() || self.gizmo_drag.is_some();
+        let on_gizmo = self.hovered.is_some() || self.gizmo_drag.is_some();
         if viewport::left_action(vp.alt, on_gizmo, vp.left_clicked) == viewport::LeftAction::Select
             && let (Some(pointer), Some(camera)) =
                 (vp.pointer, world.get_resource::<Camera>().copied())
@@ -1096,275 +1095,235 @@ impl Editor {
     }
 
     fn build_gizmo(&mut self, world: &mut World, ui: &mut egui::Ui, vp: &viewport::ViewportInput) {
-        // Guard M4: check entity existence
-        let entity = match self.selected {
-            Some(e) => {
-                if world.get_entity(e).is_err() {
-                    self.clear_selection();
-                    return;
-                }
-                e
-            }
-            None => return,
+        self.overlay_draws.clear();
+        let Some(entity) = self.selected else {
+            return;
         };
-
-        // Guard M5: skip if no Transform. The gizmo works on the world pose.
+        if world.get_entity(entity).is_err() {
+            self.clear_selection();
+            return;
+        }
         if world.get::<Transform>(entity).is_none() {
             return;
         }
+        let Some(camera) = world.get_resource::<Camera>().copied() else {
+            return;
+        };
+        // The gizmo works on the world pose (parents included).
         let transform = Transform::from_mat4(world_matrix(world, entity));
-
-        let camera = match world.get_resource::<Camera>() {
-            Some(c) => *c,
-            None => return,
+        let screen = vp.size;
+        let clip = camera.view_proj() * transform.translation.extend(1.0);
+        if clip.w <= 0.0 || !transform.translation.is_finite() || !transform.rotation.is_finite() {
+            // Behind the camera, or a degenerate (zero-scale) pose: no gizmo.
+            self.gizmo_drag = None;
+            self.hovered = None;
+            return;
+        }
+        let world_per_pixel = 2.0 * (camera.fov_y_radians * 0.5).tan() * clip.w / screen.y;
+        let pose = GizmoPose {
+            center: transform.translation,
+            rotation: transform.rotation,
+            size: GIZMO_SIZE_PX * world_per_pixel,
         };
 
-        // Viewport-local points, matching the camera's aspect.
-        let screen_size_vec2 = vp.size;
-
-        // Guard C4: project entity center, skip if behind camera
-        let entity_screen = match camera.world_to_screen(transform.translation, screen_size_vec2) {
-            Some(p) => p,
-            None => {
-                self.gizmo_drag = None;
-                self.hovered_axis = None;
-                return;
-            }
-        };
-
-        let entity_screen_egui = egui::pos2(entity_screen.x, entity_screen.y);
-
-        // Compute gizmo size in world space
-        let clip = camera.view_proj()
-            * glam::Vec4::new(
-                transform.translation.x,
-                transform.translation.y,
-                transform.translation.z,
-                1.0,
-            );
-        let depth = if clip.w > 0.0 { clip.w } else { 1.0 };
-        let world_per_pixel = 2.0 * (camera.fov_y_radians * 0.5).tan() * depth / screen_size_vec2.y;
-        let axis_length = GIZMO_SIZE_PX * world_per_pixel;
-
-        // Local-space axes (Issue M6)
-        let axes = [
-            transform.rotation * AXIS_X,
-            transform.rotation * AXIS_Y,
-            transform.rotation * AXIS_Z,
-        ];
-
-        let camera_forward = camera.forward();
-
-        let pointer_pos = vp.pointer;
+        let pointer = vp.pointer;
         let primary_down = ui.ctx().input(|i| i.pointer.primary_down());
         let primary_pressed = ui.ctx().input(|i| i.pointer.primary_pressed());
-        let primary_released = ui.ctx().input(|i| i.pointer.primary_released());
         let snap = ui
             .ctx()
             .input(|i| i.key_down(egui::Key::ShiftLeft) || i.key_down(egui::Key::ShiftRight));
-        // Hover/start a gizmo drag only over the viewport, never while orbiting.
+        // Hover or start a drag only over the viewport, never while orbiting.
         let wants_pointer = !vp.hovered || vp.alt || vp.typing;
+        let ray = |p: glam::Vec2| camera.screen_to_world_ray(p, screen);
 
-        // Handle active drag
-        if let Some(drag) = self.gizmo_drag {
+        if let Some(mut drag) = self.gizmo_drag {
             if !primary_down {
                 self.gizmo_drag = None;
-            } else if let Some(pp) = pointer_pos {
-                let pointer_screen = glam::Vec2::new(pp.x, pp.y);
-                let (ray_origin, ray_dir) =
-                    camera.screen_to_world_ray(pointer_screen, screen_size_vec2);
-
-                match drag.mode {
-                    GizmoMode::Move => {
-                        if let Some(current_hit) = ray_plane_intersect(
-                            ray_origin,
-                            ray_dir,
-                            drag.plane_point,
-                            drag.plane_normal,
-                        ) {
-                            let delta = current_hit - drag.initial_hit_point;
-                            let mut axis_delta = project_onto_axis(delta, drag.axis);
-                            if drag.snap {
-                                axis_delta = snap_value(axis_delta, SNAP_MOVE);
-                            }
-                            let new_translation = drag.initial_translation + drag.axis * axis_delta;
-                            set_world_transform(
-                                world,
-                                entity,
-                                Transform {
-                                    translation: new_translation,
-                                    ..transform
-                                },
-                            );
-                            snap_previous_transform(world, entity);
-                            self.write_to_physics_body(world, entity, Some(new_translation), None);
-                        }
-                    }
-                    GizmoMode::Rotate => {
-                        if let Some(current_hit) = ray_plane_intersect(
-                            ray_origin,
-                            ray_dir,
-                            drag.plane_point,
-                            drag.plane_normal,
-                        ) {
-                            let current_angle = rotate_angle_in_plane(
-                                current_hit,
-                                drag.initial_translation,
-                                drag.plane_tangent,
-                                drag.plane_bitangent,
-                            );
-                            let mut delta_angle =
-                                wrap_angle_delta(current_angle - drag.initial_angle);
-                            if drag.snap {
-                                delta_angle = snap_angle(delta_angle, SNAP_ROTATE_RAD);
-                            }
-                            let new_rotation = glam::Quat::from_axis_angle(drag.axis, delta_angle)
-                                * drag.initial_rotation;
-                            set_world_transform(
-                                world,
-                                entity,
-                                Transform {
-                                    rotation: new_rotation,
-                                    ..transform
-                                },
-                            );
-                            snap_previous_transform(world, entity);
-                            self.write_to_physics_body(world, entity, None, Some(new_rotation));
-                        }
-                    }
-                    GizmoMode::Scale => {
-                        if let Some(current_hit) = ray_plane_intersect(
-                            ray_origin,
-                            ray_dir,
-                            drag.plane_point,
-                            drag.plane_normal,
-                        ) {
-                            let current_proj = project_onto_axis(
-                                current_hit - drag.initial_translation,
-                                drag.axis,
-                            );
-                            if drag.initial_projection.abs() > 1e-6 {
-                                let mut scale_factor = current_proj / drag.initial_projection;
-                                scale_factor = scale_factor.clamp(SCALE_MIN, SCALE_MAX);
-                                if drag.snap {
-                                    scale_factor = snap_value(scale_factor, SNAP_SCALE);
-                                }
-                                let mut new_scale = drag.initial_scale;
-                                match drag.axis_index {
-                                    0 => new_scale.x = drag.initial_scale.x * scale_factor,
-                                    1 => new_scale.y = drag.initial_scale.y * scale_factor,
-                                    2 => new_scale.z = drag.initial_scale.z * scale_factor,
-                                    _ => {}
-                                }
-                                set_world_transform(
-                                    world,
-                                    entity,
-                                    Transform {
-                                        scale: new_scale,
-                                        ..transform
-                                    },
-                                );
-                                snap_previous_transform(world, entity);
-                            }
-                        }
-                    }
+            } else if let Some(p) = pointer {
+                let (origin, dir) = ray(p);
+                if let Some(next) = self.drag_gizmo(&mut drag, &pose, origin, dir, p, snap) {
+                    set_world_transform(world, entity, next);
+                    snap_previous_transform(world, entity);
+                    let now = Transform::from_mat4(world_matrix(world, entity));
+                    self.write_to_physics_body(
+                        world,
+                        entity,
+                        Some(now.translation),
+                        Some(now.rotation),
+                    );
                 }
-            }
-
-            if primary_released {
-                self.gizmo_drag = None;
+                self.gizmo_drag = Some(drag);
             }
         }
 
-        // Picking (only when not dragging and egui doesn't want pointer).
-        // Off the viewport, forget the hovered handle so the Grab cursor clears.
-        if self.gizmo_drag.is_none() && wants_pointer {
-            self.hovered_axis = None;
-        }
-        if self.gizmo_drag.is_none() && !wants_pointer {
-            self.hovered_axis = None;
-            if let Some(pp) = pointer_pos {
-                let pointer_vec = glam::Vec2::new(pp.x, pp.y);
-                let local_axes = [AXIS_X, AXIS_Y, AXIS_Z];
-                for (i, &local_axis) in local_axes.iter().enumerate() {
-                    let world_axis = transform.rotation * local_axis;
-                    let endpoint_world = transform.translation + world_axis * axis_length;
-                    if let Some(endpoint_screen) =
-                        camera.world_to_screen(endpoint_world, screen_size_vec2)
-                    {
-                        let dist = point_to_segment_dist_2d(
-                            pointer_vec,
-                            entity_screen,
-                            glam::Vec2::new(endpoint_screen.x, endpoint_screen.y),
-                        );
-                        if dist < PICK_THRESHOLD {
-                            self.hovered_axis = Some(i);
-                            break;
-                        }
-                    }
-                }
-
-                // Start drag on click
-                if primary_pressed && let Some(axis_index) = self.hovered_axis {
-                    let axis = axes[axis_index];
-                    let (plane_point, plane_normal) =
-                        compute_drag_plane(transform.translation, axis, camera_forward);
-                    let (plane_tangent, plane_bitangent) = plane_basis(axis, plane_normal);
-
-                    let pointer_screen = glam::Vec2::new(pp.x, pp.y);
-                    let (ray_origin, ray_dir) =
-                        camera.screen_to_world_ray(pointer_screen, screen_size_vec2);
-                    let initial_hit =
-                        ray_plane_intersect(ray_origin, ray_dir, plane_point, plane_normal);
-
-                    if let Some(hit) = initial_hit {
-                        let initial_angle = rotate_angle_in_plane(
-                            hit,
-                            transform.translation,
-                            plane_tangent,
-                            plane_bitangent,
-                        );
-                        let initial_projection =
-                            project_onto_axis(hit - transform.translation, axis);
-
-                        self.gizmo_drag = Some(GizmoDrag {
-                            axis,
-                            axis_index,
-                            mode: self.gizmo_mode,
-                            initial_translation: transform.translation,
-                            initial_rotation: transform.rotation,
-                            initial_scale: transform.scale,
-                            initial_hit_point: hit,
-                            initial_angle,
-                            initial_projection,
-                            plane_point,
-                            plane_normal,
-                            plane_tangent,
-                            plane_bitangent,
-                            snap,
-                        });
-                    }
+        if self.gizmo_drag.is_none() {
+            self.hovered = None;
+            if !wants_pointer && let Some(p) = pointer {
+                let (origin, dir) = ray(p);
+                let tolerance = PICK_TOLERANCE_PX * world_per_pixel;
+                self.hovered = pick_handle(self.gizmo_mode, &pose, origin, dir, tolerance);
+                if primary_pressed && let Some(handle) = self.hovered {
+                    self.gizmo_drag = Self::start_gizmo_drag(
+                        self.gizmo_mode,
+                        handle,
+                        transform,
+                        &pose,
+                        &camera,
+                        origin,
+                        dir,
+                        p,
+                        screen,
+                    );
                 }
             }
         }
 
-        // Generate geometry
-        self.generate_gizmo_geometry(
-            transform.translation,
-            axes,
-            axis_length,
-            camera,
-            screen_size_vec2,
-        );
+        let highlight = self.gizmo_drag.map(|d| d.handle).or(self.hovered);
+        self.overlay_draws = gizmo_draws(self.gizmo_mode, &pose, highlight);
 
-        // Draw cursor hint
         if self.gizmo_drag.is_some() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-        } else if self.hovered_axis.is_some() {
+        } else if self.hovered.is_some() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
+    }
 
-        let _ = entity_screen_egui;
+    /// Set up a drag of `handle`: the plane its pointer hits are measured on
+    /// and the values at the press.
+    #[allow(clippy::too_many_arguments)]
+    fn start_gizmo_drag(
+        mode: GizmoMode,
+        handle: GizmoHandle,
+        start: Transform,
+        pose: &GizmoPose,
+        camera: &Camera,
+        origin: glam::Vec3,
+        dir: glam::Vec3,
+        pointer: glam::Vec2,
+        screen: glam::Vec2,
+    ) -> Option<GizmoDrag> {
+        let center = pose.center;
+        let (plane_normal, rotate_axis) = match (mode, handle) {
+            (GizmoMode::Rotate, GizmoHandle::Axis(i)) => (pose.axis(i), pose.axis(i)),
+            (_, GizmoHandle::Axis(i)) => (
+                compute_drag_plane(center, pose.axis(i), camera.forward()).1,
+                pose.axis(i),
+            ),
+            (_, GizmoHandle::Plane(i)) => (pose.axis(i), pose.axis(i)),
+            (_, GizmoHandle::Center) => (camera.forward(), camera.forward()),
+        };
+        let press_hit = ray_plane_intersect(origin, dir, center, plane_normal).unwrap_or(center);
+        let press_angle = (mode == GizmoMode::Rotate)
+            .then(|| rotate_angle(center, rotate_axis, origin, dir))
+            .flatten();
+        // Edge-on rings: drag along the ring's on-screen line (perpendicular
+        // to the axis as seen on screen).
+        let ring_tangent_px = match (
+            camera.world_to_screen(center, screen),
+            camera.world_to_screen(center + rotate_axis * pose.size, screen),
+        ) {
+            (Some(a), Some(b)) => glam::Vec2::new(-(b - a).y, (b - a).x),
+            _ => glam::Vec2::X,
+        };
+        Some(GizmoDrag {
+            handle,
+            mode,
+            start,
+            plane_normal,
+            press_hit,
+            press_pointer: pointer,
+            press_angle,
+            last_angle: press_angle,
+            angle_sum: 0.0,
+            ring_tangent_px,
+        })
+    }
+
+    /// The new world pose for this pointer position, or `None` to leave it.
+    fn drag_gizmo(
+        &self,
+        drag: &mut GizmoDrag,
+        pose: &GizmoPose,
+        origin: glam::Vec3,
+        dir: glam::Vec3,
+        pointer: glam::Vec2,
+        snap: bool,
+    ) -> Option<Transform> {
+        let start = drag.start;
+        let center = start.translation;
+        let hit = || ray_plane_intersect(origin, dir, center, drag.plane_normal);
+        let axes_of = |i: usize| ((i + 1) % 3, (i + 2) % 3);
+        let start_axis = |i: usize| start.rotation * [AXIS_X, AXIS_Y, AXIS_Z][i];
+        Some(match (drag.mode, drag.handle) {
+            (GizmoMode::Move, GizmoHandle::Axis(i)) => {
+                drag_move_axis(start, start_axis(i), drag.press_hit, hit()?, snap)
+            }
+            (GizmoMode::Move, GizmoHandle::Plane(i)) => {
+                let (a, b) = axes_of(i);
+                drag_move_plane(
+                    start,
+                    drag.press_hit,
+                    hit()?,
+                    [start_axis(a), start_axis(b)],
+                    snap,
+                )
+            }
+            (GizmoMode::Move, GizmoHandle::Center) => {
+                drag_move_center(start, drag.press_hit, hit()?, snap)
+            }
+            (GizmoMode::Rotate, GizmoHandle::Axis(i)) => {
+                let axis = start_axis(i);
+                match drag.press_angle {
+                    Some(_) => {
+                        // Accumulate small steps so turns past 180° keep going.
+                        if let (Some(last), Some(now)) =
+                            (drag.last_angle, rotate_angle(center, axis, origin, dir))
+                        {
+                            drag.angle_sum += wrap_angle_delta(now - last);
+                            drag.last_angle = Some(now);
+                        }
+                    }
+                    None => {
+                        drag.angle_sum =
+                            screen_drag_angle(pointer - drag.press_pointer, drag.ring_tangent_px);
+                    }
+                }
+                drag_rotate(start, axis, drag.angle_sum, snap)
+            }
+            (GizmoMode::Rotate, _) => return None,
+            (GizmoMode::Scale, GizmoHandle::Axis(i)) => {
+                let axis = start_axis(i);
+                let press = project_onto_axis(drag.press_hit - center, axis);
+                if press.abs() < 1e-6 {
+                    return None;
+                }
+                drag_scale(
+                    start,
+                    &[i],
+                    project_onto_axis(hit()? - center, axis) / press,
+                    snap,
+                )
+            }
+            (GizmoMode::Scale, GizmoHandle::Plane(i)) => {
+                let (a, b) = axes_of(i);
+                let diagonal = (start_axis(a) + start_axis(b)).normalize();
+                let press = (drag.press_hit - center).dot(diagonal);
+                if press.abs() < 1e-6 {
+                    return None;
+                }
+                drag_scale(
+                    start,
+                    &[a, b],
+                    (hit()? - center).dot(diagonal) / press,
+                    snap,
+                )
+            }
+            (GizmoMode::Scale, GizmoHandle::Center) => {
+                let factor = uniform_scale_factor(pointer - drag.press_pointer);
+                drag_scale(start, &[0, 1, 2], factor, snap)
+            }
+        })
+        .filter(|_| pose.size.is_finite())
     }
 
     fn write_to_physics_body(
@@ -1394,118 +1353,6 @@ impl Editor {
                 body.set_rotation(r, true);
             }
         }
-    }
-
-    fn generate_gizmo_geometry(
-        &mut self,
-        center: glam::Vec3,
-        axes: [glam::Vec3; 3],
-        axis_length: f32,
-        camera: Camera,
-        screen_size: glam::Vec2,
-    ) {
-        let mut verts: Vec<LineVertex> = Vec::new();
-
-        match self.gizmo_mode {
-            GizmoMode::Move => {
-                for (i, &axis) in axes.iter().enumerate() {
-                    let color = if self.hovered_axis == Some(i) {
-                        hovered_color(i)
-                    } else {
-                        axis_color(i)
-                    };
-                    let endpoint = center + axis * axis_length;
-                    verts.push(LineVertex {
-                        position: center.to_array(),
-                        color: color.to_array(),
-                    });
-                    verts.push(LineVertex {
-                        position: endpoint.to_array(),
-                        color: color.to_array(),
-                    });
-
-                    let handle_size = axis_length * 0.15;
-                    let lines = cube_handle_lines(endpoint, handle_size, color);
-                    for [a, b] in lines {
-                        verts.push(LineVertex {
-                            position: a.to_array(),
-                            color: color.to_array(),
-                        });
-                        verts.push(LineVertex {
-                            position: b.to_array(),
-                            color: color.to_array(),
-                        });
-                    }
-                }
-            }
-            GizmoMode::Rotate => {
-                for (i, &axis) in axes.iter().enumerate() {
-                    let radius = axis_length;
-                    let color = if self.hovered_axis == Some(i) {
-                        hovered_color(i)
-                    } else {
-                        axis_color(i)
-                    };
-
-                    // Check degenerate circle (Issue 3.5)
-                    let circle_center_screen = camera.world_to_screen(center, screen_size);
-                    let point_on_circle = center + axis.cross(glam::Vec3::Y).normalize() * radius;
-                    let circle_point_screen = camera.world_to_screen(point_on_circle, screen_size);
-
-                    if let (Some(cs), Some(ps)) = (circle_center_screen, circle_point_screen) {
-                        let screen_radius = ((ps.x - cs.x).powi(2) + (ps.y - cs.y).powi(2)).sqrt();
-                        if screen_radius < DEGENERATE_CIRCLE_PX {
-                            continue;
-                        }
-                    }
-
-                    let lines = circle_lines(center, radius, axis, color, CIRCLE_SEGMENTS);
-                    for [a, b] in lines {
-                        verts.push(LineVertex {
-                            position: a.to_array(),
-                            color: color.to_array(),
-                        });
-                        verts.push(LineVertex {
-                            position: b.to_array(),
-                            color: color.to_array(),
-                        });
-                    }
-                }
-            }
-            GizmoMode::Scale => {
-                for (i, &axis) in axes.iter().enumerate() {
-                    let color = if self.hovered_axis == Some(i) {
-                        hovered_color(i)
-                    } else {
-                        axis_color(i)
-                    };
-                    let endpoint = center + axis * axis_length;
-                    verts.push(LineVertex {
-                        position: center.to_array(),
-                        color: color.to_array(),
-                    });
-                    verts.push(LineVertex {
-                        position: endpoint.to_array(),
-                        color: color.to_array(),
-                    });
-
-                    let handle_size = axis_length * 0.15;
-                    let lines = cube_handle_lines(endpoint, handle_size, color);
-                    for [a, b] in lines {
-                        verts.push(LineVertex {
-                            position: a.to_array(),
-                            color: color.to_array(),
-                        });
-                        verts.push(LineVertex {
-                            position: b.to_array(),
-                            color: color.to_array(),
-                        });
-                    }
-                }
-            }
-        }
-
-        self.gizmo_vertices = verts;
     }
 }
 
@@ -2305,6 +2152,58 @@ mod tests {
         editor.pending_operation = Some(PendingOperation::Exit);
         assert!(editor.run_pending_operation(&mut world));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One frame of `build_gizmo` for the selected entity (default camera).
+    fn gizmo_frame(editor: &mut Editor, world: &mut World) {
+        let ctx = egui::Context::default();
+        let vp = viewport::ViewportInput {
+            size: glam::Vec2::new(800.0, 600.0),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            editor.build_gizmo(world, ui, &vp)
+        });
+    }
+
+    fn gizmo_world(scale: glam::Vec3) -> (World, Entity) {
+        let mut world = World::new();
+        world.insert_resource(Camera::default());
+        let e = world
+            .spawn(Transform {
+                scale,
+                ..Default::default()
+            })
+            .id();
+        (world, e)
+    }
+
+    #[test]
+    fn take_overlay_draws_after_gizmo_frame() {
+        let (mut world, e) = gizmo_world(glam::Vec3::ONE);
+        let mut editor = Editor::new();
+        editor.set_selected(Some(e));
+        gizmo_frame(&mut editor, &mut world);
+        let draws = editor.take_overlay_draws();
+        assert!(!draws.is_empty());
+        assert!(
+            draws
+                .iter()
+                .all(|d| d.depth == melon_render::OverlayDepth::OnTop)
+        );
+    }
+
+    #[test]
+    fn no_gizmo_for_deleted_or_zero_scale_entity() {
+        let (mut world, e) = gizmo_world(glam::Vec3::new(0.0, 1.0, 1.0));
+        let mut editor = Editor::new();
+        editor.set_selected(Some(e));
+        gizmo_frame(&mut editor, &mut world);
+        assert!(editor.take_overlay_draws().is_empty(), "zero scale");
+        world.despawn(e);
+        gizmo_frame(&mut editor, &mut world);
+        assert!(editor.take_overlay_draws().is_empty(), "deleted");
+        assert_eq!(editor.selected_entity(), None);
     }
 
     #[test]

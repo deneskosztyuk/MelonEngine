@@ -343,8 +343,7 @@ impl ApplicationHandler for App {
                 if editor_ui.run_pending_operation(&mut self.core.world) {
                     event_loop.exit();
                 }
-                // The line gizmo is being replaced by overlay draws.
-                editor_ui.take_gizmo_vertices();
+                let overlay = editor_ui.take_overlay_draws();
                 let world_line_vertices = editor_ui.take_world_line_vertices();
 
                 // Follow the viewport panel's size: recreate the target, hand it
@@ -373,7 +372,7 @@ impl ApplicationHandler for App {
                         &mut server,
                         target,
                         &world_line_vertices,
-                        &[],
+                        &overlay,
                     );
                 }
                 {
