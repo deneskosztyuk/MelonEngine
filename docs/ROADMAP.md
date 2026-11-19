@@ -10,7 +10,7 @@ missing for a core 3D engine. Update this file when an item lands.
 | `melon_core` | `Core` wraps a bevy_ecs `World` + `Schedule`. Components: `Transform`, `Name`, `MeshRef`, `Aabb`, `BodyInfo`, `Spin`, `Bob`, `PendingDelete`. Resources: `Camera` (fly camera, `world_to_screen`, `screen_to_world_ray`), one directional `Light`, `Time`, `SimulationState`, `Input`, `NameCounter`. |
 | `melon_render` | wgpu forward renderer. Frame: sun shadow pass (directional shadow map, 3x3 PCF), 3D pass into an HDR target, ACES tonemap pass onto the display. Textured Lambert + ambient mesh pipeline, line pipeline (gizmos), depth buffer, dynamic-offset model uniforms, checkerboard fallback texture, glTF loader (positions, normals, uv0, indices, base color texture), offscreen `ViewportTarget`, surface lost/outdated recovery. |
 | `melon_physics` | rapier3d wrapper: dynamic and fixed cuboids, ECS to rapier sync both ways, `PendingDelete` cleanup. |
-| `melon_editor` | egui overlay: hierarchy, add/delete entity, inspector, Move/Rotate/Scale gizmos with snapping, RON scene save/load (versioned, atomic write, validated). Experiments: `imgui-poc`, `slint-poc` features. |
+| `melon_editor` | egui editor with dockable panels (Hierarchy, Scene, Inspector, Content Browser, Console), menu bar, toolbar, status bar, Move/Rotate/Scale gizmos with snapping, Play/Pause/Step/Stop, RON scene save/load (versioned, atomic write, validated). |
 | `melon_game` | Hot-reloadable dylib with two demo systems. |
 | `melon_host` | winit event loop that wires all crates together. |
 
@@ -93,8 +93,10 @@ Goal: an editor that looks and works like Unity / Unreal / Godot.
       click select, grid + axes + selection box, MSAA 4x, FPS and
       orientation overlays.
 - [x] Pick the UI library: egui + `egui_dock` (see `docs/adr/0001-editor-ui-library.md`).
-- [ ] Layout redesign: docking panels, menu bar, toolbar, hierarchy and
-      inspector as separate panels.
+- [x] Layout redesign: dockable tabbed panels (saved layout), menu bar,
+      toolbar, status bar, theme, console from `tracing`, content browser,
+      hierarchy search, Step.
+- [ ] Undo / Redo (command history), rename, duplicate.
 - [ ] Game view (game camera) next to the Scene view.
 - [ ] Gizmo upgrades: plane handles, local/world toggle.
 

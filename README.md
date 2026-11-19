@@ -57,6 +57,16 @@ Viewport (Unity-style, pointer over the viewport):
 Simulation:
 
 - **F5** — Play / resume, **F6** — Pause, **Shift+F5** — Stop (restores the scene)
+- **Step** (toolbar, while paused) — advance one fixed step
+
+Editor:
+
+- **W / E / R** — Move / Rotate / Scale tool
+- **Delete** — delete the selected entity
+- **Ctrl+S** — save the scene (File ▸ Save As… the first time)
+- Panels (Hierarchy, Scene, Inspector, Content Browser, Console) dock and tab
+  by dragging their tabs; the arrangement is saved to `.melon/editor_layout.ron`.
+  **Window** reopens closed panels; **Window ▸ Reset Layout** restores the default.
 
 The editor opens in edit mode. Pass `--play` to start playing right away:
 

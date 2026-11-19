@@ -101,11 +101,12 @@ docking, ImGui's port and FFI) are structural.
 
 ## Action items
 
-1. [ ] Add `egui_dock` 0.20 and move Hierarchy, Inspector, Scene, Console,
+1. [x] Add `egui_dock` 0.20 and move Hierarchy, Inspector, Scene, Console,
        Content Browser into dock tabs; persist the layout.
-2. [ ] Menu bar + toolbar (tool modes, Play/Pause/Step) + status bar,
+2. [x] Menu bar + toolbar (tool modes, Play/Pause/Step) + status bar,
        following the Slint mock-up.
-3. [ ] Theme: colours and spacing from `ui/theme.slint`, Inter-style font,
-       icon set.
-4. [ ] Remove the `imgui-poc` and `slint-poc` features, their code and
+3. [x] Theme: colours and spacing from `ui/theme.slint` (now `theme.rs`).
+       Kept egui's default font and built-in icon glyphs; a custom font and
+       icon set are open.
+4. [x] Remove the `imgui-poc` and `slint-poc` features, their code and
        dependencies.
