@@ -5,7 +5,9 @@ use bevy_ecs::world::World;
 use egui::ViewportId;
 use egui_wgpu::ScreenDescriptor;
 use melon_core::glam;
-use melon_core::{Aabb, BodyInfo, Camera, MeshRef, Name, SimulationState, Spin, Transform};
+use melon_core::{
+    Aabb, AssetServer, BodyInfo, Camera, Handle, Model, Name, SimulationState, Spin, Transform,
+};
 use melon_render::LineVertex;
 use tracing::instrument;
 use winit::event::WindowEvent;
@@ -572,9 +574,14 @@ impl Editor {
         }
 
         self.world_line_vertices = viewport::grid_lines();
-        if let Some(t) = self.selected.and_then(|e| world.get::<Transform>(e)) {
+        if let Some(e) = self.selected
+            && let Some(t) = world.get::<Transform>(e)
+        {
             self.world_line_vertices
-                .extend(viewport::selection_box_lines(t));
+                .extend(viewport::selection_box_lines(
+                    t,
+                    viewport::model_bounds(world, e),
+                ));
         }
 
         let painter = ui.painter_at(rect);
@@ -1356,11 +1363,14 @@ pub fn create_cube(world: &mut World) -> Entity {
     let mut counter = world.get_resource_or_insert_with(melon_core::NameCounter::default);
     let name = format!("Cube {}", counter.0);
     counter.0 += 1;
+    let cube: Handle<Model> = world
+        .get_resource_or_insert_with(|| AssetServer::new(".".into()))
+        .load("builtin:cube");
     world
         .spawn((
             Name(name),
             melon_core::Transform::default(),
-            MeshRef::Cube,
+            cube,
             Aabb {
                 half_extents: glam::Vec3::new(0.5, 0.5, 0.5),
             },
@@ -1814,7 +1824,7 @@ mod tests {
         let mut world = World::new();
         let e = create_cube(&mut world);
         assert_eq!(world.get::<Name>(e).unwrap().0, "Cube 0");
-        assert!(world.get::<MeshRef>(e).is_some());
+        assert!(world.get::<Handle<Model>>(e).is_some());
         let e2 = create_cube(&mut world);
         assert_eq!(world.get::<Name>(e2).unwrap().0, "Cube 1");
     }

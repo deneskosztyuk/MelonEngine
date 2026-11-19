@@ -3,10 +3,9 @@
 //! The UI glue only fills a `ViewportInput` each frame.
 
 use bevy_ecs::entity::Entity;
-use bevy_ecs::query::With;
 use bevy_ecs::world::World;
 use melon_core::glam::{Vec2, Vec3};
-use melon_core::{Camera, MeshRef, Transform};
+use melon_core::{AssetServer, Camera, Handle, Model, Transform};
 use melon_render::LineVertex;
 
 /// Radians of look/orbit per point of pointer movement.
@@ -18,8 +17,8 @@ const MIN_DISTANCE: f32 = 0.2;
 const MIN_FLY_SPEED: f32 = 0.5;
 const MAX_FLY_SPEED: f32 = 100.0;
 const SHIFT_MULTIPLIER: f32 = 3.0;
-/// Half size of every mesh today: the unit cube (`MeshRef::Cube` and `cube.glb`).
-const MESH_HALF_EXTENT: f32 = 0.5;
+/// Bounds used until a model's real bounds are known (and for `builtin:cube`).
+pub const UNIT_BOUNDS: (Vec3, Vec3) = (Vec3::splat(-0.5), Vec3::splat(0.5));
 
 const GRID_HALF_SIZE: i32 = 50;
 /// The grid sits a hair above y = 0 so it does not z-fight a floor whose top is y = 0.
@@ -162,10 +161,13 @@ impl EditorCamera {
 /// Nearest entity with a mesh hit by the ray, tested against the mesh's local
 /// bounds in the entity's own space, so rotated and scaled boxes are exact.
 pub fn pick(world: &mut World, origin: Vec3, dir: Vec3) -> Option<Entity> {
-    let mut query = world.query_filtered::<(Entity, &Transform), With<MeshRef>>();
+    let mut query = world.query::<(Entity, &Transform, &Handle<Model>)>();
+    let world: &World = world;
+    let server = world.get_resource::<AssetServer>();
     query
         .iter(world)
-        .filter_map(|(entity, transform)| {
+        .filter_map(|(entity, transform, model)| {
+            let (min, max) = server.and_then(|s| s.bounds(*model)).unwrap_or(UNIT_BOUNDS);
             let inverse = transform.to_mat4().inverse();
             if !inverse.is_finite() {
                 return None; // zero scale
@@ -173,25 +175,25 @@ pub fn pick(world: &mut World, origin: Vec3, dir: Vec3) -> Option<Entity> {
             // Affine map: the hit distance t is the same in local and world space.
             let o = inverse.transform_point3(origin);
             let d = inverse.transform_vector3(dir);
-            ray_unit_box(o, d).map(|t| (t, entity))
+            ray_box(o, d, min, max).map(|t| (t, entity))
         })
         .min_by(|a, b| a.0.total_cmp(&b.0))
         .map(|(_, entity)| entity)
 }
 
-/// Slab test against the box `[-0.5, 0.5]^3`. Returns the entry distance
+/// Slab test against the box `[min, max]`. Returns the entry distance
 /// (0 if the origin is inside), or `None` on a miss or a hit behind the origin.
-fn ray_unit_box(o: Vec3, d: Vec3) -> Option<f32> {
+fn ray_box(o: Vec3, d: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
     let (mut t_min, mut t_max) = (0.0f32, f32::INFINITY);
     for axis in 0..3 {
-        let (o, d) = (o[axis], d[axis]);
+        let (o, d, lo, hi) = (o[axis], d[axis], min[axis], max[axis]);
         if d.abs() < 1e-12 {
-            if o.abs() > MESH_HALF_EXTENT {
+            if o < lo || o > hi {
                 return None;
             }
             continue;
         }
-        let (t0, t1) = ((-MESH_HALF_EXTENT - o) / d, (MESH_HALF_EXTENT - o) / d);
+        let (t0, t1) = ((lo - o) / d, (hi - o) / d);
         t_min = t_min.max(t0.min(t1));
         t_max = t_max.min(t0.max(t1));
         if t_min > t_max {
@@ -205,10 +207,20 @@ fn ray_unit_box(o: Vec3, d: Vec3) -> Option<f32> {
 /// `None` if the entity no longer exists.
 pub fn frame_target(world: &World, entity: Entity) -> Option<(Vec3, f32)> {
     let transform = world.get::<Transform>(entity)?;
+    let (min, max) = model_bounds(world, entity);
     Some((
-        transform.translation,
-        (transform.scale.abs() * MESH_HALF_EXTENT).length(),
+        transform.to_mat4().transform_point3((min + max) * 0.5),
+        ((max - min) * 0.5 * transform.scale.abs()).length(),
     ))
+}
+
+/// Local bounds of an entity's model: measured when loaded, else `UNIT_BOUNDS`.
+pub fn model_bounds(world: &World, entity: Entity) -> (Vec3, Vec3) {
+    world
+        .get::<Handle<Model>>(entity)
+        .zip(world.get_resource::<AssetServer>())
+        .and_then(|(h, server)| server.bounds(*h))
+        .unwrap_or(UNIT_BOUNDS)
 }
 
 /// Input for the camera: while a gizmo handle is being dragged the left button
@@ -298,13 +310,12 @@ pub fn grid_lines() -> Vec<LineVertex> {
     vertices
 }
 
-/// Orange wire box around the mesh bounds under `transform` (12 edges).
-pub fn selection_box_lines(transform: &Transform) -> Vec<LineVertex> {
+/// Orange wire box around the model bounds under `transform` (12 edges).
+pub fn selection_box_lines(transform: &Transform, (min, max): (Vec3, Vec3)) -> Vec<LineVertex> {
     let m = transform.to_mat4();
-    let h = MESH_HALF_EXTENT;
     let corner = |i: usize| {
-        let sign = |bit: usize| if i & bit != 0 { h } else { -h };
-        m.transform_point3(Vec3::new(sign(1), sign(2), sign(4)))
+        let pick = |bit: usize, axis: usize| if i & bit != 0 { max[axis] } else { min[axis] };
+        m.transform_point3(Vec3::new(pick(1, 0), pick(2, 1), pick(4, 2)))
     };
     let mut vertices = Vec::with_capacity(24);
     for a in 0..8 {
@@ -320,8 +331,8 @@ pub fn selection_box_lines(transform: &Transform) -> Vec<LineVertex> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use melon_core::Name;
     use melon_core::glam::Quat;
-    use melon_core::{MeshRef, Name};
 
     fn approx(a: Vec3, b: Vec3) -> bool {
         (a - b).length() < 1e-4
@@ -497,9 +508,10 @@ mod tests {
     }
 
     fn spawn_box(world: &mut World, t: Transform) -> Entity {
-        world
-            .spawn((Name("Box".to_string()), t, MeshRef::Cube))
-            .id()
+        let cube: Handle<Model> = world
+            .get_resource_or_insert_with(|| AssetServer::new(".".into()))
+            .load("builtin:cube");
+        world.spawn((Name("Box".to_string()), t, cube)).id()
     }
 
     #[test]
@@ -539,6 +551,31 @@ mod tests {
         let down = Vec3::NEG_Y;
         assert_eq!(pick(&mut world, Vec3::new(0.0, 5.0, 1.9), down), Some(e));
         assert_eq!(pick(&mut world, Vec3::new(0.0, 5.0, 2.1), down), None);
+    }
+
+    #[test]
+    fn pick_uses_model_bounds() {
+        let mut world = World::new();
+        let mut server = AssetServer::new(".".into());
+        let h: Handle<Model> = server.load("assets/models/wide.glb");
+        server.set_bounds(h, Vec3::ZERO, Vec3::new(2.0, 1.0, 1.0));
+        world.insert_resource(server);
+        let e = world.spawn((Transform::default(), h)).id();
+        let down = Vec3::NEG_Y;
+        assert_eq!(pick(&mut world, Vec3::new(1.9, 5.0, 0.5), down), Some(e));
+        assert_eq!(pick(&mut world, Vec3::new(2.1, 5.0, 0.5), down), None);
+    }
+
+    #[test]
+    fn pick_without_bounds_uses_unit_cube() {
+        let mut world = World::new();
+        let mut server = AssetServer::new(".".into());
+        let h: Handle<Model> = server.load("assets/models/unloaded.glb");
+        world.insert_resource(server);
+        let e = world.spawn((Transform::default(), h)).id();
+        let down = Vec3::NEG_Y;
+        assert_eq!(pick(&mut world, Vec3::new(0.4, 5.0, 0.0), down), Some(e));
+        assert_eq!(pick(&mut world, Vec3::new(0.6, 5.0, 0.0), down), None);
     }
 
     #[test]
@@ -644,6 +681,9 @@ mod tests {
 
     #[test]
     fn selection_box_has_12_edges() {
-        assert_eq!(selection_box_lines(&Transform::default()).len(), 24);
+        assert_eq!(
+            selection_box_lines(&Transform::default(), UNIT_BOUNDS).len(),
+            24
+        );
     }
 }

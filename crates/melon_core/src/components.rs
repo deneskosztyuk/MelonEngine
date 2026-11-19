@@ -58,13 +58,6 @@ pub fn store_previous_transforms_system(mut query: Query<(&Transform, &mut Previ
 #[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct Name(pub String);
 
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum MeshRef {
-    #[default]
-    Cube,
-    GltfModel,
-}
-
 #[derive(Component, Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Aabb {
     pub half_extents: Vec3,

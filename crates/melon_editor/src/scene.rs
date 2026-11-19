@@ -4,11 +4,30 @@ use anyhow::{Context, Result, bail};
 use bevy_ecs::entity::Entity;
 use bevy_ecs::query::With;
 use bevy_ecs::world::World;
-use melon_core::{Aabb, Bob, BodyInfo, BodyKind, MeshRef, Name, NameCounter, Spin, Transform};
+use melon_core::{
+    Aabb, AssetServer, Bob, BodyInfo, BodyKind, Handle, Model, Name, NameCounter, Spin, Transform,
+};
 use melon_physics::{ColliderComponent, PhysicsWorld, RigidBodyComponent, RigidBodyType};
 use serde::{Deserialize, Serialize};
 
-const SCENE_VERSION: u32 = 1;
+/// 2: entities store a model path (`model`) instead of `mesh_ref`.
+const SCENE_VERSION: u32 = 2;
+
+/// Version 1 `mesh_ref` values, read so old scenes still load.
+#[derive(Deserialize, Clone, Copy)]
+enum LegacyMeshRef {
+    Cube,
+    GltfModel,
+}
+
+impl LegacyMeshRef {
+    fn model_path(self) -> &'static str {
+        match self {
+            LegacyMeshRef::Cube => "builtin:cube",
+            LegacyMeshRef::GltfModel => "assets/models/cube.glb",
+        }
+    }
+}
 
 /// A whole scene in memory: what save files hold, and what Play snapshots.
 #[derive(Serialize, Deserialize, Clone)]
@@ -22,8 +41,12 @@ pub struct SceneData {
 pub struct SceneEntity {
     name: String,
     transform: Transform,
+    /// Version 1 only.
+    #[serde(default, skip_serializing)]
+    mesh_ref: Option<LegacyMeshRef>,
+    /// Model asset path (project-relative, or `builtin:cube`).
     #[serde(default)]
-    mesh_ref: Option<MeshRef>,
+    model: Option<String>,
     #[serde(default)]
     aabb: Option<Aabb>,
     #[serde(default)]
@@ -32,8 +55,6 @@ pub struct SceneEntity {
     spin: Option<Spin>,
     #[serde(default)]
     bob: Option<Bob>,
-    #[serde(default)]
-    model_path: Option<String>,
 }
 
 /// Capture all entities with Name + Transform, except ones marked for deletion
@@ -42,25 +63,27 @@ pub fn scene_to_data(world: &mut World) -> SceneData {
     let mut query = world.query_filtered::<(
         &Name,
         &Transform,
-        Option<&MeshRef>,
+        Option<&Handle<Model>>,
         Option<&Aabb>,
         Option<&BodyInfo>,
         Option<&Spin>,
         Option<&Bob>,
     ), bevy_ecs::query::Without<melon_core::PendingDelete>>();
+    let world: &World = world;
+    let server = world.get_resource::<AssetServer>();
 
     let entities: Vec<SceneEntity> = query
         .iter(world)
         .map(
-            |(name, transform, mesh_ref, aabb, body_info, spin, bob)| SceneEntity {
+            |(name, transform, model, aabb, body_info, spin, bob)| SceneEntity {
                 name: name.0.clone(),
                 transform: *transform,
-                mesh_ref: mesh_ref.copied(),
+                mesh_ref: None,
+                model: model.zip(server).map(|(h, s)| s.path(*h).to_string()),
                 aabb: aabb.copied(),
                 body_info: body_info.copied(),
                 spin: spin.copied(),
                 bob: bob.copied(),
-                model_path: None,
             },
         )
         .collect();
@@ -82,7 +105,7 @@ pub fn scene_to_data(world: &mut World) -> SceneData {
 /// Clears all existing scene entities + physics bodies, then spawns from `data`.
 pub fn apply_scene(world: &mut World, physics: &mut PhysicsWorld, data: &SceneData) -> Result<()> {
     // Phase 1: Validate (no world mutation)
-    if data.version != SCENE_VERSION {
+    if !(1..=SCENE_VERSION).contains(&data.version) {
         bail!(
             "unsupported scene version: expected {}, got {}",
             SCENE_VERSION,
@@ -194,8 +217,15 @@ fn spawn_scene_entity(world: &mut World, physics: &mut PhysicsWorld, entity: &Sc
         .spawn((Name(entity.name.clone()), entity.transform))
         .id();
 
-    if let Some(mesh_ref) = entity.mesh_ref {
-        world.entity_mut(id).insert(mesh_ref);
+    let model = entity
+        .model
+        .clone()
+        .or_else(|| entity.mesh_ref.map(|m| m.model_path().to_string()));
+    if let Some(path) = model {
+        let handle: Handle<Model> = world
+            .get_resource_or_insert_with(|| AssetServer::new(".".into()))
+            .load(&path);
+        world.entity_mut(id).insert(handle);
     }
 
     if let Some(aabb) = entity.aabb {
@@ -257,21 +287,82 @@ mod tests {
     fn world_with_entities() -> World {
         let mut world = World::new();
         world.insert_resource(NameCounter(5));
+        let mut server = AssetServer::new(".".into());
+        let cube: Handle<Model> = server.load("builtin:cube");
+        let model: Handle<Model> = server.load("assets/models/cube.glb");
+        world.insert_resource(server);
         world.spawn((
             Name("Floor".to_string()),
             Transform::from_translation(Vec3::new(0.0, -1.0, 0.0)),
-            MeshRef::Cube,
+            cube,
             Aabb {
                 half_extents: Vec3::new(10.0, 0.5, 10.0),
             },
         ));
-        world.spawn((
-            Name("Cube".to_string()),
-            Transform::default(),
-            MeshRef::GltfModel,
-            Spin,
-        ));
+        world.spawn((Name("Cube".to_string()), Transform::default(), model, Spin));
         world
+    }
+
+    fn model_path_of(world: &mut World, name: &str) -> String {
+        let handle = *world
+            .query::<(&Name, &melon_core::Handle<melon_core::Model>)>()
+            .iter(world)
+            .find(|(n, _)| n.0 == name)
+            .map(|(_, h)| h)
+            .unwrap();
+        world
+            .resource::<melon_core::AssetServer>()
+            .path(handle)
+            .to_string()
+    }
+
+    #[test]
+    fn v2_roundtrip_keeps_model_paths() {
+        let mut world = world_with_entities();
+        let mut physics = PhysicsWorld::new();
+        let data = scene_to_data(&mut world);
+        apply_scene(&mut world, &mut physics, &data).unwrap();
+        assert_eq!(model_path_of(&mut world, "Floor"), "builtin:cube");
+        assert_eq!(model_path_of(&mut world, "Cube"), "assets/models/cube.glb");
+    }
+
+    #[test]
+    fn v1_mesh_ref_cube_loads_as_builtin() {
+        let ron = r#"(
+            version: 1,
+            entities: [
+                (name: "Old", transform: (translation: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0, 1.0), scale: (1.0, 1.0, 1.0)),
+                 mesh_ref: Some(Cube), model_path: None),
+                (name: "OldModel", transform: (translation: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0, 1.0), scale: (1.0, 1.0, 1.0)),
+                 mesh_ref: Some(GltfModel)),
+            ],
+            name_counter: 0,
+        )"#;
+        let data: SceneData = ron::from_str(ron).unwrap();
+        let mut world = World::new();
+        let mut physics = PhysicsWorld::new();
+        apply_scene(&mut world, &mut physics, &data).unwrap();
+        assert_eq!(model_path_of(&mut world, "Old"), "builtin:cube");
+        assert_eq!(
+            model_path_of(&mut world, "OldModel"),
+            "assets/models/cube.glb"
+        );
+    }
+
+    #[test]
+    fn missing_model_path_still_loads() {
+        let mut world = world_with_entities();
+        let h: melon_core::Handle<melon_core::Model> = world
+            .resource_mut::<melon_core::AssetServer>()
+            .load("assets/models/does_not_exist.glb");
+        world.spawn((Name("Ghost".to_string()), Transform::default(), h));
+        let mut physics = PhysicsWorld::new();
+        let data = scene_to_data(&mut world);
+        apply_scene(&mut world, &mut physics, &data).unwrap();
+        assert_eq!(
+            model_path_of(&mut world, "Ghost"),
+            "assets/models/does_not_exist.glb"
+        );
     }
 
     #[test]

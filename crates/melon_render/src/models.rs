@@ -30,15 +30,37 @@ impl ModelCache {
         }
     }
 
-    /// The model to draw for `handle`. Loads it on first use or after its file
-    /// changed. On a load error the previous version stays in use, or the
-    /// built-in cube if there is none yet; the error is logged once.
+    /// `prepare` then `model`.
     pub fn get(
         &mut self,
         scene: &SceneRenderer,
         server: &mut AssetServer,
         handle: Handle<Model>,
     ) -> &LoadedModel {
+        self.prepare(scene, server, handle);
+        self.model(server, handle)
+    }
+
+    /// The model to draw for `handle` (after `prepare`): the loaded model,
+    /// or the built-in cube for `builtin:cube` and for anything not loaded.
+    pub fn model(&self, server: &AssetServer, handle: Handle<Model>) -> &LoadedModel {
+        if server.path(handle) == "builtin:cube" {
+            return &self.builtin_cube;
+        }
+        self.models
+            .get(&handle.id())
+            .map_or(&self.builtin_cube, |m| &m.model)
+    }
+
+    /// Load `handle` on first use or after its file changed. On a load error
+    /// the previous version stays in use, or the built-in cube if there is
+    /// none yet; the error is logged once per file version.
+    pub fn prepare(
+        &mut self,
+        scene: &SceneRenderer,
+        server: &mut AssetServer,
+        handle: Handle<Model>,
+    ) {
         let id = handle.id();
         let path = server.path(handle).to_string();
         if path == "builtin:cube" {
@@ -46,7 +68,7 @@ impl ModelCache {
                 let (min, max) = self.builtin_cube.bounds;
                 server.set_bounds(handle, min, max);
             }
-            return &self.builtin_cube;
+            return;
         }
 
         let version = server.version(handle);
@@ -69,8 +91,5 @@ impl ModelCache {
                 }
             }
         }
-        self.models
-            .get(&id)
-            .map_or(&self.builtin_cube, |m| &m.model)
     }
 }

@@ -7,8 +7,8 @@ use melon_core::bevy_ecs::system::Res;
 use melon_core::bevy_ecs::world::World;
 use melon_core::glam::{Mat4, Quat, Vec2, Vec3};
 use melon_core::{
-    Aabb, BodyInfo, BodyKind, Camera, FrameCounter, Input, KeyCode, Light, MeshRef, Name,
-    PreviousTransform, SimulationState, Time, Transform, Update,
+    Aabb, BodyInfo, BodyKind, Camera, FrameCounter, Input, KeyCode, Light, Name, PreviousTransform,
+    SimulationState, Time, Transform, Update,
 };
 use melon_editor::Editor;
 use melon_editor::EditorOverlay;
@@ -90,15 +90,23 @@ struct App {
     /// Offscreen image the scene renders into; the editor shows it in its viewport panel.
     viewport_target: Option<melon_render::ViewportTarget>,
     core: melon_core::Core,
-    cube_mesh: Option<melon_render::Mesh>,
-    loaded_model: Option<melon_render::LoadedModel>,
+    /// GPU models per asset handle (created with the renderer).
+    model_cache: Option<melon_render::ModelCache>,
     last_cursor_pos: Option<Vec2>,
     last_frame: Option<Instant>,
     // Pre-allocated render loop buffers (reused each frame to avoid heap allocation)
     entity_matrices: Vec<Mat4>,
 }
 
+/// Project folder asset paths are relative to.
+// shortcut: the source tree, fixed at compile time; ship builds need a real
+// project path (CLI argument or project file).
+const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+
 fn spawn_default_scene(world: &mut World, physics: &mut PhysicsWorld) {
+    let cube: melon_core::Handle<melon_core::Model> = world
+        .resource_mut::<melon_core::AssetServer>()
+        .load("builtin:cube");
     // Ground: flat cube scaled to 5x0.1x5, top surface at y=0
     let half_extents = Vec3::new(2.5, 0.05, 2.5);
     let translation = Vec3::new(0.0, -0.05, 0.0);
@@ -110,7 +118,7 @@ fn spawn_default_scene(world: &mut World, physics: &mut PhysicsWorld) {
             rotation: Quat::IDENTITY,
             scale: Vec3::new(5.0, 0.1, 5.0),
         },
-        MeshRef::Cube,
+        cube,
         Aabb { half_extents },
         RigidBody {
             body_handle: body_h,
@@ -136,6 +144,9 @@ impl App {
         core.world.insert_resource(Light::default());
         core.world.insert_resource(Input::default());
 
+        // Asset paths are relative to the project root (the source tree in dev builds).
+        core.world
+            .insert_resource(melon_core::AssetServer::new(PROJECT_ROOT.into()));
         let mut physics = PhysicsWorld::new();
         spawn_default_scene(&mut core.world, &mut physics);
         core.world.insert_resource(physics);
@@ -161,8 +172,7 @@ impl App {
             editor_ui: None,
             viewport_target: None,
             core,
-            cube_mesh: None,
-            loaded_model: None,
+            model_cache: None,
             last_cursor_pos: None,
             last_frame: None,
             entity_matrices: Vec::with_capacity(64),
@@ -203,10 +213,7 @@ impl ApplicationHandler for App {
         editor_ui.set_console(self.console.clone());
         // shortcut: the project root is the source tree, fixed at compile time;
         // ship builds need a real project path (CLI argument or project file).
-        editor_ui.set_project_root(std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../.."
-        )));
+        editor_ui.set_project_root(std::path::Path::new(PROJECT_ROOT));
 
         let size = renderer.size();
         let aspect = size.width as f32 / size.height.max(1) as f32;
@@ -225,21 +232,7 @@ impl ApplicationHandler for App {
         );
         tracing::info!("scene: ground plane");
 
-        let cube_mesh = renderer.cube_mesh();
-        let glb_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/models/cube.glb");
-        let loaded_model = match renderer.load_gltf(glb_path) {
-            Ok(m) => {
-                tracing::info!("loaded glTF model from {glb_path}");
-                Some(m)
-            }
-            Err(e) => {
-                tracing::warn!("failed to load glTF model, falling back to procedural cube: {e:?}");
-                None
-            }
-        };
-
-        self.cube_mesh = Some(cube_mesh);
-        self.loaded_model = loaded_model;
+        self.model_cache = Some(melon_render::ModelCache::new(renderer.scene()));
         self.window = Some(window.clone());
         self.renderer = Some(renderer);
         {
@@ -338,9 +331,6 @@ impl ApplicationHandler for App {
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
                 };
-                let Some(mesh) = self.cube_mesh.as_ref() else {
-                    return;
-                };
                 let Some(window) = self.window.as_ref() else {
                     return;
                 };
@@ -370,14 +360,19 @@ impl ApplicationHandler for App {
                     ),
                 );
 
-                // Collect model matrices from all entities with Transform and MeshRef,
+                // Collect model matrices from all entities with a Transform and a model,
                 // blending fixed-step entities between their last two steps.
                 let alpha = self.core.world.resource::<Time>().alpha();
                 let blend = blends(*self.core.world.resource::<SimulationState>());
-                let entities: Vec<(Entity, Mat4, MeshRef)> = self
+                let entities: Vec<(Entity, Mat4, melon_core::Handle<melon_core::Model>)> = self
                     .core
                     .world
-                    .query::<(Entity, &Transform, Option<&PreviousTransform>, &MeshRef)>()
+                    .query::<(
+                        Entity,
+                        &Transform,
+                        Option<&PreviousTransform>,
+                        &melon_core::Handle<melon_core::Model>,
+                    )>()
                     .iter(&self.core.world)
                     .map(|(e, t, prev, m)| (e, render_matrix(t, prev, alpha, blend), *m))
                     .collect();
@@ -388,28 +383,26 @@ impl ApplicationHandler for App {
                     .extend(entities.iter().map(|(_, mat, _)| *mat));
                 renderer.update_model_uniforms(&self.entity_matrices);
 
-                // Build draw calls based on MeshRef: (entity_index, mesh)
-                let loaded_model = self.loaded_model.as_ref();
-                let mut textured_draw_calls: Vec<(
-                    usize,
-                    &melon_render::Mesh,
-                    Option<&wgpu::BindGroup>,
-                )> = Vec::with_capacity(entities.len());
-                let mut cube_draw_calls: Vec<(usize, &melon_render::Mesh)> =
+                // Draw calls: every part of each entity's model, sharing the
+                // entity's uniform slot. Load / reload models first (needs the
+                // server mutably), then borrow them all for this frame.
+                let model_cache = self.model_cache.as_mut().unwrap();
+                {
+                    let mut server = self.core.world.resource_mut::<melon_core::AssetServer>();
+                    for (_, _, handle) in &entities {
+                        model_cache.prepare(renderer.scene(), &mut server, *handle);
+                    }
+                }
+                let model_cache = &*model_cache;
+                let mut draw_calls: Vec<(usize, &melon_render::Mesh, Option<&wgpu::BindGroup>)> =
                     Vec::with_capacity(entities.len());
-
-                for (i, (_, _, mesh_ref)) in entities.iter().enumerate() {
-                    if *mesh_ref == MeshRef::GltfModel {
-                        if let Some(model) = loaded_model
-                            && let (Some(mesh), Some(albedo_bg)) =
-                                (model.meshes.first(), model.albedo_bind_groups.first())
-                        {
-                            textured_draw_calls.push((i, mesh, albedo_bg.as_ref()));
-                        } else {
-                            cube_draw_calls.push((i, mesh));
+                {
+                    let server = self.core.world.resource::<melon_core::AssetServer>();
+                    for (i, (_, _, handle)) in entities.iter().enumerate() {
+                        let model = model_cache.model(server, *handle);
+                        for (mesh, albedo) in model.meshes.iter().zip(&model.albedo_bind_groups) {
+                            draw_calls.push((i, mesh, albedo.as_ref()));
                         }
-                    } else {
-                        cube_draw_calls.push((i, mesh));
                     }
                 }
 
@@ -537,11 +530,8 @@ impl ApplicationHandler for App {
                 let scene_depth_view = viewport_target.depth_view();
                 let scene_hdr = viewport_target.hdr_target();
 
-                let shadow_draw_calls: Vec<(usize, &melon_render::Mesh)> = textured_draw_calls
-                    .iter()
-                    .map(|(i, mesh, _)| (*i, *mesh))
-                    .chain(cube_draw_calls.iter().copied())
-                    .collect();
+                let shadow_draw_calls: Vec<(usize, &melon_render::Mesh)> =
+                    draw_calls.iter().map(|(i, mesh, _)| (*i, *mesh)).collect();
                 renderer.render_shadow_pass(&mut frame.encoder, &shadow_draw_calls);
 
                 {
@@ -572,8 +562,7 @@ impl ApplicationHandler for App {
                             occlusion_query_set: None,
                             multiview_mask: None,
                         });
-                    renderer.draw_meshes_textured(&mut pass, &textured_draw_calls);
-                    renderer.draw_meshes(&mut pass, &cube_draw_calls);
+                    renderer.draw_meshes_textured(&mut pass, &draw_calls);
                     renderer.draw_world_lines(&mut pass, &world_line_vertices, view_proj);
                 }
                 {

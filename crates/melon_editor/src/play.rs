@@ -89,7 +89,9 @@ mod tests {
     use super::*;
     use bevy_ecs::entity::Entity;
     use melon_core::glam::Vec3;
-    use melon_core::{BodyInfo, BodyKind, MeshRef, Name, NameCounter, Time, Transform};
+    use melon_core::{
+        AssetServer, BodyInfo, BodyKind, Handle, Model, Name, NameCounter, Time, Transform,
+    };
     use melon_physics::RigidBodyComponent;
 
     fn edit_world() -> World {
@@ -98,10 +100,12 @@ mod tests {
         world.insert_resource(Time::default());
         world.insert_resource(SimulationState::Editing);
         world.insert_resource(NameCounter(0));
+        world.insert_resource(AssetServer::new(".".into()));
+        let cube: Handle<Model> = world.resource_mut::<AssetServer>().load("builtin:cube");
         world.spawn((
             Name("Floor".to_string()),
             Transform::from_translation(Vec3::new(0.0, -1.0, 0.0)),
-            MeshRef::Cube,
+            cube,
             BodyInfo {
                 body_type: BodyKind::Fixed,
                 half_extents: Vec3::new(5.0, 0.5, 5.0),
@@ -110,7 +114,7 @@ mod tests {
         world.spawn((
             Name("Box".to_string()),
             Transform::from_translation(Vec3::new(0.0, 3.0, 0.0)),
-            MeshRef::Cube,
+            cube,
             BodyInfo {
                 body_type: BodyKind::Dynamic,
                 half_extents: Vec3::splat(0.5),
@@ -244,6 +248,26 @@ mod tests {
         step(&mut world);
         stop(&mut world).unwrap();
         assert!(!world.contains_resource::<melon_core::StepOnce>());
+    }
+
+    #[test]
+    fn stop_keeps_model_handles() {
+        let mut world = edit_world();
+        let h: melon_core::Handle<melon_core::Model> = world
+            .resource_mut::<melon_core::AssetServer>()
+            .load("assets/models/cube.glb");
+        let e = find(&mut world, "Box");
+        world.entity_mut(e).insert(h);
+        play(&mut world).unwrap();
+        stop(&mut world).unwrap();
+        let e = find(&mut world, "Box");
+        let h = *world
+            .get::<melon_core::Handle<melon_core::Model>>(e)
+            .unwrap();
+        assert_eq!(
+            world.resource::<melon_core::AssetServer>().path(h),
+            "assets/models/cube.glb"
+        );
     }
 
     #[test]
