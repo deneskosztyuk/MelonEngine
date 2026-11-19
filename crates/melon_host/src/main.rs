@@ -629,7 +629,7 @@ fn main() {
         .with(
             console
                 .layer()
-                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+                .with_filter(melon_editor::console::capture_filter()),
         )
         .init();
     tracing_log::LogTracer::init().ok();

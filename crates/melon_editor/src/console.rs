@@ -52,6 +52,19 @@ impl ConsoleLog {
     }
 }
 
+/// What the Console captures: INFO and above, minus the Vulkan debug
+/// messenger (`wgpu_hal::vulkan::instance`), which forwards driver and loader
+/// chatter (e.g. a stale third-party layer entry) at ERROR level. Those lines
+/// still reach the terminal.
+pub fn capture_filter() -> tracing_subscriber::filter::Targets {
+    tracing_subscriber::filter::Targets::new()
+        .with_default(Level::INFO)
+        .with_target(
+            "wgpu_hal::vulkan::instance",
+            tracing_subscriber::filter::LevelFilter::OFF,
+        )
+}
+
 struct ConsoleLayer(ConsoleLog);
 
 impl<S: Subscriber> Layer<S> for ConsoleLayer {
@@ -192,6 +205,22 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].level, tracing::Level::WARN);
         assert_eq!(lines[0].message, "hello 1");
+    }
+
+    #[test]
+    fn capture_filter_drops_vulkan_driver_messages() {
+        use tracing_subscriber::Layer as _;
+        let log = ConsoleLog::default();
+        let subscriber =
+            tracing_subscriber::registry().with(log.layer().with_filter(capture_filter()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(target: "wgpu_hal::vulkan::instance", "loader_get_json: Failed to open JSON file");
+            tracing::info!("scene loaded");
+            tracing::debug!("per-frame detail");
+        });
+        let lines = log.snapshot();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].message, "scene loaded");
     }
 
     #[test]
