@@ -79,6 +79,12 @@ pub struct Editor {
     viewport_texture: Option<egui::TextureId>,
     /// Pixel size the viewport panel wants its render target to be.
     viewport_size: winit::dpi::PhysicalSize<u32>,
+    /// Scene-view camera driven by the viewport (Unity controls).
+    camera: viewport::EditorCamera,
+    /// Grid and selection box, drawn depth-tested in the 3D pass.
+    world_line_vertices: Vec<LineVertex>,
+    /// Smoothed frame time in milliseconds, for the FPS readout.
+    frame_ms: f32,
 }
 
 impl Default for Editor {
@@ -94,6 +100,9 @@ impl Default for Editor {
             status_message: None,
             viewport_texture: None,
             viewport_size: winit::dpi::PhysicalSize::new(1, 1),
+            camera: viewport::EditorCamera::default(),
+            world_line_vertices: Vec::new(),
+            frame_ms: 16.7,
         }
     }
 }
@@ -127,6 +136,11 @@ impl Editor {
         self.hovered_axis = None;
     }
 
+    /// Grid + selection box for this frame, drawn with `draw_world_lines`.
+    pub fn take_world_line_vertices(&mut self) -> Vec<LineVertex> {
+        std::mem::take(&mut self.world_line_vertices)
+    }
+
     pub fn take_gizmo_vertices(&mut self) -> Vec<LineVertex> {
         std::mem::take(&mut self.gizmo_vertices)
     }
@@ -151,11 +165,6 @@ impl Editor {
         egui::Panel::top("debug_bar").min_size(24.0).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("MelonEngine v{}", melon_core::version()));
-                let frame = world
-                    .get_resource::<melon_core::FrameCounter>()
-                    .map(|fc| fc.frame)
-                    .unwrap_or(0);
-                ui.label(format!("Frame {}", frame));
                 ui.separator();
                 self.play_controls(world, ui);
                 ui.separator();
@@ -266,21 +275,75 @@ impl Editor {
         self.gizmo_vertices.clear();
         egui::CentralPanel::default()
             .frame(egui::Frame::new())
-            .show(ui, |ui| {
-                let rect = ui.available_rect_before_wrap();
-                self.viewport_size = viewport::viewport_pixel_size(
-                    glam::Vec2::new(rect.width(), rect.height()),
-                    ui.ctx().pixels_per_point(),
-                );
-                if let Some(texture) = self.viewport_texture {
-                    ui.put(
-                        rect,
-                        egui::Image::new((texture, rect.size()))
-                            .sense(egui::Sense::click_and_drag()),
-                    );
-                }
-                self.build_gizmo(world, ui);
-            });
+            .show(ui, |ui| self.viewport_panel(world, ui));
+    }
+
+    /// The scene viewport: image, camera navigation, gizmo, click select,
+    /// grid/selection lines and overlays.
+    fn viewport_panel(&mut self, world: &mut World, ui: &mut egui::Ui) {
+        let rect = ui.available_rect_before_wrap();
+        let ctx = ui.ctx().clone();
+        self.viewport_size = viewport::viewport_pixel_size(
+            glam::Vec2::new(rect.width(), rect.height()),
+            ctx.pixels_per_point(),
+        );
+        let Some(texture) = self.viewport_texture else {
+            return;
+        };
+        let response = ui.put(
+            rect,
+            egui::Image::new((texture, rect.size())).sense(egui::Sense::click_and_drag()),
+        );
+        let vp = viewport_input(&ctx, &response, rect);
+        let dt = world
+            .get_resource::<melon_core::Time>()
+            .map_or(1.0 / 60.0, |t| t.delta_seconds);
+
+        self.camera.apply(&vp, dt);
+        if vp.f_pressed
+            && let Some((center, radius)) =
+                self.selected.and_then(|e| viewport::frame_target(world, e))
+        {
+            self.camera.frame(center, radius);
+        }
+        if let Some(mut camera) = world.get_resource_mut::<Camera>() {
+            self.camera.write(&mut camera);
+        }
+
+        self.build_gizmo(world, ui, &vp);
+
+        let on_gizmo = self.hovered_axis.is_some() || self.gizmo_drag.is_some();
+        if viewport::left_action(vp.alt, on_gizmo, vp.left_clicked) == viewport::LeftAction::Select
+            && let (Some(pointer), Some(camera)) =
+                (vp.pointer, world.get_resource::<Camera>().copied())
+        {
+            let (origin, dir) = camera.screen_to_world_ray(pointer, vp.size);
+            self.selected = viewport::pick(world, origin, dir);
+            self.gizmo_drag = None;
+        }
+
+        self.world_line_vertices = viewport::grid_lines();
+        if let Some(t) = self.selected.and_then(|e| world.get::<Transform>(e)) {
+            self.world_line_vertices
+                .extend(viewport::selection_box_lines(t));
+        }
+
+        self.frame_ms += 0.1 * (dt * 1000.0 - self.frame_ms);
+        let painter = ui.painter_at(rect);
+        painter.text(
+            rect.right_top() + egui::vec2(-10.0, 8.0),
+            egui::Align2::RIGHT_TOP,
+            format!(
+                "{:.0} FPS  {:.1} ms",
+                1000.0 / self.frame_ms.max(0.001),
+                self.frame_ms
+            ),
+            egui::FontId::monospace(13.0),
+            egui::Color32::from_gray(210),
+        );
+        if let Some(camera) = world.get_resource::<Camera>() {
+            draw_orientation(&painter, rect.right_top() + egui::vec2(-50.0, 75.0), camera);
+        }
     }
 
     /// Play / Pause / Stop buttons, state label and F5 / F6 / Shift+F5 shortcuts.
@@ -497,7 +560,7 @@ impl Editor {
         snap_previous_transform(world, entity);
     }
 
-    fn build_gizmo(&mut self, world: &mut World, ui: &mut egui::Ui) {
+    fn build_gizmo(&mut self, world: &mut World, ui: &mut egui::Ui, vp: &viewport::ViewportInput) {
         // Guard M4: check entity existence
         let entity = match self.selected {
             Some(e) => {
@@ -521,8 +584,8 @@ impl Editor {
             None => return,
         };
 
-        let screen_size = ui.max_rect().size();
-        let screen_size_vec2 = glam::Vec2::new(screen_size.x, screen_size.y);
+        // Viewport-local points, matching the camera's aspect.
+        let screen_size_vec2 = vp.size;
 
         // Guard C4: project entity center, skip if behind camera
         let entity_screen = match camera.world_to_screen(transform.translation, screen_size_vec2) {
@@ -557,14 +620,15 @@ impl Editor {
 
         let camera_forward = camera.forward();
 
-        let pointer_pos = ui.ctx().input(|i| i.pointer.latest_pos());
+        let pointer_pos = vp.pointer;
         let primary_down = ui.ctx().input(|i| i.pointer.primary_down());
         let primary_pressed = ui.ctx().input(|i| i.pointer.primary_pressed());
         let primary_released = ui.ctx().input(|i| i.pointer.primary_released());
         let snap = ui
             .ctx()
             .input(|i| i.key_down(egui::Key::ShiftLeft) || i.key_down(egui::Key::ShiftRight));
-        let wants_pointer = ui.ctx().egui_wants_pointer_input();
+        // Hover/start a gizmo drag only over the viewport, never while orbiting.
+        let wants_pointer = !vp.hovered || vp.alt || vp.typing;
 
         // Handle active drag
         if let Some(drag) = self.gizmo_drag {
@@ -1016,6 +1080,84 @@ impl EditorOverlay {
     pub fn render(&self, pass: &mut wgpu::RenderPass<'static>) {
         self.renderer
             .render(pass, &self.paint_jobs, &self.screen_descriptor);
+    }
+}
+
+/// Fill the library-independent viewport input from egui. Buttons count as
+/// held only if the press started on the viewport image.
+fn viewport_input(
+    ctx: &egui::Context,
+    response: &egui::Response,
+    rect: egui::Rect,
+) -> viewport::ViewportInput {
+    use egui::{Key, PointerButton};
+    let down_on = response.is_pointer_button_down_on();
+    let hovered = response.hovered();
+    let typing = ctx.text_edit_focused();
+    ctx.input(|i| viewport::ViewportInput {
+        size: glam::Vec2::new(rect.width(), rect.height()),
+        pointer: i
+            .pointer
+            .latest_pos()
+            .map(|p| glam::Vec2::new(p.x - rect.min.x, p.y - rect.min.y)),
+        pointer_delta: glam::Vec2::new(i.pointer.delta().x, i.pointer.delta().y),
+        hovered,
+        left_down: down_on && i.pointer.button_down(PointerButton::Primary),
+        right_down: down_on && i.pointer.button_down(PointerButton::Secondary),
+        middle_down: down_on && i.pointer.button_down(PointerButton::Middle),
+        left_clicked: response.clicked(),
+        // Wheel notches: positive = wheel away from the user.
+        scroll: if hovered {
+            i.raw
+                .events
+                .iter()
+                .map(|event| match event {
+                    egui::Event::MouseWheel { unit, delta, .. } => match unit {
+                        egui::MouseWheelUnit::Line => delta.y,
+                        egui::MouseWheelUnit::Point => delta.y / 50.0,
+                        egui::MouseWheelUnit::Page => delta.y * 3.0,
+                    },
+                    _ => 0.0,
+                })
+                .sum()
+        } else {
+            0.0
+        },
+        alt: i.modifiers.alt,
+        shift: i.modifiers.shift,
+        keys: viewport::FlyKeys {
+            w: i.key_down(Key::W),
+            a: i.key_down(Key::A),
+            s: i.key_down(Key::S),
+            d: i.key_down(Key::D),
+            q: i.key_down(Key::Q),
+            e: i.key_down(Key::E),
+        },
+        f_pressed: hovered && !typing && i.key_pressed(Key::F),
+        typing,
+    })
+}
+
+/// Small X/Y/Z indicator showing the camera's orientation.
+fn draw_orientation(painter: &egui::Painter, center: egui::Pos2, camera: &Camera) {
+    let forward = camera.forward();
+    let right = forward.cross(glam::Vec3::Y).normalize_or_zero();
+    let up = right.cross(forward);
+    let axes = [
+        (glam::Vec3::X, egui::Color32::from_rgb(230, 60, 60), "X"),
+        (glam::Vec3::Y, egui::Color32::from_rgb(90, 200, 90), "Y"),
+        (glam::Vec3::Z, egui::Color32::from_rgb(70, 120, 235), "Z"),
+    ];
+    for (axis, color, label) in axes {
+        let tip = center + egui::vec2(axis.dot(right), -axis.dot(up)) * 30.0;
+        painter.line_segment([center, tip], egui::Stroke::new(2.0, color));
+        painter.text(
+            center + (tip - center) * 1.3,
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(12.0),
+            color,
+        );
     }
 }
 

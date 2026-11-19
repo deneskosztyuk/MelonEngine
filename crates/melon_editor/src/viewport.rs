@@ -211,6 +211,30 @@ pub fn frame_target(world: &World, entity: Entity) -> Option<(Vec3, f32)> {
     ))
 }
 
+/// What a left-button click in the viewport does, by priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftAction {
+    /// Alt held: the left button orbits the camera.
+    Orbit,
+    /// The pointer is on a gizmo handle (or dragging one).
+    Gizmo,
+    /// A plain click: pick the entity under the pointer.
+    Select,
+    None,
+}
+
+pub fn left_action(alt: bool, on_gizmo_handle: bool, clicked: bool) -> LeftAction {
+    if alt {
+        LeftAction::Orbit
+    } else if on_gizmo_handle {
+        LeftAction::Gizmo
+    } else if clicked {
+        LeftAction::Select
+    } else {
+        LeftAction::None
+    }
+}
+
 /// Texture size for a viewport of `size_points` UI points: rounded to pixels,
 /// never 0 on either side (a 0-sized wgpu texture is invalid).
 pub fn viewport_pixel_size(
@@ -559,6 +583,26 @@ mod tests {
             .find(|v| v.color == AXIS_Z_COLOR)
             .expect("z axis line");
         assert!(blue.position[0].abs() < 1e-6);
+    }
+
+    #[test]
+    fn alt_wins_over_gizmo_and_click() {
+        assert_eq!(left_action(true, true, true), LeftAction::Orbit);
+    }
+
+    #[test]
+    fn gizmo_handle_wins_over_select() {
+        assert_eq!(left_action(false, true, true), LeftAction::Gizmo);
+    }
+
+    #[test]
+    fn plain_click_selects() {
+        assert_eq!(left_action(false, false, true), LeftAction::Select);
+    }
+
+    #[test]
+    fn no_click_no_action() {
+        assert_eq!(left_action(false, false, false), LeftAction::None);
     }
 
     #[test]
