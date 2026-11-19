@@ -1511,34 +1511,44 @@ impl SceneRenderer {
         Ok(model)
     }
 
-    /// Load one glTF mesh (`<file>#mesh<N>`): its primitives in mesh-local
-    /// space, no node transform baked in. Errors if the index doesn't exist.
+    /// Load every glTF mesh of a file from one import: entry `i` is mesh `i`
+    /// (`<file>#mesh<i>`), its primitives in mesh-local space, no node
+    /// transform baked in. A mesh that fails gets its own error.
     #[instrument(skip(self), level = "info")]
-    pub fn load_gltf_mesh(&self, path: &str, mesh: usize) -> Result<LoadedModel> {
+    pub fn load_gltf_meshes(&self, path: &str) -> Result<Vec<Result<LoadedModel>>> {
         let (document, buffers, images) =
             gltf::import(path).with_context(|| format!("failed to import glTF file: {path}"))?;
-        let gltf_mesh = document
+        Ok(document
             .meshes()
+            .map(|gltf_mesh| {
+                let mut model = LoadedModel {
+                    meshes: Vec::new(),
+                    albedo_bind_groups: Vec::new(),
+                    bounds: (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)),
+                };
+                for primitive in gltf_mesh.primitives() {
+                    self.add_primitive(
+                        &primitive,
+                        glam::Mat4::IDENTITY,
+                        &buffers,
+                        &images,
+                        &mut model,
+                    )?;
+                }
+                if model.meshes.is_empty() {
+                    anyhow::bail!("{path} mesh {} has no primitives", gltf_mesh.index());
+                }
+                Ok(model)
+            })
+            .collect())
+    }
+
+    /// Load one glTF mesh (`<file>#mesh<N>`); see `load_gltf_meshes`.
+    pub fn load_gltf_mesh(&self, path: &str, mesh: usize) -> Result<LoadedModel> {
+        self.load_gltf_meshes(path)?
+            .into_iter()
             .nth(mesh)
-            .with_context(|| format!("{path} has no mesh {mesh}"))?;
-        let mut model = LoadedModel {
-            meshes: Vec::new(),
-            albedo_bind_groups: Vec::new(),
-            bounds: (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)),
-        };
-        for primitive in gltf_mesh.primitives() {
-            self.add_primitive(
-                &primitive,
-                glam::Mat4::IDENTITY,
-                &buffers,
-                &images,
-                &mut model,
-            )?;
-        }
-        if model.meshes.is_empty() {
-            anyhow::bail!("{path} mesh {mesh} has no primitives");
-        }
-        Ok(model)
+            .with_context(|| format!("{path} has no mesh {mesh}"))?
     }
 
     /// Load a glTF / GLB from memory (embedded or data-URI buffers only).
@@ -2443,6 +2453,33 @@ mod tests {
                     Err(format!(
                         "load_gltf_mesh_unbaked: {} meshes, bounds {min} .. {max}",
                         model.meshes.len()
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
+                use melon_core::{AssetServer, Handle, Model};
+                let root = temp_project("siblings");
+                // Two meshes (same triangle), one node each.
+                let two_meshes = TWO_NODE_GLTF
+                    .replace(r#"{"mesh": 0, "translation": [3, 0, 0]}"#, r#"{"mesh": 1, "translation": [3, 0, 0]}"#)
+                    .replace(
+                        r#""meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}]"#,
+                        r#""meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}, {"primitives": [{"attributes": {"POSITION": 0}}]}]"#,
+                    );
+                std::fs::write(root.join("assets/models/m.gltf"), two_meshes).unwrap();
+                let mut server = AssetServer::new(root.clone());
+                let m0: Handle<Model> = server.load("assets/models/m.gltf#mesh0");
+                let m1: Handle<Model> = server.load("assets/models/m.gltf#mesh1");
+                let mut cache = ModelCache::new(renderer.scene());
+                cache.prepare(renderer.scene(), &mut server, m0);
+                // mesh1 was never prepared: it must come from the same import.
+                let bounds = cache.model(&server, m1).bounds;
+                let _ = std::fs::remove_dir_all(&root);
+                if bounds == (glam::Vec3::ZERO, glam::Vec3::new(1.0, 1.0, 0.0)) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "fragments_share_one_import: mesh1 bounds {bounds:?}"
                     ))
                 }
             }),
