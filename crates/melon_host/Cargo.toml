@@ -19,19 +19,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-log.workspace = true
 egui.workspace = true
-slint = { workspace = true, optional = true }
 hot-lib-reloader.workspace = true
 
 [features]
 default = ["hot-reload"]
 hot-reload = []
-imgui-poc = ["melon_editor/imgui-poc"]
-slint-poc = ["dep:slint", "melon_editor/slint-poc"]
 
-[[bin]]
-name = "melon_slint_poc"
-path = "src/bin/melon_slint_poc.rs"
-required-features = ["slint-poc"]
 
 [lints]
 workspace = true

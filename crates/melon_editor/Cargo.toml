@@ -11,10 +11,6 @@ melon_physics.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
 egui-winit.workspace = true
-imgui = { workspace = true, optional = true }
-imgui-wgpu = { workspace = true, optional = true }
-imgui-winit-support = { workspace = true, optional = true }
-slint = { workspace = true, optional = true }
 winit.workspace = true
 wgpu.workspace = true
 tracing.workspace = true
@@ -25,12 +21,7 @@ ron.workspace = true
 rfd.workspace = true
 anyhow.workspace = true
 
-[features]
-imgui-poc = ["dep:imgui", "dep:imgui-wgpu", "dep:imgui-winit-support"]
-slint-poc = ["dep:slint"]
 
-[build-dependencies]
-slint-build.workspace = true
 
 [lints]
 workspace = true

@@ -25,15 +25,6 @@ Dev build with hot reload:
 cargo run -p melon_host
 ```
 
-The dockable Dear ImGui editor proof of concept is opt-in while the editor
-architecture is being migrated:
-
-```sh
-cargo run -p melon_host --features imgui-poc
-```
-
-The default command continues to use the existing egui editor.
-
 Or via the justfile:
 
 ```sh

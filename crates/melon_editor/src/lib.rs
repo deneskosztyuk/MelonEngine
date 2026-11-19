@@ -12,12 +12,8 @@ use winit::event::WindowEvent;
 use winit::window::Window;
 
 pub mod gizmo;
-#[cfg(feature = "imgui-poc")]
-pub mod imgui_poc;
 pub mod play;
 pub mod scene;
-#[cfg(feature = "slint-poc")]
-pub mod slint_poc;
 pub mod viewport;
 
 use gizmo::{
