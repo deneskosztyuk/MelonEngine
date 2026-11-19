@@ -726,7 +726,16 @@ impl Editor {
             })
             .collect();
 
-        let (zone, dropped_model) = ui.dnd_drop_zone::<String, _>(egui::Frame::new(), |ui| {
+        // Read what is being dragged without taking it: egui's
+        // `dnd_release_payload::<T>` takes the payload even when it isn't a `T`.
+        let carried_entity = egui::DragAndDrop::payload::<Entity>(ui.ctx()).map(|e| *e);
+        let carried_model = egui::DragAndDrop::payload::<String>(ui.ctx()).map(|p| (*p).clone());
+        let carrying = carried_entity.is_some() || carried_model.is_some();
+        let released = ui.ctx().input(|i| i.pointer.any_released());
+        // Row the pointer was released over, if any (a row wins over the zone).
+        let mut released_on_row: Option<Entity> = None;
+
+        let zone = egui::Frame::new().show(ui, |ui| {
             // Rows below a collapsed row are hidden.
             let mut hide_below: Option<usize> = None;
             for (entity, depth, name, has_children) in rows {
@@ -777,34 +786,28 @@ impl Editor {
                 if response.secondary_clicked() {
                     to_delete = Some(entity);
                 }
-                if !searching {
-                    let row_rect = row.response.rect;
-                    if response.dnd_hover_payload::<Entity>().is_some()
-                        || response.dnd_hover_payload::<String>().is_some()
-                    {
-                        ui.painter().rect_stroke(
-                            row_rect,
-                            theme::sizes::RADIUS,
-                            egui::Stroke::new(1.0, theme::colors::ACCENT),
-                            egui::StrokeKind::Inside,
-                        );
-                    }
-                    if let Some(dragged) = response.dnd_release_payload::<Entity>() {
-                        reparent = Some((*dragged, Some(entity)));
-                    }
-                    if let Some(path) = response.dnd_release_payload::<String>() {
-                        model_drop = Some(((*path).clone(), Some(entity)));
+                if !searching && carrying && row.response.contains_pointer() {
+                    ui.painter().rect_stroke(
+                        row.response.rect,
+                        theme::sizes::RADIUS,
+                        egui::Stroke::new(1.0, theme::colors::ACCENT),
+                        egui::StrokeKind::Inside,
+                    );
+                    if released {
+                        released_on_row = Some(entity);
                     }
                 }
             }
             // Fill the rest of the panel so empty space below the rows is a target.
             ui.allocate_space(ui.available_size());
         });
-        if let Some(dragged) = zone.response.dnd_release_payload::<Entity>() {
-            reparent = Some((*dragged, None));
-        }
-        if let Some(path) = dropped_model {
-            model_drop = Some(((*path).clone(), None));
+        if released && (released_on_row.is_some() || zone.response.contains_pointer()) {
+            if let Some(dragged) = carried_entity {
+                reparent = Some((dragged, released_on_row));
+            }
+            if let Some(path) = carried_model {
+                model_drop = Some((path, released_on_row));
+            }
         }
 
         if let Some((dragged, target)) = reparent
@@ -1954,6 +1957,100 @@ mod tests {
             (at - glam::Vec3::new(4.0, 0.0, 0.0)).length() < 1e-4,
             "{at}"
         );
+    }
+
+    /// One Hierarchy frame with the pointer at `pos`, optionally released.
+    fn hierarchy_frame(
+        editor: &mut Editor,
+        world: &mut World,
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+        release: bool,
+    ) {
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        if release {
+            events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 600.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| editor.build_hierarchy(world, ui));
+    }
+
+    /// Release `payload` over the row of `row` (or the empty area for `None`).
+    fn drop_in_hierarchy<P: std::any::Any + Send + Sync>(
+        editor: &mut Editor,
+        world: &mut World,
+        payload: P,
+        row: Option<Entity>,
+    ) {
+        let ctx = egui::Context::default();
+        let empty = egui::pos2(100.0, 550.0);
+        hierarchy_frame(editor, world, &ctx, empty, false);
+        let pos = match row {
+            Some(e) => ctx
+                .read_response(egui::Id::new(("hierarchy_row", e)))
+                .expect("row was drawn")
+                .rect
+                .center(),
+            None => empty,
+        };
+        egui::DragAndDrop::set_payload(&ctx, payload);
+        hierarchy_frame(editor, world, &ctx, pos, true);
+    }
+
+    fn two_roots() -> (World, Entity, Entity) {
+        let mut world = World::new();
+        world.insert_resource(AssetServer::new(".".into()));
+        let a = world
+            .spawn((Name("A".into()), Transform::from_translation(glam::Vec3::X)))
+            .id();
+        let b = world.spawn((Name("B".into()), Transform::default())).id();
+        (world, a, b)
+    }
+
+    #[test]
+    fn hierarchy_ui_entity_onto_row_reparents() {
+        let (mut world, a, b) = two_roots();
+        let mut editor = Editor::new();
+        drop_in_hierarchy(&mut editor, &mut world, b, Some(a));
+        assert_eq!(
+            world.get::<melon_core::ChildOf>(b).map(|c| c.parent()),
+            Some(a)
+        );
+    }
+
+    #[test]
+    fn hierarchy_ui_entity_onto_empty_area_makes_root() {
+        let (mut world, a, b) = two_roots();
+        world.entity_mut(b).insert(melon_core::ChildOf(a));
+        let mut editor = Editor::new();
+        drop_in_hierarchy(&mut editor, &mut world, b, None);
+        assert!(world.get::<melon_core::ChildOf>(b).is_none());
+    }
+
+    #[test]
+    fn hierarchy_ui_model_onto_row_spawns_child() {
+        let (mut world, a, _) = two_roots();
+        let mut editor = Editor::new();
+        drop_in_hierarchy(
+            &mut editor,
+            &mut world,
+            "assets/models/missing.glb".to_string(),
+            Some(a),
+        );
+        let children = world.get::<melon_core::Children>(a).map_or(0, |c| c.len());
+        assert_eq!(children, 1);
     }
 
     #[test]
