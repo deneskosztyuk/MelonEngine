@@ -111,7 +111,7 @@ fn spawn_default_scene(world: &mut World, physics: &mut PhysicsWorld) {
     let half_extents = Vec3::new(2.5, 0.05, 2.5);
     let translation = Vec3::new(0.0, -0.05, 0.0);
     let (body_h, collider_h) =
-        physics.spawn_fixed_cuboid(translation, glam::Quat::IDENTITY, half_extents);
+        physics.spawn_fixed_cuboid(translation, Quat::IDENTITY, half_extents);
     world.spawn((
         Name("Ground".to_string()),
         Transform {
