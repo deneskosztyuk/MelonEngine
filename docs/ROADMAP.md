@@ -92,7 +92,7 @@ Goal: an editor that looks and works like Unity / Unreal / Godot.
 - [x] Viewport basics: scene renders inside its panel, Unity camera controls,
       click select, grid + axes + selection box, MSAA 4x, FPS and
       orientation overlays.
-- [ ] Pick the UI library (egui / Dear ImGui / Slint).
+- [x] Pick the UI library: egui + `egui_dock` (see `docs/adr/0001-editor-ui-library.md`).
 - [ ] Layout redesign: docking panels, menu bar, toolbar, hierarchy and
       inspector as separate panels.
 - [ ] Game view (game camera) next to the Scene view.
