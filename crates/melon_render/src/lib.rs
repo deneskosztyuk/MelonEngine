@@ -26,6 +26,7 @@ struct LightUniform {
     ambient: f32,
     color: [f32; 3],
     _pad: f32,
+    light_view_proj: [[f32; 4]; 4],
 }
 
 #[repr(C)]
@@ -141,6 +142,28 @@ fn image_from_gltf_data(data: &gltf::image::Data) -> image::DynamicImage {
 /// Format of the scene colour target. The tonemap pass maps it to the display.
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// Width and height of the sun's shadow map, in texels.
+pub const SHADOW_MAP_SIZE: u32 = 2048;
+
+/// World -> shadow clip space for a directional light. An orthographic box of
+/// half-size `radius` around `center`, seen from `to_light`.
+pub fn directional_light_view_proj(
+    to_light: glam::Vec3,
+    center: glam::Vec3,
+    radius: f32,
+) -> glam::Mat4 {
+    use glam::camera::rh::{proj::directx, view};
+    // look_at degenerates when the view direction is parallel to `up`.
+    let up = if to_light.y.abs() > 0.99 {
+        glam::Vec3::Z
+    } else {
+        glam::Vec3::Y
+    };
+    let eye = center + to_light * (2.0 * radius);
+    directx::orthographic(-radius, radius, -radius, radius, 0.0, 4.0 * radius)
+        * view::look_at_mat4(eye, center, up)
+}
+
 /// Offscreen HDR colour target that the 3D pass renders into.
 pub struct HdrTarget {
     _texture: wgpu::Texture,
@@ -172,8 +195,16 @@ pub struct SceneRenderer {
     texture_bind_group_layout: wgpu::BindGroupLayout,
     camera_buffer: wgpu::Buffer,
     light_buffer: wgpu::Buffer,
-    /// Group 0: per-frame data shared by every pipeline (camera, light).
+    /// Group 0: per-frame data shared by every pipeline (camera, light,
+    /// shadow map).
     frame_bind_group: wgpu::BindGroup,
+    shadow_pipeline: wgpu::RenderPipeline,
+    /// Light view-proj for the shadow pass (group 0 of `shadow_pipeline`).
+    shadow_camera_buffer: wgpu::Buffer,
+    shadow_bind_group: wgpu::BindGroup,
+    // Kept alive for `shadow_view`.
+    _shadow_texture: wgpu::Texture,
+    shadow_view: wgpu::TextureView,
     // Kept to keep the texture alive for the lifetime of the renderer.
     #[allow(dead_code)]
     albedo_texture: wgpu::Texture,
@@ -308,9 +339,31 @@ impl SceneRenderer {
             entries: &[
                 uniform_entry(0, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
                 uniform_entry(1, wgpu::ShaderStages::FRAGMENT),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
             ],
         });
         let model_layout = dynamic_uniform_buffer_layout(&device, "model bind group layout");
+        let shadow_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow camera bind group layout"),
+            entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX)],
+        });
+        let shadow_pipeline =
+            Renderer::build_shadow_pipeline(&device, &shadow_layout, &model_layout);
         let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("texture bind group layout"),
             entries: &[
@@ -364,6 +417,47 @@ impl SceneRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+
+        let shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow map"),
+            size: wgpu::Extent3d {
+                width: SHADOW_MAP_SIZE,
+                height: SHADOW_MAP_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let shadow_view = shadow_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Linear filtering on a comparison sampler gives 2x2 hardware PCF per tap.
+        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shadow comparison sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+        let shadow_camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shadow camera uniform buffer"),
+            size: std::mem::size_of::<CameraUniform>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let shadow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow camera bind group"),
+            layout: &shadow_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: shadow_camera_buffer.as_entire_binding(),
+            }],
+        });
+
         let frame_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("frame bind group"),
             layout: &frame_layout,
@@ -375,6 +469,14 @@ impl SceneRenderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: light_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&shadow_sampler),
                 },
             ],
         });
@@ -423,6 +525,11 @@ impl SceneRenderer {
             camera_buffer,
             light_buffer,
             frame_bind_group,
+            shadow_pipeline,
+            shadow_camera_buffer,
+            shadow_bind_group,
+            _shadow_texture: shadow_texture,
+            shadow_view,
             albedo_texture,
             albedo_bind_group,
             line_pipeline,
@@ -531,6 +638,56 @@ impl Renderer {
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
+            multiview_mask: None,
+            cache: None,
+        })
+    }
+
+    fn build_shadow_pipeline(
+        device: &wgpu::Device,
+        shadow_layout: &wgpu::BindGroupLayout,
+        model_layout: &wgpu::BindGroupLayout,
+    ) -> wgpu::RenderPipeline {
+        let shader =
+            device.create_shader_module(wgpu::include_wgsl!("../../../assets/shaders/shadow.wgsl"));
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow pipeline layout"),
+            bind_group_layouts: &[Some(shadow_layout), Some(model_layout)],
+            immediate_size: 0,
+        });
+
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("melon_render shadow pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                }],
+            },
+            primitive: wgpu::PrimitiveState {
+                // Back faces (from the sun) store depth, so lit front faces
+                // sit in front of their own stored depth: less acne.
+                cull_mode: Some(wgpu::Face::Front),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: 2.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: None,
             multiview_mask: None,
             cache: None,
         })
@@ -1027,15 +1184,64 @@ impl SceneRenderer {
     }
 
     /// `to_light` points from the scene toward the light (world space, normalized).
-    pub fn update_light(&self, to_light: glam::Vec3, ambient: f32, color: glam::Vec3) {
+    /// `light_view_proj` is the shadow box, see [`directional_light_view_proj`].
+    pub fn update_light(
+        &self,
+        to_light: glam::Vec3,
+        ambient: f32,
+        color: glam::Vec3,
+        light_view_proj: glam::Mat4,
+    ) {
         let uniform = LightUniform {
             direction: to_light.to_array(),
             ambient,
             color: color.to_array(),
             _pad: 0.0,
+            light_view_proj: light_view_proj.to_cols_array_2d(),
         };
         self.queue
             .write_buffer(&self.light_buffer, 0, bytemuck::cast_slice(&[uniform]));
+        let shadow_camera = CameraUniform {
+            view_proj: light_view_proj.to_cols_array_2d(),
+        };
+        self.queue.write_buffer(
+            &self.shadow_camera_buffer,
+            0,
+            bytemuck::cast_slice(&[shadow_camera]),
+        );
+    }
+
+    /// Renders every mesh into the sun's shadow map. Call before the 3D pass,
+    /// after `update_light` and `update_model_uniforms`.
+    pub fn render_shadow_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        draw_calls: &[(usize, &Mesh)],
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("melon_render shadow pass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.shadow_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.shadow_pipeline);
+        pass.set_bind_group(0, &self.shadow_bind_group, &[]);
+        for (entity_index, mesh) in draw_calls {
+            let offset = self.model_uniform_offset(*entity_index);
+            pass.set_bind_group(1, &self.model_bind_group, &[offset]);
+            pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
     }
 
     /// Upload an arbitrary image to a wgpu texture. The caller picks the
@@ -1538,8 +1744,37 @@ mod tests {
     }
 
     #[test]
-    fn light_uniform_size_is_32() {
-        assert_eq!(std::mem::size_of::<LightUniform>(), 32);
+    fn light_uniform_size_is_96() {
+        assert_eq!(std::mem::size_of::<LightUniform>(), 96);
+    }
+
+    fn clip(m: glam::Mat4, p: glam::Vec3) -> glam::Vec3 {
+        let c = m * p.extend(1.0);
+        c.truncate() / c.w
+    }
+
+    #[test]
+    fn light_view_proj_center_maps_to_middle() {
+        let to_light = glam::Vec3::new(1.0, 1.0, 0.0).normalize();
+        let c = clip(
+            directional_light_view_proj(to_light, glam::Vec3::new(3.0, 0.0, -2.0), 20.0),
+            glam::Vec3::new(3.0, 0.0, -2.0),
+        );
+        assert!(c.x.abs() < 1e-4 && c.y.abs() < 1e-4, "xy = {c:?}");
+        assert!(c.z > 0.0 && c.z < 1.0, "z = {}", c.z);
+    }
+
+    #[test]
+    fn light_view_proj_nearer_point_has_smaller_depth() {
+        let to_light = glam::Vec3::new(1.0, 1.0, 0.0).normalize();
+        let m = directional_light_view_proj(to_light, glam::Vec3::ZERO, 20.0);
+        assert!(clip(m, to_light).z < clip(m, -to_light).z);
+    }
+
+    #[test]
+    fn light_view_proj_vertical_light_is_finite() {
+        let m = directional_light_view_proj(glam::Vec3::Y, glam::Vec3::ZERO, 20.0);
+        assert!(m.to_cols_array().iter().all(|v| v.is_finite()), "{m:?}");
     }
 
     // --- Shared GPU test scene ---
@@ -1548,14 +1783,13 @@ mod tests {
 
     const TEST_SIZE: u32 = 64;
     /// World (-2, 0, 0): on the floor, inside the occluder's shadow.
-    #[allow(dead_code)] // read by the shadow test in Task 3
     const SHADOW_PX: (u32, u32) = (16, 32);
     /// World (2, 0, 0): on the floor, in the open.
     const LIT_PX: (u32, u32) = (48, 32);
 
     /// Renders the test scene and returns TEST_SIZE x TEST_SIZE RGBA8 sRGB pixels.
-    /// `_shadow_radius` sizes the shadow box once shadows exist.
-    fn render_test_scene(r: &mut Renderer, _shadow_radius: f32) -> Vec<u8> {
+    /// `shadow_radius` is the half-size of the shadow box around the origin.
+    fn render_test_scene(r: &mut Renderer, shadow_radius: f32) -> Vec<u8> {
         use glam::camera::rh::{proj::directx, view};
         use glam::{Mat4, Quat, Vec3};
 
@@ -1569,7 +1803,13 @@ mod tests {
             directx::orthographic(-4.0, 4.0, -4.0, 4.0, 0.1, 20.0)
                 * view::look_at_mat4(Vec3::new(0.0, 10.0, 0.0), Vec3::ZERO, Vec3::NEG_Z),
         );
-        r.update_light(Vec3::new(1.0, 1.0, 0.0).normalize(), 0.2, Vec3::ONE);
+        let to_light = Vec3::new(1.0, 1.0, 0.0).normalize();
+        r.update_light(
+            to_light,
+            0.2,
+            Vec3::ONE,
+            directional_light_view_proj(to_light, Vec3::ZERO, shadow_radius),
+        );
         r.update_model_uniforms(&[
             Mat4::from_scale_rotation_translation(
                 Vec3::new(8.0, 0.2, 8.0),
@@ -1589,6 +1829,7 @@ mod tests {
 
         let hdr = r.create_hdr_target(size);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        r.render_shadow_pass(&mut encoder, &[(0, &cube), (1, &cube)]);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("test scene pass"),
@@ -1798,6 +2039,26 @@ mod tests {
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
+            Box::new(|renderer| {
+                let pixels = render_test_scene(renderer, 20.0);
+                let (shadow, lit) = (value_at(&pixels, SHADOW_PX), value_at(&pixels, LIT_PX));
+                if shadow < 170 && lit > 200 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "occluder_casts_shadow: SHADOW_PX={shadow} (want < 170), LIT_PX={lit} (want > 200)"
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
+                let pixels = render_test_scene(renderer, 0.5);
+                let v = value_at(&pixels, LIT_PX);
+                if v > 200 {
+                    Ok(())
+                } else {
+                    Err(format!("outside_shadow_box_is_lit: LIT_PX={v}, want > 200"))
+                }
+            }),
             Box::new(|renderer| {
                 let size = renderer
                     .create_hdr_target(winit::dpi::PhysicalSize::new(0, 0))

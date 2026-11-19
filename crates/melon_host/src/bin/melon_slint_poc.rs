@@ -72,8 +72,13 @@ impl SlintScene {
         ];
 
         self.renderer.update_camera(self.camera.view_proj());
-        self.renderer
-            .update_light(Vec3::new(-0.5, 1.0, -0.5).normalize(), 0.22, Vec3::ONE);
+        let to_light = Vec3::new(-0.5, 1.0, -0.5).normalize();
+        self.renderer.update_light(
+            to_light,
+            0.22,
+            Vec3::ONE,
+            melon_render::directional_light_view_proj(to_light, Vec3::ZERO, 10.0),
+        );
         self.renderer.update_model_uniforms(&matrices);
 
         let color_view = self.target.color_view();
@@ -83,6 +88,8 @@ impl SlintScene {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Slint scene viewport encoder"),
                 });
+        let draw_calls = [(0, &self.cube), (1, &self.cube)];
+        self.renderer.render_shadow_pass(&mut encoder, &draw_calls);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Slint scene viewport pass"),
@@ -107,7 +114,6 @@ impl SlintScene {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            let draw_calls = [(0, &self.cube), (1, &self.cube)];
             self.renderer.draw_meshes(&mut pass, &draw_calls);
         }
         self.renderer

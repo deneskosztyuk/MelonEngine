@@ -53,6 +53,11 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
+// ponytail: fixed shadow box around the origin; fit it to the camera frustum
+// (or use cascades) once scenes outgrow 40 m.
+const SHADOW_CENTER: Vec3 = Vec3::ZERO;
+const SHADOW_RADIUS: f32 = 20.0;
+
 fn map_key(code: &WinitKeyCode) -> Option<KeyCode> {
     Some(match code {
         WinitKeyCode::KeyW => KeyCode::W,
@@ -370,7 +375,16 @@ impl ApplicationHandler for App {
                     .get_resource::<Light>()
                     .copied()
                     .unwrap_or_default();
-                renderer.update_light(light.to_light(), light.ambient, light.color);
+                renderer.update_light(
+                    light.to_light(),
+                    light.ambient,
+                    light.color,
+                    melon_render::directional_light_view_proj(
+                        light.to_light(),
+                        SHADOW_CENTER,
+                        SHADOW_RADIUS,
+                    ),
+                );
 
                 // Collect model matrices from all entities with Transform and MeshRef
                 let entities: Vec<(Entity, Mat4, MeshRef)> = self
@@ -514,6 +528,13 @@ impl ApplicationHandler for App {
                 let scene_depth_view = renderer.depth_view();
                 #[cfg(not(feature = "imgui-poc"))]
                 let scene_hdr = renderer.hdr_target();
+
+                let shadow_draw_calls: Vec<(usize, &melon_render::Mesh)> = textured_draw_calls
+                    .iter()
+                    .map(|(i, mesh, _)| (*i, *mesh))
+                    .chain(cube_draw_calls.iter().copied())
+                    .collect();
+                renderer.render_shadow_pass(&mut frame.encoder, &shadow_draw_calls);
 
                 {
                     let mut pass = frame

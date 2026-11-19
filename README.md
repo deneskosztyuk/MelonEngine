@@ -11,7 +11,7 @@ v0.1 — released.
 | Crate | Role |
 |---|---|
 | `melon_core` | Math (glam) re-exports, ECS (bevy_ecs) world/schedule bootstrap, Time resource |
-| `melon_render` | wgpu device/swapchain, pipelines, meshes, glTF loading, WGSL shaders. Frame: 3D pass into an HDR target, then a tonemap pass (plus gizmo lines) onto the display |
+| `melon_render` | wgpu device/swapchain, pipelines, meshes, glTF loading, WGSL shaders. Frame: sun shadow pass, 3D pass into an HDR target, then a tonemap pass (plus gizmo lines) onto the display |
 | `melon_physics` | rapier3d wrapper + transform sync systems |
 | `melon_editor` | egui-wgpu debug overlay (FPS, inspector, gizmos) |
 | `melon_host` | Binary crate: winit event loop, wires all systems, owns hot-reloader |
