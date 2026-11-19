@@ -554,7 +554,10 @@ impl Editor {
                 (vp.pointer, world.get_resource::<Camera>().copied())
         {
             let at = viewport::drop_point(&camera, pointer, vp.size);
-            self.selected = Some(spawn_model(world, &path, at));
+            match spawn_model(world, &self.project_root, &path, at, None) {
+                Ok(e) => self.selected = Some(e),
+                Err(message) => self.set_status_warning(message),
+            }
             self.gizmo_drag = None;
         }
         self.flying = vp.right_down;
@@ -726,7 +729,10 @@ impl Editor {
         if let Some(path) = dropped
             && content::is_model_path(&path)
         {
-            self.selected = Some(spawn_model(world, &path, glam::Vec3::ZERO));
+            match spawn_model(world, &self.project_root, &path, glam::Vec3::ZERO, None) {
+                Ok(e) => self.selected = Some(e),
+                Err(message) => self.set_status_warning(message),
+            }
         }
 
         if let Some(entity) = to_delete {
@@ -1486,22 +1492,81 @@ pub enum StatusKind {
     Error,
 }
 
-/// Spawn an entity showing the model at `path`, named after the file.
-pub fn spawn_model(world: &mut World, path: &str, at: glam::Vec3) -> Entity {
+/// Spawn the model at `path`: a root entity named after the file at `at`
+/// (local to `parent`, if given) with the file's glTF node tree as children,
+/// each node with a mesh drawing `<path>#mesh<N>`. A file that can't be read
+/// spawns one entity drawing the whole file (placeholder until it loads).
+/// `Err` (nothing spawned) if the meshes would pass `MAX_ENTITIES`.
+pub fn spawn_model(
+    world: &mut World,
+    project_root: &std::path::Path,
+    path: &str,
+    at: glam::Vec3,
+    parent: Option<Entity>,
+) -> Result<Entity, String> {
     let name = std::path::Path::new(path)
         .file_stem()
         .map_or_else(|| "Model".to_string(), |s| s.to_string_lossy().into_owned());
-    let handle: Handle<Model> = world
-        .get_resource_or_insert_with(|| AssetServer::new(".".into()))
-        .load(path);
-    world
-        .spawn((Name(name), Transform::from_translation(at), handle))
-        .id()
+    let nodes = (!path.starts_with(melon_core::assets::BUILTIN_PREFIX))
+        .then(|| melon_render::gltf_nodes(&project_root.join(path)).ok())
+        .flatten();
+    let meshes = nodes
+        .as_ref()
+        .map_or(1, |n| n.iter().filter(|n| n.mesh.is_some()).count());
+    let used = world.query::<&Handle<Model>>().iter(world).count();
+    if used + meshes > melon_render::MAX_ENTITIES {
+        return Err(format!(
+            "{name} has {meshes} meshes: the scene would pass the {} model limit ({used} used)",
+            melon_render::MAX_ENTITIES
+        ));
+    }
+
+    world.get_resource_or_insert_with(|| AssetServer::new(".".into()));
+    let root = world
+        .spawn((Name(name), Transform::from_translation(at)))
+        .id();
+    if let Some(p) = parent {
+        world.entity_mut(root).insert(melon_core::ChildOf(p));
+    }
+    let Some(nodes) = nodes else {
+        let handle: Handle<Model> = world.resource_mut::<AssetServer>().load(path);
+        world.entity_mut(root).insert(handle);
+        return Ok(root);
+    };
+    let mut ids = Vec::with_capacity(nodes.len());
+    for (i, node) in nodes.iter().enumerate() {
+        let parent = node.parent.map_or(root, |p| ids[p]);
+        let id = world
+            .spawn((
+                Name(node.name.clone().unwrap_or_else(|| format!("Node {i}"))),
+                Transform {
+                    translation: node.translation,
+                    rotation: node.rotation,
+                    scale: node.scale,
+                },
+                melon_core::ChildOf(parent),
+            ))
+            .id();
+        if let Some(mesh) = node.mesh {
+            let handle: Handle<Model> = world
+                .resource_mut::<AssetServer>()
+                .load(&format!("{path}#mesh{mesh}"));
+            world.entity_mut(id).insert(handle);
+        }
+        ids.push(id);
+    }
+    Ok(root)
 }
 
-/// Short label for a model path in the Inspector: the file name.
-fn model_label(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+/// Short label for a model path in the Inspector: the file name, plus the
+/// mesh for `#mesh<N>` paths.
+fn model_label(path: &str) -> String {
+    let (file, mesh) = melon_core::assets::split_mesh_fragment(path);
+    let name = file.rsplit('/').next().unwrap_or(file);
+    match mesh {
+        Some(i) => format!("{name} \u{203a} mesh{i}"),
+        None => name.to_string(),
+    }
 }
 
 /// Editor keyboard shortcuts (F5/F6/Shift+F5 live in `play_controls`, F in the viewport).
@@ -1930,14 +1995,161 @@ mod tests {
         );
     }
 
+    /// One triangle used by two nodes at x = -2 and x = +3 (as in melon_render).
+    const TWO_NODE_GLTF: &str = r#"{
+        "asset": {"version": "2.0"},
+        "scene": 0,
+        "scenes": [{"nodes": [0, 1]}],
+        "nodes": [
+            {"mesh": 0, "translation": [-2, 0, 0]},
+            {"mesh": 0, "translation": [3, 0, 0]}
+        ],
+        "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
+        "buffers": [{"byteLength": 36,
+            "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAA"}],
+        "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 36}],
+        "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3,
+            "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0]}]
+    }"#;
+
+    fn two_node_project(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("melon_unpack_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("assets/models")).unwrap();
+        std::fs::write(dir.join("assets/models/two.gltf"), TWO_NODE_GLTF).unwrap();
+        dir
+    }
+
+    fn model_path(world: &World, e: Entity) -> Option<String> {
+        world
+            .get::<Handle<Model>>(e)
+            .map(|h| world.resource::<AssetServer>().path(*h).to_string())
+    }
+
+    #[test]
+    fn unpacked_drop_spawns_root_and_node_children() {
+        let root_dir = two_node_project("tree");
+        let mut world = World::new();
+        let at = glam::Vec3::new(1.0, 0.0, 2.0);
+        let root = spawn_model(&mut world, &root_dir, "assets/models/two.gltf", at, None).unwrap();
+        assert_eq!(world.get::<Name>(root).unwrap().0, "two");
+        assert_eq!(world.get::<Transform>(root).unwrap().translation, at);
+        assert!(model_path(&world, root).is_none());
+        let children: Vec<Entity> = world
+            .get::<melon_core::Children>(root)
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(children.len(), 2);
+        let expect = [("Node 0", -2.0), ("Node 1", 3.0)];
+        for (&c, (name, x)) in children.iter().zip(expect) {
+            assert_eq!(world.get::<Name>(c).unwrap().0, name);
+            assert_eq!(
+                world.get::<Transform>(c).unwrap().translation,
+                glam::Vec3::new(x, 0.0, 0.0)
+            );
+            assert_eq!(
+                model_path(&world, c).as_deref(),
+                Some("assets/models/two.gltf#mesh0")
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root_dir);
+    }
+
+    #[test]
+    fn unreadable_file_spawns_single_whole_file_entity() {
+        let root_dir = two_node_project("unreadable");
+        std::fs::write(root_dir.join("assets/models/bad.glb"), "garbage").unwrap();
+        let mut world = World::new();
+        let e = spawn_model(
+            &mut world,
+            &root_dir,
+            "assets/models/bad.glb",
+            glam::Vec3::ZERO,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            model_path(&world, e).as_deref(),
+            Some("assets/models/bad.glb")
+        );
+        assert!(world.get::<melon_core::Children>(e).is_none());
+        let _ = std::fs::remove_dir_all(&root_dir);
+    }
+
+    #[test]
+    fn drop_onto_row_parents_new_root() {
+        let root_dir = two_node_project("row");
+        let mut world = World::new();
+        let row = world
+            .spawn((
+                Name("Row".into()),
+                Transform::from_translation(glam::Vec3::X),
+            ))
+            .id();
+        let root = spawn_model(
+            &mut world,
+            &root_dir,
+            "assets/models/two.gltf",
+            glam::Vec3::ZERO,
+            Some(row),
+        )
+        .unwrap();
+        assert_eq!(
+            world.get::<melon_core::ChildOf>(root).unwrap().parent(),
+            row
+        );
+        assert_eq!(
+            world.get::<Transform>(root).unwrap().translation,
+            glam::Vec3::ZERO
+        );
+        let _ = std::fs::remove_dir_all(&root_dir);
+    }
+
+    #[test]
+    fn drop_past_entity_cap_is_refused() {
+        let root_dir = two_node_project("cap");
+        let mut world = World::new();
+        let cube: Handle<Model> = world
+            .get_resource_or_insert_with(|| AssetServer::new(".".into()))
+            .load("builtin:cube");
+        for _ in 0..melon_render::MAX_ENTITIES - 1 {
+            world.spawn((Transform::default(), cube));
+        }
+        let before = world.query::<Entity>().iter(&world).count();
+        let result = spawn_model(
+            &mut world,
+            &root_dir,
+            "assets/models/two.gltf",
+            glam::Vec3::ZERO,
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(world.query::<Entity>().iter(&world).count(), before);
+        let _ = std::fs::remove_dir_all(&root_dir);
+    }
+
+    #[test]
+    fn mesh_label_shows_fragment() {
+        assert_eq!(
+            model_label("assets/models/car.glb#mesh2"),
+            "car.glb › mesh2"
+        );
+        assert_eq!(model_label("assets/models/car.glb"), "car.glb");
+    }
+
     #[test]
     fn spawn_model_names_from_stem() {
         let mut world = World::new();
         let e = spawn_model(
             &mut world,
+            std::path::Path::new("."),
             "assets/models/sub/Barrel.glb",
             glam::Vec3::new(1.0, 0.0, 2.0),
-        );
+            None,
+        )
+        .unwrap();
         assert_eq!(world.get::<Name>(e).unwrap().0, "Barrel");
         assert_eq!(
             world.get::<Transform>(e).unwrap().translation,
