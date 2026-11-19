@@ -39,6 +39,7 @@ rapier3d = "0.34"
 egui = "0.35"
 egui-wgpu = { version = "0.35", default-features = false }
 egui-winit = { version = "0.35", default-features = false }
+egui_dock = { version = "0.20", features = ["serde"] }
 hot-lib-reloader = "0.8"
 serde = { version = "1", features = ["derive"] }
 ron = "0.8"

@@ -95,18 +95,18 @@ impl ContentBrowser {
                 self.refresh();
             }
             ui.separator();
-            let relative = self
-                .current
-                .strip_prefix(&self.root)
-                .unwrap_or(Path::new(""));
             let root_name = self
                 .root
                 .file_name()
                 .map_or("assets".into(), |n| n.to_string_lossy().into_owned());
-            ui.label(
-                egui::RichText::new(Path::new(&root_name).join(relative).display().to_string())
-                    .color(theme::colors::TEXT_MUTED),
-            );
+            let mut crumb = root_name;
+            if let Ok(rel) = self.current.strip_prefix(&self.root) {
+                for part in rel.components() {
+                    crumb.push_str(" / ");
+                    crumb.push_str(&part.as_os_str().to_string_lossy());
+                }
+            }
+            ui.label(egui::RichText::new(crumb).color(theme::colors::TEXT_MUTED));
         });
         ui.separator();
         if self.entries.is_empty() {
@@ -119,9 +119,9 @@ impl ContentBrowser {
             .show(ui, |ui| {
                 for entry in &self.entries {
                     let (icon, detail) = if entry.is_dir {
-                        ("📁", String::new())
+                        ("🗀", String::new())
                     } else {
-                        ("📄", format_size(entry.size))
+                        ("🗋", format_size(entry.size))
                     };
                     let row = ui.horizontal(|ui| {
                         let response = ui.selectable_label(false, format!("{icon} {}", entry.name));

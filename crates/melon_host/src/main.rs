@@ -201,6 +201,7 @@ impl ApplicationHandler for App {
         editor.set_viewport_target(renderer.device(), &viewport_target);
         let mut editor_ui = Editor::new();
         editor_ui.set_console(self.console.clone());
+        editor_ui.set_assets_root(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets").into());
 
         let size = renderer.size();
         let aspect = size.width as f32 / size.height.max(1) as f32;
@@ -257,6 +258,9 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 tracing::info!("close requested");
+                if let Some(editor) = self.editor_ui.as_ref() {
+                    editor.save_layout();
+                }
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {

@@ -14,6 +14,7 @@ use winit::window::Window;
 pub mod console;
 pub mod content;
 pub mod gizmo;
+pub mod layout;
 pub mod play;
 pub mod scene;
 pub mod theme;
@@ -86,6 +87,11 @@ pub struct Editor {
     frame_ms: f32,
     /// Engine log shown in the Console panel.
     console: console::ConsoleLog,
+    console_filter: console::ConsoleFilter,
+    /// Dockable panel arrangement (saved between runs).
+    dock: egui_dock::DockState<layout::EditorTab>,
+    content: content::ContentBrowser,
+    hierarchy_query: String,
 }
 
 impl Default for Editor {
@@ -105,13 +111,33 @@ impl Default for Editor {
             world_line_vertices: Vec::new(),
             frame_ms: 16.7,
             console: console::ConsoleLog::default(),
+            console_filter: console::ConsoleFilter::default(),
+            dock: layout::default_layout(),
+            content: content::ContentBrowser::new("assets".into()),
+            hierarchy_query: String::new(),
         }
     }
 }
 
 impl Editor {
+    /// Editor with the layout saved by the last run (or the default one).
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            dock: layout::load_layout(&layout::layout_path()),
+            ..Self::default()
+        }
+    }
+
+    /// Save the panel arrangement; the host calls this when the window closes.
+    pub fn save_layout(&self) {
+        if let Err(error) = layout::save_layout(&self.dock, &layout::layout_path()) {
+            tracing::warn!(?error, "could not save the editor layout");
+        }
+    }
+
+    /// Folder the Content Browser shows (the project's `assets/`).
+    pub fn set_assets_root(&mut self, root: std::path::PathBuf) {
+        self.content = content::ContentBrowser::new(root);
     }
 
     pub fn selected_entity(&self) -> Option<Entity> {
@@ -266,23 +292,28 @@ impl Editor {
             });
         });
 
-        // Left panel: Scene hierarchy + inspector
-        egui::Panel::left("debug_panel")
-            .default_size(280.0)
-            .resizable(true)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.build_hierarchy(world, ui);
-                    ui.separator();
-                    self.build_inspector(world, ui);
-                });
-            });
-
-        // Central area: the scene viewport image, plus gizmo interaction.
+        // Dockable panels fill the rest of the window.
         self.gizmo_vertices.clear();
+        let mut dock = std::mem::replace(&mut self.dock, egui_dock::DockState::new(Vec::new()));
         egui::CentralPanel::default()
-            .frame(egui::Frame::new())
-            .show(ui, |ui| self.viewport_panel(world, ui));
+            .frame(egui::Frame::new().fill(theme::colors::CHROME))
+            .show(ui, |ui| {
+                let style = egui_dock::Style::from_egui(ui.style());
+                // Per-tab close buttons only (Window menu reopens panels); no
+                // group-wide close-all or collapse buttons.
+                egui_dock::DockArea::new(&mut dock)
+                    .style(style)
+                    .show_leaf_close_all_buttons(false)
+                    .show_leaf_collapse_buttons(false)
+                    .show_inside(
+                        ui,
+                        &mut EditorTabs {
+                            editor: self,
+                            world,
+                        },
+                    );
+            });
+        self.dock = dock;
     }
 
     /// The scene viewport: image, camera navigation, gizmo, click select,
@@ -411,10 +442,17 @@ impl Editor {
     }
 
     fn build_hierarchy(&mut self, world: &mut World, ui: &mut egui::Ui) {
-        ui.heading("Scene");
+        let mut add = false;
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.hierarchy_query)
+                    .hint_text("Search")
+                    .desired_width(ui.available_width() - 60.0),
+            );
+            add = ui.button("+ Add").clicked();
+        });
 
-        // Add Entity button
-        if ui.button("+ Add Entity").clicked() {
+        if add {
             let mut counter = world.get_resource_or_insert_with(melon_core::NameCounter::default);
             let name = format!("Entity {}", counter.0);
             counter.0 += 1;
@@ -439,9 +477,11 @@ impl Editor {
             .collect();
 
         for (entity, name) in entities {
+            if !layout::hierarchy_matches(&name.0, &self.hierarchy_query) {
+                continue;
+            }
             let is_selected = self.selected == Some(entity);
-            let label = format!("{} ({})", name.0, entity.index());
-            let response = ui.selectable_label(is_selected, label);
+            let response = ui.selectable_label(is_selected, &name.0);
             if response.clicked() {
                 self.selected = if is_selected { None } else { Some(entity) };
                 self.gizmo_drag = None;
@@ -463,8 +503,6 @@ impl Editor {
         if let Some(entity) = self.selected {
             let mut transform_edited = false;
             if let Ok(mut entity_mut) = world.get_entity_mut(entity) {
-                ui.heading("Inspector");
-
                 // Name
                 if let Some(name) = entity_mut.get::<Name>() {
                     ui.label(format!("Name: {}", name.0));
@@ -554,6 +592,8 @@ impl Editor {
             if transform_edited {
                 self.after_transform_edit(world, entity);
             }
+        } else {
+            ui.weak("Nothing selected");
         }
     }
 
@@ -1088,6 +1128,49 @@ impl EditorOverlay {
     pub fn render(&self, pass: &mut wgpu::RenderPass<'static>) {
         self.renderer
             .render(pass, &self.paint_jobs, &self.screen_descriptor);
+    }
+}
+
+/// Routes each dock tab to its panel.
+struct EditorTabs<'a> {
+    editor: &'a mut Editor,
+    world: &'a mut World,
+}
+
+impl egui_dock::TabViewer for EditorTabs<'_> {
+    type Tab = layout::EditorTab;
+
+    fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
+        tab.title().into()
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
+        use layout::EditorTab;
+        match tab {
+            EditorTab::Scene => self.editor.viewport_panel(self.world, ui),
+            EditorTab::Hierarchy => self.editor.build_hierarchy(self.world, ui),
+            EditorTab::Inspector => {
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .show(ui, |ui| self.editor.build_inspector(self.world, ui));
+            }
+            EditorTab::ContentBrowser => self.editor.content.ui(ui),
+            EditorTab::Console => {
+                console::console_ui(ui, &self.editor.console, &mut self.editor.console_filter)
+            }
+        }
+    }
+
+    /// The Scene tab fills its panel edge to edge.
+    fn clear_background(&self, tab: &Self::Tab) -> bool {
+        *tab != layout::EditorTab::Scene
+    }
+
+    /// Only the Hierarchy relies on the dock's scroll area; the other panels
+    /// size themselves (and the viewport must not scroll).
+    fn scroll_bars(&self, tab: &Self::Tab) -> [bool; 2] {
+        let scroll = *tab == layout::EditorTab::Hierarchy;
+        [false, scroll]
     }
 }
 
