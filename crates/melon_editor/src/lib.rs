@@ -58,6 +58,8 @@ struct GizmoDrag {
 pub enum PendingOperation {
     Save(std::path::PathBuf),
     Load(std::path::PathBuf),
+    /// File > Exit: the host saves the layout and closes the window.
+    Exit,
 }
 
 enum DialogChannel {
@@ -92,6 +94,11 @@ pub struct Editor {
     dock: egui_dock::DockState<layout::EditorTab>,
     content: content::ContentBrowser,
     hierarchy_query: String,
+    /// Scene file last saved or loaded; File > Save writes here.
+    current_scene: Option<std::path::PathBuf>,
+    /// Right mouse held over the viewport (fly mode): W/E/R are fly keys then.
+    flying: bool,
+    show_about: bool,
 }
 
 impl Default for Editor {
@@ -115,6 +122,9 @@ impl Default for Editor {
             dock: layout::default_layout(),
             content: content::ContentBrowser::new("assets".into()),
             hierarchy_query: String::new(),
+            current_scene: None,
+            flying: false,
+            show_about: false,
         }
     }
 }
@@ -133,6 +143,249 @@ impl Editor {
         if let Err(error) = layout::save_layout(&self.dock, &layout::layout_path()) {
             tracing::warn!(?error, "could not save the editor layout");
         }
+    }
+
+    /// The host calls this after a successful save or load.
+    pub fn set_current_scene(&mut self, path: std::path::PathBuf) {
+        self.current_scene = Some(path);
+    }
+
+    /// Mark the selected entity for deletion and clear the selection.
+    pub fn delete_selected(&mut self, world: &mut World) {
+        if let Some(entity) = self.selected
+            && let Ok(mut entity_mut) = world.get_entity_mut(entity)
+        {
+            entity_mut.insert(melon_core::PendingDelete);
+        }
+        self.clear_selection();
+    }
+
+    fn open_dialog(&mut self, save: bool) {
+        if self.pending_dialog.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let dialog = rfd::FileDialog::new().add_filter("RON", &["ron"]);
+            let path = if save {
+                dialog.set_file_name("scene.ron").save_file()
+            } else {
+                dialog.pick_file()
+            };
+            let _ = tx.send(path);
+        });
+        self.pending_dialog = Some(if save {
+            DialogChannel::Save(rx)
+        } else {
+            DialogChannel::Load(rx)
+        });
+    }
+
+    /// Turn a finished file dialog into a pending Save/Load.
+    fn poll_dialog(&mut self, world: &World) {
+        let Some(dialog) = self.pending_dialog.take() else {
+            return;
+        };
+        let result = match &dialog {
+            DialogChannel::Save(rx) => rx.try_recv(),
+            DialogChannel::Load(rx) => rx.try_recv(),
+        };
+        match result {
+            Ok(Some(mut path)) => {
+                if path.extension().is_none() {
+                    path = path.with_extension("ron");
+                }
+                let is_save = matches!(dialog, DialogChannel::Save(_));
+                self.pending_operation = dialog_operation(is_save, path, sim_state(world));
+                if self.pending_operation.is_none() {
+                    self.set_status("Stop the game before saving or loading".into());
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.pending_dialog = Some(dialog),
+            // Cancelled, or the dialog thread died.
+            Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        }
+    }
+
+    /// File > Save: write to the current scene file, or ask for one.
+    fn save(&mut self, world: &World) {
+        if sim_state(world) != SimulationState::Editing {
+            self.set_status("Stop the game before saving".into());
+            return;
+        }
+        match self.current_scene.clone() {
+            Some(path) => self.pending_operation = Some(PendingOperation::Save(path)),
+            None => self.open_dialog(true),
+        }
+    }
+
+    fn handle_shortcuts(&mut self, world: &mut World, ui: &egui::Ui) {
+        let typing = ui.ctx().text_edit_focused();
+        let pressed: Vec<Shortcut> = ui.input(|i| {
+            [
+                egui::Key::S,
+                egui::Key::Delete,
+                egui::Key::W,
+                egui::Key::E,
+                egui::Key::R,
+            ]
+            .into_iter()
+            .filter(|key| i.key_pressed(*key))
+            .filter_map(|key| shortcut_for(key, i.modifiers.command, typing, self.flying))
+            .collect()
+        });
+        for shortcut in pressed {
+            match shortcut {
+                Shortcut::Save => self.save(world),
+                Shortcut::Delete => self.delete_selected(world),
+                Shortcut::Move => self.gizmo_mode = GizmoMode::Move,
+                Shortcut::Rotate => self.gizmo_mode = GizmoMode::Rotate,
+                Shortcut::Scale => self.gizmo_mode = GizmoMode::Scale,
+            }
+        }
+    }
+
+    fn menu_bar(&mut self, world: &mut World, ui: &mut egui::Ui) {
+        let editing = sim_state(world) == SimulationState::Editing;
+        let dialog_open = self.pending_dialog.is_some();
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui
+                    .add_enabled(editing && !dialog_open, egui::Button::new("Open…"))
+                    .clicked()
+                {
+                    self.open_dialog(false);
+                }
+                if ui
+                    .add_enabled(
+                        editing && !dialog_open,
+                        egui::Button::new("Save").shortcut_text("Ctrl+S"),
+                    )
+                    .clicked()
+                {
+                    self.save(world);
+                }
+                if ui
+                    .add_enabled(editing && !dialog_open, egui::Button::new("Save As…"))
+                    .clicked()
+                {
+                    self.open_dialog(true);
+                }
+                ui.separator();
+                if ui.button("Exit").clicked() {
+                    self.pending_operation = Some(PendingOperation::Exit);
+                }
+            });
+            ui.menu_button("Edit", |ui| {
+                if ui
+                    .add_enabled(
+                        self.selected.is_some(),
+                        egui::Button::new("Delete").shortcut_text("Del"),
+                    )
+                    .clicked()
+                {
+                    self.delete_selected(world);
+                }
+            });
+            ui.menu_button("GameObject", |ui| {
+                if ui.button("Create Cube").clicked() {
+                    self.selected = Some(create_cube(world));
+                }
+            });
+            ui.menu_button("Window", |ui| {
+                for tab in layout::EditorTab::ALL {
+                    if ui.button(tab.title()).clicked() {
+                        layout::reopen(&mut self.dock, tab);
+                    }
+                }
+                ui.separator();
+                if ui.button("Reset Layout").clicked() {
+                    self.dock = layout::default_layout();
+                }
+            });
+            ui.menu_button("Help", |ui| {
+                if ui.button("About MelonEngine").clicked() {
+                    self.show_about = true;
+                }
+            });
+        });
+    }
+
+    fn toolbar(&mut self, world: &mut World, ui: &mut egui::Ui) {
+        ui.horizontal_centered(|ui| {
+            for (mode, label, key) in [
+                (GizmoMode::Move, "Move", "W"),
+                (GizmoMode::Rotate, "Rotate", "E"),
+                (GizmoMode::Scale, "Scale", "R"),
+            ] {
+                ui.selectable_value(&mut self.gizmo_mode, mode, label)
+                    .on_hover_text(format!("{label} tool ({key})"));
+            }
+            let snap = ui.input(|i| i.modifiers.shift);
+            if snap {
+                ui.colored_label(theme::colors::INFO, "Snap");
+            }
+            // Centre the play controls in the remaining width.
+            let controls_width = 330.0;
+            ui.add_space(((ui.available_width() - controls_width) / 2.0 - 160.0).max(8.0));
+            self.play_controls(world, ui);
+        });
+    }
+
+    fn status_bar(&mut self, world: &mut World, ui: &mut egui::Ui) {
+        ui.horizontal_centered(|ui| {
+            if let Some((message, time)) = &self.status_message {
+                if time.elapsed().as_secs() < 5 {
+                    let color = if message.contains("fail") {
+                        theme::colors::ERROR
+                    } else if message.starts_with("Stop the game") {
+                        theme::colors::WARNING
+                    } else {
+                        theme::colors::SUCCESS
+                    };
+                    ui.colored_label(color, message);
+                } else {
+                    self.status_message = None;
+                }
+            } else {
+                ui.colored_label(theme::colors::SUCCESS, "Ready");
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let tool = match self.gizmo_mode {
+                    GizmoMode::Move => "Move",
+                    GizmoMode::Rotate => "Rotate",
+                    GizmoMode::Scale => "Scale",
+                };
+                ui.weak(tool);
+                ui.separator();
+                ui.weak(format!("{:.0} FPS", 1000.0 / self.frame_ms.max(0.001)));
+                ui.separator();
+                let count = world.query::<&Name>().iter(world).count();
+                ui.weak(format!(
+                    "{count} {}",
+                    if count == 1 { "entity" } else { "entities" }
+                ));
+                if let Some(path) = &self.current_scene {
+                    ui.separator();
+                    ui.weak(
+                        path.file_name()
+                            .map_or(String::new(), |n| n.to_string_lossy().into_owned()),
+                    );
+                }
+            });
+        });
+    }
+
+    fn about_window(&mut self, ui: &egui::Ui) {
+        egui::Window::new("About MelonEngine")
+            .open(&mut self.show_about)
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                ui.heading(format!("MelonEngine {}", melon_core::version()));
+                ui.label("A Rust 3D game engine.");
+                ui.weak("bevy_ecs · wgpu · rapier3d · egui");
+            });
     }
 
     /// Folder the Content Browser shows (the project's `assets/`).
@@ -194,103 +447,34 @@ impl Editor {
 
     /// Build the editor UI, reading from and writing to the ECS world.
     pub fn build_ui(&mut self, world: &mut World, ui: &mut egui::Ui) {
-        // Top bar
-        egui::Panel::top("debug_bar").min_size(24.0).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(format!("MelonEngine v{}", melon_core::version()));
-                ui.separator();
-                self.play_controls(world, ui);
-                ui.separator();
-                ui.label("Gizmo:");
-                ui.radio_value(&mut self.gizmo_mode, GizmoMode::Move, "Move");
-                ui.radio_value(&mut self.gizmo_mode, GizmoMode::Rotate, "Rotate");
-                ui.radio_value(&mut self.gizmo_mode, GizmoMode::Scale, "Scale");
-                ui.separator();
-                let snap = ui.input(|i| {
-                    i.key_down(egui::Key::ShiftLeft) || i.key_down(egui::Key::ShiftRight)
-                });
-                if snap {
-                    ui.colored_label(egui::Color32::CYAN, " SNAP");
-                }
-                ui.separator();
-                // Save/Load only in edit mode, so a play session is never saved by accident.
-                let editing = world
-                    .get_resource::<SimulationState>()
-                    .copied()
-                    .unwrap_or_default()
-                    == SimulationState::Editing;
-                let dialog_open = self.pending_dialog.is_some();
-                if ui
-                    .add_enabled(!dialog_open && editing, egui::Button::new("Save"))
-                    .clicked()
-                {
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
-                        let path = rfd::FileDialog::new()
-                            .add_filter("RON", &["ron"])
-                            .set_file_name("scene.ron")
-                            .save_file();
-                        let _ = tx.send(path);
-                    });
-                    self.pending_dialog = Some(DialogChannel::Save(rx));
-                }
-                if ui
-                    .add_enabled(!dialog_open && editing, egui::Button::new("Load"))
-                    .clicked()
-                {
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
-                        let path = rfd::FileDialog::new()
-                            .add_filter("RON", &["ron"])
-                            .pick_file();
-                        let _ = tx.send(path);
-                    });
-                    self.pending_dialog = Some(DialogChannel::Load(rx));
-                }
-                // Check for dialog results
-                if let Some(dialog) = self.pending_dialog.take() {
-                    let result = match &dialog {
-                        DialogChannel::Save(rx) => rx.try_recv(),
-                        DialogChannel::Load(rx) => rx.try_recv(),
-                    };
-                    match result {
-                        Ok(Some(mut path)) => {
-                            // Append .ron extension if missing
-                            if path.extension().is_none() {
-                                path = path.with_extension("ron");
-                            }
-                            let is_save = matches!(dialog, DialogChannel::Save(_));
-                            let state = world
-                                .get_resource::<SimulationState>()
-                                .copied()
-                                .unwrap_or_default();
-                            self.pending_operation = dialog_operation(is_save, path, state);
-                            if self.pending_operation.is_none() {
-                                self.set_status("Stop the game before saving or loading".into());
-                            }
-                        }
-                        Ok(None) => {
-                            // User cancelled
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => {
-                            // Dialog still open — put it back
-                            self.pending_dialog = Some(dialog);
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            // Thread died
-                        }
-                    }
-                }
-                // Show status message for 3 seconds
-                if let Some((msg, time)) = &self.status_message {
-                    if time.elapsed().as_secs() < 3 {
-                        ui.colored_label(egui::Color32::LIGHT_BLUE, msg);
-                    } else {
-                        self.status_message = None;
-                    }
-                }
-            });
-        });
+        self.poll_dialog(world);
+        self.handle_shortcuts(world, ui);
+
+        egui::Panel::top("menu_bar")
+            .exact_size(theme::sizes::MENU_HEIGHT)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::colors::CHROME)
+                    .inner_margin(egui::vec2(6.0, 2.0)),
+            )
+            .show(ui, |ui| self.menu_bar(world, ui));
+        egui::Panel::top("toolbar")
+            .exact_size(theme::sizes::TOOLBAR_HEIGHT)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::colors::CHROME_RAISED)
+                    .inner_margin(egui::vec2(8.0, 6.0)),
+            )
+            .show(ui, |ui| self.toolbar(world, ui));
+        egui::Panel::bottom("status_bar")
+            .exact_size(theme::sizes::STATUS_HEIGHT)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::colors::CHROME)
+                    .inner_margin(egui::vec2(8.0, 2.0)),
+            )
+            .show(ui, |ui| self.status_bar(world, ui));
+        self.about_window(ui);
 
         // Dockable panels fill the rest of the window.
         self.gizmo_vertices.clear();
@@ -333,6 +517,7 @@ impl Editor {
             egui::Image::new((texture, rect.size())).sense(egui::Sense::click_and_drag()),
         );
         let vp = viewport_input(&ctx, &response, rect);
+        self.flying = vp.right_down;
         let dt = world
             .get_resource::<melon_core::Time>()
             .map_or(1.0 / 60.0, |t| t.delta_seconds);
@@ -413,9 +598,19 @@ impl Editor {
         want_pause |= ui
             .add_enabled(can_pause, egui::Button::new("⏸ Pause"))
             .clicked();
+        let step = ui
+            .add_enabled(
+                state == SimulationState::Paused,
+                egui::Button::new("⏭ Step"),
+            )
+            .on_hover_text("Advance one fixed step")
+            .clicked();
         want_stop |= ui
             .add_enabled(can_stop, egui::Button::new("⏹ Stop"))
             .clicked();
+        if step {
+            play::step(world);
+        }
 
         if want_play && can_play {
             match play::play(world) {
@@ -434,9 +629,9 @@ impl Editor {
         }
 
         let (color, label) = match state {
-            SimulationState::Editing => (egui::Color32::GRAY, "EDITING"),
-            SimulationState::Playing => (egui::Color32::GREEN, "PLAYING"),
-            SimulationState::Paused => (egui::Color32::YELLOW, "PAUSED"),
+            SimulationState::Editing => (theme::colors::TEXT_MUTED, "EDITING"),
+            SimulationState::Playing => (theme::colors::SUCCESS, "PLAYING"),
+            SimulationState::Paused => (theme::colors::WARNING, "PAUSED"),
         };
         ui.colored_label(color, label);
     }
@@ -453,17 +648,7 @@ impl Editor {
         });
 
         if add {
-            let mut counter = world.get_resource_or_insert_with(melon_core::NameCounter::default);
-            let name = format!("Entity {}", counter.0);
-            counter.0 += 1;
-            world.spawn((
-                Name(name),
-                melon_core::Transform::default(),
-                MeshRef::Cube,
-                Aabb {
-                    half_extents: glam::Vec3::new(0.5, 0.5, 0.5),
-                },
-            ));
+            self.selected = Some(create_cube(world));
         }
 
         ui.separator();
@@ -1131,6 +1316,56 @@ impl EditorOverlay {
     }
 }
 
+fn sim_state(world: &World) -> SimulationState {
+    world
+        .get_resource::<SimulationState>()
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Spawn a unit cube at the origin, named "Cube N".
+pub fn create_cube(world: &mut World) -> Entity {
+    let mut counter = world.get_resource_or_insert_with(melon_core::NameCounter::default);
+    let name = format!("Cube {}", counter.0);
+    counter.0 += 1;
+    world
+        .spawn((
+            Name(name),
+            melon_core::Transform::default(),
+            MeshRef::Cube,
+            Aabb {
+                half_extents: glam::Vec3::new(0.5, 0.5, 0.5),
+            },
+        ))
+        .id()
+}
+
+/// Editor keyboard shortcuts (F5/F6/Shift+F5 live in `play_controls`, F in the viewport).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shortcut {
+    Save,
+    Delete,
+    Move,
+    Rotate,
+    Scale,
+}
+
+/// Map a pressed key to a shortcut. Nothing fires while typing in a text
+/// field; W/E/R are fly keys while the right mouse button flies the camera.
+pub fn shortcut_for(key: egui::Key, ctrl: bool, typing: bool, flying: bool) -> Option<Shortcut> {
+    if typing {
+        return None;
+    }
+    match key {
+        egui::Key::S if ctrl => Some(Shortcut::Save),
+        egui::Key::Delete => Some(Shortcut::Delete),
+        egui::Key::W if !flying && !ctrl => Some(Shortcut::Move),
+        egui::Key::E if !flying && !ctrl => Some(Shortcut::Rotate),
+        egui::Key::R if !flying && !ctrl => Some(Shortcut::Scale),
+        _ => None,
+    }
+}
+
 /// Routes each dock tab to its panel.
 struct EditorTabs<'a> {
     editor: &'a mut Editor,
@@ -1365,6 +1600,68 @@ mod tests {
             dialog_operation(true, path, SimulationState::Editing),
             Some(PendingOperation::Save(_))
         ));
+    }
+
+    #[test]
+    fn ctrl_s_saves() {
+        assert_eq!(
+            shortcut_for(egui::Key::S, true, false, false),
+            Some(Shortcut::Save)
+        );
+        assert_eq!(shortcut_for(egui::Key::S, false, false, false), None);
+    }
+
+    #[test]
+    fn shortcuts_blocked_while_typing() {
+        for (key, ctrl) in [
+            (egui::Key::W, false),
+            (egui::Key::Delete, false),
+            (egui::Key::S, true),
+        ] {
+            assert_eq!(shortcut_for(key, ctrl, true, false), None, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn tool_keys_ignored_while_flying() {
+        assert_eq!(shortcut_for(egui::Key::W, false, false, true), None);
+        assert_eq!(
+            shortcut_for(egui::Key::W, false, false, false),
+            Some(Shortcut::Move)
+        );
+        assert_eq!(
+            shortcut_for(egui::Key::E, false, false, false),
+            Some(Shortcut::Rotate)
+        );
+        assert_eq!(
+            shortcut_for(egui::Key::R, false, false, false),
+            Some(Shortcut::Scale)
+        );
+        assert_eq!(
+            shortcut_for(egui::Key::Delete, false, false, false),
+            Some(Shortcut::Delete)
+        );
+    }
+
+    #[test]
+    fn create_cube_spawns_named_cube() {
+        let mut world = World::new();
+        let e = create_cube(&mut world);
+        assert_eq!(world.get::<Name>(e).unwrap().0, "Cube 0");
+        assert!(world.get::<MeshRef>(e).is_some());
+        let e2 = create_cube(&mut world);
+        assert_eq!(world.get::<Name>(e2).unwrap().0, "Cube 1");
+    }
+
+    #[test]
+    fn delete_selected_marks_entity_and_clears_selection() {
+        let mut world = World::new();
+        let e = create_cube(&mut world);
+        let mut editor = Editor::default();
+        editor.set_selected(Some(e));
+        editor.delete_selected(&mut world);
+        assert!(world.get::<melon_core::PendingDelete>(e).is_some());
+        assert_eq!(editor.selected_entity(), None);
     }
 
     #[test]

@@ -443,15 +443,19 @@ impl ApplicationHandler for App {
                 let pending_op = self.editor_ui.as_mut().unwrap().take_pending_operation();
                 if let Some(op) = pending_op {
                     match op {
+                        melon_editor::PendingOperation::Exit => {
+                            self.editor_ui.as_ref().unwrap().save_layout();
+                            event_loop.exit();
+                        }
                         melon_editor::PendingOperation::Save(path) => {
                             let result =
                                 melon_editor::scene::save_scene(&mut self.core.world, &path);
                             match result {
-                                Ok(()) => self
-                                    .editor_ui
-                                    .as_mut()
-                                    .unwrap()
-                                    .set_status(format!("Saved to {}", path.display())),
+                                Ok(()) => {
+                                    let editor = self.editor_ui.as_mut().unwrap();
+                                    editor.set_status(format!("Saved to {}", path.display()));
+                                    editor.set_current_scene(path);
+                                }
                                 Err(e) => self
                                     .editor_ui
                                     .as_mut()
@@ -483,6 +487,10 @@ impl ApplicationHandler for App {
                             match result {
                                 Ok(()) => {
                                     self.editor_ui.as_mut().unwrap().clear_selection();
+                                    self.editor_ui
+                                        .as_mut()
+                                        .unwrap()
+                                        .set_current_scene(path.clone());
                                     self.editor_ui
                                         .as_mut()
                                         .unwrap()
