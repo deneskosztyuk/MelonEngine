@@ -1,11 +1,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use melon_core::bevy_ecs::entity::Entity;
 use melon_core::bevy_ecs::schedule::IntoScheduleConfigs;
 use melon_core::bevy_ecs::system::Res;
 use melon_core::bevy_ecs::world::World;
-use melon_core::glam::{Mat4, Quat, Vec2, Vec3};
+use melon_core::glam::{Quat, Vec2, Vec3};
 use melon_core::{
     Aabb, BodyInfo, BodyKind, Camera, FrameCounter, Input, KeyCode, Light, Name, SimulationState,
     Time, Transform, Update,
@@ -41,24 +40,6 @@ mod hot_game {
     pub use melon_game::*;
 }
 
-const CLEAR_COLOR: wgpu::Color = wgpu::Color {
-    r: 0.06,
-    g: 0.07,
-    b: 0.09,
-    a: 1.0,
-};
-
-// ponytail: fixed shadow box around the origin; fit it to the camera frustum
-// (or use cascades) once scenes outgrow 40 m.
-const SHADOW_CENTER: Vec3 = Vec3::ZERO;
-const SHADOW_RADIUS: f32 = 20.0;
-
-/// Blend while playing and while paused (alpha is frozen then, so the pose
-/// holds still). In edit mode draw the current `Transform`.
-fn blends(state: SimulationState) -> bool {
-    state != SimulationState::Editing
-}
-
 fn map_key(code: &WinitKeyCode) -> Option<KeyCode> {
     Some(match code {
         WinitKeyCode::KeyW => KeyCode::W,
@@ -81,12 +62,8 @@ struct App {
     /// Offscreen image the scene renders into; the editor shows it in its viewport panel.
     viewport_target: Option<melon_render::ViewportTarget>,
     core: melon_core::Core,
-    /// GPU models per asset handle (created with the renderer).
-    model_cache: Option<melon_render::ModelCache>,
     last_cursor_pos: Option<Vec2>,
     last_frame: Option<Instant>,
-    // Pre-allocated render loop buffers (reused each frame to avoid heap allocation)
-    entity_matrices: Vec<Mat4>,
 }
 
 /// Project folder asset paths are relative to.
@@ -164,10 +141,8 @@ impl App {
             editor_ui: None,
             viewport_target: None,
             core,
-            model_cache: None,
             last_cursor_pos: None,
             last_frame: None,
-            entity_matrices: Vec::with_capacity(64),
         }
     }
 }
@@ -245,7 +220,6 @@ impl ApplicationHandler for App {
         );
         tracing::info!("scene: ground plane");
 
-        self.model_cache = Some(melon_render::ModelCache::new(renderer.scene()));
         self.window = Some(window.clone());
         self.renderer = Some(renderer);
         {
@@ -347,266 +321,64 @@ impl ApplicationHandler for App {
                 let Some(window) = self.window.as_ref() else {
                     return;
                 };
-
-                let view_proj = self
-                    .core
-                    .world
-                    .get_resource::<Camera>()
-                    .map(|c| c.view_proj())
-                    .unwrap_or_default();
-                renderer.update_camera(view_proj);
-
-                let light = self
-                    .core
-                    .world
-                    .get_resource::<Light>()
-                    .copied()
-                    .unwrap_or_default();
-                renderer.update_light(
-                    light.to_light(),
-                    light.ambient,
-                    light.color,
-                    melon_render::directional_light_view_proj(
-                        light.to_light(),
-                        SHADOW_CENTER,
-                        SHADOW_RADIUS,
-                    ),
-                );
-
-                // World matrices of every entity with a model, each link of the
-                // parent chain blended between its last two fixed steps.
-                let alpha = self.core.world.resource::<Time>().alpha();
-                let blend = blends(*self.core.world.resource::<SimulationState>());
-                let matrices =
-                    melon_core::hierarchy::render_matrices(&mut self.core.world, alpha, blend);
-                let entities: Vec<(Entity, Mat4, melon_core::Handle<melon_core::Model>)> = self
-                    .core
-                    .world
-                    .query::<(Entity, &melon_core::Handle<melon_core::Model>)>()
-                    .iter(&self.core.world)
-                    .filter_map(|(e, m)| matrices.get(&e).map(|mat| (e, *mat, *m)))
-                    .collect();
-
-                // Write all model uniforms to the shared buffer (one write_buffer call)
-                self.entity_matrices.clear();
-                self.entity_matrices
-                    .extend(entities.iter().map(|(_, mat, _)| *mat));
-                renderer.update_model_uniforms(&self.entity_matrices);
-
-                // Draw calls: every part of each entity's model, sharing the
-                // entity's uniform slot. Load / reload models first (needs the
-                // server mutably), then borrow them all for this frame.
-                let model_cache = self.model_cache.as_mut().unwrap();
-                {
-                    let mut server = self.core.world.resource_mut::<melon_core::AssetServer>();
-                    for (_, _, handle) in &entities {
-                        model_cache.prepare(renderer.scene(), &mut server, *handle);
-                    }
-                }
-                let model_cache = &*model_cache;
-                let mut draw_calls: Vec<(usize, &melon_render::Mesh, Option<&wgpu::BindGroup>)> =
-                    Vec::with_capacity(entities.len());
-                {
-                    let server = self.core.world.resource::<melon_core::AssetServer>();
-                    for (i, (_, _, handle)) in entities.iter().enumerate() {
-                        let model = model_cache.model(server, *handle);
-                        for (mesh, albedo) in model.meshes.iter().zip(&model.albedo_bind_groups) {
-                            draw_calls.push((i, mesh, albedo.as_ref()));
-                        }
-                    }
-                }
-
-                // --- Three-pass render: egui update, 3D + gizmo, egui overlay ---
-
+                let (Some(editor), Some(editor_ui)) =
+                    (self.editor.as_mut(), self.editor_ui.as_mut())
+                else {
+                    return;
+                };
                 let Some(mut frame) = renderer.begin_frame() else {
                     return;
                 };
 
-                // Editor update: run UI, upload textures/buffers.
-                // This generates gizmo vertices stored on the editor.
-                self.editor.as_mut().unwrap().update(
+                // Editor UI first: it may move the camera, edit entities or
+                // queue a File operation, and this frame should show all of it.
+                editor.update(
                     window,
                     renderer.device(),
                     renderer.queue(),
                     &mut frame.encoder,
                     &mut self.core.world,
-                    self.editor_ui.as_mut().unwrap(),
+                    editor_ui,
                 );
+                if editor_ui.run_pending_operation(&mut self.core.world) {
+                    event_loop.exit();
+                }
+                let gizmo_vertices = editor_ui.take_gizmo_vertices();
+                let world_line_vertices = editor_ui.take_world_line_vertices();
 
-                // Retrieve gizmo line vertices generated by the editor
-                let gizmo_vertices = self.editor_ui.as_mut().unwrap().take_gizmo_vertices();
-                let world_line_vertices =
-                    self.editor_ui.as_mut().unwrap().take_world_line_vertices();
                 // Follow the viewport panel's size: recreate the target, hand it
-                // to the editor UI, and match the camera aspect, before this frame's
-                // 3D pass so the new size is never drawn with the old aspect.
-                let requested_size = self.editor_ui.as_ref().unwrap().requested_viewport_size();
-                if requested_size != self.viewport_target.as_ref().unwrap().size() {
+                // to the editor UI, and match the camera aspect before drawing.
+                let requested_size = editor_ui.requested_viewport_size();
+                if self
+                    .viewport_target
+                    .as_ref()
+                    .is_none_or(|t| t.size() != requested_size)
+                {
                     let viewport_target = renderer.create_viewport_target(requested_size);
-                    self.editor
-                        .as_mut()
-                        .unwrap()
-                        .set_viewport_target(renderer.device(), &viewport_target);
+                    editor.set_viewport_target(renderer.device(), &viewport_target);
                     self.viewport_target = Some(viewport_target);
-
                     let aspect = requested_size.width as f32 / requested_size.height as f32;
                     if let Some(mut camera) = self.core.world.get_resource_mut::<Camera>() {
                         camera.set_aspect(aspect);
                     }
                 }
 
-                // The editor may have moved the camera: upload it again so every
-                // pass (and the gizmo it generated) uses this frame's pose.
-                let view_proj = self
-                    .core
-                    .world
-                    .get_resource::<Camera>()
-                    .map(|c| c.view_proj())
-                    .unwrap_or_default();
-                renderer.update_camera(view_proj);
-
-                // Check for pending scene save/load operations from the editor
-                let pending_op = self.editor_ui.as_mut().unwrap().take_pending_operation();
-                if let Some(op) = pending_op {
-                    match op {
-                        melon_editor::PendingOperation::Exit => {
-                            self.editor_ui.as_ref().unwrap().save_layout();
-                            event_loop.exit();
-                        }
-                        melon_editor::PendingOperation::Save(path) => {
-                            let result =
-                                melon_editor::scene::save_scene(&mut self.core.world, &path);
-                            match result {
-                                Ok(()) => {
-                                    let editor = self.editor_ui.as_mut().unwrap();
-                                    editor.set_status(format!("Saved to {}", path.display()));
-                                    editor.set_current_scene(path);
-                                }
-                                Err(e) => self
-                                    .editor_ui
-                                    .as_mut()
-                                    .unwrap()
-                                    .set_status_error(format!("Save failed: {e}")),
-                            }
-                        }
-                        melon_editor::PendingOperation::Load(path) => {
-                            let mut physics = self
-                                .core
-                                .world
-                                .get_resource_mut::<PhysicsWorld>()
-                                .map(|mut pw| {
-                                    let mut new_pw = PhysicsWorld::new();
-                                    std::mem::swap(&mut *pw, &mut new_pw);
-                                    new_pw
-                                })
-                                .unwrap_or_default();
-                            let result = melon_editor::scene::load_scene(
-                                &mut self.core.world,
-                                &mut physics,
-                                &path,
-                            );
-                            // Put physics world back
-                            if let Some(mut pw) = self.core.world.get_resource_mut::<PhysicsWorld>()
-                            {
-                                std::mem::swap(&mut *pw, &mut physics);
-                            }
-                            match result {
-                                Ok(()) => {
-                                    self.editor_ui.as_mut().unwrap().clear_selection();
-                                    self.editor_ui
-                                        .as_mut()
-                                        .unwrap()
-                                        .set_current_scene(path.clone());
-                                    self.editor_ui
-                                        .as_mut()
-                                        .unwrap()
-                                        .set_status(format!("Loaded from {}", path.display()));
-                                }
-                                Err(e) => self
-                                    .editor_ui
-                                    .as_mut()
-                                    .unwrap()
-                                    .set_status_error(format!("Load failed: {e}")),
-                            }
-                        }
-                    }
-                }
-
-                // Pass 1: clear + draw 3D meshes into the HDR target.
-                // Pass 2: tonemap HDR onto the display image + gizmo lines.
-                let viewport_target = self.viewport_target.as_ref().unwrap();
-                let viewport_color_view = viewport_target.color_view();
-                let scene_color_view = viewport_color_view.as_ref();
-                let scene_depth_view = viewport_target.depth_view();
-                let scene_hdr = viewport_target.hdr_target();
-
-                let shadow_draw_calls: Vec<(usize, &melon_render::Mesh)> =
-                    draw_calls.iter().map(|(i, mesh, _)| (*i, *mesh)).collect();
-                renderer.render_shadow_pass(&mut frame.encoder, &shadow_draw_calls);
-
-                {
-                    let mut pass = frame
-                        .encoder
-                        .begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("melon_render 3D pass"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: scene_hdr.msaa_view(),
-                                depth_slice: None,
-                                resolve_target: Some(scene_hdr.view()),
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(CLEAR_COLOR),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: Some(
-                                wgpu::RenderPassDepthStencilAttachment {
-                                    view: scene_depth_view,
-                                    depth_ops: Some(wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(1.0),
-                                        store: wgpu::StoreOp::Store,
-                                    }),
-                                    stencil_ops: None,
-                                },
-                            ),
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                            multiview_mask: None,
-                        });
-                    renderer.draw_meshes_textured(&mut pass, &draw_calls);
-                    renderer.draw_world_lines(&mut pass, &world_line_vertices, view_proj);
+                let frame_data = melon_render::extract(&mut self.core.world);
+                if let Some(target) = self.viewport_target.as_ref() {
+                    let mut server = self.core.world.resource_mut::<melon_core::AssetServer>();
+                    renderer.render_scene(
+                        &mut frame.encoder,
+                        &frame_data,
+                        &mut server,
+                        target,
+                        &world_line_vertices,
+                        &gizmo_vertices,
+                    );
                 }
                 {
-                    let mut pass =
-                        renderer.tonemap_pass(&mut frame.encoder, scene_hdr, scene_color_view);
-                    if !gizmo_vertices.is_empty() {
-                        renderer.draw_lines(&mut pass, &gizmo_vertices, view_proj);
-                    }
+                    let mut pass = renderer.ui_pass(&mut frame);
+                    editor.render(&mut pass);
                 }
-
-                // Pass 2: egui overlay (load existing color, no depth)
-                {
-                    let pass = frame
-                        .encoder
-                        .begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("melon_render egui pass"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &frame.view,
-                                depth_slice: None,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(CLEAR_COLOR),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: None,
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                            multiview_mask: None,
-                        });
-                    let mut pass = pass.forget_lifetime();
-                    self.editor.as_mut().unwrap().render(&mut pass);
-                }
-
                 renderer.end_frame(frame);
 
                 window.request_redraw();
@@ -663,15 +435,5 @@ mod tests {
         assert_eq!(map_key(&WinitKeyCode::Escape), None);
         assert_eq!(map_key(&WinitKeyCode::Enter), None);
         assert_eq!(map_key(&WinitKeyCode::Tab), None);
-    }
-
-    #[test]
-    fn blends_while_playing_and_paused() {
-        assert!(blends(SimulationState::Playing) && blends(SimulationState::Paused));
-    }
-
-    #[test]
-    fn no_blend_while_editing() {
-        assert!(!blends(SimulationState::Editing));
     }
 }
