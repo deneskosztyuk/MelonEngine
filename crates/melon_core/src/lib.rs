@@ -22,9 +22,9 @@ pub use components::{
 };
 pub use glam;
 pub use hierarchy::{ChildOf, Children, GlobalTransform};
-pub use input::{Input, KeyCode};
+pub use input::{Input, InputButton, KeyCode, MouseButton};
 pub use resources::{Camera, Light, NameCounter, SimulationState, Time};
-pub use stages::{FixedUpdate, PostUpdate, Update};
+pub use stages::{FixedUpdate, PostUpdate, PreUpdate, Update};
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -45,11 +45,11 @@ pub struct LogInterval {
     pub frames_per_log: u64,
 }
 
-/// End of frame: per-frame input deltas start over, so a game system reading
-/// `Input::mouse_delta` sees only this frame's motion.
-fn clear_input_deltas_system(input: Option<ResMut<Input>>) {
+/// End of frame: input edges, deltas and wheel start over, so a game system
+/// sees only this frame's changes.
+fn clear_input_frame_system(input: Option<ResMut<Input>>) {
     if let Some(mut input) = input {
-        input.mouse_delta = glam::Vec2::ZERO;
+        input.clear_frame();
     }
 }
 
@@ -83,6 +83,7 @@ impl Core {
         world.insert_resource(AssetServer::new(".".into()));
 
         let mut schedules = Schedules::new();
+        schedules.insert(Schedule::new(PreUpdate));
         schedules.insert(Schedule::new(FixedUpdate));
         schedules.insert(Schedule::new(Update));
         schedules.insert(Schedule::new(PostUpdate));
@@ -92,7 +93,7 @@ impl Core {
         core.add_systems(
             PostUpdate,
             (
-                clear_input_deltas_system,
+                clear_input_frame_system,
                 hierarchy::propagate_transforms_system,
             ),
         );
@@ -100,7 +101,8 @@ impl Core {
         core
     }
 
-    /// Register systems into a frame stage (`FixedUpdate`, `Update`, `PostUpdate`).
+    /// Register systems into a frame stage (`PreUpdate`, `FixedUpdate`,
+    /// `Update`, `PostUpdate`).
     pub fn add_systems<M>(
         &mut self,
         label: impl ScheduleLabel,
@@ -110,7 +112,7 @@ impl Core {
         self
     }
 
-    /// Run one frame: `FixedUpdate` once per whole `Time::fixed_delta` of
+    /// Run one frame: `PreUpdate`, then `FixedUpdate` once per whole `Time::fixed_delta` of
     /// accumulated time (only while `Playing`), then `Update`, then `PostUpdate`.
     /// Call `Time::update(frame_delta)` before this.
     #[instrument(skip(self), level = "debug")]
@@ -132,6 +134,7 @@ impl Core {
                 SimulationState::Editing => time.overstep = 0.0,
             }
         }
+        self.run_stage(PreUpdate);
         // Step button: exactly one fixed step while paused.
         if state == SimulationState::Paused && self.world.remove_resource::<StepOnce>().is_some() {
             if let Some(mut time) = self.world.get_resource_mut::<Time>() {
@@ -258,13 +261,25 @@ mod tests {
         core.world.insert_resource(state);
     }
 
+    #[derive(Resource, Default)]
+    struct Order(Vec<&'static str>);
+
+    #[test]
+    fn pre_update_runs_before_fixed_update() {
+        let mut core = counting_core();
+        core.world.init_resource::<Order>();
+        core.add_systems(PreUpdate, |mut o: ResMut<Order>| o.0.push("pre"));
+        core.add_systems(FixedUpdate, |mut o: ResMut<Order>| o.0.push("fixed"));
+        run_frames(&mut core, 1.0 / 60.0, 1);
+        assert_eq!(core.world.resource::<Order>().0, ["pre", "fixed"]);
+    }
+
     #[test]
     fn input_mouse_delta_cleared_each_frame() {
         let mut core = Core::new();
-        core.world.insert_resource(crate::Input {
-            mouse_delta: glam::Vec2::new(5.0, 5.0),
-            ..Default::default()
-        });
+        let mut input = crate::Input::default();
+        input.mouse_delta = glam::Vec2::new(5.0, 5.0);
+        core.world.insert_resource(input);
         core.update();
         assert_eq!(
             core.world.resource::<crate::Input>().mouse_delta,

@@ -6,8 +6,8 @@ use melon_core::bevy_ecs::system::Res;
 use melon_core::bevy_ecs::world::World;
 use melon_core::glam::{Quat, Vec2, Vec3};
 use melon_core::{
-    Aabb, BodyInfo, BodyKind, Camera, FrameCounter, Input, KeyCode, Light, Name, SimulationState,
-    Time, Transform, Update,
+    Aabb, BodyInfo, BodyKind, Camera, FrameCounter, Input, InputButton, KeyCode, Light, Name,
+    SimulationState, Time, Transform, Update,
 };
 use melon_editor::Editor;
 use melon_editor::EditorOverlay;
@@ -47,7 +47,8 @@ fn map_key(code: &WinitKeyCode) -> Option<KeyCode> {
         WinitKeyCode::KeyS => KeyCode::S,
         WinitKeyCode::KeyD => KeyCode::D,
         WinitKeyCode::Space => KeyCode::Space,
-        WinitKeyCode::ShiftLeft | WinitKeyCode::ShiftRight => KeyCode::LeftShift,
+        WinitKeyCode::ShiftLeft => KeyCode::ShiftLeft,
+        WinitKeyCode::ShiftRight => KeyCode::ShiftRight,
         _ => return None,
     })
 }
@@ -261,12 +262,8 @@ impl ApplicationHandler for App {
                         return;
                     };
                     match event.state {
-                        ElementState::Pressed => {
-                            input.keys_pressed.insert(mapped);
-                        }
-                        ElementState::Released => {
-                            input.keys_pressed.remove(&mapped);
-                        }
+                        ElementState::Pressed => input.press(InputButton::Key(mapped)),
+                        ElementState::Released => input.release(InputButton::Key(mapped)),
                     }
                 }
             }
@@ -275,8 +272,11 @@ impl ApplicationHandler for App {
                     let Some(mut input) = self.core.world.get_resource_mut::<Input>() else {
                         return;
                     };
-                    input.right_mouse_held = state == ElementState::Pressed;
-                    if state == ElementState::Released {
+                    let rmb = InputButton::Mouse(melon_core::MouseButton::Right);
+                    if state == ElementState::Pressed {
+                        input.press(rmb);
+                    } else {
+                        input.release(rmb);
                         self.last_cursor_pos = None;
                     }
                 }
@@ -287,7 +287,7 @@ impl ApplicationHandler for App {
                     self.last_cursor_pos = Some(new_pos);
                     return;
                 };
-                if input.right_mouse_held
+                if input.pressed(InputButton::Mouse(melon_core::MouseButton::Right))
                     && let Some(last) = self.last_cursor_pos
                 {
                     input.mouse_delta += new_pos - last;
@@ -426,8 +426,11 @@ mod tests {
         assert_eq!(map_key(&WinitKeyCode::KeyS), Some(KeyCode::S));
         assert_eq!(map_key(&WinitKeyCode::KeyD), Some(KeyCode::D));
         assert_eq!(map_key(&WinitKeyCode::Space), Some(KeyCode::Space));
-        assert_eq!(map_key(&WinitKeyCode::ShiftLeft), Some(KeyCode::LeftShift));
-        assert_eq!(map_key(&WinitKeyCode::ShiftRight), Some(KeyCode::LeftShift));
+        assert_eq!(map_key(&WinitKeyCode::ShiftLeft), Some(KeyCode::ShiftLeft));
+        assert_eq!(
+            map_key(&WinitKeyCode::ShiftRight),
+            Some(KeyCode::ShiftRight)
+        );
     }
 
     #[test]
