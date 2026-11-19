@@ -62,6 +62,11 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   `theme::colors` / `theme::sizes`, not literals. Log with `tracing`; INFO and
   above shows in the Console panel. Menu items and buttons need a working
   action: no placeholder controls.
+- **Overlay shapes.** Solid editor shapes (gizmo now; icons and debug shapes
+  later) are `melon_render::OverlayDraw`s passed to `render_scene(.., overlay)`:
+  drawn after tonemapping in exact sRGB colours, `OnTop` or `SceneTested`.
+  The gizmo builds its draws and picks handles in `melon_editor::gizmo`
+  (`gizmo_draws`, `pick_handle`, `drag_*`).
 - **Viewport.** `melon_editor/src/viewport.rs` holds the UI-library-independent
   viewport logic (`EditorCamera`, `pick`, grid/selection lines). UI glue only
   fills a `ViewportInput` and shows the `ViewportTarget` image; the scene

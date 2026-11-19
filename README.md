@@ -11,7 +11,7 @@ v0.1 — released.
 | Crate | Role |
 |---|---|
 | `melon_core` | Math (glam) re-exports, ECS (bevy_ecs) world/schedule bootstrap, Time resource |
-| `melon_render` | wgpu device/swapchain, pipelines, meshes, glTF loading, WGSL shaders. Frame: sun shadow pass, 3D pass into an HDR target, then a tonemap pass (plus gizmo lines) onto the display |
+| `melon_render` | wgpu device/swapchain, pipelines, meshes, glTF loading, WGSL shaders. Frame: sun shadow pass, 3D pass into an HDR target, then a tonemap pass onto the display, then an overlay pass (solid editor shapes such as the gizmo) |
 | `melon_physics` | rapier3d wrapper + transform sync systems |
 | `melon_editor` | egui-wgpu debug overlay (FPS, inspector, gizmos) |
 | `melon_host` | Binary crate: winit event loop, wires all systems, owns hot-reloader |
@@ -52,7 +52,7 @@ Viewport (Unity-style, pointer over the viewport):
 - **Middle drag** — pan
 - **Scroll** — zoom toward the pivot
 - **F** — frame the selected entity
-- **Left click** — select (click empty space to deselect); drag a gizmo handle to move/rotate/scale
+- **Left click** — select (click empty space to deselect); drag a gizmo handle to move/rotate/scale. Move: arrows (one axis), the small squares (two axes), the grey centre ball (free). Scale: cube tips (one axis), the triangles (two axes), the centre cube (uniform). Hold **Shift** while dragging to snap
 
 Simulation:
 
