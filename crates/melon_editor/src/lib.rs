@@ -778,45 +778,96 @@ impl Editor {
                     hide_below = self.collapsed.contains(&entity).then_some(depth);
                 }
                 let is_selected = self.selected == Some(entity);
-                let row = ui.horizontal(|ui| {
-                    if !searching {
-                        ui.add_space(depth as f32 * theme::sizes::SPACING * 2.0);
-                        if has_children {
-                            let open = !self.collapsed.contains(&entity);
-                            if ui
-                                .small_button(if open { "\u{25be}" } else { "\u{25b8}" })
-                                .clicked()
-                            {
-                                if open {
-                                    self.collapsed.insert(entity);
-                                } else {
-                                    self.collapsed.remove(&entity);
-                                }
-                            }
-                        } else {
-                            ui.add_space(theme::sizes::SPACING * 3.0);
-                        }
-                    }
-                    if searching {
-                        ui.selectable_label(is_selected, &name)
-                    } else {
-                        ui.dnd_drag_source(egui::Id::new(("hierarchy_row", entity)), entity, |ui| {
-                            ui.selectable_label(is_selected, &name)
-                        })
-                        .inner
-                    }
-                });
-                let response = row.inner;
+                // One full-width hit area per row: click selects, the arrow
+                // toggles children, dragging carries the entity.
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), theme::sizes::ROW_HEIGHT),
+                    egui::Sense::hover(),
+                );
+                let sense = if searching {
+                    egui::Sense::click()
+                } else {
+                    egui::Sense::click_and_drag()
+                };
+                let response = ui.interact(rect, egui::Id::new(("hierarchy_row", entity)), sense);
+                let indent = if searching {
+                    0.0
+                } else {
+                    depth as f32 * theme::sizes::SPACING * 2.0
+                };
+                let arrow_rect = egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + indent, rect.top()),
+                    egui::vec2(theme::sizes::ROW_HEIGHT, rect.height()),
+                );
+                let on_arrow = !searching
+                    && has_children
+                    && response
+                        .interact_pointer_pos()
+                        .is_some_and(|p| arrow_rect.contains(p));
                 if response.clicked() {
-                    self.selected = if is_selected { None } else { Some(entity) };
-                    self.gizmo_drag = None;
+                    if on_arrow {
+                        if !self.collapsed.remove(&entity) {
+                            self.collapsed.insert(entity);
+                        }
+                    } else {
+                        self.selected = if is_selected { None } else { Some(entity) };
+                        self.gizmo_drag = None;
+                    }
                 }
                 if response.secondary_clicked() {
                     to_delete = Some(entity);
                 }
-                if !searching && carrying && row.response.contains_pointer() {
-                    ui.painter().rect_stroke(
-                        row.response.rect,
+                if !searching && response.drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), entity);
+                }
+
+                let painter = ui.painter();
+                let fill = if is_selected {
+                    theme::colors::ACCENT_SOFT
+                } else if response.hovered() {
+                    theme::colors::SURFACE_RAISED
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                painter.rect_filled(rect, theme::sizes::RADIUS, fill);
+                if !searching && has_children {
+                    let c = arrow_rect.center();
+                    let r = theme::sizes::ROW_HEIGHT * 0.15;
+                    let points = if self.collapsed.contains(&entity) {
+                        vec![
+                            c + egui::vec2(-r, -r),
+                            c + egui::vec2(r, 0.0),
+                            c + egui::vec2(-r, r),
+                        ]
+                    } else {
+                        vec![
+                            c + egui::vec2(-r, -r * 0.6),
+                            c + egui::vec2(r, -r * 0.6),
+                            c + egui::vec2(0.0, r),
+                        ]
+                    };
+                    painter.add(egui::Shape::convex_polygon(
+                        points,
+                        theme::colors::TEXT_MUTED,
+                        egui::Stroke::NONE,
+                    ));
+                }
+                let text_x = if searching {
+                    rect.left() + theme::sizes::SPACING
+                } else {
+                    arrow_rect.right()
+                };
+                painter.text(
+                    egui::pos2(text_x, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    &name,
+                    egui::TextStyle::Body.resolve(ui.style()),
+                    theme::colors::TEXT,
+                );
+
+                if !searching && carrying && response.contains_pointer() {
+                    painter.rect_stroke(
+                        rect,
                         theme::sizes::RADIUS,
                         egui::Stroke::new(1.0, theme::colors::ACCENT),
                         egui::StrokeKind::Inside,
@@ -2047,6 +2098,84 @@ mod tests {
             .id();
         let b = world.spawn((Name("B".into()), Transform::default())).id();
         (world, a, b)
+    }
+
+    /// Rect of `e`'s Hierarchy row after one layout frame.
+    fn row_rect(
+        editor: &mut Editor,
+        world: &mut World,
+        ctx: &egui::Context,
+        e: Entity,
+    ) -> egui::Rect {
+        hierarchy_frame(editor, world, ctx, egui::pos2(100.0, 550.0), false);
+        ctx.read_response(egui::Id::new(("hierarchy_row", e)))
+            .expect("row was drawn")
+            .rect
+    }
+
+    /// Move to `pos`, press, release: one click, as egui sees it.
+    fn click_hierarchy(
+        editor: &mut Editor,
+        world: &mut World,
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+    ) {
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(pos)],
+            vec![button(true)],
+            vec![button(false)],
+        ] {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| editor.build_hierarchy(world, ui));
+        }
+    }
+
+    #[test]
+    fn hierarchy_ui_click_selects_row() {
+        let (mut world, a, _) = two_roots();
+        let mut editor = Editor::new();
+        let ctx = egui::Context::default();
+        let rect = row_rect(&mut editor, &mut world, &ctx, a);
+        click_hierarchy(&mut editor, &mut world, &ctx, rect.center());
+        assert_eq!(editor.selected_entity(), Some(a));
+    }
+
+    #[test]
+    fn hierarchy_rows_span_full_width() {
+        let (mut world, a, _) = two_roots();
+        let mut editor = Editor::new();
+        let ctx = egui::Context::default();
+        let rect = row_rect(&mut editor, &mut world, &ctx, a);
+        assert!(rect.width() > 380.0, "row is {} wide", rect.width());
+    }
+
+    #[test]
+    fn hierarchy_ui_arrow_click_collapses_without_selecting() {
+        let (mut world, a, b) = two_roots();
+        world.entity_mut(b).insert(melon_core::ChildOf(a));
+        let mut editor = Editor::new();
+        let ctx = egui::Context::default();
+        let rect = row_rect(&mut editor, &mut world, &ctx, a);
+        let arrow = egui::pos2(
+            rect.left() + theme::sizes::ROW_HEIGHT * 0.5,
+            rect.center().y,
+        );
+        click_hierarchy(&mut editor, &mut world, &ctx, arrow);
+        assert!(editor.collapsed.contains(&a));
+        assert_eq!(editor.selected_entity(), None);
     }
 
     #[test]
