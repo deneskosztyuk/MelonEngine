@@ -14,6 +14,7 @@ use winit::window::Window;
 pub mod gizmo;
 pub mod play;
 pub mod scene;
+pub mod theme;
 pub mod viewport;
 
 use gizmo::{
@@ -969,6 +970,7 @@ impl EditorOverlay {
         surface_format: wgpu::TextureFormat,
     ) -> Self {
         let ctx = egui::Context::default();
+        theme::apply(&ctx);
         let state =
             egui_winit::State::new(ctx.clone(), ViewportId::ROOT, &**window, None, None, None);
         let renderer = egui_wgpu::Renderer::new(
