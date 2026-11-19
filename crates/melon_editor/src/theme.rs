@@ -10,6 +10,14 @@ pub mod colors {
     pub const CHROME_RAISED: Color32 = Color32::from_rgb(0x18, 0x1b, 0x20);
     pub const SURFACE: Color32 = Color32::from_rgb(0x1c, 0x20, 0x26);
     pub const SURFACE_RAISED: Color32 = Color32::from_rgb(0x24, 0x29, 0x32);
+    pub const INSPECTOR_CARDS: [Color32; 2] = [
+        Color32::from_rgb(0x1a, 0x1d, 0x22),
+        Color32::from_rgb(0x23, 0x27, 0x2d),
+    ];
+    pub const INSPECTOR_ROWS: [Color32; 2] = [
+        Color32::from_rgb(0x30, 0x34, 0x3a),
+        Color32::from_rgb(0x39, 0x3d, 0x43),
+    ];
     pub const VIEWPORT: Color32 = Color32::from_rgb(0x34, 0x3b, 0x46);
     pub const BORDER: Color32 = Color32::from_rgb(0x30, 0x36, 0x40);
     pub const BORDER_STRONG: Color32 = Color32::from_rgb(0x41, 0x49, 0x56);
@@ -32,6 +40,7 @@ pub mod colors {
 pub mod sizes {
     pub const ABOUT_LOGO: f32 = 96.0;
     pub const MENU_HEIGHT: f32 = 28.0;
+    pub const TOOL_BUTTON: egui::Vec2 = egui::vec2(32.0, 26.0);
     pub const TOOLBAR_HEIGHT: f32 = 38.0;
     pub const PANEL_HEADER_HEIGHT: f32 = 30.0;
     pub const STATUS_HEIGHT: f32 = 23.0;

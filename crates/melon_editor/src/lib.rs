@@ -23,6 +23,8 @@ pub mod layout;
 pub mod play;
 pub mod scene;
 pub mod theme;
+mod toolbar_icon;
+use toolbar_icon::ToolbarIcon;
 pub mod viewport;
 
 use gizmo::{
@@ -353,22 +355,31 @@ impl Editor {
 
     fn toolbar(&mut self, world: &mut World, ui: &mut egui::Ui) {
         ui.horizontal_centered(|ui| {
-            for (mode, label, key) in [
-                (GizmoMode::Move, "Move", "W"),
-                (GizmoMode::Rotate, "Rotate", "E"),
-                (GizmoMode::Scale, "Scale", "R"),
+            let spacing = ui.spacing().item_spacing.x;
+            let controls_width =
+                7.0 * theme::sizes::TOOL_BUTTON.x + 7.0 * spacing + theme::sizes::SPACING;
+            ui.add_space(((ui.available_width() - controls_width) * 0.5).max(0.0));
+            for (mode, icon) in [
+                (GizmoMode::Move, ToolbarIcon::Move),
+                (GizmoMode::Rotate, ToolbarIcon::Rotate),
+                (GizmoMode::Scale, ToolbarIcon::Scale),
             ] {
-                ui.selectable_value(&mut self.gizmo_mode, mode, label)
-                    .on_hover_text(format!("{label} tool ({key})"));
+                if icon
+                    .button(ui, true, Some(self.gizmo_mode == mode))
+                    .clicked()
+                {
+                    self.gizmo_mode = mode;
+                }
             }
-            let snap = ui.input(|i| i.modifiers.shift);
-            if snap {
+            ui.add(
+                egui::Separator::default()
+                    .vertical()
+                    .spacing(theme::sizes::SPACING),
+            );
+            self.play_controls(world, ui);
+            if ui.input(|i| i.modifiers.shift) {
                 ui.colored_label(theme::colors::INFO, "Snap");
             }
-            // Centre the play controls in the remaining width.
-            let controls_width = 330.0;
-            ui.add_space(((ui.available_width() - controls_width) / 2.0 - 160.0).max(8.0));
-            self.play_controls(world, ui);
         });
     }
 
@@ -713,22 +724,12 @@ impl Editor {
         let can_play = state != SimulationState::Playing;
         let can_pause = state == SimulationState::Playing;
         let can_stop = state != SimulationState::Editing;
-        want_play |= ui
-            .add_enabled(can_play, egui::Button::new("▶ Play"))
+        want_play |= ToolbarIcon::Play.button(ui, can_play, None).clicked();
+        want_pause |= ToolbarIcon::Pause.button(ui, can_pause, None).clicked();
+        let step = ToolbarIcon::Step
+            .button(ui, state == SimulationState::Paused, None)
             .clicked();
-        want_pause |= ui
-            .add_enabled(can_pause, egui::Button::new("⏸ Pause"))
-            .clicked();
-        let step = ui
-            .add_enabled(
-                state == SimulationState::Paused,
-                egui::Button::new("⏭ Step"),
-            )
-            .on_hover_text("Advance one fixed step")
-            .clicked();
-        want_stop |= ui
-            .add_enabled(can_stop, egui::Button::new("⏹ Stop"))
-            .clicked();
+        want_stop |= ToolbarIcon::Stop.button(ui, can_stop, None).clicked();
         if step {
             play::step(world);
         }
@@ -973,66 +974,58 @@ impl Editor {
             ui.add_space(2.0);
         }
 
+        let mut card_fills = theme::colors::INSPECTOR_CARDS;
         let mut transform_edited = false;
         if let Some(mut transform) = entity_mut.get_mut::<Transform>() {
             // Edit a copy and write back only on change, so change detection
             // does not fire every frame just because the inspector is open.
             let mut t = *transform;
-            egui::CollapsingHeader::new("Transform")
-                .default_open(true)
-                .show(ui, |ui| {
-                    egui::Grid::new("inspector_transform")
-                        .num_columns(2)
-                        .spacing([8.0, 6.0])
-                        .show(ui, |ui| {
-                            if let Some(current) = &current_model {
-                                ui.label("Mesh");
-                                egui::ComboBox::from_id_salt("inspector_mesh")
-                                    .selected_text(model_label(current))
-                                    .width(ui.available_width())
-                                    .show_ui(ui, |ui| {
-                                        // Listed only while the dropdown is open.
-                                        for path in content::model_list(&self.project_root) {
-                                            if ui
-                                                .selectable_label(
-                                                    *current == path,
-                                                    model_label(&path),
-                                                )
-                                                .on_hover_text(&path)
-                                                .clicked()
-                                            {
-                                                new_model = Some(path);
-                                            }
-                                        }
-                                    });
-                                ui.end_row();
+            inspector_card(ui, &mut card_fills, "Transform", |ui| {
+                if let Some(current) = &current_model {
+                    ui.label("Mesh");
+                    egui::ComboBox::from_id_salt("inspector_mesh")
+                        .selected_text(model_label(current))
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            // Listed only while the dropdown is open.
+                            for path in content::model_list(&self.project_root) {
+                                if ui
+                                    .selectable_label(*current == path, model_label(&path))
+                                    .on_hover_text(&path)
+                                    .clicked()
+                                {
+                                    new_model = Some(path);
+                                }
                             }
-
-                            ui.label("Position");
-                            transform_edited |= vec3_field(ui, &mut t.translation, 0.05, None);
-                            ui.end_row();
-
-                            ui.label("Rotation");
-                            let (x, y, z) = t.rotation.to_euler(glam::EulerRot::XYZ);
-                            let mut degrees =
-                                glam::Vec3::new(x.to_degrees(), y.to_degrees(), z.to_degrees());
-                            if vec3_field(ui, &mut degrees, 0.5, None) {
-                                t.rotation = glam::Quat::from_euler(
-                                    glam::EulerRot::XYZ,
-                                    degrees.x.to_radians(),
-                                    degrees.y.to_radians(),
-                                    degrees.z.to_radians(),
-                                );
-                                transform_edited = true;
-                            }
-                            ui.end_row();
-
-                            ui.label("Scale");
-                            // Zero scale is rejected by scene validation (and Play).
-                            transform_edited |= vec3_field(ui, &mut t.scale, 0.01, Some(0.001));
-                            ui.end_row();
                         });
-                });
+                    ui.end_row();
+                }
+
+                ui.label("Position");
+                transform_edited |=
+                    vec3_field(ui, &mut t.translation, glam::Vec3::ZERO, 0.05, None);
+                ui.end_row();
+
+                ui.label("Rotation");
+                let (x, y, z) = t.rotation.to_euler(glam::EulerRot::XYZ);
+                let mut degrees = glam::Vec3::new(x.to_degrees(), y.to_degrees(), z.to_degrees());
+                if vec3_field(ui, &mut degrees, glam::Vec3::ZERO, 0.5, None) {
+                    t.rotation = glam::Quat::from_euler(
+                        glam::EulerRot::XYZ,
+                        degrees.x.to_radians(),
+                        degrees.y.to_radians(),
+                        degrees.z.to_radians(),
+                    );
+                    transform_edited = true;
+                }
+                ui.end_row();
+
+                ui.label("Scale");
+                // Zero scale is rejected by scene validation (and Play).
+                transform_edited |=
+                    vec3_field(ui, &mut t.scale, glam::Vec3::ONE, 0.01, Some(0.001));
+                ui.end_row();
+            });
             if transform_edited {
                 *transform = t;
             }
@@ -1040,37 +1033,32 @@ impl Editor {
 
         if let Some(body_info) = entity_mut.get::<BodyInfo>() {
             let body_info = *body_info;
-            egui::CollapsingHeader::new("Rigidbody")
-                .default_open(true)
-                .show(ui, |ui| {
-                    egui::Grid::new("inspector_rigidbody")
-                        .num_columns(2)
-                        .spacing([8.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label("Type");
-                            ui.label(format!("{:?}", body_info.body_type));
-                            ui.end_row();
-                            let h = body_info.half_extents;
-                            ui.label("Half extents");
-                            ui.label(format!("{:.2}  {:.2}  {:.2}", h.x, h.y, h.z));
-                            ui.end_row();
-                        });
-                });
+            inspector_card(ui, &mut card_fills, "Rigidbody", |ui| {
+                ui.label("Type");
+                inspector_value(ui, format!("{:?}", body_info.body_type));
+                ui.end_row();
+                let h = body_info.half_extents;
+                ui.label("Half extents");
+                inspector_value(ui, format!("{:.2}  {:.2}  {:.2}", h.x, h.y, h.z));
+                ui.end_row();
+            });
         }
 
         let spins = entity_mut.get::<Spin>().is_some();
         let bobs = entity_mut.get::<melon_core::Bob>().is_some();
         if spins || bobs {
-            egui::CollapsingHeader::new("Behaviours")
-                .default_open(true)
-                .show(ui, |ui| {
-                    if spins {
-                        ui.label("Spin: rotates about Y while playing");
-                    }
-                    if bobs {
-                        ui.label("Bob: moves up and down while playing");
-                    }
-                });
+            inspector_card(ui, &mut card_fills, "Behaviours", |ui| {
+                if spins {
+                    ui.label("Spin");
+                    inspector_value(ui, "Rotates about Y while playing");
+                    ui.end_row();
+                }
+                if bobs {
+                    ui.label("Bob");
+                    inspector_value(ui, "Moves up and down while playing");
+                    ui.end_row();
+                }
+            });
         }
 
         if transform_edited {
@@ -1512,10 +1500,51 @@ pub fn create_cube(world: &mut World) -> Entity {
         .id()
 }
 
+fn inspector_card(
+    ui: &mut egui::Ui,
+    fills: &mut [egui::Color32; 2],
+    title: &str,
+    rows: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Frame::new()
+        .fill(fills[0])
+        .stroke(egui::Stroke::new(1.0, theme::colors::BORDER))
+        .corner_radius(theme::sizes::RADIUS)
+        .inner_margin(theme::sizes::SPACING)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            egui::CollapsingHeader::new(title)
+                .id_salt(title)
+                .default_open(true)
+                .show_unindented(ui, |ui| {
+                    egui::Grid::new(("inspector_rows", title))
+                        .num_columns(2)
+                        .spacing([8.0, theme::sizes::SPACING])
+                        .with_row_color(|row, _| Some(theme::colors::INSPECTOR_ROWS[row % 2]))
+                        .show(ui, rows);
+                });
+        });
+    fills.swap(0, 1);
+}
+
+/// Fill the value column so read-only rows get the same band width as editable rows.
+fn inspector_value(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
+    ui.horizontal(|ui| {
+        ui.set_min_width(ui.available_width());
+        ui.add(egui::Label::new(text).wrap());
+    });
+}
+
 /// One inspector row of three colour-coded X / Y / Z drag fields sharing the
 /// row's width. Every field is always drawn (no short-circuit). Returns true
 /// if any value changed.
-fn vec3_field(ui: &mut egui::Ui, value: &mut glam::Vec3, speed: f64, min: Option<f32>) -> bool {
+fn vec3_field(
+    ui: &mut egui::Ui,
+    value: &mut glam::Vec3,
+    default: glam::Vec3,
+    speed: f64,
+    min: Option<f32>,
+) -> bool {
     let mut changed = false;
     let axes = [
         ("X", theme::colors::AXIS_X),
@@ -1523,22 +1552,46 @@ fn vec3_field(ui: &mut egui::Ui, value: &mut glam::Vec3, speed: f64, min: Option
         ("Z", theme::colors::AXIS_Z),
     ];
     ui.horizontal(|ui| {
+        ui.set_min_width(ui.available_width());
         let spacing = ui.spacing().item_spacing.x;
         let field_width = ((ui.available_width() - 3.0 * (12.0 + 2.0 * spacing)) / 3.0).max(48.0);
         for (i, (label, color)) in axes.into_iter().enumerate() {
             ui.label(egui::RichText::new(label).color(color).strong());
-            let mut drag = egui::DragValue::new(&mut value[i])
-                .speed(speed)
-                .max_decimals(3);
-            if let Some(min) = min {
-                drag = drag.range(min..=f32::MAX);
-            }
-            changed |= ui
-                .add_sized([field_width, theme::sizes::INPUT_HEIGHT], drag)
-                .changed();
+            changed |=
+                resettable_drag_value(ui, &mut value[i], default[i], speed, min, field_width)
+                    .changed();
         }
     });
     changed
+}
+
+fn resettable_drag_value(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    default: f32,
+    speed: f64,
+    min: Option<f32>,
+    width: f32,
+) -> egui::Response {
+    let mut drag = egui::DragValue::new(value).speed(speed).max_decimals(3);
+    if let Some(min) = min {
+        drag = drag.range(min..=f32::MAX);
+    }
+    let mut response = ui
+        .add_sized([width, theme::sizes::INPUT_HEIGHT], drag)
+        .on_hover_text("Double-click to reset");
+    if response.double_clicked() {
+        // The first click opens DragValue's text editor. Discard its buffer
+        // before it can commit the old text on losing focus.
+        ui.data_mut(|data| data.remove_temp::<String>(response.id));
+        response.surrender_focus();
+        let reset = min.map_or(default, |min| default.max(min));
+        if *value != reset {
+            *value = reset;
+            response.mark_changed();
+        }
+    }
+    response
 }
 
 /// Severity of a status-bar message (its colour).
@@ -1839,6 +1892,38 @@ fn snap_previous_transform(world: &mut World, entity: Entity) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn double_click_resets_drag_value_to_its_field_default() {
+        let ctx = egui::Context::default();
+        let mut value = 2.5;
+        let mut pos = egui::Pos2::ZERO;
+        let mut changed = false;
+        for frame in 0..7 {
+            let events = match frame {
+                0 | 6 => vec![],
+                1 => vec![egui::Event::PointerMoved(pos)],
+                _ => vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: frame % 2 == 0,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            };
+            let input = egui::RawInput {
+                time: Some(f64::from(frame) * 0.05),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                let response = resettable_drag_value(ui, &mut value, 1.0, 0.01, Some(0.001), 80.0);
+                pos = response.rect.center();
+                changed = response.changed();
+            });
+            assert_eq!(value, if frame < 5 { 2.5 } else { 1.0 });
+            assert_eq!(changed, frame == 5);
+        }
+    }
 
     fn world_pos(world: &World, e: Entity) -> glam::Vec3 {
         world_matrix(world, e).transform_point3(glam::Vec3::ZERO)
