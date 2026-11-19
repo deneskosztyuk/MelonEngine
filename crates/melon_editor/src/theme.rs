@@ -30,6 +30,7 @@ pub mod colors {
 
 /// Size tokens, in points.
 pub mod sizes {
+    pub const ABOUT_LOGO: f32 = 96.0;
     pub const MENU_HEIGHT: f32 = 28.0;
     pub const TOOLBAR_HEIGHT: f32 = 38.0;
     pub const PANEL_HEADER_HEIGHT: f32 = 30.0;

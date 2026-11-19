@@ -178,13 +178,34 @@ impl ApplicationHandler for App {
             return;
         }
 
+        let attributes = Window::default_attributes()
+            .with_title("MelonEngine v0.1")
+            .with_maximized(true);
+        #[cfg(target_os = "windows")]
+        let attributes = {
+            use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
+            let scale = event_loop
+                .primary_monitor()
+                .map_or(1.0, |m| m.scale_factor());
+            let icon = |points: u32| {
+                let size = winit::dpi::LogicalSize::new(points, points).to_physical(scale);
+                winit::window::Icon::from_resource(1, Some(size)).expect("embedded engine icon")
+            };
+            attributes
+                .with_window_icon(Some(icon(16)))
+                .with_taskbar_icon(Some(icon(32)))
+        };
+        #[cfg(not(target_os = "windows"))]
+        let attributes = {
+            let pixels = melon_editor::engine_icon();
+            let (width, height) = pixels.dimensions();
+            let icon = winit::window::Icon::from_rgba(pixels.into_raw(), width, height)
+                .expect("embedded engine icon");
+            attributes.with_window_icon(Some(icon))
+        };
         let window = Arc::new(
             event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title("MelonEngine v0.1")
-                        .with_maximized(true),
-                )
+                .create_window(attributes)
                 .expect("failed to create window"),
         );
 

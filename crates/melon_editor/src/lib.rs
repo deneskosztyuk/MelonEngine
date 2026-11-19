@@ -72,6 +72,13 @@ enum DialogChannel {
     Load(std::sync::mpsc::Receiver<Option<std::path::PathBuf>>),
 }
 
+/// Shared artwork for native windows and the editor chrome.
+pub fn engine_icon() -> image::RgbaImage {
+    image::load_from_memory(include_bytes!("../../../assets/branding/melon-engine.png"))
+        .expect("embedded MelonEngine PNG")
+        .into_rgba8()
+}
+
 /// Editor holds the UI state (selection, gizmo mode, etc.) and builds the egui UI.
 pub struct Editor {
     selected: Option<Entity>,
@@ -110,6 +117,7 @@ pub struct Editor {
     /// Right mouse held over the viewport (fly mode): W/E/R are fly keys then.
     flying: bool,
     show_about: bool,
+    logo: Option<egui::TextureHandle>,
 }
 
 impl Default for Editor {
@@ -139,6 +147,7 @@ impl Default for Editor {
             current_scene: None,
             flying: false,
             show_about: false,
+            logo: None,
         }
     }
 }
@@ -261,6 +270,20 @@ impl Editor {
                 Shortcut::Scale => self.gizmo_mode = GizmoMode::Scale,
             }
         }
+    }
+
+    fn logo(&mut self, ctx: &egui::Context) -> egui::TextureId {
+        self.logo
+            .get_or_insert_with(|| {
+                let pixels = engine_icon();
+                let size = [pixels.width() as usize, pixels.height() as usize];
+                ctx.load_texture(
+                    "MelonEngine",
+                    egui::ColorImage::from_rgba_unmultiplied(size, &pixels),
+                    egui::TextureOptions::LINEAR,
+                )
+            })
+            .id()
     }
 
     fn menu_bar(&mut self, world: &mut World, ui: &mut egui::Ui) {
@@ -393,11 +416,16 @@ impl Editor {
     }
 
     fn about_window(&mut self, ui: &egui::Ui) {
+        let logo = self.logo(ui.ctx());
         egui::Window::new("About MelonEngine")
             .open(&mut self.show_about)
             .collapsible(false)
             .resizable(false)
             .show(ui.ctx(), |ui| {
+                ui.add(
+                    egui::Image::new((logo, egui::Vec2::splat(theme::sizes::ABOUT_LOGO)))
+                        .alt_text("MelonEngine"),
+                );
                 ui.heading(format!("MelonEngine {}", melon_core::version()));
                 ui.label("A Rust 3D game engine.");
                 ui.weak("bevy_ecs · wgpu · rapier3d · egui");

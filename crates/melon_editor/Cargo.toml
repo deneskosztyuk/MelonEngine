@@ -5,6 +5,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+image.workspace = true
 melon_core.workspace = true
 melon_render.workspace = true
 melon_physics.workspace = true

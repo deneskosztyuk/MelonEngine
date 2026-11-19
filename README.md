@@ -1,4 +1,4 @@
-# MelonEngine
+# <img src="assets/branding/melon-engine.png" alt="" width="48" height="48"> MelonEngine
 
 A from-scratch 3D game engine written in Rust.
 
