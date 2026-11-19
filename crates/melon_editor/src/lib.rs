@@ -1695,7 +1695,11 @@ mod tests {
     fn gizmo_physics_write_works_while_paused() {
         let mut world = World::new();
         let mut physics = melon_physics::PhysicsWorld::new();
-        let (body, _) = physics.spawn_dynamic_cuboid(glam::Vec3::ZERO, glam::Vec3::splat(0.5));
+        let (body, _) = physics.spawn_dynamic_cuboid(
+            glam::Vec3::ZERO,
+            glam::Quat::IDENTITY,
+            glam::Vec3::splat(0.5),
+        );
         world.insert_resource(physics);
         world.insert_resource(SimulationState::Paused);
         let e = world
@@ -1725,7 +1729,11 @@ mod tests {
     fn inspector_edit_while_paused_reaches_physics_and_prev() {
         let mut world = World::new();
         let mut physics = melon_physics::PhysicsWorld::new();
-        let (body, _) = physics.spawn_dynamic_cuboid(glam::Vec3::ZERO, glam::Vec3::splat(0.5));
+        let (body, _) = physics.spawn_dynamic_cuboid(
+            glam::Vec3::ZERO,
+            glam::Quat::IDENTITY,
+            glam::Vec3::splat(0.5),
+        );
         world.insert_resource(physics);
         world.insert_resource(SimulationState::Paused);
         let e = world

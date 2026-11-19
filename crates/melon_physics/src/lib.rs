@@ -19,9 +19,10 @@ use rapier3d::pipeline::PhysicsPipeline;
 use rapier3d::prelude::IntegrationParameters;
 use tracing::instrument;
 
+use melon_core::hierarchy::{propagate_transforms_system, safe_inverse};
 use melon_core::{
-    Core, FixedUpdate, PendingDelete, PostUpdate, PreviousTransform, Time, Transform,
-    store_previous_transforms_system,
+    ChildOf, Core, FixedUpdate, GlobalTransform, PendingDelete, PostUpdate, PreviousTransform,
+    Time, Transform, store_previous_transforms_system,
 };
 
 /// Gravity vector in m/s^2. Default is Earth gravity pointing down (-Y).
@@ -88,10 +89,13 @@ impl PhysicsWorld {
     pub fn spawn_dynamic_cuboid(
         &mut self,
         translation: Vec3,
+        rotation: Quat,
         half_extents: Vec3,
     ) -> (RigidBodyHandle, ColliderHandle) {
         use rapier3d::dynamics::RigidBodyBuilder;
-        let body = RigidBodyBuilder::dynamic().translation(translation).build();
+        let body = RigidBodyBuilder::dynamic()
+            .pose(rapier3d::math::Pose::from_parts(translation, rotation))
+            .build();
         let body_handle = self.bodies.insert(body);
         let collider =
             ColliderBuilder::cuboid(half_extents.x, half_extents.y, half_extents.z).build();
@@ -106,10 +110,13 @@ impl PhysicsWorld {
     pub fn spawn_fixed_cuboid(
         &mut self,
         translation: Vec3,
+        rotation: Quat,
         half_extents: Vec3,
     ) -> (RigidBodyHandle, ColliderHandle) {
         use rapier3d::dynamics::RigidBodyBuilder;
-        let body = RigidBodyBuilder::fixed().translation(translation).build();
+        let body = RigidBodyBuilder::fixed()
+            .pose(rapier3d::math::Pose::from_parts(translation, rotation))
+            .build();
         let body_handle = self.bodies.insert(body);
         let collider =
             ColliderBuilder::cuboid(half_extents.x, half_extents.y, half_extents.z).build();
@@ -216,12 +223,14 @@ pub fn add_previous_transforms_system(
 }
 
 /// Register the physics systems into their frame stages. Fixed-step order:
-/// remember previous transforms, push ECS edits into rapier, step, pull results back.
+/// remember previous transforms, update world poses, push ECS edits into
+/// rapier, step, pull results back.
 pub fn add_physics_systems(core: &mut Core) {
     core.add_systems(
         FixedUpdate,
         (
             store_previous_transforms_system,
+            propagate_transforms_system,
             sync_to_physics_system,
             step_system,
             sync_from_physics_system,
@@ -234,38 +243,58 @@ pub fn add_physics_systems(core: &mut Core) {
     );
 }
 
-/// System: sync rapier body transforms back into ECS Transform components.
-/// Only updates dynamic bodies (body_type == Dynamic). Fixed/kinematic bodies
-/// keep their ECS transform as the source of truth.
+/// System: sync rapier body poses back into ECS Transform components.
+/// Only updates dynamic bodies, which physics owns in world space: a child's
+/// local transform is rewritten so its world pose matches the body (it does
+/// not follow its parent). Fixed bodies keep their ECS transform as the
+/// source of truth.
 pub fn sync_from_physics_system(
     physics: Res<PhysicsWorld>,
-    mut query: Query<(&RigidBodyComponent, &mut Transform)>,
+    parents: Query<&GlobalTransform>,
+    mut query: Query<(&RigidBodyComponent, &mut Transform, Option<&ChildOf>)>,
 ) {
-    for (rb, mut transform) in &mut query {
+    for (rb, mut transform, child_of) in &mut query {
         if rb.body_type != RigidBodyType::Dynamic {
             continue;
         }
-        if let Some(body) = physics.bodies.get(rb.body_handle) {
-            transform.translation = body.translation();
-            transform.rotation = *body.rotation();
+        let Some(body) = physics.bodies.get(rb.body_handle) else {
+            continue;
+        };
+        let (translation, rotation) = (body.translation(), *body.rotation());
+        match child_of.and_then(|c| parents.get(c.parent()).ok()) {
+            Some(parent) => {
+                let inv = safe_inverse(parent.0);
+                let local = Transform::from_mat4(
+                    inv * glam::Mat4::from_rotation_translation(rotation, translation),
+                );
+                if local.translation.is_finite() && local.rotation.is_finite() {
+                    transform.translation = local.translation;
+                    transform.rotation = local.rotation;
+                }
+            }
+            None => {
+                transform.translation = translation;
+                transform.rotation = rotation;
+            }
         }
     }
 }
 
-/// System: sync ECS Transform into rapier for fixed/kinematic bodies.
-/// Dynamic bodies are controlled by physics, so their ECS transform is NOT
-/// written back to rapier.
+/// System: sync ECS world poses into rapier for fixed bodies (they follow
+/// their parent). Dynamic bodies are controlled by physics, so their ECS
+/// transform is NOT written back to rapier.
 pub fn sync_to_physics_system(
     mut physics: ResMut<PhysicsWorld>,
-    query: Query<(&RigidBodyComponent, &Transform)>,
+    query: Query<(&RigidBodyComponent, &Transform, Option<&GlobalTransform>)>,
 ) {
-    for (rb, transform) in &query {
+    for (rb, transform, global) in &query {
         if rb.body_type == RigidBodyType::Dynamic {
             continue;
         }
+        let world = global.map_or(*transform, |g| Transform::from_mat4(g.0));
         if let Some(body) = physics.bodies.get_mut(rb.body_handle) {
-            body.set_translation(transform.translation, true);
-            body.set_rotation(transform.rotation, true);
+            body.set_translation(world.translation, true);
+            body.set_rotation(world.rotation, true);
         }
     }
 }
@@ -284,17 +313,22 @@ pub fn cleanup_deleted_system(
             Entity,
             Option<&RigidBodyComponent>,
             Option<&ColliderComponent>,
+            Option<&ChildOf>,
         ),
         With<PendingDelete>,
     >,
+    marked: Query<(), With<PendingDelete>>,
 ) {
-    for (entity, rb_opt, collider_opt) in &query {
+    for (entity, rb_opt, collider_opt, child_of) in &query {
         if let Some(rb) = rb_opt {
             physics.remove_body(rb.body_handle);
         } else if let Some(col) = collider_opt {
             physics.remove_collider(col.collider_handle);
         }
-        commands.entity(entity).despawn();
+        // A marked parent's despawn takes its children with it (`linked_spawn`).
+        if !child_of.is_some_and(|c| marked.contains(c.parent())) {
+            commands.entity(entity).despawn();
+        }
     }
 }
 
@@ -316,8 +350,11 @@ mod tests {
     #[test]
     fn spawn_dynamic_cuboid_creates_body_and_collider() {
         let mut pw = PhysicsWorld::new();
-        let (body_h, collider_h) =
-            pw.spawn_dynamic_cuboid(Vec3::new(0.0, 5.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
+        let (body_h, collider_h) = pw.spawn_dynamic_cuboid(
+            Vec3::new(0.0, 5.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::new(0.5, 0.5, 0.5),
+        );
         assert!(pw.bodies.get(body_h).is_some());
         assert!(pw.colliders.get(collider_h).is_some());
         assert_eq!(pw.bodies.len(), 1);
@@ -327,8 +364,11 @@ mod tests {
     #[test]
     fn spawn_fixed_cuboid_is_fixed_type() {
         let mut pw = PhysicsWorld::new();
-        let (body_h, _) =
-            pw.spawn_fixed_cuboid(Vec3::new(0.0, -1.0, 0.0), Vec3::new(10.0, 0.5, 10.0));
+        let (body_h, _) = pw.spawn_fixed_cuboid(
+            Vec3::new(0.0, -1.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::new(10.0, 0.5, 10.0),
+        );
         let body = pw.bodies.get(body_h).unwrap();
         assert_eq!(body.body_type(), RigidBodyType::Fixed);
     }
@@ -336,8 +376,11 @@ mod tests {
     #[test]
     fn step_makes_dynamic_body_fall() {
         let mut pw = PhysicsWorld::new();
-        let (body_h, _) =
-            pw.spawn_dynamic_cuboid(Vec3::new(0.0, 10.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
+        let (body_h, _) = pw.spawn_dynamic_cuboid(
+            Vec3::new(0.0, 10.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::new(0.5, 0.5, 0.5),
+        );
         let y_before = pw.bodies.get(body_h).unwrap().translation().y;
         pw.step();
         let y_after = pw.bodies.get(body_h).unwrap().translation().y;
@@ -350,8 +393,11 @@ mod tests {
     #[test]
     fn fixed_body_does_not_fall() {
         let mut pw = PhysicsWorld::new();
-        let (body_h, _) =
-            pw.spawn_fixed_cuboid(Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 0.5, 10.0));
+        let (body_h, _) = pw.spawn_fixed_cuboid(
+            Vec3::new(0.0, 0.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::new(10.0, 0.5, 10.0),
+        );
         let y_before = pw.bodies.get(body_h).unwrap().translation().y;
         pw.step();
         let y_after = pw.bodies.get(body_h).unwrap().translation().y;
@@ -365,10 +411,17 @@ mod tests {
     fn dynamic_body_lands_on_floor() {
         let mut pw = PhysicsWorld::new();
         // Floor at y=0, half-extent 0.5 thick, so top surface at y=0.5
-        let _ = pw.spawn_fixed_cuboid(Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 0.5, 10.0));
+        let _ = pw.spawn_fixed_cuboid(
+            Vec3::new(0.0, 0.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::new(10.0, 0.5, 10.0),
+        );
         // Cube at y=5, half-extent 0.5, so bottom at y=4.5
-        let (body_h, _) =
-            pw.spawn_dynamic_cuboid(Vec3::new(0.0, 5.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
+        let (body_h, _) = pw.spawn_dynamic_cuboid(
+            Vec3::new(0.0, 5.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::new(0.5, 0.5, 0.5),
+        );
 
         // Step many times to let it fall and settle
         for _ in 0..300 {
@@ -386,8 +439,11 @@ mod tests {
     #[test]
     fn sync_from_physics_updates_transform() {
         let mut pw = PhysicsWorld::new();
-        let (body_h, _) =
-            pw.spawn_dynamic_cuboid(Vec3::new(0.0, 10.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
+        let (body_h, _) = pw.spawn_dynamic_cuboid(
+            Vec3::new(0.0, 10.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::new(0.5, 0.5, 0.5),
+        );
         pw.step();
 
         let mut world = World::new();
@@ -419,7 +475,11 @@ mod tests {
     #[test]
     fn sync_to_physics_updates_kinematic_body() {
         let mut pw = PhysicsWorld::new();
-        let (body_h, _) = pw.spawn_fixed_cuboid(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0));
+        let (body_h, _) = pw.spawn_fixed_cuboid(
+            Vec3::new(0.0, 0.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::new(1.0, 1.0, 1.0),
+        );
 
         let mut world = World::new();
         world.insert_resource(pw);
@@ -450,8 +510,16 @@ mod tests {
     #[test]
     fn clear_empties_all_sets() {
         let mut pw = PhysicsWorld::new();
-        pw.spawn_dynamic_cuboid(Vec3::new(0.0, 5.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
-        pw.spawn_fixed_cuboid(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 1.0));
+        pw.spawn_dynamic_cuboid(
+            Vec3::new(0.0, 5.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::new(0.5, 0.5, 0.5),
+        );
+        pw.spawn_fixed_cuboid(
+            Vec3::new(0.0, 0.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::new(1.0, 1.0, 1.0),
+        );
         assert!(!pw.bodies.is_empty());
         assert!(!pw.colliders.is_empty());
 
@@ -472,7 +540,11 @@ mod tests {
     fn clear_preserves_gravity() {
         let mut pw = PhysicsWorld::new();
         pw.gravity = Vector::new(1.0, -20.0, 0.0);
-        pw.spawn_dynamic_cuboid(Vec3::new(0.0, 5.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
+        pw.spawn_dynamic_cuboid(
+            Vec3::new(0.0, 5.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::new(0.5, 0.5, 0.5),
+        );
 
         pw.clear();
 
@@ -491,8 +563,11 @@ mod tests {
     #[test]
     fn cleanup_removes_physics_body() {
         let mut pw = PhysicsWorld::new();
-        let (body_h, collider_h) =
-            pw.spawn_dynamic_cuboid(Vec3::new(0.0, 5.0, 0.0), Vec3::new(0.5, 0.5, 0.5));
+        let (body_h, collider_h) = pw.spawn_dynamic_cuboid(
+            Vec3::new(0.0, 5.0, 0.0),
+            Quat::IDENTITY,
+            Vec3::new(0.5, 0.5, 0.5),
+        );
 
         let mut world = World::new();
         world.insert_resource(pw);
@@ -550,8 +625,9 @@ mod tests {
         let mut core = melon_core::Core::new();
         let mut pw = PhysicsWorld::new();
         let start = Vec3::new(0.0, 10.0, 0.0);
-        let (body, _) = pw.spawn_dynamic_cuboid(start, Vec3::splat(0.5));
-        let (fixed_body, _) = pw.spawn_fixed_cuboid(Vec3::new(0.0, -50.0, 0.0), Vec3::splat(1.0));
+        let (body, _) = pw.spawn_dynamic_cuboid(start, Quat::IDENTITY, Vec3::splat(0.5));
+        let (fixed_body, _) =
+            pw.spawn_fixed_cuboid(Vec3::new(0.0, -50.0, 0.0), Quat::IDENTITY, Vec3::splat(1.0));
         core.world.insert_resource(pw);
         let dynamic = core
             .world
@@ -629,6 +705,92 @@ mod tests {
         let (mut core, _, fixed) = drop_test_core();
         run_frames(&mut core, 1.0 / 60.0, 2);
         assert!(core.world.get::<PreviousTransform>(fixed).is_none());
+    }
+
+    /// Parent (no body) at the origin with a child body at local (1,0,0).
+    /// Gravity off, so only parent motion could move the child.
+    fn parented_core(kind: RigidBodyType) -> (melon_core::Core, Entity, Entity) {
+        let mut core = melon_core::Core::new();
+        let mut pw = PhysicsWorld::new();
+        pw.gravity = Vector::ZERO;
+        let at = Vec3::X;
+        let (body, _) = match kind {
+            RigidBodyType::Dynamic => pw.spawn_dynamic_cuboid(at, Quat::IDENTITY, Vec3::splat(0.5)),
+            _ => pw.spawn_fixed_cuboid(at, Quat::IDENTITY, Vec3::splat(0.5)),
+        };
+        core.world.insert_resource(pw);
+        let parent = core.world.spawn(Transform::default()).id();
+        let child = core
+            .world
+            .spawn((
+                Transform::from_translation(at),
+                RigidBodyComponent {
+                    body_handle: body,
+                    body_type: kind,
+                },
+                melon_core::ChildOf(parent),
+            ))
+            .id();
+        core.world
+            .insert_resource(melon_core::SimulationState::Playing);
+        add_physics_systems(&mut core);
+        (core, parent, child)
+    }
+
+    fn body_pos(core: &melon_core::Core, e: Entity) -> Vec3 {
+        let h = core.world.get::<RigidBodyComponent>(e).unwrap().body_handle;
+        core.world
+            .resource::<PhysicsWorld>()
+            .body_translation(h)
+            .unwrap()
+    }
+
+    #[test]
+    fn fixed_child_body_follows_moved_parent() {
+        let (mut core, parent, child) = parented_core(RigidBodyType::Fixed);
+        core.world.get_mut::<Transform>(parent).unwrap().translation = Vec3::new(5.0, 0.0, 0.0);
+        run_frames(&mut core, 1.0 / 60.0, 1);
+        assert!((body_pos(&core, child) - Vec3::new(6.0, 0.0, 0.0)).length() < 1e-4);
+    }
+
+    #[test]
+    fn dynamic_child_ignores_parent_motion() {
+        let (mut core, parent, child) = parented_core(RigidBodyType::Dynamic);
+        core.world.get_mut::<Transform>(parent).unwrap().translation = Vec3::new(5.0, 0.0, 0.0);
+        run_frames(&mut core, 1.0 / 60.0, 1);
+        let body = body_pos(&core, child);
+        assert!((body - Vec3::X).length() < 1e-4, "body moved to {body}");
+        let world = melon_core::hierarchy::world_matrix(&core.world, child);
+        assert!((world.transform_point3(Vec3::ZERO) - body).length() < 1e-4);
+    }
+
+    #[test]
+    fn dynamic_sync_under_zero_scale_parent_stays_finite() {
+        let (mut core, parent, child) = parented_core(RigidBodyType::Dynamic);
+        core.world.get_mut::<Transform>(parent).unwrap().scale = Vec3::new(0.0, 1.0, 1.0);
+        run_frames(&mut core, 1.0 / 60.0, 1);
+        let t = core.world.get::<Transform>(child).unwrap();
+        assert!(t.translation.is_finite() && t.rotation.is_finite());
+    }
+
+    #[test]
+    fn deleting_parent_and_child_same_frame_removes_both_bodies() {
+        let (mut core, parent, child) = parented_core(RigidBodyType::Dynamic);
+        core.world.entity_mut(parent).insert(PendingDelete);
+        core.world.entity_mut(child).insert(PendingDelete);
+        run_frames(&mut core, 0.001, 1);
+        assert_eq!(core.world.resource::<PhysicsWorld>().bodies.len(), 0);
+        assert!(core.world.get_entity(parent).is_err());
+        assert!(core.world.get_entity(child).is_err());
+    }
+
+    #[test]
+    fn deleting_only_parent_with_mark_for_delete_removes_child_body() {
+        let (mut core, parent, child) = parented_core(RigidBodyType::Dynamic);
+        melon_core::hierarchy::mark_for_delete(&mut core.world, parent);
+        run_frames(&mut core, 0.001, 1);
+        assert_eq!(core.world.resource::<PhysicsWorld>().bodies.len(), 0);
+        assert!(core.world.get_entity(child).is_err());
     }
 
     #[test]

@@ -236,8 +236,11 @@ fn spawn_scene_entity(world: &mut World, physics: &mut PhysicsWorld, entity: &Sc
         // Create rapier body based on BodyKind
         match body_info.body_type {
             BodyKind::Dynamic => {
-                let (body_h, collider_h) = physics
-                    .spawn_dynamic_cuboid(entity.transform.translation, body_info.half_extents);
+                let (body_h, collider_h) = physics.spawn_dynamic_cuboid(
+                    entity.transform.translation,
+                    entity.transform.rotation,
+                    body_info.half_extents,
+                );
                 world.entity_mut(id).insert((
                     RigidBodyComponent {
                         body_handle: body_h,
@@ -250,8 +253,11 @@ fn spawn_scene_entity(world: &mut World, physics: &mut PhysicsWorld, entity: &Sc
                 ));
             }
             BodyKind::Fixed => {
-                let (body_h, collider_h) = physics
-                    .spawn_fixed_cuboid(entity.transform.translation, body_info.half_extents);
+                let (body_h, collider_h) = physics.spawn_fixed_cuboid(
+                    entity.transform.translation,
+                    entity.transform.rotation,
+                    body_info.half_extents,
+                );
                 world.entity_mut(id).insert((
                     RigidBodyComponent {
                         body_handle: body_h,
