@@ -5,7 +5,7 @@ mod models;
 mod overlay;
 
 pub use extract::{FrameData, blends, extract};
-pub use overlay::{OverlayDepth, OverlayDraw, OverlayShape};
+pub use overlay::{OverlayDepth, OverlayDraw, OverlayShape, TORUS_TUBE};
 
 /// Model uniform slots: at most this many entities with a model are drawn.
 pub const MAX_ENTITIES: usize = 1024;

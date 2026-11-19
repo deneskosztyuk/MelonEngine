@@ -365,6 +365,132 @@ pub fn gizmo_draws(
         .collect()
 }
 
+/// Distance along the ray (`dir` unit) to its closest approach to point `p`,
+/// and that closest distance. `None` when `p` is behind the origin.
+fn ray_point(origin: Vec3, dir: Vec3, p: Vec3) -> Option<(f32, f32)> {
+    let t = (p - origin).dot(dir);
+    (t > 0.0).then(|| (t, (origin + dir * t - p).length()))
+}
+
+/// Closest approach between the ray and segment `a..b`: (ray distance,
+/// fraction along the segment, gap).
+fn ray_segment(origin: Vec3, dir: Vec3, a: Vec3, b: Vec3) -> Option<(f32, f32, f32)> {
+    let seg = b - a;
+    let len2 = seg.length_squared();
+    if len2 < 1e-12 {
+        return ray_point(origin, dir, a).map(|(t, d)| (t, 0.0, d));
+    }
+    let w = origin - a;
+    let (b_, c, d, e) = (dir.dot(seg), len2, dir.dot(w), seg.dot(w));
+    let denom = c - b_ * b_; // dir is unit, so a = 1
+    let u = if denom.abs() < 1e-9 {
+        0.0
+    } else {
+        ((e - b_ * d) / denom).clamp(0.0, 1.0)
+    };
+    let p = a + seg * u;
+    ray_point(origin, dir, p).map(|(t, gap)| (t, u, gap))
+}
+
+/// The handle under the ray `origin + t * dir`, picked against the same
+/// shapes the gizmo draws (widened by `tolerance` world units). The centre
+/// handle wins wherever it is hit; otherwise the nearest hit wins.
+pub fn pick_handle(
+    mode: GizmoMode,
+    pose: &GizmoPose,
+    origin: Vec3,
+    dir: Vec3,
+    tolerance: f32,
+) -> Option<GizmoHandle> {
+    let dir = dir.normalize_or_zero();
+    if dir == Vec3::ZERO || !pose.size.is_finite() || pose.size <= 0.0 {
+        return None;
+    }
+    let (s, c) = (pose.size, pose.center);
+    let mut best: Option<(f32, GizmoHandle)> = None;
+    let mut consider = |t: f32, handle: GizmoHandle| {
+        if best.is_none_or(|(bt, _)| t < bt) {
+            best = Some((t, handle));
+        }
+    };
+    match mode {
+        GizmoMode::Move | GizmoMode::Scale => {
+            if ray_point(origin, dir, c)
+                .is_some_and(|(_, gap)| gap < s * CENTER_SIZE * 0.5 + tolerance)
+            {
+                return Some(GizmoHandle::Center);
+            }
+            let (tip_from, tip_radius) = match mode {
+                GizmoMode::Move => (1.0 - CONE_LENGTH, CONE_RADIUS),
+                _ => (1.0 - TIP_CUBE, TIP_CUBE * 0.5),
+            };
+            for i in 0..3 {
+                let axis = pose.axis(i);
+                let end = c + axis
+                    * s
+                    * if mode == GizmoMode::Scale {
+                        1.0 + TIP_CUBE * 0.5
+                    } else {
+                        1.0
+                    };
+                if let Some((t, u, gap)) = ray_segment(origin, dir, c, end) {
+                    let radius = if u >= tip_from {
+                        tip_radius
+                    } else {
+                        SHAFT_RADIUS
+                    };
+                    if gap < s * radius + tolerance {
+                        consider(t, GizmoHandle::Axis(i));
+                    }
+                }
+                // Plane handle: hit the plane, then test the quad / triangle.
+                let normal = axis;
+                let denom = dir.dot(normal);
+                if denom.abs() > 1e-6 {
+                    let t = (c - origin).dot(normal) / denom;
+                    if t > 0.0 {
+                        let local = origin + dir * t - c;
+                        let (a, b) = pose.plane_axes(i);
+                        let tol = tolerance / s;
+                        let (u, v) = (
+                            local.dot(a) / s - PLANE_OFFSET,
+                            local.dot(b) / s - PLANE_OFFSET,
+                        );
+                        let inside = match mode {
+                            GizmoMode::Move => {
+                                (-tol..=PLANE_SIZE + tol).contains(&u)
+                                    && (-tol..=PLANE_SIZE + tol).contains(&v)
+                            }
+                            _ => u >= -tol && v >= -tol && u + v <= PLANE_SIZE + tol,
+                        };
+                        if inside {
+                            consider(t, GizmoHandle::Plane(i));
+                        }
+                    }
+                }
+            }
+        }
+        GizmoMode::Rotate => {
+            // Sample each ring: works at every viewing angle, edge-on included.
+            const SAMPLES: usize = 96;
+            let band = s * melon_render::TORUS_TUBE + tolerance;
+            for i in 0..3 {
+                let (a, b) = pose.plane_axes(i);
+                for k in 0..SAMPLES {
+                    let angle = std::f32::consts::TAU * k as f32 / SAMPLES as f32;
+                    let p = c + (a * angle.cos() + b * angle.sin()) * s;
+                    if let Some((t, gap)) = ray_point(origin, dir, p)
+                        && gap < band
+                    {
+                        consider(t, GizmoHandle::Axis(i));
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(_, handle)| handle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +507,111 @@ mod tests {
 
     fn count(draws: &[melon_render::OverlayDraw], shape: OverlayShape) -> usize {
         draws.iter().filter(|d| d.shape == shape).count()
+    }
+
+    const EYE: Vec3 = Vec3::new(4.0, 3.0, 6.0);
+
+    fn pick_at(mode: GizmoMode, target: Vec3) -> Option<GizmoHandle> {
+        pick_handle(mode, &pose(), EYE, (target - EYE).normalize(), 0.02)
+    }
+
+    /// A point on each handle (where a user would aim).
+    fn handle_points(mode: GizmoMode) -> Vec<(GizmoHandle, Vec3)> {
+        let p = pose();
+        let mut points = vec![];
+        for i in 0..3 {
+            let axis = p.axis(i);
+            let (a, b) = p.plane_axes(i);
+            match mode {
+                GizmoMode::Rotate => {
+                    let angle = 0.6f32;
+                    points.push((
+                        GizmoHandle::Axis(i),
+                        (a * angle.cos() + b * angle.sin()) * p.size,
+                    ));
+                }
+                _ => {
+                    points.push((GizmoHandle::Axis(i), axis * 0.6 * p.size));
+                    let inside = if mode == GizmoMode::Move {
+                        PLANE_OFFSET + PLANE_SIZE * 0.5
+                    } else {
+                        PLANE_OFFSET + PLANE_SIZE * 0.3
+                    };
+                    points.push((GizmoHandle::Plane(i), (a + b) * inside * p.size));
+                }
+            }
+        }
+        if mode != GizmoMode::Rotate {
+            points.push((GizmoHandle::Center, Vec3::ZERO));
+        }
+        points
+    }
+
+    #[test]
+    fn ray_through_each_handle_picks_it() {
+        for mode in [GizmoMode::Move, GizmoMode::Rotate, GizmoMode::Scale] {
+            for (handle, point) in handle_points(mode) {
+                assert_eq!(pick_at(mode, point), Some(handle), "{mode:?} {handle:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ray_between_handles_picks_nothing() {
+        let p = pose();
+        let between = (p.axis(0) + p.axis(1)) * 0.9 * p.size;
+        assert_eq!(pick_at(GizmoMode::Move, between), None);
+        assert_eq!(pick_at(GizmoMode::Scale, between), None);
+    }
+
+    #[test]
+    fn center_wins_over_planes() {
+        assert_eq!(
+            pick_at(GizmoMode::Move, Vec3::ZERO),
+            Some(GizmoHandle::Center)
+        );
+        assert_eq!(
+            pick_at(GizmoMode::Scale, Vec3::ZERO),
+            Some(GizmoHandle::Center)
+        );
+    }
+
+    #[test]
+    fn rotate_ring_picked_on_band_only() {
+        let diagonal = Vec3::new(1.0, 0.0, 1.0).normalize();
+        let down = Vec3::NEG_Y;
+        let on_ring = pick_handle(
+            GizmoMode::Rotate,
+            &pose(),
+            diagonal + Vec3::Y * 5.0,
+            down,
+            0.02,
+        );
+        assert_eq!(on_ring, Some(GizmoHandle::Axis(1)));
+        let inside = pick_handle(
+            GizmoMode::Rotate,
+            &pose(),
+            diagonal * 0.5 + Vec3::Y * 5.0,
+            down,
+            0.02,
+        );
+        assert_eq!(inside, None);
+    }
+
+    #[test]
+    fn axis_pointing_at_camera_is_finite() {
+        let hit = pick_handle(GizmoMode::Move, &pose(), Vec3::Z * 5.0, Vec3::NEG_Z, 0.02);
+        assert!(
+            matches!(hit, Some(GizmoHandle::Center) | Some(GizmoHandle::Axis(2))),
+            "{hit:?}"
+        );
+        for mode in [GizmoMode::Move, GizmoMode::Rotate, GizmoMode::Scale] {
+            assert!(
+                gizmo_draws(mode, &pose(), None)
+                    .iter()
+                    .all(|d| d.transform.is_finite())
+            );
+        }
     }
 
     #[test]
