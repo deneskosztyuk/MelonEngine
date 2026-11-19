@@ -1,4 +1,7 @@
-use melon_core::glam::Vec3;
+use melon_core::glam::{Mat4, Quat, Vec3};
+use melon_render::{OverlayDepth, OverlayDraw, OverlayShape};
+
+use crate::GizmoMode;
 
 pub const SNAP_MOVE: f32 = 0.25;
 pub const SNAP_SCALE: f32 = 0.25;
@@ -173,9 +176,259 @@ pub fn circle_lines(
         .collect()
 }
 
+// --- Unreal-style gizmo: handles as overlay shapes ---------------------------
+
+/// A grabbable part of the gizmo. `Plane(i)` is the plane perpendicular to
+/// axis i (it moves / scales along the other two).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GizmoHandle {
+    Axis(usize),
+    Plane(usize),
+    Center,
+}
+
+/// Where the gizmo is: its centre and axes in world space, and `size`, the
+/// world length of `GIZMO_SIZE_PX` at its distance (constant screen size).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GizmoPose {
+    pub center: Vec3,
+    pub rotation: Quat,
+    pub size: f32,
+}
+
+impl GizmoPose {
+    pub fn axis(&self, i: usize) -> Vec3 {
+        self.rotation * [AXIS_X, AXIS_Y, AXIS_Z][i]
+    }
+
+    /// The two axes spanning `Plane(i)`.
+    pub fn plane_axes(&self, i: usize) -> (Vec3, Vec3) {
+        (self.axis((i + 1) % 3), self.axis((i + 2) % 3))
+    }
+}
+
+// Proportions as fractions of `size` (pixels at the 80 px default).
+pub const SHAFT_RADIUS: f32 = 2.5 / 80.0;
+pub const CONE_RADIUS: f32 = 4.5 / 80.0;
+pub const CONE_LENGTH: f32 = 18.0 / 80.0;
+pub const TIP_CUBE: f32 = 10.0 / 80.0;
+/// Rotate rings: tube radius = ring radius × `melon_render`'s `TORUS_TUBE`.
+pub const PLANE_OFFSET: f32 = 0.3;
+pub const PLANE_SIZE: f32 = 0.2;
+pub const CENTER_SIZE: f32 = 10.0 / 80.0;
+
+pub const HIGHLIGHT: [f32; 4] = [1.0, 0.85, 0.1, 1.0];
+pub const CENTER_COLOR: [f32; 4] = [0.85, 0.85, 0.85, 1.0];
+pub const PLANE_ALPHA: f32 = 0.5;
+
+/// Display colour of axis `i` (theme X / Y / Z).
+pub fn handle_color(i: usize) -> [f32; 4] {
+    use crate::theme::colors::{AXIS_X, AXIS_Y, AXIS_Z};
+    [AXIS_X, AXIS_Y, AXIS_Z][i].to_normalized_gamma_f32()
+}
+
+/// Unit shape placed from `origin` along `dir`: unit y → `dir * length`,
+/// unit x / z → `radius`.
+fn along(origin: Vec3, dir: Vec3, length: f32, radius: f32) -> Mat4 {
+    Mat4::from_scale_rotation_translation(
+        Vec3::new(radius, length, radius),
+        Quat::from_rotation_arc(Vec3::Y, dir),
+        origin,
+    )
+}
+
+/// Unit quad / triangle (XZ, 0..1) placed with its corner at `corner`, x
+/// along `a`, z along `b` (both already scaled).
+fn flat(corner: Vec3, a: Vec3, b: Vec3) -> Mat4 {
+    Mat4::from_cols(
+        a.extend(0.0),
+        a.cross(b).normalize_or_zero().extend(0.0),
+        b.extend(0.0),
+        corner.extend(1.0),
+    )
+}
+
+/// Every shape of the gizmo with the handle it belongs to.
+pub fn gizmo_parts(mode: GizmoMode, pose: &GizmoPose) -> Vec<(GizmoHandle, OverlayShape, Mat4)> {
+    let s = pose.size;
+    let c = pose.center;
+    let mut parts = Vec::new();
+    match mode {
+        GizmoMode::Move | GizmoMode::Scale => {
+            let tip = if mode == GizmoMode::Move {
+                CONE_LENGTH
+            } else {
+                TIP_CUBE * 0.5
+            };
+            for i in 0..3 {
+                let axis = pose.axis(i);
+                let h = GizmoHandle::Axis(i);
+                parts.push((
+                    h,
+                    OverlayShape::Cylinder,
+                    along(c, axis, s * (1.0 - tip), s * SHAFT_RADIUS),
+                ));
+                if mode == GizmoMode::Move {
+                    let base = c + axis * s * (1.0 - CONE_LENGTH);
+                    parts.push((
+                        h,
+                        OverlayShape::Cone,
+                        along(base, axis, s * CONE_LENGTH, s * CONE_RADIUS),
+                    ));
+                } else {
+                    let cube = Mat4::from_scale_rotation_translation(
+                        Vec3::splat(s * TIP_CUBE),
+                        pose.rotation,
+                        c + axis * s,
+                    );
+                    parts.push((h, OverlayShape::Cube, cube));
+                }
+                let (a, b) = pose.plane_axes(i);
+                let corner = c + (a + b) * s * PLANE_OFFSET;
+                let shape = if mode == GizmoMode::Move {
+                    OverlayShape::Quad
+                } else {
+                    OverlayShape::Triangle
+                };
+                parts.push((
+                    GizmoHandle::Plane(i),
+                    shape,
+                    flat(corner, a * s * PLANE_SIZE, b * s * PLANE_SIZE),
+                ));
+            }
+            let centre = if mode == GizmoMode::Move {
+                (
+                    OverlayShape::Sphere,
+                    Mat4::from_scale_rotation_translation(
+                        Vec3::splat(s * CENTER_SIZE * 0.5),
+                        pose.rotation,
+                        c,
+                    ),
+                )
+            } else {
+                (
+                    OverlayShape::Cube,
+                    Mat4::from_scale_rotation_translation(
+                        Vec3::splat(s * CENTER_SIZE),
+                        pose.rotation,
+                        c,
+                    ),
+                )
+            };
+            parts.push((GizmoHandle::Center, centre.0, centre.1));
+        }
+        GizmoMode::Rotate => {
+            for i in 0..3 {
+                let ring = Mat4::from_scale_rotation_translation(
+                    Vec3::splat(s),
+                    Quat::from_rotation_arc(Vec3::Y, pose.axis(i)),
+                    c,
+                );
+                parts.push((GizmoHandle::Axis(i), OverlayShape::Torus, ring));
+            }
+        }
+    }
+    parts
+}
+
+/// The gizmo as overlay draws (all on top). `highlight` (hovered or dragged)
+/// is drawn yellow.
+pub fn gizmo_draws(
+    mode: GizmoMode,
+    pose: &GizmoPose,
+    highlight: Option<GizmoHandle>,
+) -> Vec<OverlayDraw> {
+    gizmo_parts(mode, pose)
+        .into_iter()
+        .map(|(handle, shape, transform)| {
+            let [r, g, b, a] = match handle {
+                GizmoHandle::Axis(i) => handle_color(i),
+                GizmoHandle::Plane(i) => {
+                    let [r, g, b, _] = handle_color(i);
+                    [r, g, b, PLANE_ALPHA]
+                }
+                GizmoHandle::Center => CENTER_COLOR,
+            };
+            // Highlighted handles turn yellow; plane handles stay see-through.
+            let color = if highlight == Some(handle) {
+                [HIGHLIGHT[0], HIGHLIGHT[1], HIGHLIGHT[2], a]
+            } else {
+                [r, g, b, a]
+            };
+            OverlayDraw {
+                shape,
+                transform,
+                color,
+                depth: OverlayDepth::OnTop,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GizmoMode;
+    use melon_render::{OverlayDepth, OverlayShape};
+
+    fn pose() -> GizmoPose {
+        GizmoPose {
+            center: Vec3::ZERO,
+            rotation: melon_core::glam::Quat::IDENTITY,
+            size: 1.0,
+        }
+    }
+
+    fn count(draws: &[melon_render::OverlayDraw], shape: OverlayShape) -> usize {
+        draws.iter().filter(|d| d.shape == shape).count()
+    }
+
+    #[test]
+    fn move_builds_shafts_cones_planes_center() {
+        let d = gizmo_draws(GizmoMode::Move, &pose(), None);
+        assert_eq!(count(&d, OverlayShape::Cylinder), 3);
+        assert_eq!(count(&d, OverlayShape::Cone), 3);
+        assert_eq!(count(&d, OverlayShape::Quad), 3);
+        assert_eq!(count(&d, OverlayShape::Sphere), 1);
+        assert!(d.iter().all(|d| d.depth == OverlayDepth::OnTop));
+    }
+
+    #[test]
+    fn rotate_builds_three_rings() {
+        let d = gizmo_draws(GizmoMode::Rotate, &pose(), None);
+        assert_eq!(count(&d, OverlayShape::Torus), 3);
+        assert_eq!(d.len(), 3);
+    }
+
+    #[test]
+    fn scale_builds_shafts_cubes_triangles_center() {
+        let d = gizmo_draws(GizmoMode::Scale, &pose(), None);
+        assert_eq!(count(&d, OverlayShape::Cylinder), 3);
+        assert_eq!(count(&d, OverlayShape::Cube), 4);
+        assert_eq!(count(&d, OverlayShape::Triangle), 3);
+    }
+
+    #[test]
+    fn highlighted_handle_is_yellow_others_keep_axis_colours() {
+        let d = gizmo_draws(GizmoMode::Move, &pose(), Some(GizmoHandle::Axis(1)));
+        let yellow: Vec<_> = d.iter().filter(|d| d.color == HIGHLIGHT).collect();
+        assert_eq!(yellow.len(), 2, "shaft and cone of Y");
+        let x = handle_color(0);
+        assert!(
+            d.iter()
+                .any(|d| d.shape == OverlayShape::Cone && d.color == x)
+        );
+    }
+
+    #[test]
+    fn plane_handles_are_translucent() {
+        let d = gizmo_draws(GizmoMode::Move, &pose(), None);
+        assert!(
+            d.iter()
+                .filter(|d| d.shape == OverlayShape::Quad)
+                .all(|d| d.color[3] == PLANE_ALPHA)
+        );
+    }
 
     #[test]
     fn ray_plane_hit() {

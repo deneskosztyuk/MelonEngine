@@ -18,7 +18,7 @@ pub enum OverlayShape {
     Cube,
     /// Radius 1.
     Sphere,
-    /// Major radius 1 in the XZ plane, tube radius 0.1.
+    /// Major radius 1 in the XZ plane, tube radius 0.03.
     Torus,
     /// 0..1 in X and Z at y = 0.
     Quad,
@@ -66,6 +66,8 @@ pub(crate) struct OverlayVertex {
 }
 
 const SEGMENTS: u16 = 24;
+/// Tube radius of the unit torus (thin rings at any ring size).
+pub const TORUS_TUBE: f32 = 0.03;
 
 fn vertex(position: Vec3, normal: Vec3) -> OverlayVertex {
     OverlayVertex {
@@ -169,7 +171,7 @@ pub(crate) fn shape_mesh(shape: OverlayShape) -> (Vec<OverlayVertex>, Vec<u16>) 
                     let (c, sn) = around(s);
                     let ring = Vec3::new(c, 0.0, sn);
                     let n = ring * b.cos() + Vec3::Y * b.sin();
-                    v.push(vertex(ring + n * 0.1, n));
+                    v.push(vertex(ring + n * TORUS_TUBE, n));
                 }
             }
             grid_indices(tube + 1, 0, &mut i);
@@ -664,8 +666,8 @@ mod tests {
             (OverlayShape::Sphere, Vec3::splat(-1.0), Vec3::splat(1.0)),
             (
                 OverlayShape::Torus,
-                Vec3::new(-1.1, -0.1, -1.1),
-                Vec3::new(1.1, 0.1, 1.1),
+                Vec3::new(-1.03, -0.03, -1.03),
+                Vec3::new(1.03, 0.03, 1.03),
             ),
             (OverlayShape::Quad, Vec3::ZERO, Vec3::new(1.0, 0.0, 1.0)),
             (OverlayShape::Triangle, Vec3::ZERO, Vec3::new(1.0, 0.0, 1.0)),
