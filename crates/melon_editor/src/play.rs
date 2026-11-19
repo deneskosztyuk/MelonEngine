@@ -271,6 +271,18 @@ mod tests {
     }
 
     #[test]
+    fn stop_restores_hierarchy() {
+        let mut world = edit_world();
+        let floor = find(&mut world, "Floor");
+        let b = find(&mut world, "Box");
+        world.entity_mut(b).insert(melon_core::ChildOf(floor));
+        play(&mut world).unwrap();
+        stop(&mut world).unwrap();
+        let (floor, b) = (find(&mut world, "Floor"), find(&mut world, "Box"));
+        assert_eq!(world.get::<melon_core::ChildOf>(b).unwrap().parent(), floor);
+    }
+
+    #[test]
     fn wrong_state_calls_are_noops() {
         let mut world = edit_world();
         stop(&mut world).unwrap();

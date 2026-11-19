@@ -4,14 +4,17 @@ use anyhow::{Context, Result, bail};
 use bevy_ecs::entity::Entity;
 use bevy_ecs::query::With;
 use bevy_ecs::world::World;
+use melon_core::hierarchy::{depth_first, world_matrix};
 use melon_core::{
-    Aabb, AssetServer, Bob, BodyInfo, BodyKind, Handle, Model, Name, NameCounter, Spin, Transform,
+    Aabb, AssetServer, Bob, BodyInfo, BodyKind, ChildOf, Handle, Model, Name, NameCounter, Spin,
+    Transform,
 };
 use melon_physics::{ColliderComponent, PhysicsWorld, RigidBodyComponent, RigidBodyType};
 use serde::{Deserialize, Serialize};
 
 /// 2: entities store a model path (`model`) instead of `mesh_ref`.
-const SCENE_VERSION: u32 = 2;
+/// 3: entities store a `parent` index; `transform` is local to the parent.
+const SCENE_VERSION: u32 = 3;
 
 /// Version 1 `mesh_ref` values, read so old scenes still load.
 #[derive(Deserialize, Clone, Copy)]
@@ -40,7 +43,11 @@ pub struct SceneData {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SceneEntity {
     name: String,
+    /// Local to the parent (world for roots).
     transform: Transform,
+    /// Index of the parent in `entities` (version 3+).
+    #[serde(default)]
+    parent: Option<u32>,
     /// Version 1 only.
     #[serde(default, skip_serializing)]
     mesh_ref: Option<LegacyMeshRef>,
@@ -58,34 +65,39 @@ pub struct SceneEntity {
 }
 
 /// Capture all entities with Name + Transform, except ones marked for deletion
-/// (deleted this frame but not yet despawned).
+/// (deleted this frame but not yet despawned). Depth-first, so parents come
+/// before their children and sibling order is kept.
 pub fn scene_to_data(world: &mut World) -> SceneData {
-    let mut query = world.query_filtered::<(
-        &Name,
-        &Transform,
-        Option<&Handle<Model>>,
-        Option<&Aabb>,
-        Option<&BodyInfo>,
-        Option<&Spin>,
-        Option<&Bob>,
-    ), bevy_ecs::query::Without<melon_core::PendingDelete>>();
+    let rows: Vec<Entity> = depth_first(world).into_iter().map(|(e, _)| e).collect();
     let world: &World = world;
+    let index: std::collections::HashMap<Entity, u32> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (*e, i as u32))
+        .collect();
     let server = world.get_resource::<AssetServer>();
 
-    let entities: Vec<SceneEntity> = query
-        .iter(world)
-        .map(
-            |(name, transform, model, aabb, body_info, spin, bob)| SceneEntity {
-                name: name.0.clone(),
-                transform: *transform,
-                mesh_ref: None,
-                model: model.zip(server).map(|(h, s)| s.path(*h).to_string()),
-                aabb: aabb.copied(),
-                body_info: body_info.copied(),
-                spin: spin.copied(),
-                bob: bob.copied(),
-            },
-        )
+    let entities: Vec<SceneEntity> = rows
+        .iter()
+        .map(|&e| SceneEntity {
+            name: world
+                .get::<Name>(e)
+                .map(|n| n.0.clone())
+                .unwrap_or_default(),
+            transform: world.get::<Transform>(e).copied().unwrap_or_default(),
+            parent: world
+                .get::<ChildOf>(e)
+                .and_then(|c| index.get(&c.parent()).copied()),
+            mesh_ref: None,
+            model: world
+                .get::<Handle<Model>>(e)
+                .zip(server)
+                .map(|(h, s)| s.path(*h).to_string()),
+            aabb: world.get::<Aabb>(e).copied(),
+            body_info: world.get::<BodyInfo>(e).copied(),
+            spin: world.get::<Spin>(e).copied(),
+            bob: world.get::<Bob>(e).copied(),
+        })
         .collect();
 
     let name_counter = world
@@ -116,6 +128,7 @@ pub fn apply_scene(world: &mut World, physics: &mut PhysicsWorld, data: &SceneDa
     for (i, entity) in data.entities.iter().enumerate() {
         validate_entity(entity, i)?;
     }
+    validate_parents(&data.entities)?;
 
     // Phase 2: Mutate world in place.
     // Despawn only scene entities (those with a Transform). In bevy_ecs 0.19
@@ -126,14 +139,56 @@ pub fn apply_scene(world: &mut World, physics: &mut PhysicsWorld, data: &SceneDa
         .iter(world)
         .collect();
     for entity in scene_entities {
-        world.despawn(entity);
+        // Children may already be gone with their parent (`linked_spawn`).
+        if let Ok(e) = world.get_entity_mut(entity) {
+            e.despawn();
+        }
     }
     world.insert_resource(NameCounter(data.name_counter));
 
     physics.clear();
 
-    for entity in &data.entities {
-        spawn_scene_entity(world, physics, entity);
+    // Spawn everything, attach parents, then create bodies from world poses
+    // (which need the parents in place).
+    let ids: Vec<Entity> = data
+        .entities
+        .iter()
+        .map(|entity| spawn_scene_entity(world, entity))
+        .collect();
+    for (entity, &id) in data.entities.iter().zip(&ids) {
+        if let Some(p) = entity.parent {
+            world.entity_mut(id).insert(ChildOf(ids[p as usize]));
+        }
+    }
+    for (entity, &id) in data.entities.iter().zip(&ids) {
+        if let Some(body_info) = entity.body_info {
+            spawn_body(world, physics, id, body_info);
+        }
+    }
+    Ok(())
+}
+
+/// Every parent index points at another entity in the file, without cycles.
+fn validate_parents(entities: &[SceneEntity]) -> Result<()> {
+    for (i, entity) in entities.iter().enumerate() {
+        let name = &entity.name;
+        let mut current = i;
+        for _ in 0..=entities.len() {
+            let Some(p) = entities[current].parent else {
+                break;
+            };
+            let p = p as usize;
+            if p >= entities.len() {
+                bail!("entity '{name}' (index {i}): parent index {p} is out of range");
+            }
+            if p == i {
+                bail!("entity '{name}' (index {i}) is its own parent or ancestor");
+            }
+            current = p;
+        }
+        if entities[current].parent.is_some() {
+            bail!("entity '{name}' (index {i}) is in a parent cycle");
+        }
     }
     Ok(())
 }
@@ -212,7 +267,8 @@ fn validate_entity(entity: &SceneEntity, index: usize) -> Result<()> {
     Ok(())
 }
 
-fn spawn_scene_entity(world: &mut World, physics: &mut PhysicsWorld, entity: &SceneEntity) {
+/// Spawn one entity without its physics body (see `spawn_body`).
+fn spawn_scene_entity(world: &mut World, entity: &SceneEntity) -> Entity {
     let id = world
         .spawn((Name(entity.name.clone()), entity.transform))
         .id();
@@ -232,49 +288,6 @@ fn spawn_scene_entity(world: &mut World, physics: &mut PhysicsWorld, entity: &Sc
         world.entity_mut(id).insert(aabb);
     }
 
-    if let Some(body_info) = entity.body_info {
-        // Create rapier body based on BodyKind
-        match body_info.body_type {
-            BodyKind::Dynamic => {
-                let (body_h, collider_h) = physics.spawn_dynamic_cuboid(
-                    entity.transform.translation,
-                    entity.transform.rotation,
-                    body_info.half_extents,
-                );
-                world.entity_mut(id).insert((
-                    RigidBodyComponent {
-                        body_handle: body_h,
-                        body_type: RigidBodyType::Dynamic,
-                    },
-                    ColliderComponent {
-                        collider_handle: collider_h,
-                    },
-                    body_info,
-                ));
-            }
-            BodyKind::Fixed => {
-                let (body_h, collider_h) = physics.spawn_fixed_cuboid(
-                    entity.transform.translation,
-                    entity.transform.rotation,
-                    body_info.half_extents,
-                );
-                world.entity_mut(id).insert((
-                    RigidBodyComponent {
-                        body_handle: body_h,
-                        body_type: RigidBodyType::Fixed,
-                    },
-                    ColliderComponent {
-                        collider_handle: collider_h,
-                    },
-                    body_info,
-                ));
-            }
-            BodyKind::None => {
-                world.entity_mut(id).insert(body_info);
-            }
-        }
-    }
-
     if entity.spin.is_some() {
         world.entity_mut(id).insert(Spin);
     }
@@ -282,13 +295,43 @@ fn spawn_scene_entity(world: &mut World, physics: &mut PhysicsWorld, entity: &Sc
     if entity.bob.is_some() {
         world.entity_mut(id).insert(Bob);
     }
+    id
+}
+
+/// Create the rapier body for `id` at its world pose.
+fn spawn_body(world: &mut World, physics: &mut PhysicsWorld, id: Entity, body_info: BodyInfo) {
+    let pose = Transform::from_mat4(world_matrix(world, id));
+    let (kind, (body_h, collider_h)) = match body_info.body_type {
+        BodyKind::Dynamic => (
+            RigidBodyType::Dynamic,
+            physics.spawn_dynamic_cuboid(pose.translation, pose.rotation, body_info.half_extents),
+        ),
+        BodyKind::Fixed => (
+            RigidBodyType::Fixed,
+            physics.spawn_fixed_cuboid(pose.translation, pose.rotation, body_info.half_extents),
+        ),
+        BodyKind::None => {
+            world.entity_mut(id).insert(body_info);
+            return;
+        }
+    };
+    world.entity_mut(id).insert((
+        RigidBodyComponent {
+            body_handle: body_h,
+            body_type: kind,
+        },
+        ColliderComponent {
+            collider_handle: collider_h,
+        },
+        body_info,
+    ));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bevy_ecs::world::World;
-    use melon_core::glam::Vec3;
+    use melon_core::glam::{Quat, Vec3};
 
     fn world_with_entities() -> World {
         let mut world = World::new();
@@ -320,6 +363,147 @@ mod tests {
             .resource::<melon_core::AssetServer>()
             .path(handle)
             .to_string()
+    }
+
+    fn named(world: &mut World, name: &str) -> Entity {
+        world
+            .query::<(Entity, &Name)>()
+            .iter(world)
+            .find(|(_, n)| n.0 == name)
+            .map(|(e, _)| e)
+            .unwrap_or_else(|| panic!("no entity named {name}"))
+    }
+
+    /// Car > (WheelA at local (1,0,0), WheelB).
+    fn car_world() -> World {
+        let mut world = World::new();
+        world.insert_resource(AssetServer::new(".".into()));
+        let car = world
+            .spawn((
+                Name("Car".to_string()),
+                Transform::from_translation(Vec3::new(5.0, 0.0, 0.0)),
+            ))
+            .id();
+        for (name, x) in [("WheelA", 1.0), ("WheelB", -1.0)] {
+            world.spawn((
+                Name(name.to_string()),
+                Transform::from_translation(Vec3::new(x, 0.0, 0.0)),
+                melon_core::ChildOf(car),
+            ));
+        }
+        world
+    }
+
+    fn entity(name: &str, parent: Option<u32>) -> SceneEntity {
+        SceneEntity {
+            name: name.to_string(),
+            transform: Transform::default(),
+            parent,
+            mesh_ref: None,
+            model: None,
+            aabb: None,
+            body_info: None,
+            spin: None,
+            bob: None,
+        }
+    }
+
+    #[test]
+    fn v3_roundtrip_keeps_parents_local_transforms_and_order() {
+        let mut world = car_world();
+        let mut physics = PhysicsWorld::new();
+        let data = scene_to_data(&mut world);
+        apply_scene(&mut world, &mut physics, &data).unwrap();
+        let car = named(&mut world, "Car");
+        let children: Vec<String> = world
+            .get::<melon_core::Children>(car)
+            .unwrap()
+            .iter()
+            .map(|c| world.get::<Name>(*c).unwrap().0.clone())
+            .collect();
+        assert_eq!(children, ["WheelA", "WheelB"]);
+        let a = named(&mut world, "WheelA");
+        assert_eq!(world.get::<Transform>(a).unwrap().translation, Vec3::X);
+    }
+
+    #[test]
+    fn v2_scene_loads_all_roots() {
+        let ron = r#"(version: 2, entities: [
+            (name: "A", transform: (translation: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0, 1.0), scale: (1.0, 1.0, 1.0))),
+            (name: "B", transform: (translation: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0, 1.0), scale: (1.0, 1.0, 1.0))),
+        ], name_counter: 0)"#;
+        let data: SceneData = ron::from_str(ron).unwrap();
+        let mut world = World::new();
+        apply_scene(&mut world, &mut PhysicsWorld::new(), &data).unwrap();
+        assert_eq!(
+            world.query::<&melon_core::ChildOf>().iter(&world).count(),
+            0
+        );
+        assert_eq!(world.query::<&Name>().iter(&world).count(), 2);
+    }
+
+    #[test]
+    fn bad_parent_index_fails_and_keeps_world() {
+        let cases = [
+            vec![entity("Lost", Some(99))],
+            vec![entity("Selfie", Some(0))],
+            vec![entity("Egg", Some(1)), entity("Hen", Some(0))],
+        ];
+        for entities in cases {
+            let mut world = car_world();
+            let data = SceneData {
+                version: SCENE_VERSION,
+                entities,
+                name_counter: 0,
+            };
+            let err = apply_scene(&mut world, &mut PhysicsWorld::new(), &data).unwrap_err();
+            let first = &data.entities[0].name;
+            assert!(err.to_string().contains(first.as_str()), "{err}");
+            assert_eq!(world.query::<&Name>().iter(&world).count(), 3);
+        }
+    }
+
+    #[test]
+    fn reapplying_scene_with_children_does_not_panic() {
+        let mut world = car_world();
+        let mut physics = PhysicsWorld::new();
+        let data = scene_to_data(&mut world);
+        apply_scene(&mut world, &mut physics, &data).unwrap();
+        apply_scene(&mut world, &mut physics, &data).unwrap();
+        assert_eq!(world.query::<&Name>().iter(&world).count(), 3);
+    }
+
+    #[test]
+    fn child_body_spawns_at_world_pose() {
+        let mut parent = entity("Parent", None);
+        parent.transform = Transform {
+            translation: Vec3::new(5.0, 0.0, 0.0),
+            rotation: Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+            ..Default::default()
+        };
+        let mut child = entity("Child", Some(0));
+        child.transform = Transform::from_translation(Vec3::X);
+        child.body_info = Some(BodyInfo {
+            body_type: BodyKind::Fixed,
+            half_extents: Vec3::splat(0.5),
+        });
+        let data = SceneData {
+            version: SCENE_VERSION,
+            entities: vec![parent, child],
+            name_counter: 0,
+        };
+        let mut world = World::new();
+        let mut physics = PhysicsWorld::new();
+        apply_scene(&mut world, &mut physics, &data).unwrap();
+        let e = named(&mut world, "Child");
+        let h = world.get::<RigidBodyComponent>(e).unwrap().body_handle;
+        let body = physics.bodies.get(h).unwrap();
+        assert!((body.translation() - Vec3::new(5.0, 0.0, -1.0)).length() < 1e-4);
+        assert!(
+            body.rotation()
+                .angle_between(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2))
+                < 1e-4
+        );
     }
 
     #[test]
