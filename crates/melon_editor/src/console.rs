@@ -138,11 +138,14 @@ pub fn console_ui(ui: &mut egui::Ui, log: &ConsoleLog, filter: &mut ConsoleFilte
         ui.weak(format!("{} lines", lines.len()));
     });
     ui.separator();
+    // Lay out only the visible rows: the log can hold thousands of lines.
+    let shown: Vec<&LogLine> = lines.iter().filter(|l| filter.shows(l.level)).collect();
+    let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .stick_to_bottom(true)
-        .show(ui, |ui| {
-            for line in lines.iter().filter(|l| filter.shows(l.level)) {
+        .show_rows(ui, row_height, shown.len(), |ui, rows| {
+            for line in &shown[rows] {
                 ui.label(
                     egui::RichText::new(format!(
                         "[{:<5}] {}: {}",

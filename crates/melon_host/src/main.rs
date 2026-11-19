@@ -478,7 +478,7 @@ impl ApplicationHandler for App {
                                     .editor_ui
                                     .as_mut()
                                     .unwrap()
-                                    .set_status(format!("Save failed: {e}")),
+                                    .set_status_error(format!("Save failed: {e}")),
                             }
                         }
                         melon_editor::PendingOperation::Load(path) => {
@@ -518,7 +518,7 @@ impl ApplicationHandler for App {
                                     .editor_ui
                                     .as_mut()
                                     .unwrap()
-                                    .set_status(format!("Load failed: {e}")),
+                                    .set_status_error(format!("Load failed: {e}")),
                             }
                         }
                     }

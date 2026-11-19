@@ -97,14 +97,24 @@ pub fn save_layout(state: &DockState<EditorTab>, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Bring a panel to the front, or put it back if it was closed.
+/// Bring a panel to the front, or put it back if it was closed. A closed
+/// panel goes into the largest panel group (by last frame's size), so the
+/// Scene doesn't land in a thin bottom strip just because it had focus.
 pub fn reopen(state: &mut DockState<EditorTab>, tab: EditorTab) {
-    match state.find_tab(&tab) {
-        Some(path) => {
-            let _ = state.set_active_tab(path);
-        }
-        None => state.push_to_focused_leaf(tab),
+    if let Some(path) = state.find_tab(&tab) {
+        let _ = state.set_active_tab(path);
+        return;
     }
+    let largest = state
+        .iter_leaves()
+        .map(|(path, leaf)| (path, leaf.rect.area()))
+        .filter(|(_, area)| *area > 0.0)
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(path, _)| path);
+    if let Some(path) = largest {
+        state.set_focused_node_and_surface(path);
+    }
+    state.push_to_focused_leaf(tab);
 }
 
 /// Hierarchy search: case-insensitive substring; a blank query matches all.
@@ -176,6 +186,26 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn reopen_goes_to_largest_leaf() {
+        let mut state = default_layout();
+        let scene = state.find_tab(&EditorTab::Scene).unwrap();
+        state.remove_tab(scene);
+        // Pretend last frame laid out the Hierarchy leaf largest.
+        for (_, leaf) in state.iter_leaves_mut() {
+            let big = leaf.tabs.contains(&EditorTab::Hierarchy);
+            let side = if big { 800.0 } else { 100.0 };
+            leaf.rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(side, side));
+        }
+        // Focus the bottom leaf, where a plain push would land.
+        let console = state.find_tab(&EditorTab::Console).unwrap();
+        state.set_focused_node_and_surface(console.node_path());
+        reopen(&mut state, EditorTab::Scene);
+        let scene = state.find_tab(&EditorTab::Scene).unwrap();
+        let hierarchy = state.find_tab(&EditorTab::Hierarchy).unwrap();
+        assert_eq!(scene.node_path(), hierarchy.node_path());
     }
 
     #[test]

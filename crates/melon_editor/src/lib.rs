@@ -76,7 +76,7 @@ pub struct Editor {
     gizmo_vertices: Vec<LineVertex>,
     pending_dialog: Option<DialogChannel>,
     pending_operation: Option<PendingOperation>,
-    status_message: Option<(String, std::time::Instant)>,
+    status_message: Option<(String, StatusKind, std::time::Instant)>,
     /// egui texture showing the scene (set by `EditorOverlay`).
     viewport_texture: Option<egui::TextureId>,
     /// Pixel size the viewport panel wants its render target to be.
@@ -198,7 +198,7 @@ impl Editor {
                 let is_save = matches!(dialog, DialogChannel::Save(_));
                 self.pending_operation = dialog_operation(is_save, path, sim_state(world));
                 if self.pending_operation.is_none() {
-                    self.set_status("Stop the game before saving or loading".into());
+                    self.set_status_warning("Stop the game before saving or loading".into());
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => self.pending_dialog = Some(dialog),
@@ -210,7 +210,7 @@ impl Editor {
     /// File > Save: write to the current scene file, or ask for one.
     fn save(&mut self, world: &World) {
         if sim_state(world) != SimulationState::Editing {
-            self.set_status("Stop the game before saving".into());
+            self.set_status_warning("Stop the game before saving".into());
             return;
         }
         match self.current_scene.clone() {
@@ -334,14 +334,12 @@ impl Editor {
 
     fn status_bar(&mut self, world: &mut World, ui: &mut egui::Ui) {
         ui.horizontal_centered(|ui| {
-            if let Some((message, time)) = &self.status_message {
+            if let Some((message, kind, time)) = &self.status_message {
                 if time.elapsed().as_secs() < 5 {
-                    let color = if message.contains("fail") {
-                        theme::colors::ERROR
-                    } else if message.starts_with("Stop the game") {
-                        theme::colors::WARNING
-                    } else {
-                        theme::colors::SUCCESS
+                    let color = match kind {
+                        StatusKind::Success => theme::colors::SUCCESS,
+                        StatusKind::Warning => theme::colors::WARNING,
+                        StatusKind::Error => theme::colors::ERROR,
                     };
                     ui.colored_label(color, message);
                 } else {
@@ -441,12 +439,36 @@ impl Editor {
         self.viewport_size
     }
 
+    pub fn set_status_error(&mut self, message: String) {
+        self.status_message = Some((message, StatusKind::Error, std::time::Instant::now()));
+    }
+
+    pub fn set_status_warning(&mut self, message: String) {
+        self.status_message = Some((message, StatusKind::Warning, std::time::Instant::now()));
+    }
+
+    /// Kind of the status message currently shown, if any.
+    pub fn status_kind(&self) -> Option<StatusKind> {
+        self.status_message.as_ref().map(|(_, kind, _)| *kind)
+    }
+
+    /// Smooth this frame's delta into the FPS readout. Runs every frame from
+    /// `build_ui`, so the readout keeps updating with the Scene tab hidden.
+    fn tick_frame_time(&mut self, dt: f32) {
+        self.frame_ms += 0.1 * (dt * 1000.0 - self.frame_ms);
+    }
+
+    /// Show a success/info message in the status bar.
     pub fn set_status(&mut self, message: String) {
-        self.status_message = Some((message, std::time::Instant::now()));
+        self.status_message = Some((message, StatusKind::Success, std::time::Instant::now()));
     }
 
     /// Build the editor UI, reading from and writing to the ECS world.
     pub fn build_ui(&mut self, world: &mut World, ui: &mut egui::Ui) {
+        let dt = world
+            .get_resource::<melon_core::Time>()
+            .map_or(1.0 / 60.0, |t| t.delta_seconds);
+        self.tick_frame_time(dt);
         self.poll_dialog(world);
         self.handle_shortcuts(world, ui);
 
@@ -552,7 +574,6 @@ impl Editor {
                 .extend(viewport::selection_box_lines(t));
         }
 
-        self.frame_ms += 0.1 * (dt * 1000.0 - self.frame_ms);
         let painter = ui.painter_at(rect);
         painter.text(
             rect.right_top() + egui::vec2(-10.0, 8.0),
@@ -618,14 +639,14 @@ impl Editor {
                 // Play from edit mode rebuilds the scene, so entity ids change.
                 Ok(()) if state == SimulationState::Editing => self.clear_selection(),
                 Ok(()) => {}
-                Err(e) => self.set_status(format!("Play failed: {e}")),
+                Err(e) => self.set_status_error(format!("Play failed: {e}")),
             }
         } else if want_pause && can_pause {
             play::pause(world);
         } else if want_stop && can_stop {
             match play::stop(world) {
                 Ok(()) => self.clear_selection(),
-                Err(e) => self.set_status(format!("Stop failed: {e}")),
+                Err(e) => self.set_status_error(format!("Stop failed: {e}")),
             }
         }
 
@@ -1345,6 +1366,14 @@ pub fn create_cube(world: &mut World) -> Entity {
         .id()
 }
 
+/// Severity of a status-bar message (its colour).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusKind {
+    Success,
+    Warning,
+    Error,
+}
+
 /// Editor keyboard shortcuts (F5/F6/Shift+F5 live in `play_controls`, F in the viewport).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shortcut {
@@ -1605,6 +1634,30 @@ mod tests {
             dialog_operation(true, path, SimulationState::Editing),
             Some(PendingOperation::Save(_))
         ));
+    }
+
+    #[test]
+    fn status_kind_follows_setter_not_text() {
+        let mut editor = Editor::default();
+        editor.set_status(r"Saved to C:\failover\scene.ron".into());
+        assert_eq!(editor.status_kind(), Some(StatusKind::Success));
+        editor.set_status_error("Save failed: disk full".into());
+        assert_eq!(editor.status_kind(), Some(StatusKind::Error));
+        editor.set_status_warning("Stop the game before saving".into());
+        assert_eq!(editor.status_kind(), Some(StatusKind::Warning));
+    }
+
+    #[test]
+    fn frame_time_smoothing_tracks_delta() {
+        let mut editor = Editor::default();
+        for _ in 0..200 {
+            editor.tick_frame_time(0.010);
+        }
+        assert!(
+            (editor.frame_ms - 10.0).abs() < 0.1,
+            "frame_ms {}",
+            editor.frame_ms
+        );
     }
 
     #[test]
