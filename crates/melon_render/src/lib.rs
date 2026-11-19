@@ -333,7 +333,22 @@ pub struct Renderer {
     size: winit::dpi::PhysicalSize<u32>,
     window: Arc<Window>,
     scene: SceneRenderer,
+    /// GPU models per asset handle, used by `render_scene`.
+    model_cache: ModelCache,
 }
+
+/// Background of the scene and of the window behind the editor UI.
+pub const CLEAR_COLOR: wgpu::Color = wgpu::Color {
+    r: 0.06,
+    g: 0.07,
+    b: 0.09,
+    a: 1.0,
+};
+
+// ponytail: fixed shadow box around the origin; fit it to the camera frustum
+// (or use cascades) once scenes outgrow 40 m.
+pub const SHADOW_CENTER: glam::Vec3 = glam::Vec3::ZERO;
+pub const SHADOW_RADIUS: f32 = 20.0;
 
 impl std::ops::Deref for Renderer {
     type Target = SceneRenderer;
@@ -396,6 +411,7 @@ impl Renderer {
             .context("surface reported no usable formats")?;
 
         let scene = SceneRenderer::new(device, queue, surface_format);
+        let model_cache = ModelCache::new(&scene);
 
         let renderer = Self {
             instance,
@@ -403,6 +419,7 @@ impl Renderer {
             size,
             window,
             scene,
+            model_cache,
         };
         renderer.configure_surface();
         Ok(renderer)
@@ -410,6 +427,108 @@ impl Renderer {
 
     pub fn scene(&self) -> &SceneRenderer {
         &self.scene
+    }
+
+    /// Record one view of `frame` into `target`: shadow pass, 3D pass (HDR,
+    /// MSAA) with the meshes and depth-tested `world_lines`, then the tonemap
+    /// pass onto the target's display image with `overlay_lines` on top.
+    /// Models load (or hot-reload) here on first use.
+    pub fn render_scene(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &FrameData,
+        server: &mut melon_core::AssetServer,
+        target: &ViewportTarget,
+        world_lines: &[LineVertex],
+        overlay_lines: &[LineVertex],
+    ) {
+        let scene = &mut self.scene;
+        scene.update_camera(frame.view_proj);
+        let to_light = frame.light.to_light();
+        scene.update_light(
+            to_light,
+            frame.light.ambient,
+            frame.light.color,
+            directional_light_view_proj(to_light, SHADOW_CENTER, SHADOW_RADIUS),
+        );
+        let matrices: Vec<glam::Mat4> = frame.models.iter().map(|(m, _)| *m).collect();
+        scene.update_model_uniforms(&matrices);
+
+        // Every part of each entity's model shares the entity's uniform slot.
+        for (_, handle) in &frame.models {
+            self.model_cache.prepare(&self.scene, server, *handle);
+        }
+        let mut draw_calls: Vec<(usize, &Mesh, Option<&wgpu::BindGroup>)> =
+            Vec::with_capacity(frame.models.len());
+        for (i, (_, handle)) in frame.models.iter().enumerate() {
+            let model = self.model_cache.model(server, *handle);
+            for (mesh, albedo) in model.meshes.iter().zip(&model.albedo_bind_groups) {
+                draw_calls.push((i, mesh, albedo.as_ref()));
+            }
+        }
+        // The draw list borrows the model cache; the scene is a separate field.
+        let scene = &mut self.scene;
+        let shadow_draw_calls: Vec<(usize, &Mesh)> =
+            draw_calls.iter().map(|(i, mesh, _)| (*i, *mesh)).collect();
+        scene.render_shadow_pass(encoder, &shadow_draw_calls);
+
+        let hdr = target.hdr_target();
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("melon_render 3D pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: hdr.msaa_view(),
+                    depth_slice: None,
+                    resolve_target: Some(hdr.view()),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: target.depth_view(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            scene.draw_meshes_textured(&mut pass, &draw_calls);
+            scene.draw_world_lines(&mut pass, world_lines, frame.view_proj);
+        }
+        let color_view = target.color_view();
+        let mut pass = scene.tonemap_pass(encoder, hdr, &color_view);
+        if !overlay_lines.is_empty() {
+            scene.draw_lines(&mut pass, overlay_lines, frame.view_proj);
+        }
+    }
+
+    /// The pass the editor UI draws into: the swapchain image cleared to
+    /// `CLEAR_COLOR`, no depth.
+    pub fn ui_pass(&self, frame: &mut Frame) -> wgpu::RenderPass<'static> {
+        frame
+            .encoder
+            .begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("melon_render egui pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &frame.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            })
+            .forget_lifetime()
     }
 
     pub fn scene_mut(&mut self) -> &mut SceneRenderer {
@@ -1902,7 +2021,9 @@ impl ViewportTarget {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[format.remove_srgb_suffix()],
         }));
         let color_view =
@@ -2545,6 +2666,41 @@ mod tests {
                 } else {
                     Err(format!(
                         "cache_keeps_previous_on_broken_reload: first {first}, version {version}, after {after}"
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
+                use melon_core::{AssetServer, Handle, Model};
+                let mut server = AssetServer::new(".".into());
+                let cube: Handle<Model> = server.load("builtin:cube");
+                let mut centre = |models: Vec<(glam::Mat4, Handle<Model>)>| {
+                    let target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(
+                        TEST_SIZE, TEST_SIZE,
+                    ));
+                    let frame = FrameData {
+                        view_proj: melon_core::Camera::default().view_proj(),
+                        light: melon_core::Light::default(),
+                        models,
+                    };
+                    let mut encoder = renderer
+                        .device()
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                    renderer.render_scene(&mut encoder, &frame, &mut server, &target, &[], &[]);
+                    let pixels = read_back(
+                        renderer.device(),
+                        renderer.queue(),
+                        encoder,
+                        &target.color_texture,
+                    );
+                    value_at(&pixels, (TEST_SIZE / 2, TEST_SIZE / 2))
+                };
+                let empty = centre(vec![]);
+                let with_cube = centre(vec![(glam::Mat4::IDENTITY, cube)]);
+                if empty != with_cube {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "render_scene_draws_a_cube: centre {empty} with and without the cube"
                     ))
                 }
             }),
