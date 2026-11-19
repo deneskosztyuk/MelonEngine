@@ -469,6 +469,47 @@ impl Editor {
         std::mem::take(&mut self.pending_operation)
     }
 
+    /// Run the File menu's pending Save / Load / Exit, once. Returns `true`
+    /// when the window should close (the layout is already saved then).
+    pub fn run_pending_operation(&mut self, world: &mut World) -> bool {
+        match self.take_pending_operation() {
+            None => false,
+            Some(PendingOperation::Exit) => {
+                self.save_layout();
+                true
+            }
+            Some(PendingOperation::Save(path)) => {
+                match scene::save_scene(world, &path) {
+                    Ok(()) => {
+                        self.set_status(format!("Saved to {}", path.display()));
+                        self.set_current_scene(path);
+                    }
+                    Err(e) => self.set_status_error(format!("Save failed: {e}")),
+                }
+                false
+            }
+            Some(PendingOperation::Load(path)) => {
+                if !world.contains_resource::<melon_physics::PhysicsWorld>() {
+                    world.insert_resource(melon_physics::PhysicsWorld::new());
+                }
+                let result = world.resource_scope(
+                    |world, mut physics: bevy_ecs::world::Mut<melon_physics::PhysicsWorld>| {
+                        scene::load_scene(world, &mut physics, &path)
+                    },
+                );
+                match result {
+                    Ok(()) => {
+                        self.clear_selection();
+                        self.set_status(format!("Loaded from {}", path.display()));
+                        self.set_current_scene(path);
+                    }
+                    Err(e) => self.set_status_error(format!("Load failed: {e}")),
+                }
+                false
+            }
+        }
+    }
+
     /// Share the engine's log buffer with the Console panel.
     pub fn set_console(&mut self, log: console::ConsoleLog) {
         self.console = log;
@@ -2210,6 +2251,60 @@ mod tests {
         );
         let children = world.get::<melon_core::Children>(a).map_or(0, |c| c.len());
         assert_eq!(children, 1);
+    }
+
+    fn pending_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("melon_pending_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn pending_save_writes_file_and_reports() {
+        let dir = pending_dir("save");
+        let path = dir.join("scene.ron");
+        let mut world = World::new();
+        world.spawn((Name("A".into()), Transform::default()));
+        let mut editor = Editor::new();
+        editor.pending_operation = Some(PendingOperation::Save(path.clone()));
+        assert!(!editor.run_pending_operation(&mut world));
+        assert!(path.exists());
+        assert_eq!(editor.status_kind(), Some(StatusKind::Success));
+        std::fs::remove_file(&path).unwrap();
+        assert!(!editor.run_pending_operation(&mut world));
+        assert!(!path.exists(), "the operation ran twice");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_load_failure_keeps_world_and_physics() {
+        let dir = pending_dir("load");
+        let mut world = World::new();
+        world.insert_resource(melon_physics::PhysicsWorld::new());
+        world.spawn((Name("A".into()), Transform::default()));
+        let mut editor = Editor::new();
+        editor.pending_operation = Some(PendingOperation::Load(dir.join("missing.ron")));
+        assert!(!editor.run_pending_operation(&mut world));
+        assert_eq!(editor.status_kind(), Some(StatusKind::Error));
+        assert_eq!(world.query::<&Name>().iter(&world).count(), 1);
+        assert!(
+            world
+                .get_resource::<melon_physics::PhysicsWorld>()
+                .is_some()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_exit_returns_true() {
+        let dir = pending_dir("exit");
+        let mut world = World::new();
+        let mut editor = Editor::new();
+        editor.layout_file = dir.join("layout.ron");
+        editor.pending_operation = Some(PendingOperation::Exit);
+        assert!(editor.run_pending_operation(&mut world));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
