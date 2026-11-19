@@ -196,9 +196,15 @@ pub fn step_system(mut world: ResMut<PhysicsWorld>, time: Res<Time>) {
 /// System: give every dynamic body a `PreviousTransform` (equal to its
 /// current `Transform`, so it never blends from the origin). One system
 /// covers all spawn paths: default scene, scene load, editor.
+#[allow(clippy::type_complexity)]
 pub fn add_previous_transforms_system(
     mut commands: Commands,
-    query: Query<(Entity, &RigidBodyComponent, &Transform), Without<PreviousTransform>>,
+    // Skip entities being deleted: their despawn may apply first in the same
+    // PostUpdate, and an insert on a despawned entity is an error.
+    query: Query<
+        (Entity, &RigidBodyComponent, &Transform),
+        (Without<PreviousTransform>, Without<PendingDelete>),
+    >,
 ) {
     for (entity, rb, transform) in &query {
         if rb.body_type == RigidBodyType::Dynamic {

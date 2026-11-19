@@ -41,6 +41,14 @@ pub struct LogInterval {
     pub frames_per_log: u64,
 }
 
+/// End of frame: per-frame input deltas start over, so a game system reading
+/// `Input::mouse_delta` sees only this frame's motion.
+fn clear_input_deltas_system(input: Option<ResMut<Input>>) {
+    if let Some(mut input) = input {
+        input.mouse_delta = glam::Vec2::ZERO;
+    }
+}
+
 fn frame_counter_system(mut counter: ResMut<FrameCounter>) {
     counter.frame += 1;
 }
@@ -76,6 +84,7 @@ impl Core {
 
         let mut core = Self { world, schedules };
         core.add_systems(Update, (frame_counter_system, log_frame_system));
+        core.add_systems(PostUpdate, clear_input_deltas_system);
         core
     }
 
@@ -98,7 +107,7 @@ impl Core {
             .world
             .get_resource::<SimulationState>()
             .copied()
-            .unwrap_or(SimulationState::Playing);
+            .unwrap_or_default();
 
         if let Some(mut time) = self.world.get_resource_mut::<Time>() {
             match state {
@@ -235,6 +244,32 @@ mod tests {
 
     fn set_state(core: &mut Core, state: SimulationState) {
         core.world.insert_resource(state);
+    }
+
+    #[test]
+    fn input_mouse_delta_cleared_each_frame() {
+        let mut core = Core::new();
+        core.world.insert_resource(crate::Input {
+            mouse_delta: glam::Vec2::new(5.0, 5.0),
+            ..Default::default()
+        });
+        core.update();
+        assert_eq!(
+            core.world.resource::<crate::Input>().mouse_delta,
+            glam::Vec2::ZERO
+        );
+    }
+
+    #[test]
+    fn missing_state_runs_no_fixed_steps() {
+        let mut core = counting_core();
+        core.world.remove_resource::<SimulationState>();
+        run_frames(&mut core, 1.0 / 30.0, 10);
+        assert_eq!(
+            steps(&core),
+            0,
+            "a missing state means Editing, like everywhere else"
+        );
     }
 
     #[test]

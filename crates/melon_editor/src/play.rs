@@ -78,6 +78,8 @@ pub fn stop(world: &mut World) -> Result<()> {
         time.elapsed_seconds = 0.0;
         time.overstep = 0.0;
     }
+    // A Step queued in the same frame must not fire on the next Pause.
+    world.remove_resource::<melon_core::StepOnce>();
     world.insert_resource(SimulationState::Editing);
     Ok(())
 }
@@ -232,6 +234,16 @@ mod tests {
         pause(&mut world);
         step(&mut world);
         assert!(world.contains_resource::<melon_core::StepOnce>());
+    }
+
+    #[test]
+    fn stop_clears_pending_step() {
+        let mut world = edit_world();
+        play(&mut world).unwrap();
+        pause(&mut world);
+        step(&mut world);
+        stop(&mut world).unwrap();
+        assert!(!world.contains_resource::<melon_core::StepOnce>());
     }
 
     #[test]
