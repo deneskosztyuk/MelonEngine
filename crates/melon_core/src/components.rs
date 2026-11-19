@@ -32,6 +32,16 @@ impl Transform {
         glam::Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
     }
 
+    /// Decompose a matrix (shear is lost).
+    pub fn from_mat4(m: glam::Mat4) -> Self {
+        let (scale, rotation, translation) = m.to_scale_rotation_translation();
+        Self {
+            translation,
+            rotation: rotation.normalize(),
+            scale,
+        }
+    }
+
     /// Blend from `prev` (alpha 0) to `self` (alpha 1).
     pub fn interpolate(&self, prev: &Transform, alpha: f32) -> Transform {
         Transform {

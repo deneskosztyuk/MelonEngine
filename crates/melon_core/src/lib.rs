@@ -8,6 +8,7 @@ use tracing::instrument;
 
 pub mod assets;
 pub mod components;
+pub mod hierarchy;
 pub mod input;
 pub mod resources;
 pub mod stages;
@@ -20,6 +21,7 @@ pub use components::{
     store_previous_transforms_system,
 };
 pub use glam;
+pub use hierarchy::{ChildOf, Children, GlobalTransform};
 pub use input::{Input, KeyCode};
 pub use resources::{Camera, Light, NameCounter, SimulationState, Time};
 pub use stages::{FixedUpdate, PostUpdate, Update};
@@ -87,7 +89,13 @@ impl Core {
 
         let mut core = Self { world, schedules };
         core.add_systems(Update, (frame_counter_system, log_frame_system));
-        core.add_systems(PostUpdate, clear_input_deltas_system);
+        core.add_systems(
+            PostUpdate,
+            (
+                clear_input_deltas_system,
+                hierarchy::propagate_transforms_system,
+            ),
+        );
         core.add_systems(Update, assets::hot_reload_system);
         core
     }
