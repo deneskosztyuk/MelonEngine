@@ -7,8 +7,8 @@ use melon_core::bevy_ecs::system::Res;
 use melon_core::bevy_ecs::world::World;
 use melon_core::glam::{Mat4, Quat, Vec2, Vec3};
 use melon_core::{
-    Aabb, BodyInfo, BodyKind, Camera, FrameCounter, Input, KeyCode, Light, Name, PreviousTransform,
-    SimulationState, Time, Transform, Update,
+    Aabb, BodyInfo, BodyKind, Camera, FrameCounter, Input, KeyCode, Light, Name, SimulationState,
+    Time, Transform, Update,
 };
 use melon_editor::Editor;
 use melon_editor::EditorOverlay;
@@ -52,15 +52,6 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
 // (or use cascades) once scenes outgrow 40 m.
 const SHADOW_CENTER: Vec3 = Vec3::ZERO;
 const SHADOW_RADIUS: f32 = 20.0;
-
-/// Model matrix to draw. Fixed-step entities blend between their last two
-/// steps when `blend` is set; otherwise the current `Transform` shows directly.
-fn render_matrix(t: &Transform, prev: Option<&PreviousTransform>, alpha: f32, blend: bool) -> Mat4 {
-    match prev {
-        Some(prev) if blend => t.interpolate(&prev.0, alpha).to_mat4(),
-        _ => t.to_mat4(),
-    }
-}
 
 /// Blend while playing and while paused (alpha is frozen then, so the pose
 /// holds still). In edit mode draw the current `Transform`.
@@ -361,21 +352,18 @@ impl ApplicationHandler for App {
                     ),
                 );
 
-                // Collect model matrices from all entities with a Transform and a model,
-                // blending fixed-step entities between their last two steps.
+                // World matrices of every entity with a model, each link of the
+                // parent chain blended between its last two fixed steps.
                 let alpha = self.core.world.resource::<Time>().alpha();
                 let blend = blends(*self.core.world.resource::<SimulationState>());
+                let matrices =
+                    melon_core::hierarchy::render_matrices(&mut self.core.world, alpha, blend);
                 let entities: Vec<(Entity, Mat4, melon_core::Handle<melon_core::Model>)> = self
                     .core
                     .world
-                    .query::<(
-                        Entity,
-                        &Transform,
-                        Option<&PreviousTransform>,
-                        &melon_core::Handle<melon_core::Model>,
-                    )>()
+                    .query::<(Entity, &melon_core::Handle<melon_core::Model>)>()
                     .iter(&self.core.world)
-                    .map(|(e, t, prev, m)| (e, render_matrix(t, prev, alpha, blend), *m))
+                    .filter_map(|(e, m)| matrices.get(&e).map(|mat| (e, *mat, *m)))
                     .collect();
 
                 // Write all model uniforms to the shared buffer (one write_buffer call)
@@ -656,28 +644,6 @@ mod tests {
         assert_eq!(map_key(&WinitKeyCode::Tab), None);
     }
 
-    fn prev_and_cur() -> (PreviousTransform, Transform) {
-        (
-            PreviousTransform(Transform::default()),
-            Transform::from_translation(Vec3::new(2.0, 0.0, 0.0)),
-        )
-    }
-
-    #[test]
-    fn render_matrix_without_blend_uses_current() {
-        let (prev, cur) = prev_and_cur();
-        assert_eq!(render_matrix(&cur, Some(&prev), 0.0, false), cur.to_mat4());
-    }
-
-    #[test]
-    fn render_matrix_playing_blends() {
-        let (prev, cur) = prev_and_cur();
-        assert_eq!(
-            render_matrix(&cur, Some(&prev), 0.0, true),
-            prev.0.to_mat4()
-        );
-    }
-
     #[test]
     fn blends_while_playing_and_paused() {
         assert!(blends(SimulationState::Playing) && blends(SimulationState::Paused));
@@ -686,11 +652,5 @@ mod tests {
     #[test]
     fn no_blend_while_editing() {
         assert!(!blends(SimulationState::Editing));
-    }
-
-    #[test]
-    fn render_matrix_without_prev_uses_current() {
-        let (_, cur) = prev_and_cur();
-        assert_eq!(render_matrix(&cur, None, 0.5, true), cur.to_mat4());
     }
 }

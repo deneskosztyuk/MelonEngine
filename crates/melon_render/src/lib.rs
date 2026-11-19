@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
 mod models;
+
+/// Model uniform slots: at most this many entities with a model are drawn.
+pub const MAX_ENTITIES: usize = 1024;
 pub use models::ModelCache;
 
 use anyhow::{Context, Result};
@@ -532,7 +535,6 @@ impl SceneRenderer {
         // Reusable model uniform buffer with dynamic offsets.
         // Stride = max(ModelUniform size, min_uniform_buffer_offset_alignment).
         // This avoids creating a new buffer+bind group per entity per frame (memory leak fix).
-        const MAX_ENTITIES: usize = 1024;
         let model_uniform_size = std::mem::size_of::<ModelUniform>() as wgpu::BufferAddress;
         let min_alignment =
             device.limits().min_uniform_buffer_offset_alignment as wgpu::BufferAddress;
