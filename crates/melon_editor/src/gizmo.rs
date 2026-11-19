@@ -1,4 +1,5 @@
-use melon_core::glam::{Mat4, Quat, Vec3};
+use melon_core::Transform;
+use melon_core::glam::{Mat4, Quat, Vec2, Vec3};
 use melon_render::{OverlayDepth, OverlayDraw, OverlayShape};
 
 use crate::GizmoMode;
@@ -491,6 +492,124 @@ pub fn pick_handle(
     best.map(|(_, handle)| handle)
 }
 
+// --- Drag math (world space; `start` is the world pose at press) ------------
+
+/// Move along `axis` by how far the pointer's plane hit moved along it.
+pub fn drag_move_axis(
+    start: Transform,
+    axis: Vec3,
+    press_hit: Vec3,
+    hit: Vec3,
+    snap: bool,
+) -> Transform {
+    let mut delta = project_onto_axis(hit - press_hit, axis);
+    if snap {
+        delta = snap_value(delta, SNAP_MOVE);
+    }
+    Transform {
+        translation: start.translation + axis * delta,
+        ..start
+    }
+}
+
+/// Move within the plane spanned by `axes`; each axis snaps on its own.
+pub fn drag_move_plane(
+    start: Transform,
+    press_hit: Vec3,
+    hit: Vec3,
+    axes: [Vec3; 2],
+    snap: bool,
+) -> Transform {
+    let delta = hit - press_hit;
+    let offset = axes
+        .iter()
+        .map(|&axis| {
+            let d = project_onto_axis(delta, axis);
+            axis * if snap { snap_value(d, SNAP_MOVE) } else { d }
+        })
+        .sum::<Vec3>();
+    Transform {
+        translation: start.translation + offset,
+        ..start
+    }
+}
+
+/// Free move: hits are on the camera-facing plane through the gizmo centre,
+/// so the distance from the camera stays the same. Snaps per world axis.
+pub fn drag_move_center(start: Transform, press_hit: Vec3, hit: Vec3, snap: bool) -> Transform {
+    let mut delta = hit - press_hit;
+    if snap {
+        delta = Vec3::new(
+            snap_value(delta.x, SNAP_MOVE),
+            snap_value(delta.y, SNAP_MOVE),
+            snap_value(delta.z, SNAP_MOVE),
+        );
+    }
+    Transform {
+        translation: start.translation + delta,
+        ..start
+    }
+}
+
+/// Angle (radians, right-handed around `axis`) of where the ray hits the
+/// plane through `center` perpendicular to `axis`. `None` when the plane is
+/// seen nearly edge-on (use `screen_drag_angle` then) or is behind the ray.
+pub fn rotate_angle(center: Vec3, axis: Vec3, origin: Vec3, dir: Vec3) -> Option<f32> {
+    let dir = dir.normalize_or_zero();
+    let denom = dir.dot(axis);
+    if denom.abs() < 0.1 {
+        return None;
+    }
+    let t = (center - origin).dot(axis) / denom;
+    if t <= 0.0 {
+        return None;
+    }
+    let p = origin + dir * t - center;
+    let u = axis.any_orthonormal_vector();
+    let w = axis.cross(u);
+    Some(p.dot(w).atan2(p.dot(u)))
+}
+
+/// Edge-on ring fallback (Unreal style): the pointer's movement along the
+/// ring's screen tangent, 0.01 rad per pixel.
+pub fn screen_drag_angle(pointer_delta_px: Vec2, ring_tangent_px: Vec2) -> f32 {
+    0.01 * pointer_delta_px.dot(ring_tangent_px.normalize_or_zero())
+}
+
+/// Rotate `start` by `delta_angle` around the world `axis`.
+pub fn drag_rotate(start: Transform, axis: Vec3, delta_angle: f32, snap: bool) -> Transform {
+    let angle = if snap {
+        snap_angle(delta_angle, SNAP_ROTATE_RAD)
+    } else {
+        delta_angle
+    };
+    Transform {
+        rotation: (Quat::from_axis_angle(axis, angle) * start.rotation).normalize(),
+        ..start
+    }
+}
+
+/// Scale the listed local axes (one for an axis handle, two for a plane
+/// handle, all three for the centre) by `factor`, clamped to
+/// `SCALE_MIN..SCALE_MAX`; snapping rounds the factor to `SNAP_SCALE`.
+pub fn drag_scale(start: Transform, axes: &[usize], factor: f32, snap: bool) -> Transform {
+    let mut factor = factor.clamp(SCALE_MIN, SCALE_MAX);
+    if snap {
+        factor = snap_value(factor, SNAP_SCALE).max(SNAP_SCALE);
+    }
+    let mut scale = start.scale;
+    for &i in axes {
+        scale[i] = (start.scale[i] * factor).clamp(SCALE_MIN, SCALE_MAX);
+    }
+    Transform { scale, ..start }
+}
+
+/// Uniform scale from screen drag since the press (Unreal style): right or
+/// up grows, 100 px doubles.
+pub fn uniform_scale_factor(pointer_delta_px: Vec2) -> f32 {
+    1.0 + 0.01 * (pointer_delta_px.x - pointer_delta_px.y)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,6 +626,126 @@ mod tests {
 
     fn count(draws: &[melon_render::OverlayDraw], shape: OverlayShape) -> usize {
         draws.iter().filter(|d| d.shape == shape).count()
+    }
+
+    fn close(a: Vec3, b: Vec3) -> bool {
+        (a - b).length() < 1e-4
+    }
+
+    #[test]
+    fn rotate_sweep_of_90_degrees_turns_90() {
+        let a0 = rotate_angle(Vec3::ZERO, Vec3::Y, Vec3::new(1.0, 5.0, 0.0), Vec3::NEG_Y).unwrap();
+        let a1 = rotate_angle(Vec3::ZERO, Vec3::Y, Vec3::new(0.0, 5.0, -1.0), Vec3::NEG_Y).unwrap();
+        let delta = wrap_angle_delta(a1 - a0);
+        assert!(
+            (delta - std::f32::consts::FRAC_PI_2).abs() < 1e-4,
+            "{delta}"
+        );
+        let t = drag_rotate(Transform::default(), Vec3::Y, delta, false);
+        assert!(
+            t.rotation
+                .angle_between(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2))
+                < 1e-4
+        );
+    }
+
+    #[test]
+    fn rotate_edge_on_returns_none() {
+        assert_eq!(
+            rotate_angle(Vec3::ZERO, Vec3::Y, Vec3::new(-5.0, 0.2, 0.0), Vec3::X),
+            None
+        );
+    }
+
+    #[test]
+    fn edge_on_screen_drag_follows_ring_tangent() {
+        let angle = screen_drag_angle(Vec2::new(50.0, 0.0), Vec2::new(2.0, 0.0));
+        assert!((angle - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn plane_move_changes_only_plane_axes() {
+        let t = drag_move_plane(
+            Transform::default(),
+            Vec3::ZERO,
+            Vec3::new(0.4, 3.0, 0.7),
+            [Vec3::Z, Vec3::X],
+            false,
+        );
+        assert!(
+            close(t.translation, Vec3::new(0.4, 0.0, 0.7)),
+            "{}",
+            t.translation
+        );
+    }
+
+    #[test]
+    fn center_move_keeps_depth_from_camera() {
+        let start = Transform::default();
+        let t = drag_move_center(start, Vec3::ZERO, Vec3::new(1.0, 1.0, 0.0), false);
+        assert!(close(t.translation, Vec3::new(1.0, 1.0, 0.0)));
+    }
+
+    #[test]
+    fn plane_scale_leaves_third_axis() {
+        let start = Transform {
+            scale: Vec3::new(1.0, 2.0, 3.0),
+            ..Default::default()
+        };
+        let t = drag_scale(start, &[0, 2], 1.5, false);
+        assert!(close(t.scale, Vec3::new(1.5, 2.0, 4.5)));
+    }
+
+    #[test]
+    fn uniform_scale_factor_100px_doubles() {
+        assert!((uniform_scale_factor(Vec2::new(100.0, 0.0)) - 2.0).abs() < 1e-6);
+        assert!((uniform_scale_factor(Vec2::new(-50.0, 0.0)) - 0.5).abs() < 1e-6);
+        assert!((uniform_scale_factor(Vec2::new(0.0, -100.0)) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn snapping_applies_to_each_drag() {
+        let start = Transform::default();
+        let moved = drag_move_axis(start, Vec3::X, Vec3::ZERO, Vec3::new(0.3, 0.0, 0.0), true);
+        assert!(close(moved.translation, Vec3::new(0.25, 0.0, 0.0)));
+        let turned = drag_rotate(start, Vec3::Y, 20f32.to_radians(), true);
+        assert!(
+            turned
+                .rotation
+                .angle_between(Quat::from_rotation_y(15f32.to_radians()))
+                < 1e-4
+        );
+        let scaled = drag_scale(start, &[0], 1.3, true);
+        assert!((scaled.scale.x - 1.25).abs() < 1e-5);
+    }
+
+    #[test]
+    fn drags_under_rotated_scaled_parent_write_world_pose() {
+        use melon_core::bevy_ecs::world::World;
+        use melon_core::hierarchy::{set_world_transform, world_matrix};
+        let mut world = World::new();
+        let parent = world
+            .spawn(Transform {
+                translation: Vec3::new(5.0, 0.0, 0.0),
+                rotation: Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+                scale: Vec3::splat(2.0),
+            })
+            .id();
+        let child = world
+            .spawn((
+                Transform::from_translation(Vec3::X),
+                melon_core::ChildOf(parent),
+            ))
+            .id();
+        let start = Transform::from_mat4(world_matrix(&world, child));
+        let moved = drag_move_axis(start, Vec3::X, Vec3::ZERO, Vec3::X, false);
+        set_world_transform(&mut world, child, moved);
+        let now = world_matrix(&world, child).transform_point3(Vec3::ZERO);
+        assert!(
+            close(now, moved.translation),
+            "{now} vs {}",
+            moved.translation
+        );
     }
 
     const EYE: Vec3 = Vec3::new(4.0, 3.0, 6.0);
