@@ -92,13 +92,14 @@ impl Visit for MessageVisitor {
     }
 }
 
-/// Which levels the console panel shows.
+/// Which levels the console panel shows. The host captures INFO and above
+/// only (DEBUG would flood the buffer from per-frame spans), so there is no
+/// Debug toggle.
 #[derive(Clone, Copy, Debug)]
 pub struct ConsoleFilter {
     pub error: bool,
     pub warn: bool,
     pub info: bool,
-    pub debug: bool,
 }
 
 impl Default for ConsoleFilter {
@@ -107,7 +108,6 @@ impl Default for ConsoleFilter {
             error: true,
             warn: true,
             info: true,
-            debug: false,
         }
     }
 }
@@ -118,7 +118,7 @@ impl ConsoleFilter {
             Level::ERROR => self.error,
             Level::WARN => self.warn,
             Level::INFO => self.info,
-            _ => self.debug,
+            _ => false,
         }
     }
 }
@@ -134,7 +134,6 @@ pub fn console_ui(ui: &mut egui::Ui, log: &ConsoleLog, filter: &mut ConsoleFilte
         ui.toggle_value(&mut filter.error, "Errors");
         ui.toggle_value(&mut filter.warn, "Warnings");
         ui.toggle_value(&mut filter.info, "Info");
-        ui.toggle_value(&mut filter.debug, "Debug");
         ui.separator();
         ui.weak(format!("{} lines", lines.len()));
     });
