@@ -1786,10 +1786,16 @@ mod tests {
     const SHADOW_PX: (u32, u32) = (16, 32);
     /// World (2, 0, 0): on the floor, in the open.
     const LIT_PX: (u32, u32) = (48, 32);
+    /// World (-3.44, 0, 0): on the floor, in the open, left of the shadow.
+    const FAR_LEFT_PX: (u32, u32) = (4, 32);
 
     /// Renders the test scene and returns TEST_SIZE x TEST_SIZE RGBA8 sRGB pixels.
-    /// `shadow_radius` is the half-size of the shadow box around the origin.
-    fn render_test_scene(r: &mut Renderer, shadow_radius: f32) -> Vec<u8> {
+    /// The shadow box has half-size `shadow_radius` around `shadow_center`.
+    fn render_test_scene(
+        r: &mut Renderer,
+        shadow_center: glam::Vec3,
+        shadow_radius: f32,
+    ) -> Vec<u8> {
         use glam::camera::rh::{proj::directx, view};
         use glam::{Mat4, Quat, Vec3};
 
@@ -1808,7 +1814,7 @@ mod tests {
             to_light,
             0.2,
             Vec3::ONE,
-            directional_light_view_proj(to_light, Vec3::ZERO, shadow_radius),
+            directional_light_view_proj(to_light, shadow_center, shadow_radius),
         );
         r.update_model_uniforms(&[
             Mat4::from_scale_rotation_translation(
@@ -2040,7 +2046,7 @@ mod tests {
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
             Box::new(|renderer| {
-                let pixels = render_test_scene(renderer, 20.0);
+                let pixels = render_test_scene(renderer, glam::Vec3::ZERO, 20.0);
                 let (shadow, lit) = (value_at(&pixels, SHADOW_PX), value_at(&pixels, LIT_PX));
                 if shadow < 170 && lit > 200 {
                     Ok(())
@@ -2051,12 +2057,18 @@ mod tests {
                 }
             }),
             Box::new(|renderer| {
-                let pixels = render_test_scene(renderer, 0.5);
-                let v = value_at(&pixels, LIT_PX);
+                // The box edge nearest FAR_LEFT_PX runs through the occluder,
+                // and FAR_LEFT_PX sits within the box's depth range but past
+                // that edge. Without the uv-range check, clamp-to-edge would
+                // read the occluder's depth there and shadow it.
+                let pixels = render_test_scene(renderer, glam::Vec3::new(0.12, 0.0, 0.0), 1.5);
+                let v = value_at(&pixels, FAR_LEFT_PX);
                 if v > 200 {
                     Ok(())
                 } else {
-                    Err(format!("outside_shadow_box_is_lit: LIT_PX={v}, want > 200"))
+                    Err(format!(
+                        "outside_shadow_box_is_lit: FAR_LEFT_PX={v}, want > 200"
+                    ))
                 }
             }),
             Box::new(|renderer| {
@@ -2083,7 +2095,7 @@ mod tests {
                 }
             }),
             Box::new(|renderer| {
-                let pixels = render_test_scene(renderer, 20.0);
+                let pixels = render_test_scene(renderer, glam::Vec3::ZERO, 20.0);
                 let v = value_at(&pixels, LIT_PX);
                 if v > 200 {
                     Ok(())
