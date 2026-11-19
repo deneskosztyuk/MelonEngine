@@ -710,100 +710,99 @@ impl Editor {
     }
 
     fn build_inspector(&mut self, world: &mut World, ui: &mut egui::Ui) {
-        if let Some(entity) = self.selected {
-            let mut transform_edited = false;
-            if let Ok(mut entity_mut) = world.get_entity_mut(entity) {
-                // Name
-                if let Some(name) = entity_mut.get::<Name>() {
-                    ui.label(format!("Name: {}", name.0));
-                    ui.separator();
-                }
-
-                // Transform
-                if let Some(mut transform) = entity_mut.get_mut::<Transform>() {
-                    ui.heading("Transform");
-                    let mut pos = transform.translation.to_array();
-                    let pos_changed = ui
-                        .add(egui::Slider::new(&mut pos[0], -10.0..=10.0).text("X"))
-                        .changed()
-                        || ui
-                            .add(egui::Slider::new(&mut pos[1], -10.0..=10.0).text("Y"))
-                            .changed()
-                        || ui
-                            .add(egui::Slider::new(&mut pos[2], -10.0..=10.0).text("Z"))
-                            .changed();
-                    if pos_changed {
-                        transform.translation = glam::Vec3::from_array(pos);
-                    }
-
-                    let euler = transform.rotation.to_euler(glam::EulerRot::XYZ);
-                    let mut rot_deg = [
-                        euler.0.to_degrees(),
-                        euler.1.to_degrees(),
-                        euler.2.to_degrees(),
-                    ];
-                    ui.label("Rotation (degrees)");
-                    let rot_changed = ui
-                        .add(egui::Slider::new(&mut rot_deg[0], -180.0..=180.0).text("X"))
-                        .changed()
-                        || ui
-                            .add(egui::Slider::new(&mut rot_deg[1], -180.0..=180.0).text("Y"))
-                            .changed()
-                        || ui
-                            .add(egui::Slider::new(&mut rot_deg[2], -180.0..=180.0).text("Z"))
-                            .changed();
-                    if rot_changed {
-                        transform.rotation = glam::Quat::from_euler(
-                            glam::EulerRot::XYZ,
-                            rot_deg[0].to_radians(),
-                            rot_deg[1].to_radians(),
-                            rot_deg[2].to_radians(),
-                        );
-                    }
-
-                    let mut s = transform.scale.to_array();
-                    ui.label("Scale");
-                    let scale_changed = ui
-                        .add(egui::Slider::new(&mut s[0], 0.1..=5.0).text("X"))
-                        .changed()
-                        || ui
-                            .add(egui::Slider::new(&mut s[1], 0.1..=5.0).text("Y"))
-                            .changed()
-                        || ui
-                            .add(egui::Slider::new(&mut s[2], 0.1..=5.0).text("Z"))
-                            .changed();
-                    if scale_changed {
-                        transform.scale = glam::Vec3::from_array(s);
-                    }
-                    transform_edited = pos_changed || rot_changed || scale_changed;
-                    ui.separator();
-                }
-
-                // Physics info
-                if let Some(body_info) = entity_mut.get::<BodyInfo>() {
-                    ui.heading("Physics");
-                    ui.label(format!("Body: {:?}", body_info.body_type));
-                    if let Some(aabb) = entity_mut.get::<Aabb>() {
-                        ui.label(format!("Half-extents: {:?}", aabb.half_extents));
-                    }
-                    ui.separator();
-                }
-
-                // Markers
-                if entity_mut.get::<Spin>().is_some() {
-                    ui.label("⟳ Spins (Spin marker)");
-                }
-                if entity_mut.get::<melon_core::Bob>().is_some() {
-                    ui.label("↕ Bobs (Bob marker)");
-                }
-            } else {
-                self.clear_selection();
-            }
-            if transform_edited {
-                self.after_transform_edit(world, entity);
-            }
-        } else {
+        let Some(entity) = self.selected else {
             ui.weak("Nothing selected");
+            return;
+        };
+        let Ok(mut entity_mut) = world.get_entity_mut(entity) else {
+            self.clear_selection();
+            return;
+        };
+
+        if let Some(name) = entity_mut.get::<Name>() {
+            ui.label(egui::RichText::new(&name.0).strong().size(15.0));
+            ui.add_space(2.0);
+        }
+
+        let mut transform_edited = false;
+        if let Some(mut transform) = entity_mut.get_mut::<Transform>() {
+            // Edit a copy and write back only on change, so change detection
+            // does not fire every frame just because the inspector is open.
+            let mut t = *transform;
+            egui::CollapsingHeader::new("Transform")
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::Grid::new("inspector_transform")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Position");
+                            transform_edited |= vec3_field(ui, &mut t.translation, 0.05, None);
+                            ui.end_row();
+
+                            ui.label("Rotation");
+                            let (x, y, z) = t.rotation.to_euler(glam::EulerRot::XYZ);
+                            let mut degrees =
+                                glam::Vec3::new(x.to_degrees(), y.to_degrees(), z.to_degrees());
+                            if vec3_field(ui, &mut degrees, 0.5, None) {
+                                t.rotation = glam::Quat::from_euler(
+                                    glam::EulerRot::XYZ,
+                                    degrees.x.to_radians(),
+                                    degrees.y.to_radians(),
+                                    degrees.z.to_radians(),
+                                );
+                                transform_edited = true;
+                            }
+                            ui.end_row();
+
+                            ui.label("Scale");
+                            // Zero scale is rejected by scene validation (and Play).
+                            transform_edited |= vec3_field(ui, &mut t.scale, 0.01, Some(0.001));
+                            ui.end_row();
+                        });
+                });
+            if transform_edited {
+                *transform = t;
+            }
+        }
+
+        if let Some(body_info) = entity_mut.get::<BodyInfo>() {
+            let body_info = *body_info;
+            egui::CollapsingHeader::new("Rigidbody")
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::Grid::new("inspector_rigidbody")
+                        .num_columns(2)
+                        .spacing([8.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Type");
+                            ui.label(format!("{:?}", body_info.body_type));
+                            ui.end_row();
+                            let h = body_info.half_extents;
+                            ui.label("Half extents");
+                            ui.label(format!("{:.2}  {:.2}  {:.2}", h.x, h.y, h.z));
+                            ui.end_row();
+                        });
+                });
+        }
+
+        let spins = entity_mut.get::<Spin>().is_some();
+        let bobs = entity_mut.get::<melon_core::Bob>().is_some();
+        if spins || bobs {
+            egui::CollapsingHeader::new("Behaviours")
+                .default_open(true)
+                .show(ui, |ui| {
+                    if spins {
+                        ui.label("Spin: rotates about Y while playing");
+                    }
+                    if bobs {
+                        ui.label("Bob: moves up and down while playing");
+                    }
+                });
+        }
+
+        if transform_edited {
+            self.after_transform_edit(world, entity);
         }
     }
 
@@ -1369,6 +1368,35 @@ pub fn create_cube(world: &mut World) -> Entity {
         .id()
 }
 
+/// One inspector row of three colour-coded X / Y / Z drag fields sharing the
+/// row's width. Every field is always drawn (no short-circuit). Returns true
+/// if any value changed.
+fn vec3_field(ui: &mut egui::Ui, value: &mut glam::Vec3, speed: f64, min: Option<f32>) -> bool {
+    let mut changed = false;
+    let axes = [
+        ("X", theme::colors::AXIS_X),
+        ("Y", theme::colors::AXIS_Y),
+        ("Z", theme::colors::AXIS_Z),
+    ];
+    ui.horizontal(|ui| {
+        let spacing = ui.spacing().item_spacing.x;
+        let field_width = ((ui.available_width() - 3.0 * (12.0 + 2.0 * spacing)) / 3.0).max(48.0);
+        for (i, (label, color)) in axes.into_iter().enumerate() {
+            ui.label(egui::RichText::new(label).color(color).strong());
+            let mut drag = egui::DragValue::new(&mut value[i])
+                .speed(speed)
+                .max_decimals(3);
+            if let Some(min) = min {
+                drag = drag.range(min..=f32::MAX);
+            }
+            changed |= ui
+                .add_sized([field_width, theme::sizes::INPUT_HEIGHT], drag)
+                .changed();
+        }
+    });
+    changed
+}
+
 /// Severity of a status-bar message (its colour).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
@@ -1436,6 +1464,12 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
     /// The Scene tab fills its panel edge to edge.
     fn clear_background(&self, tab: &Self::Tab) -> bool {
         *tab != layout::EditorTab::Scene
+    }
+
+    /// The Inspector stays docked: closing it by accident hides every
+    /// property editor, so it has no close button.
+    fn is_closeable(&self, tab: &Self::Tab) -> bool {
+        *tab != layout::EditorTab::Inspector
     }
 
     /// Only the Hierarchy relies on the dock's scroll area; the other panels
@@ -1681,6 +1715,19 @@ mod tests {
         );
         assert_eq!(editor.content.current(), root.join("assets"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inspector_tab_cannot_be_closed() {
+        use egui_dock::TabViewer;
+        let mut editor = Editor::default();
+        let mut world = World::new();
+        let tabs = EditorTabs {
+            editor: &mut editor,
+            world: &mut world,
+        };
+        assert!(!tabs.is_closeable(&layout::EditorTab::Inspector));
+        assert!(tabs.is_closeable(&layout::EditorTab::Console));
     }
 
     #[test]

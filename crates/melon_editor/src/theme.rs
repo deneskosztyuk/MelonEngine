@@ -22,6 +22,10 @@ pub mod colors {
     pub const WARNING: Color32 = Color32::from_rgb(0xd9, 0xa4, 0x41);
     pub const ERROR: Color32 = Color32::from_rgb(0xe0, 0x56, 0x56);
     pub const INFO: Color32 = Color32::from_rgb(0x6c, 0xb2, 0xe6);
+    /// Axis labels in the inspector (X red, Y green, Z blue).
+    pub const AXIS_X: Color32 = ERROR;
+    pub const AXIS_Y: Color32 = SUCCESS;
+    pub const AXIS_Z: Color32 = ACCENT_HOVER;
 }
 
 /// Size tokens, in points.
