@@ -94,9 +94,9 @@ impl SlintScene {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Slint scene viewport pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: self.target.hdr_target().view(),
+                    view: self.target.hdr_target().msaa_view(),
                     depth_slice: None,
-                    resolve_target: None,
+                    resolve_target: Some(self.target.hdr_target().view()),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(CLEAR_COLOR),
                         store: wgpu::StoreOp::Store,

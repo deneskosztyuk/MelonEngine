@@ -142,6 +142,9 @@ fn image_from_gltf_data(data: &gltf::image::Data) -> image::DynamicImage {
 /// Format of the scene colour target. The tonemap pass maps it to the display.
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// MSAA sample count of the 3D scene pass (colour and depth).
+pub const MSAA_SAMPLES: u32 = 4;
+
 /// Width and height of the sun's shadow map, in texels.
 pub const SHADOW_MAP_SIZE: u32 = 2048;
 
@@ -164,8 +167,12 @@ pub fn directional_light_view_proj(
         * view::look_at_mat4(eye, center, up)
 }
 
-/// Offscreen HDR colour target that the 3D pass renders into.
+/// Offscreen HDR colour target that the 3D pass renders into. The pass
+/// draws into the multisampled texture and resolves into the single-sample
+/// one, which the tonemap pass reads.
 pub struct HdrTarget {
+    msaa_texture: wgpu::Texture,
+    msaa_view: wgpu::TextureView,
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
     /// Binds this target as the tonemap pass input.
@@ -174,12 +181,55 @@ pub struct HdrTarget {
 }
 
 impl HdrTarget {
+    /// Resolve target: the single-sample image the tonemap pass reads.
     pub fn view(&self) -> &wgpu::TextureView {
         &self.view
     }
 
+    /// Multisampled colour attachment of the 3D pass. Resolve into `view()`.
+    pub fn msaa_view(&self) -> &wgpu::TextureView {
+        &self.msaa_view
+    }
+
+    pub fn sample_count(&self) -> u32 {
+        self.msaa_texture.sample_count()
+    }
+
     pub fn size(&self) -> winit::dpi::PhysicalSize<u32> {
         self.size
+    }
+}
+
+/// Growable vertex buffer for line lists. Each draw site that can appear in
+/// the same frame needs its own: `queue.write_buffer` lands before the GPU
+/// runs, so a shared buffer would hold only the last upload.
+#[derive(Default)]
+struct LineBuffer {
+    buffer: Option<wgpu::Buffer>,
+    capacity: wgpu::BufferAddress,
+}
+
+impl LineBuffer {
+    /// Uploads `vertices` and returns the buffer and the byte length used.
+    fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        vertices: &[LineVertex],
+    ) -> (&wgpu::Buffer, wgpu::BufferAddress) {
+        let needed = std::mem::size_of_val(vertices) as wgpu::BufferAddress;
+        if needed > self.capacity {
+            self.capacity = needed.max(self.capacity * 2);
+            self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("line vertex buffer"),
+                size: self.capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let buffer = self.buffer.as_ref().expect("allocated above");
+        queue.write_buffer(buffer, 0, bytemuck::cast_slice(vertices));
+        (buffer, needed)
     }
 }
 
@@ -210,8 +260,10 @@ pub struct SceneRenderer {
     albedo_texture: wgpu::Texture,
     albedo_bind_group: wgpu::BindGroup,
     line_pipeline: wgpu::RenderPipeline,
-    line_vertex_buffer: Option<wgpu::Buffer>,
-    line_buffer_capacity: wgpu::BufferAddress,
+    lines: LineBuffer,
+    /// Depth-tested lines inside the 3D pass (grid, axes, selection box).
+    world_line_pipeline: wgpu::RenderPipeline,
+    world_lines: LineBuffer,
     model_uniform_buffer: wgpu::Buffer,
     model_bind_group: wgpu::BindGroup,
     model_uniform_stride: wgpu::BufferAddress,
@@ -485,6 +537,7 @@ impl SceneRenderer {
             Renderer::create_checkerboard_texture(&device, &queue, &texture_layout);
 
         let line_pipeline = Renderer::build_line_pipeline(&device, surface_format, &frame_layout);
+        let world_line_pipeline = Renderer::build_world_line_pipeline(&device, &frame_layout);
 
         // Reusable model uniform buffer with dynamic offsets.
         // Stride = max(ModelUniform size, min_uniform_buffer_offset_alignment).
@@ -533,8 +586,9 @@ impl SceneRenderer {
             albedo_texture,
             albedo_bind_group,
             line_pipeline,
-            line_vertex_buffer: None,
-            line_buffer_capacity: 0,
+            lines: LineBuffer::default(),
+            world_line_pipeline,
+            world_lines: LineBuffer::default(),
             model_uniform_buffer,
             model_bind_group,
             model_uniform_stride,
@@ -587,7 +641,10 @@ impl Renderer {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: MSAA_SAMPLES,
+                ..Default::default()
+            },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_main"),
@@ -748,6 +805,66 @@ impl Renderer {
         })
     }
 
+    /// Line pipeline for the 3D pass: HDR target, multisampled, depth-tested
+    /// but not depth-writing, so lines hide behind geometry.
+    fn build_world_line_pipeline(
+        device: &wgpu::Device,
+        frame_layout: &wgpu::BindGroupLayout,
+    ) -> wgpu::RenderPipeline {
+        let shader =
+            device.create_shader_module(wgpu::include_wgsl!("../../../assets/shaders/line.wgsl"));
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("world line pipeline layout"),
+            bind_group_layouts: &[Some(frame_layout)],
+            immediate_size: 0,
+        });
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("melon_render world line pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<LineVertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x3,
+                        1 => Float32x3,
+                    ],
+                }],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: MSAA_SAMPLES,
+                ..Default::default()
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
+    }
+
     fn create_depth_target(
         device: &wgpu::Device,
         size: winit::dpi::PhysicalSize<u32>,
@@ -760,7 +877,7 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: MSAA_SAMPLES,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -1080,6 +1197,17 @@ impl SceneRenderer {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let msaa_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("hdr scene msaa texture"),
+            size: texture.size(),
+            mip_level_count: 1,
+            sample_count: MSAA_SAMPLES,
+            dimension: wgpu::TextureDimension::D2,
+            format: HDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let msaa_view = msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tonemap bind group"),
             layout: &self.tonemap_bind_group_layout,
@@ -1089,6 +1217,8 @@ impl SceneRenderer {
             }],
         });
         HdrTarget {
+            msaa_texture,
+            msaa_view,
             _texture: texture,
             view,
             bind_group,
@@ -1563,33 +1693,39 @@ impl SceneRenderer {
         if vertices.is_empty() {
             return;
         }
+        self.write_line_camera(view_proj);
+        let (buffer, len) = self.lines.upload(&self.device, &self.queue, vertices);
+        pass.set_pipeline(&self.line_pipeline);
+        pass.set_bind_group(0, &self.frame_bind_group, &[]);
+        pass.set_vertex_buffer(0, buffer.slice(..len));
+        pass.draw(0..vertices.len() as u32, 0..1);
+    }
 
+    /// Depth-tested lines in the 3D (HDR, multisampled) pass: grid, axes,
+    /// selection box. Hidden behind geometry, unlike `draw_lines`.
+    pub fn draw_world_lines(
+        &mut self,
+        pass: &mut wgpu::RenderPass<'_>,
+        vertices: &[LineVertex],
+        view_proj: glam::Mat4,
+    ) {
+        if vertices.is_empty() {
+            return;
+        }
+        self.write_line_camera(view_proj);
+        let (buffer, len) = self.world_lines.upload(&self.device, &self.queue, vertices);
+        pass.set_pipeline(&self.world_line_pipeline);
+        pass.set_bind_group(0, &self.frame_bind_group, &[]);
+        pass.set_vertex_buffer(0, buffer.slice(..len));
+        pass.draw(0..vertices.len() as u32, 0..1);
+    }
+
+    fn write_line_camera(&self, view_proj: glam::Mat4) {
         let uniform = CameraUniform {
             view_proj: view_proj.to_cols_array_2d(),
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[uniform]));
-
-        let needed = std::mem::size_of_val(vertices) as wgpu::BufferAddress;
-        if needed > self.line_buffer_capacity {
-            let new_capacity = needed.max(self.line_buffer_capacity * 2);
-            self.line_vertex_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("line vertex buffer"),
-                size: new_capacity,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-            self.line_buffer_capacity = new_capacity;
-        }
-
-        let buffer = self.line_vertex_buffer.as_ref().unwrap();
-        self.queue
-            .write_buffer(buffer, 0, bytemuck::cast_slice(vertices));
-
-        pass.set_pipeline(&self.line_pipeline);
-        pass.set_bind_group(0, &self.frame_bind_group, &[]);
-        pass.set_vertex_buffer(0, buffer.slice(..needed));
-        pass.draw(0..vertices.len() as u32, 0..1);
     }
 }
 
@@ -1840,9 +1976,9 @@ mod tests {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("test scene pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: hdr.view(),
+                    view: hdr.msaa_view(),
                     depth_slice: None,
-                    resolve_target: None,
+                    resolve_target: Some(hdr.view()),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -1963,6 +2099,61 @@ mod tests {
     }
 
     /// First channel at pixel `(x, y)`; all channels match in the test scene.
+    /// Draws one white world line along X through a row centre, with the
+    /// depth buffer cleared to `depth_clear`, and returns the pixels.
+    fn render_world_line(r: &mut Renderer, depth_clear: f32) -> Vec<u8> {
+        use glam::Vec3;
+        use glam::camera::rh::{proj::directx, view};
+
+        let device = r.device().clone();
+        let size = winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE);
+        let color = test_color_texture(&device, r.surface_format().add_srgb_suffix());
+        let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let (_depth, depth_view) = Renderer::create_depth_target(&device, size);
+        let view_proj = directx::orthographic(-4.0, 4.0, -4.0, 4.0, 0.1, 20.0)
+            * view::look_at_mat4(Vec3::new(0.0, 10.0, 0.0), Vec3::ZERO, Vec3::NEG_Z);
+        let line = [
+            LineVertex {
+                position: [-4.0, 0.0, 0.0625],
+                color: [1.0, 1.0, 1.0],
+            },
+            LineVertex {
+                position: [4.0, 0.0, 0.0625],
+                color: [1.0, 1.0, 1.0],
+            },
+        ];
+        let hdr = r.create_hdr_target(size);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("world line test pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: hdr.msaa_view(),
+                    depth_slice: None,
+                    resolve_target: Some(hdr.view()),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(depth_clear),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            r.draw_world_lines(&mut pass, &line, view_proj);
+        }
+        r.tonemap_pass(&mut encoder, &hdr, &color_view);
+        read_back(&device, r.queue(), encoder, &color)
+    }
+
     fn value_at(pixels: &[u8], (x, y): (u32, u32)) -> u8 {
         pixels[((y * TEST_SIZE + x) * 4) as usize]
     }
@@ -2045,6 +2236,31 @@ mod tests {
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
+            Box::new(|renderer| {
+                // Line at depth ~0.5: visible over a far-cleared depth buffer,
+                // hidden behind a near-cleared one (depth test on).
+                let brightest = |px: &[u8]| (31..=33).map(|y| value_at(px, (48, y))).max();
+                let shown = brightest(&render_world_line(renderer, 1.0)).unwrap_or(0);
+                let hidden = brightest(&render_world_line(renderer, 0.0)).unwrap_or(0);
+                if shown > 150 && hidden < 30 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "world_lines_depth_tested: shown={shown} (want > 150), hidden={hidden} (want < 30)"
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
+                let hdr = renderer.create_hdr_target(winit::dpi::PhysicalSize::new(8, 8));
+                if hdr.sample_count() == MSAA_SAMPLES {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "hdr_target_is_multisampled: {} samples (want {MSAA_SAMPLES})",
+                        hdr.sample_count()
+                    ))
+                }
+            }),
             Box::new(|renderer| {
                 let pixels = render_test_scene(renderer, glam::Vec3::ZERO, 20.0);
                 let (shadow, lit) = (value_at(&pixels, SHADOW_PX), value_at(&pixels, LIT_PX));

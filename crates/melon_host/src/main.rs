@@ -558,9 +558,9 @@ impl ApplicationHandler for App {
                         .begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("melon_render 3D pass"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: scene_hdr.view(),
+                                view: scene_hdr.msaa_view(),
                                 depth_slice: None,
-                                resolve_target: None,
+                                resolve_target: Some(scene_hdr.view()),
                                 ops: wgpu::Operations {
                                     load: wgpu::LoadOp::Clear(CLEAR_COLOR),
                                     store: wgpu::StoreOp::Store,
