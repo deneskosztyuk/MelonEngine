@@ -6,11 +6,13 @@ use bevy_ecs::{
 };
 use tracing::instrument;
 
+pub mod assets;
 pub mod components;
 pub mod input;
 pub mod resources;
 pub mod stages;
 
+pub use assets::{AssetServer, Handle, Model};
 pub use bevy_ecs;
 pub use bevy_ecs::query::With;
 pub use components::{
@@ -76,6 +78,7 @@ impl Core {
         world.insert_resource(NameCounter::default());
         world.init_resource::<Time>();
         world.init_resource::<SimulationState>();
+        world.insert_resource(AssetServer::new(".".into()));
 
         let mut schedules = Schedules::new();
         schedules.insert(Schedule::new(FixedUpdate));
@@ -85,6 +88,7 @@ impl Core {
         let mut core = Self { world, schedules };
         core.add_systems(Update, (frame_counter_system, log_frame_system));
         core.add_systems(PostUpdate, clear_input_deltas_system);
+        core.add_systems(Update, assets::hot_reload_system);
         core
     }
 
