@@ -50,8 +50,13 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   `#[unsafe(no_mangle)]`, and every type it uses must be imported in the
   `hot_game` module in `melon_host/src/main.rs`. Then register it in
   `App::new`.
-- **Frame-rate dependence.** Physics steps once per frame at a fixed 1/60 s.
-  Gameplay systems should read `Res<Time>`, not `FrameCounter`.
+- **Stages.** Register systems with `core.add_systems(Stage, ...)`:
+  `FixedUpdate` (1/60 s, 0..N times per frame, not while paused), `Update`
+  (once per frame, read `Time::delta_seconds`), `PostUpdate`. Schedules live
+  in `Core::schedules`, not in the `World`, so scene load keeps them.
+- **Interpolation.** Add `PreviousTransform` to entities moved in
+  `FixedUpdate` so they render smoothly. Dynamic physics bodies get it
+  automatically. Do not add it to entities moved in `Update`.
 - **Entity cap.** The model uniform buffer holds 1024 entities
   (`MAX_ENTITIES` in `melon_render/src/lib.rs`).
 - **Deleting entities.** Insert `PendingDelete`; `cleanup_deleted_system`

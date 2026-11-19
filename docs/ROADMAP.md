@@ -21,10 +21,10 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
 
 1. **Play/pause unreachable.** Nothing sets `SimulationState::Paused`. No scene
    snapshot to restore on stop.
-2. **Physics speed tied to frame rate.** `step_system` steps rapier once per
-   frame with a fixed 1/60 s timestep, so 144 Hz runs 2.4x too fast.
-3. **Demo systems ignore `Time`.** `rotation_system` hardcodes `0.5 / 60.0` per
-   frame. `bob_system` adds its offset every frame, so it drifts.
+2. ~~**Physics speed tied to frame rate.**~~ Fixed: physics runs in
+   `FixedUpdate` at 1/60 s.
+3. ~~**Demo systems ignore `Time`.**~~ Fixed: spin and bob use `Time`, bob no
+   longer drifts.
 4. **1024 entity cap.** `MAX_ENTITIES` in `melon_render` sizes the model uniform
    buffer. More entities overflow `write_buffer` and wgpu panics. No guard.
 5. **No asset system.** `MeshRef` is a hardcoded enum (`Cube | GltfModel`).
@@ -38,13 +38,18 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
    systems; signatures are duplicated in the host `hot_module` imports.
 9. **README is stale.** Links deleted LICENSE files, says "v0.1 — released",
    lists only egui as the editor.
+10. **Scene load drops resources** (from reading code, not reproduced).
+   `load_scene` swaps in a fresh `World` that keeps only some resources. The
+   host then fails to put `PhysicsWorld` back (the new world has none) and
+   `LogInterval` is lost, so systems that need them may panic after a load.
 
 ## Missing, in priority order
 
 ### Tier 0: foundation
 
-- [ ] Fixed-timestep accumulator and schedule stages
-      (PreUpdate / FixedUpdate / Update / PostUpdate / Extract). Fixes bugs 2–3.
+- [x] Fixed-timestep accumulator and stages (`FixedUpdate` / `Update` /
+      `PostUpdate`) with interpolated rendering. Fixes bugs 2–3. `PreUpdate`
+      and `Extract` get added with their first system.
 - [ ] Play / Pause / Stop with scene snapshot and restore. Fixes bug 1.
 - [ ] Asset handles (`Handle<Mesh>`, `Handle<Texture>`, `Handle<Material>`) and
       an asset server; replace the `MeshRef` enum. Fixes bug 5.

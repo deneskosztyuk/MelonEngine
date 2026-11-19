@@ -9,7 +9,7 @@ use melon_core::glam::{Mat4, Quat, Vec2, Vec3};
 use melon_core::input::fly_camera_system;
 use melon_core::{
     Aabb, BodyInfo, BodyKind, Camera, FrameCounter, Input, KeyCode, Light, MeshRef, Name,
-    SimulationState, Time, Transform, Update,
+    PreviousTransform, SimulationState, Time, Transform, Update,
 };
 use melon_editor::Editor;
 #[cfg(not(feature = "imgui-poc"))]
@@ -18,8 +18,7 @@ use melon_editor::EditorOverlay;
 use melon_editor::imgui_poc::ImguiEditorOverlay;
 use melon_physics::rapier3d::dynamics::RigidBodyType;
 use melon_physics::{
-    ColliderComponent, PhysicsWorld, RigidBodyComponent as RigidBody, cleanup_deleted_system,
-    step_system, sync_from_physics_system, sync_to_physics_system,
+    ColliderComponent, PhysicsWorld, RigidBodyComponent as RigidBody, add_physics_systems,
 };
 use tracing_subscriber::EnvFilter;
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -57,6 +56,21 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
 // (or use cascades) once scenes outgrow 40 m.
 const SHADOW_CENTER: Vec3 = Vec3::ZERO;
 const SHADOW_RADIUS: f32 = 20.0;
+
+/// Model matrix to draw. Fixed-step entities blend between their last two
+/// steps while playing; when paused, the current `Transform` shows directly
+/// so editor gizmo drags are not blended.
+fn render_matrix(
+    t: &Transform,
+    prev: Option<&PreviousTransform>,
+    alpha: f32,
+    playing: bool,
+) -> Mat4 {
+    match prev {
+        Some(prev) if playing => t.interpolate(&prev.0, alpha).to_mat4(),
+        _ => t.to_mat4(),
+    }
+}
 
 fn map_key(code: &WinitKeyCode) -> Option<KeyCode> {
     Some(match code {
@@ -123,22 +137,18 @@ impl App {
         core.world.insert_resource(Camera::default());
         core.world.insert_resource(Light::default());
         core.world.insert_resource(Input::default());
-        core.world.insert_resource(Time::default());
-        core.world.insert_resource(SimulationState::default());
 
         let mut physics = PhysicsWorld::new();
         spawn_default_scene(&mut core.world, &mut physics);
         core.world.insert_resource(physics);
-        // Always-running systems
         core.add_systems(Update, fly_camera_system);
-        core.add_systems(Update, sync_to_physics_system);
-        core.add_systems(Update, cleanup_deleted_system);
-        // Game systems that run only when playing
+        // Per-frame game visuals, only while playing. Physics runs in FixedUpdate.
         let is_playing = |state: Res<SimulationState>| *state == SimulationState::Playing;
-        core.add_systems(Update, hot_game::rotation_system.run_if(is_playing));
-        core.add_systems(Update, hot_game::bob_system.run_if(is_playing));
-        core.add_systems(Update, step_system.run_if(is_playing));
-        core.add_systems(Update, sync_from_physics_system.run_if(is_playing));
+        core.add_systems(
+            Update,
+            (hot_game::rotation_system, hot_game::bob_system).run_if(is_playing),
+        );
+        add_physics_systems(&mut core);
 
         Self {
             window: None,
@@ -383,13 +393,17 @@ impl ApplicationHandler for App {
                     ),
                 );
 
-                // Collect model matrices from all entities with Transform and MeshRef
+                // Collect model matrices from all entities with Transform and MeshRef,
+                // blending fixed-step entities between their last two steps.
+                let alpha = self.core.world.resource::<Time>().alpha();
+                let playing =
+                    *self.core.world.resource::<SimulationState>() == SimulationState::Playing;
                 let entities: Vec<(Entity, Mat4, MeshRef)> = self
                     .core
                     .world
-                    .query::<(Entity, &Transform, &MeshRef)>()
+                    .query::<(Entity, &Transform, Option<&PreviousTransform>, &MeshRef)>()
                     .iter(&self.core.world)
-                    .map(|(e, t, m)| (e, t.to_mat4(), *m))
+                    .map(|(e, t, prev, m)| (e, render_matrix(t, prev, alpha, playing), *m))
                     .collect();
 
                 // Write all model uniforms to the shared buffer (one write_buffer call)
@@ -679,5 +693,33 @@ mod tests {
         assert_eq!(map_key(&WinitKeyCode::Escape), None);
         assert_eq!(map_key(&WinitKeyCode::Enter), None);
         assert_eq!(map_key(&WinitKeyCode::Tab), None);
+    }
+
+    fn prev_and_cur() -> (PreviousTransform, Transform) {
+        (
+            PreviousTransform(Transform::default()),
+            Transform::from_translation(Vec3::new(2.0, 0.0, 0.0)),
+        )
+    }
+
+    #[test]
+    fn render_matrix_paused_uses_current() {
+        let (prev, cur) = prev_and_cur();
+        assert_eq!(render_matrix(&cur, Some(&prev), 0.0, false), cur.to_mat4());
+    }
+
+    #[test]
+    fn render_matrix_playing_blends() {
+        let (prev, cur) = prev_and_cur();
+        assert_eq!(
+            render_matrix(&cur, Some(&prev), 0.0, true),
+            prev.0.to_mat4()
+        );
+    }
+
+    #[test]
+    fn render_matrix_without_prev_uses_current() {
+        let (_, cur) = prev_and_cur();
+        assert_eq!(render_matrix(&cur, None, 0.5, true), cur.to_mat4());
     }
 }
