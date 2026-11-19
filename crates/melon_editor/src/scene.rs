@@ -10,14 +10,15 @@ use serde::{Deserialize, Serialize};
 
 const SCENE_VERSION: u32 = 1;
 
-#[derive(Serialize, Deserialize)]
+/// A whole scene in memory: what save files hold, and what Play snapshots.
+#[derive(Serialize, Deserialize, Clone)]
 pub struct SceneData {
     version: u32,
     entities: Vec<SceneEntity>,
     name_counter: u32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct SceneEntity {
     name: String,
     transform: Transform,
@@ -35,9 +36,8 @@ pub struct SceneEntity {
     model_path: Option<String>,
 }
 
-/// Save all entities with Name + Transform to a RON file.
-/// Uses atomic write (temp file + rename) to prevent corruption.
-pub fn save_scene(world: &mut World, path: &Path) -> Result<()> {
+/// Capture all entities with Name + Transform.
+pub fn scene_to_data(world: &mut World) -> SceneData {
     let mut query = world.query::<(
         &Name,
         &Transform,
@@ -69,40 +69,17 @@ pub fn save_scene(world: &mut World, path: &Path) -> Result<()> {
         .map(|c| c.0)
         .unwrap_or(0);
 
-    let data = SceneData {
+    SceneData {
         version: SCENE_VERSION,
         entities,
         name_counter,
-    };
-
-    let ron = ron::ser::to_string_pretty(&data, ron::ser::PrettyConfig::default())
-        .context("failed to serialize scene to RON")?;
-
-    // Atomic write: temp file + rename
-    let tmp_path = path.with_extension("ron.tmp");
-    std::fs::write(&tmp_path, &ron)
-        .with_context(|| format!("failed to write temp file: {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, path)
-        .with_context(|| format!("failed to rename temp to: {}", path.display()))?;
-
-    tracing::info!(
-        "saved scene to {}: {} entities",
-        path.display(),
-        data.entities.len()
-    );
-    Ok(())
+    }
 }
 
-/// Load a scene from a RON file.
+/// Replace the scene in `world` with `data`.
 /// Two-phase: validate all entities before mutating the world.
-/// Clears all existing entities + physics bodies, then spawns from scene data.
-pub fn load_scene(world: &mut World, physics: &mut PhysicsWorld, path: &Path) -> Result<()> {
-    let contents = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read scene file: {}", path.display()))?;
-
-    let data: SceneData =
-        ron::from_str(&contents).context("failed to deserialize scene from RON")?;
-
+/// Clears all existing scene entities + physics bodies, then spawns from `data`.
+pub fn apply_scene(world: &mut World, physics: &mut PhysicsWorld, data: &SceneData) -> Result<()> {
     // Phase 1: Validate (no world mutation)
     if data.version != SCENE_VERSION {
         bail!(
@@ -134,6 +111,41 @@ pub fn load_scene(world: &mut World, physics: &mut PhysicsWorld, path: &Path) ->
     for entity in &data.entities {
         spawn_scene_entity(world, physics, entity);
     }
+    Ok(())
+}
+
+/// Save all entities with Name + Transform to a RON file.
+/// Uses atomic write (temp file + rename) to prevent corruption.
+pub fn save_scene(world: &mut World, path: &Path) -> Result<()> {
+    let data = scene_to_data(world);
+
+    let ron = ron::ser::to_string_pretty(&data, ron::ser::PrettyConfig::default())
+        .context("failed to serialize scene to RON")?;
+
+    // Atomic write: temp file + rename
+    let tmp_path = path.with_extension("ron.tmp");
+    std::fs::write(&tmp_path, &ron)
+        .with_context(|| format!("failed to write temp file: {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("failed to rename temp to: {}", path.display()))?;
+
+    tracing::info!(
+        "saved scene to {}: {} entities",
+        path.display(),
+        data.entities.len()
+    );
+    Ok(())
+}
+
+/// Load a scene from a RON file (see `apply_scene`).
+pub fn load_scene(world: &mut World, physics: &mut PhysicsWorld, path: &Path) -> Result<()> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read scene file: {}", path.display()))?;
+
+    let data: SceneData =
+        ron::from_str(&contents).context("failed to deserialize scene from RON")?;
+
+    apply_scene(world, physics, &data)?;
 
     tracing::info!(
         "loaded scene from {}: {} entities",
@@ -422,6 +434,57 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    fn floor_y(world: &mut World) -> f32 {
+        world
+            .query::<(&Name, &Transform)>()
+            .iter(world)
+            .find(|(n, _)| n.0 == "Floor")
+            .map(|(_, t)| t.translation.y)
+            .unwrap()
+    }
+
+    #[test]
+    fn scene_to_data_then_apply_restores_transforms() {
+        let mut world = world_with_entities();
+        let mut physics = PhysicsWorld::new();
+        let data = scene_to_data(&mut world);
+        let floor = world
+            .query::<(Entity, &Name)>()
+            .iter(&world)
+            .find(|(_, n)| n.0 == "Floor")
+            .map(|(e, _)| e)
+            .unwrap();
+        world.get_mut::<Transform>(floor).unwrap().translation.y = 5.0;
+        apply_scene(&mut world, &mut physics, &data).unwrap();
+        assert!((floor_y(&mut world) - (-1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn apply_scene_invalid_data_leaves_world_untouched() {
+        let mut bad = World::new();
+        bad.spawn((
+            Name("Flat".to_string()),
+            Transform {
+                scale: Vec3::ZERO,
+                ..Default::default()
+            },
+        ));
+        let data = scene_to_data(&mut bad);
+        let mut world = world_with_entities();
+        let mut physics = PhysicsWorld::new();
+        assert!(apply_scene(&mut world, &mut physics, &data).is_err());
+        assert_eq!(world.query::<&Name>().iter(&world).count(), 2);
+    }
+
+    #[test]
+    fn every_transform_entity_in_default_spawn_paths_has_name() {
+        // apply_scene clears every Transform entity but scenes save only named ones.
+        let mut world = world_with_entities();
+        let with_transform = world.query::<&Transform>().iter(&world).count();
+        let named = world.query::<(&Transform, &Name)>().iter(&world).count();
+        assert_eq!(with_transform, named);
     }
 
     fn read_log_interval_system(_interval: bevy_ecs::system::Res<melon_core::LogInterval>) {}
