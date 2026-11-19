@@ -37,7 +37,7 @@ use winit::{
 )]
 mod hot_game {
     use melon_core::bevy_ecs::system::{Query, Res};
-    use melon_core::{Bob, FrameCounter, Spin, Transform, With};
+    use melon_core::{Bob, Spin, Time, Transform, With};
     hot_functions_from_file!("crates/melon_game/src/lib.rs");
 }
 

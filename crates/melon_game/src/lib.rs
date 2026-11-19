@@ -1,28 +1,37 @@
 use melon_core::bevy_ecs::system::{Query, Res};
 use melon_core::glam::Quat;
-use melon_core::{Bob, FrameCounter, Spin, Transform, With};
+use melon_core::{Bob, Spin, Time, Transform, With};
+
+/// Spin speed around Y, in rad/s.
+const ROTATION_SPEED: f32 = 0.5;
+/// Bob height, in m.
+const BOB_AMPLITUDE: f32 = 2.0;
+/// Bob angular frequency, in rad/s.
+const BOB_FREQ: f32 = 0.6;
 
 /// Rotate all entities with the Spin marker around the Y axis.
 /// Hot-reloadable: edit this function, rebuild the dylib, and see the speed
 /// change without restarting the engine.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub fn rotation_system(mut query: Query<&mut Transform, With<Spin>>) {
+pub fn rotation_system(mut query: Query<&mut Transform, With<Spin>>, time: Res<Time>) {
+    let angle = ROTATION_SPEED * time.delta_seconds;
     for mut transform in &mut query {
-        let angle = 0.5 / 60.0;
         transform.rotation = Quat::from_rotation_y(angle) * transform.rotation;
     }
 }
 
-/// Bob entities with the Bob marker up and down using a sine wave based on frame count.
+/// Bob entities with the Bob marker up and down on a sine wave.
+/// Adds this frame's change in the sine, so the motion never drifts.
 /// Hot-reloadable: edit amplitude/frequency, rebuild, see the bob change live.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
-pub fn bob_system(mut query: Query<&mut Transform, With<Bob>>, counter: Res<FrameCounter>) {
-    let t = counter.frame as f32 * 0.01;
+pub fn bob_system(mut query: Query<&mut Transform, With<Bob>>, time: Res<Time>) {
+    let (t, dt) = (time.elapsed_seconds, time.delta_seconds);
     for (i, mut transform) in query.iter_mut().enumerate() {
-        let offset = (t + i as f32).sin() * 0.02;
-        transform.translation.y += offset;
+        let phase = i as f32;
+        transform.translation.y +=
+            BOB_AMPLITUDE * ((BOB_FREQ * t + phase).sin() - (BOB_FREQ * (t - dt) + phase).sin());
     }
 }
 
@@ -31,84 +40,61 @@ mod tests {
     use super::*;
     use melon_core::bevy_ecs::schedule::Schedule;
     use melon_core::bevy_ecs::world::World;
-    use melon_core::{Bob, FrameCounter, Spin, Transform};
+    use melon_core::glam::Vec3;
+    use melon_core::{Bob, Spin, Time, Transform};
+
+    fn world_with_time(dt: f32) -> World {
+        let mut world = World::new();
+        let mut time = Time::default();
+        time.update(dt);
+        world.insert_resource(time);
+        world
+    }
 
     #[test]
-    fn rotation_system_rotates_transform() {
-        let mut world = World::new();
-        let entity = world.spawn((Transform::default(), Spin)).id();
-        let rot_before = world.get::<Transform>(entity).unwrap().rotation;
-
+    fn rotation_uses_delta() {
+        let mut world = world_with_time(0.2);
+        let e = world.spawn((Transform::default(), Spin)).id();
         let mut schedule = Schedule::default();
         schedule.add_systems(rotation_system);
         schedule.run(&mut world);
-
-        let rot_after = world.get::<Transform>(entity).unwrap().rotation;
-        assert_ne!(
-            rot_before, rot_after,
-            "rotation should change after one tick"
-        );
+        let rot = world.get::<Transform>(e).unwrap().rotation;
+        assert!(rot.angle_between(Quat::from_rotation_y(0.1)) < 1e-5);
     }
 
     #[test]
     fn rotation_system_ignores_non_spin() {
-        let mut world = World::new();
-        let entity = world.spawn(Transform::default()).id();
-        let rot_before = world.get::<Transform>(entity).unwrap().rotation;
-
+        let mut world = world_with_time(0.2);
+        let e = world.spawn(Transform::default()).id();
         let mut schedule = Schedule::default();
         schedule.add_systems(rotation_system);
         schedule.run(&mut world);
-
-        let rot_after = world.get::<Transform>(entity).unwrap().rotation;
-        assert_eq!(
-            rot_before, rot_after,
-            "rotation should not change for entities without Spin"
-        );
+        assert_eq!(world.get::<Transform>(e).unwrap().rotation, Quat::IDENTITY);
     }
 
     #[test]
-    fn bob_system_changes_y_position() {
+    fn bob_has_no_drift() {
         let mut world = World::new();
-        world.insert_resource(FrameCounter { frame: 100 });
-        let entity = world
-            .spawn((
-                Transform::from_translation(melon_core::glam::Vec3::new(0.0, 0.0, 0.0)),
-                Bob,
-            ))
-            .id();
-        let y_before = world.get::<Transform>(entity).unwrap().translation.y;
-
+        world.insert_resource(Time::default());
+        let e = world.spawn((Transform::default(), Bob)).id();
         let mut schedule = Schedule::default();
         schedule.add_systems(bob_system);
-        schedule.run(&mut world);
-
-        let y_after = world.get::<Transform>(entity).unwrap().translation.y;
-        assert!(
-            (y_after - y_before).abs() > 0.0,
-            "bob should change Y position"
-        );
+        for _ in 0..600 {
+            world.resource_mut::<Time>().update(1.0 / 60.0);
+            schedule.run(&mut world);
+        }
+        let y = world.get::<Transform>(e).unwrap().translation.y;
+        // Offsets telescope to A * sin(w * 10 s); a drifting bob would not match.
+        assert!((y - 2.0 * (0.6f32 * 10.0).sin()).abs() < 1e-3, "y = {y}");
     }
 
     #[test]
     fn bob_system_ignores_non_bob() {
-        let mut world = World::new();
-        world.insert_resource(FrameCounter { frame: 100 });
-        let entity = world
-            .spawn(Transform::from_translation(melon_core::glam::Vec3::new(
-                0.0, 0.0, 0.0,
-            )))
-            .id();
-        let y_before = world.get::<Transform>(entity).unwrap().translation.y;
-
+        let mut world = world_with_time(1.0 / 60.0);
+        let e = world.spawn(Transform::default()).id();
         let mut schedule = Schedule::default();
         schedule.add_systems(bob_system);
         schedule.run(&mut world);
-
-        let y_after = world.get::<Transform>(entity).unwrap().translation.y;
-        assert_eq!(
-            y_before, y_after,
-            "bob should not change Y position for entities without Bob"
-        );
+        assert_eq!(world.get::<Transform>(e).unwrap().translation, Vec3::ZERO);
     }
 }
