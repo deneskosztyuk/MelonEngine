@@ -138,11 +138,35 @@ fn image_from_gltf_data(data: &gltf::image::Data) -> image::DynamicImage {
     }
 }
 
+/// Format of the scene colour target. The tonemap pass maps it to the display.
+pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// Offscreen HDR colour target that the 3D pass renders into.
+pub struct HdrTarget {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// Binds this target as the tonemap pass input.
+    bind_group: wgpu::BindGroup,
+    size: winit::dpi::PhysicalSize<u32>,
+}
+
+impl HdrTarget {
+    pub fn view(&self) -> &wgpu::TextureView {
+        &self.view
+    }
+
+    pub fn size(&self) -> winit::dpi::PhysicalSize<u32> {
+        self.size
+    }
+}
+
 pub struct SceneRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface_format: wgpu::TextureFormat,
     mesh_pipeline: wgpu::RenderPipeline,
+    tonemap_pipeline: wgpu::RenderPipeline,
+    tonemap_bind_group_layout: wgpu::BindGroupLayout,
     #[allow(dead_code)]
     model_bind_group_layout: wgpu::BindGroupLayout,
     texture_bind_group_layout: wgpu::BindGroupLayout,
@@ -171,6 +195,7 @@ pub struct Renderer {
     scene: SceneRenderer,
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    hdr_target: HdrTarget,
 }
 
 impl std::ops::Deref for Renderer {
@@ -235,6 +260,7 @@ impl Renderer {
 
         let scene = SceneRenderer::new(device, queue, surface_format);
         let (depth_texture, depth_view) = Self::create_depth_target(&scene.device, size);
+        let hdr_target = scene.create_hdr_target(size);
 
         let renderer = Self {
             instance,
@@ -244,6 +270,7 @@ impl Renderer {
             scene,
             depth_texture,
             depth_view,
+            hdr_target,
         };
         renderer.configure_surface();
         Ok(renderer)
@@ -306,13 +333,24 @@ impl SceneRenderer {
             ],
         });
 
-        let mesh_pipeline = Renderer::build_mesh_pipeline(
-            &device,
-            surface_format,
-            &frame_layout,
-            &model_layout,
-            &texture_layout,
-        );
+        let mesh_pipeline =
+            Renderer::build_mesh_pipeline(&device, &frame_layout, &model_layout, &texture_layout);
+
+        let tonemap_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tonemap bind group layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let tonemap_pipeline =
+            Renderer::build_tonemap_pipeline(&device, surface_format, &tonemap_layout);
 
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera uniform buffer"),
@@ -378,6 +416,8 @@ impl SceneRenderer {
             queue,
             surface_format,
             mesh_pipeline,
+            tonemap_pipeline,
+            tonemap_bind_group_layout: tonemap_layout,
             model_bind_group_layout: model_layout,
             texture_bind_group_layout: texture_layout,
             camera_buffer,
@@ -399,14 +439,12 @@ impl SceneRenderer {
 impl Renderer {
     fn build_mesh_pipeline(
         device: &wgpu::Device,
-        surface_format: wgpu::TextureFormat,
         frame_layout: &wgpu::BindGroupLayout,
         model_layout: &wgpu::BindGroupLayout,
         texture_layout: &wgpu::BindGroupLayout,
     ) -> wgpu::RenderPipeline {
         let shader =
             device.create_shader_module(wgpu::include_wgsl!("../../../assets/shaders/mesh.wgsl"));
-        let target_format = surface_format.add_srgb_suffix();
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh pipeline layout"),
@@ -448,7 +486,47 @@ impl Renderer {
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: target_format,
+                    format: HDR_FORMAT,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
+    }
+
+    fn build_tonemap_pipeline(
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+        tonemap_layout: &wgpu::BindGroupLayout,
+    ) -> wgpu::RenderPipeline {
+        let shader = device
+            .create_shader_module(wgpu::include_wgsl!("../../../assets/shaders/tonemap.wgsl"));
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("tonemap pipeline layout"),
+            bind_group_layouts: &[Some(tonemap_layout)],
+            immediate_size: 0,
+        });
+
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("melon_render tonemap pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format.add_srgb_suffix(),
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -494,13 +572,9 @@ impl Renderer {
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
+            // Gizmo lines always draw on top, in the tonemap pass, which has
+            // no depth attachment.
+            depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -823,7 +897,77 @@ impl SceneRenderer {
     }
 
     pub fn create_viewport_target(&self, size: winit::dpi::PhysicalSize<u32>) -> ViewportTarget {
-        ViewportTarget::new(&self.device, self.surface_format.add_srgb_suffix(), size)
+        ViewportTarget::new(
+            &self.device,
+            self.surface_format.add_srgb_suffix(),
+            size,
+            self.create_hdr_target(size),
+        )
+    }
+
+    /// Creates an HDR scene colour target. Zero sizes clamp to 1x1.
+    pub fn create_hdr_target(&self, size: winit::dpi::PhysicalSize<u32>) -> HdrTarget {
+        let size = winit::dpi::PhysicalSize::new(size.width.max(1), size.height.max(1));
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("hdr scene color texture"),
+            size: wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: HDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tonemap bind group"),
+            layout: &self.tonemap_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            }],
+        });
+        HdrTarget {
+            _texture: texture,
+            view,
+            bind_group,
+            size,
+        }
+    }
+
+    /// Begins a pass on `target` that tonemaps `hdr` over it. The pass stays
+    /// open so callers can draw overlays (gizmo lines) on the display image.
+    pub fn tonemap_pass<'e>(
+        &self,
+        encoder: &'e mut wgpu::CommandEncoder,
+        hdr: &HdrTarget,
+        target: &wgpu::TextureView,
+    ) -> wgpu::RenderPass<'e> {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("melon_render tonemap pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    // The fullscreen triangle overwrites every pixel.
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.tonemap_pipeline);
+        pass.set_bind_group(0, &hdr.bind_group, &[]);
+        pass.draw(0..3, 0..1);
+        pass
     }
 
     pub fn queue(&self) -> &wgpu::Queue {
@@ -840,6 +984,11 @@ impl Renderer {
         &self.depth_view
     }
 
+    /// Scene colour target matching the window size.
+    pub fn hdr_target(&self) -> &HdrTarget {
+        &self.hdr_target
+    }
+
     #[instrument(skip(self), level = "debug")]
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width == 0 || new_size.height == 0 {
@@ -850,6 +999,7 @@ impl Renderer {
         let (depth_texture, depth_view) = Self::create_depth_target(&self.device, new_size);
         self.depth_texture = depth_texture;
         self.depth_view = depth_view;
+        self.hdr_target = self.scene.create_hdr_target(new_size);
     }
 
     fn configure_surface(&self) {
@@ -1247,49 +1397,6 @@ impl Renderer {
         self.window.pre_present_notify();
         frame.surface_texture.present();
     }
-
-    /// Convenience: begin frame, draw meshes, end frame in one call.
-    /// For simple cases where no egui overlay is needed.
-    pub fn render_meshes(
-        &mut self,
-        clear_color: wgpu::Color,
-        matrices: &[glam::Mat4],
-        draw_calls: &[(usize, &Mesh)],
-    ) {
-        let Some(mut frame) = self.begin_frame() else {
-            return;
-        };
-        self.update_model_uniforms(matrices);
-        {
-            let mut pass = frame
-                .encoder
-                .begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("melon_render mesh pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &frame.view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(clear_color),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.depth_view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-            self.draw_meshes(&mut pass, draw_calls);
-        }
-        self.end_frame(frame);
-    }
 }
 
 pub struct ViewportTarget {
@@ -1297,6 +1404,7 @@ pub struct ViewportTarget {
     color_view: Arc<wgpu::TextureView>,
     _depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    hdr_target: HdrTarget,
     size: winit::dpi::PhysicalSize<u32>,
 }
 
@@ -1305,6 +1413,7 @@ impl ViewportTarget {
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         size: winit::dpi::PhysicalSize<u32>,
+        hdr_target: HdrTarget,
     ) -> Self {
         let size = winit::dpi::PhysicalSize::new(size.width.max(1), size.height.max(1));
         let color_texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
@@ -1330,8 +1439,14 @@ impl ViewportTarget {
             color_view,
             _depth_texture: depth_texture,
             depth_view,
+            hdr_target,
             size,
         }
+    }
+
+    /// Scene colour target the 3D pass renders into before tonemapping.
+    pub fn hdr_target(&self) -> &HdrTarget {
+        &self.hdr_target
     }
 
     pub fn color_texture(&self) -> Arc<wgpu::Texture> {
@@ -1472,12 +1587,13 @@ mod tests {
         let white_bg = r.create_texture_bind_group(&white);
         let cube = r.cube_mesh();
 
+        let hdr = r.create_hdr_target(size);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("test scene pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &color_view,
+                    view: hdr.view(),
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -1502,7 +1618,42 @@ mod tests {
                 &[(0, &cube, Some(&white_bg)), (1, &cube, Some(&white_bg))],
             );
         }
+        r.tonemap_pass(&mut encoder, &hdr, &color_view);
         read_back(&device, r.queue(), encoder, &color)
+    }
+
+    /// Clears an HDR target to `value` (all channels), tonemaps it to sRGB8
+    /// and returns the centre pixel.
+    fn tonemap_value(r: &Renderer, value: f64) -> u8 {
+        let device = r.device();
+        let hdr = r.create_hdr_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let color = test_color_texture(device, r.surface_format().add_srgb_suffix());
+        let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("test hdr clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: hdr.view(),
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: value,
+                        g: value,
+                        b: value,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        r.tonemap_pass(&mut encoder, &hdr, &color_view);
+        let pixels = read_back(device, r.queue(), encoder, &color);
+        value_at(&pixels, (TEST_SIZE / 2, TEST_SIZE / 2))
     }
 
     fn test_color_texture(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::Texture {
@@ -1647,6 +1798,29 @@ mod tests {
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
+            Box::new(|renderer| {
+                let size = renderer
+                    .create_hdr_target(winit::dpi::PhysicalSize::new(0, 0))
+                    .size();
+                if size == winit::dpi::PhysicalSize::new(1, 1) {
+                    Ok(())
+                } else {
+                    Err(format!("hdr_target_clamps_zero_size: got {size:?}"))
+                }
+            }),
+            Box::new(|renderer| {
+                // Untonemapped, HDR 1.0 would read 255; a curve compresses it
+                // and still keeps brighter values brighter.
+                let one = tonemap_value(renderer, 1.0);
+                let eight = tonemap_value(renderer, 8.0);
+                if one < 250 && eight > one {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "tonemap_compresses_highlights: px(1.0)={one}, px(8.0)={eight}"
+                    ))
+                }
+            }),
             Box::new(|renderer| {
                 let pixels = render_test_scene(renderer, 20.0);
                 let v = value_at(&pixels, LIT_PX);

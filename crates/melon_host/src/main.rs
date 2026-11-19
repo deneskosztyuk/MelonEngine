@@ -498,17 +498,22 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // Pass 1: clear + draw 3D meshes + gizmo lines
+                // Pass 1: clear + draw 3D meshes into the HDR target.
+                // Pass 2: tonemap HDR onto the display image + gizmo lines.
                 #[cfg(feature = "imgui-poc")]
                 let viewport_color_view = self.viewport_target.as_ref().unwrap().color_view();
                 #[cfg(feature = "imgui-poc")]
                 let scene_color_view = viewport_color_view.as_ref();
                 #[cfg(feature = "imgui-poc")]
                 let scene_depth_view = self.viewport_target.as_ref().unwrap().depth_view();
+                #[cfg(feature = "imgui-poc")]
+                let scene_hdr = self.viewport_target.as_ref().unwrap().hdr_target();
                 #[cfg(not(feature = "imgui-poc"))]
                 let scene_color_view = &frame.view;
                 #[cfg(not(feature = "imgui-poc"))]
                 let scene_depth_view = renderer.depth_view();
+                #[cfg(not(feature = "imgui-poc"))]
+                let scene_hdr = renderer.hdr_target();
 
                 {
                     let mut pass = frame
@@ -516,7 +521,7 @@ impl ApplicationHandler for App {
                         .begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("melon_render 3D pass"),
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: scene_color_view,
+                                view: scene_hdr.view(),
                                 depth_slice: None,
                                 resolve_target: None,
                                 ops: wgpu::Operations {
@@ -540,6 +545,10 @@ impl ApplicationHandler for App {
                         });
                     renderer.draw_meshes_textured(&mut pass, &textured_draw_calls);
                     renderer.draw_meshes(&mut pass, &cube_draw_calls);
+                }
+                {
+                    let mut pass =
+                        renderer.tonemap_pass(&mut frame.encoder, scene_hdr, scene_color_view);
                     if !gizmo_vertices.is_empty() {
                         renderer.draw_lines(&mut pass, &gizmo_vertices, view_proj);
                     }

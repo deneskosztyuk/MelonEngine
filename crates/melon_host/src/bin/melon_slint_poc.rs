@@ -87,7 +87,7 @@ impl SlintScene {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Slint scene viewport pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: color_view.as_ref(),
+                    view: self.target.hdr_target().view(),
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -110,6 +110,8 @@ impl SlintScene {
             let draw_calls = [(0, &self.cube), (1, &self.cube)];
             self.renderer.draw_meshes(&mut pass, &draw_calls);
         }
+        self.renderer
+            .tonemap_pass(&mut encoder, self.target.hdr_target(), color_view.as_ref());
 
         self.renderer.queue().submit([encoder.finish()]);
     }
