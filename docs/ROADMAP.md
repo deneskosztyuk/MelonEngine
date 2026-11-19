@@ -57,7 +57,7 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
 - [ ] Full input: all keys, `just_pressed` / `just_released`, mouse buttons and
       wheel, action mapping.
 - [ ] Plugin API so `melon_game` registers its own systems. Fixes bug 8.
-- [ ] Decide on one editor UI (egui, Dear ImGui or Slint); remove the others.
+- [x] Decide on one editor UI: egui + `egui_dock` (ADR-0001); others removed.
 
 ### Tier 1: looks like a 3D game
 
@@ -65,7 +65,8 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
 - [x] Directional (sun) shadow map with 3x3 PCF.
 - [ ] Point and spot lights, their shadows, cascaded sun shadows.
 - [x] HDR target + ACES tonemap pass.
-- [ ] MSAA, skybox.
+- [x] MSAA 4x.
+- [ ] Skybox.
 - [ ] Instancing or storage buffers (removes the 1024 cap, bug 4), frustum culling.
 - [ ] `Camera` as a component; multiple cameras.
 - [ ] glTF: node tree, multiple meshes, materials, skinning, animation. Fixes bug 6.
