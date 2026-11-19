@@ -14,7 +14,8 @@ pub mod stages;
 pub use bevy_ecs;
 pub use bevy_ecs::query::With;
 pub use components::{
-    Aabb, Bob, BodyInfo, BodyKind, MeshRef, Name, PendingDelete, Spin, Transform,
+    Aabb, Bob, BodyInfo, BodyKind, MeshRef, Name, PendingDelete, PreviousTransform, Spin,
+    Transform, store_previous_transforms_system,
 };
 pub use glam;
 pub use input::{Input, KeyCode};
