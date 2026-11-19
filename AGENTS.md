@@ -77,16 +77,23 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   automatically. Do not add it to entities moved in `Update`.
 - **Entity cap.** The model uniform buffer holds 1024 entities
   (`MAX_ENTITIES` in `melon_render/src/lib.rs`).
-- **Deleting entities.** Insert `PendingDelete`; `cleanup_deleted_system`
-  removes the rapier body and despawns. Do not despawn physics entities
-  directly.
+- **Deleting entities.** Call `melon_core::hierarchy::mark_for_delete` (marks
+  the subtree `PendingDelete`); `cleanup_deleted_system` removes the rapier
+  bodies and despawns. Do not despawn physics entities directly.
+- **Hierarchy.** Parents use bevy's `ChildOf` / `Children`. `Transform` is
+  local to the parent; for world poses use `melon_core::hierarchy`
+  (`world_matrix`, `set_world_transform`, `set_parent_keep_world`,
+  `render_matrices`) or `GlobalTransform` (written in `PostUpdate` and before
+  physics sync). Fixed bodies follow their parent; dynamic bodies don't.
 - **Assets.** Reference files through `AssetServer::load::<Model>(path)` →
   `Handle<Model>`; paths are project-relative with forward slashes
-  (`assets/models/x.glb`), plus `builtin:cube`. Never store handle ids in
+  (`assets/models/x.glb`), plus `builtin:cube`; `x.glb#mesh2` draws one glTF
+  mesh unbaked (used by unpacked models). Never store handle ids in
   files. `melon_render::ModelCache` turns handles into GPU models; changed
   files hot-reload (poll every 0.5 s); a broken file keeps the last good model.
-- **Scene format.** RON, `SCENE_VERSION = 2` in `melon_editor/src/scene.rs`
-  (version 1 `mesh_ref` still loads). Adding a saved component means changing
+- **Scene format.** RON, `SCENE_VERSION = 3` in `melon_editor/src/scene.rs`:
+  `parent` is an index into `entities`, `transform` is local (versions 1 and 2
+  still load, all roots). Adding a saved component means changing
   `SceneEntity`, `scene_to_data` and `spawn_scene_entity`. Bump the version on
   breaking changes and keep reading the old one.
 - **Light direction sign.** `Light::direction` is the direction light travels

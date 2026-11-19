@@ -65,9 +65,13 @@ Editor:
 - **Delete** — delete the selected entity
 - **Ctrl+S** — save the scene (File ▸ Save As… the first time)
 - **Models:** drag a `.glb` / `.gltf` from the Content Browser into the Scene
-  (lands on the ground under the cursor) or the Hierarchy (at the origin), or
-  pick one in the Inspector's **Mesh** field. Edit and re-export a model and
+  (lands on the ground under the cursor) or the Hierarchy (at the origin, or
+  under the row you drop it on). It unpacks into an entity per glTF node. Or
+  pick a whole file in the Inspector's **Mesh** field. Edit and re-export a model and
   the editor reloads it within about a second.
+- **Hierarchy:** drag an entity onto another to make it a child (it keeps its
+  place in the world), or onto the empty space below to make it a root.
+  Deleting an entity deletes its children.
 - Panels (Hierarchy, Scene, Inspector, Content Browser, Console) dock and tab
   by dragging their tabs; the arrangement is saved to `.melon/editor_layout.ron`.
   **Window** reopens closed panels; **Window ▸ Reset Layout** restores the default.

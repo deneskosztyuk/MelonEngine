@@ -29,9 +29,8 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
    buffer. More entities overflow `write_buffer` and wgpu panics. No guard.
 5. ~~**No asset system.**~~ Fixed: `Handle<Model>` + `AssetServer`; any glTF
    in `assets/models` draws whole.
-6. **glTF node tree flattened.** Node transforms are now baked into each part
-   (models draw correctly), but nodes don't become child entities until the
-   transform hierarchy exists.
+6. ~~**glTF node tree flattened.**~~ Fixed: a dropped model unpacks into a
+   root entity with one child entity per glTF node (`<file>#mesh<N>` handles).
 7. **`melon_host/src/main.rs` does too much.** It builds draw lists, render
    passes and scene I/O, with three editor UI stacks behind `cfg` branches.
 8. **Game systems hardcoded in host.** `melon_game` cannot register its own
@@ -53,7 +52,9 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
 - [x] Asset handles (`Handle<Model>`) and an `AssetServer`, hot reload,
       editor drag-in and Inspector mesh field. Fixes bug 5. (`Handle<Texture>` /
       `Handle<Material>` come with PBR materials.)
-- [ ] Transform hierarchy: `Parent` / `Children` + `GlobalTransform` propagation.
+- [x] Transform hierarchy: `ChildOf` / `Children` + `GlobalTransform`
+      propagation, world poses everywhere (render, physics, picking, gizmos),
+      Hierarchy tree with drag reparenting, scene format v3. Fixes bug 6.
 - [ ] Render extraction moved from `melon_host` into `melon_render`. Fixes bug 7.
 - [ ] Full input: all keys, `just_pressed` / `just_released`, mouse buttons and
       wheel, action mapping.
