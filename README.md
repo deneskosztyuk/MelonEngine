@@ -55,6 +55,13 @@ just ship-run   # cargo run -p melon_host --release --no-default-features
 - **WASD** — move horizontally
 - **Space / Shift** — move up / down
 - **Right-click + drag** — look around (yaw/pitch)
+- **F5** — Play / resume, **F6** — Pause, **Shift+F5** — Stop (restores the scene)
+
+The editor opens in edit mode. Pass `--play` to start playing right away:
+
+```sh
+cargo run -p melon_host -- --play
+```
 
 ## Assets
 

@@ -58,6 +58,10 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   scene, despawn its entities (`load_scene` despawns entities with a
   `Transform`). Never call `World::clear_entities()`: in bevy 0.19 resources
   are entities, so it deletes them too.
+- **Edit mode.** The engine starts in `SimulationState::Editing`: no fixed
+  steps, no game systems. Play / Pause / Stop live in `melon_editor::play`
+  (F5 / F6 / Shift+F5). Game systems in `Update` need
+  `.run_if(Playing)`. `melon_host --play` starts playing.
 - **Interpolation.** Add `PreviousTransform` to entities moved in
   `FixedUpdate` so they render smoothly. Dynamic physics bodies get it
   automatically. Do not add it to entities moved in `Update`.

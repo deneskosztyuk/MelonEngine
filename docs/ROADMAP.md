@@ -19,8 +19,8 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
 
 ## Known bugs
 
-1. **Play/pause unreachable.** Nothing sets `SimulationState::Paused`. No scene
-   snapshot to restore on stop.
+1. ~~**Play/pause unreachable.**~~ Fixed: Play / Pause / Stop with a scene
+   snapshot.
 2. ~~**Physics speed tied to frame rate.**~~ Fixed: physics runs in
    `FixedUpdate` at 1/60 s.
 3. ~~**Demo systems ignore `Time`.**~~ Fixed: spin and bob use `Time`, bob no
@@ -49,7 +49,7 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
 - [x] Fixed-timestep accumulator and stages (`FixedUpdate` / `Update` /
       `PostUpdate`) with interpolated rendering. Fixes bugs 2–3. `PreUpdate`
       and `Extract` get added with their first system.
-- [ ] Play / Pause / Stop with scene snapshot and restore. Fixes bug 1.
+- [x] Play / Pause / Stop with scene snapshot and restore. Fixes bug 1.
 - [ ] Asset handles (`Handle<Mesh>`, `Handle<Texture>`, `Handle<Material>`) and
       an asset server; replace the `MeshRef` enum. Fixes bug 5.
 - [ ] Transform hierarchy: `Parent` / `Children` + `GlobalTransform` propagation.

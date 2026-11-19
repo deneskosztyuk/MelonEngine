@@ -58,18 +58,18 @@ const SHADOW_CENTER: Vec3 = Vec3::ZERO;
 const SHADOW_RADIUS: f32 = 20.0;
 
 /// Model matrix to draw. Fixed-step entities blend between their last two
-/// steps while playing; when paused, the current `Transform` shows directly
-/// so editor gizmo drags are not blended.
-fn render_matrix(
-    t: &Transform,
-    prev: Option<&PreviousTransform>,
-    alpha: f32,
-    playing: bool,
-) -> Mat4 {
+/// steps when `blend` is set; otherwise the current `Transform` shows directly.
+fn render_matrix(t: &Transform, prev: Option<&PreviousTransform>, alpha: f32, blend: bool) -> Mat4 {
     match prev {
-        Some(prev) if playing => t.interpolate(&prev.0, alpha).to_mat4(),
+        Some(prev) if blend => t.interpolate(&prev.0, alpha).to_mat4(),
         _ => t.to_mat4(),
     }
+}
+
+/// Blend while playing and while paused (alpha is frozen then, so the pose
+/// holds still). In edit mode draw the current `Transform`.
+fn blends(state: SimulationState) -> bool {
+    state != SimulationState::Editing
 }
 
 fn map_key(code: &WinitKeyCode) -> Option<KeyCode> {
@@ -149,6 +149,12 @@ impl App {
             (hot_game::rotation_system, hot_game::bob_system).run_if(is_playing),
         );
         add_physics_systems(&mut core);
+        // `--play` skips edit mode, for quick game runs.
+        if std::env::args().any(|arg| arg == "--play")
+            && let Err(error) = melon_editor::play::play(&mut core.world)
+        {
+            tracing::error!(?error, "--play failed; staying in edit mode");
+        }
 
         Self {
             window: None,
@@ -396,14 +402,13 @@ impl ApplicationHandler for App {
                 // Collect model matrices from all entities with Transform and MeshRef,
                 // blending fixed-step entities between their last two steps.
                 let alpha = self.core.world.resource::<Time>().alpha();
-                let playing =
-                    *self.core.world.resource::<SimulationState>() == SimulationState::Playing;
+                let blend = blends(*self.core.world.resource::<SimulationState>());
                 let entities: Vec<(Entity, Mat4, MeshRef)> = self
                     .core
                     .world
                     .query::<(Entity, &Transform, Option<&PreviousTransform>, &MeshRef)>()
                     .iter(&self.core.world)
-                    .map(|(e, t, prev, m)| (e, render_matrix(t, prev, alpha, playing), *m))
+                    .map(|(e, t, prev, m)| (e, render_matrix(t, prev, alpha, blend), *m))
                     .collect();
 
                 // Write all model uniforms to the shared buffer (one write_buffer call)
@@ -703,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn render_matrix_paused_uses_current() {
+    fn render_matrix_without_blend_uses_current() {
         let (prev, cur) = prev_and_cur();
         assert_eq!(render_matrix(&cur, Some(&prev), 0.0, false), cur.to_mat4());
     }
@@ -715,6 +720,16 @@ mod tests {
             render_matrix(&cur, Some(&prev), 0.0, true),
             prev.0.to_mat4()
         );
+    }
+
+    #[test]
+    fn blends_while_playing_and_paused() {
+        assert!(blends(SimulationState::Playing) && blends(SimulationState::Paused));
+    }
+
+    #[test]
+    fn no_blend_while_editing() {
+        assert!(!blends(SimulationState::Editing));
     }
 
     #[test]
