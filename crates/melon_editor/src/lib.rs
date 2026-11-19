@@ -5,6 +5,7 @@ use bevy_ecs::world::World;
 use egui::ViewportId;
 use egui_wgpu::ScreenDescriptor;
 use melon_core::glam;
+use melon_core::hierarchy::{mark_for_delete, set_world_transform, world_matrix};
 use melon_core::{
     Aabb, AssetServer, BodyInfo, Camera, Handle, Model, Name, SimulationState, Spin, Transform,
 };
@@ -166,10 +167,8 @@ impl Editor {
 
     /// Mark the selected entity for deletion and clear the selection.
     pub fn delete_selected(&mut self, world: &mut World) {
-        if let Some(entity) = self.selected
-            && let Ok(mut entity_mut) = world.get_entity_mut(entity)
-        {
-            entity_mut.insert(melon_core::PendingDelete);
+        if let Some(entity) = self.selected {
+            mark_for_delete(world, entity);
         }
         self.clear_selection();
     }
@@ -589,11 +588,11 @@ impl Editor {
 
         self.world_line_vertices = viewport::grid_lines();
         if let Some(e) = self.selected
-            && let Some(t) = world.get::<Transform>(e)
+            && world.get::<Transform>(e).is_some()
         {
             self.world_line_vertices
                 .extend(viewport::selection_box_lines(
-                    t,
+                    world_matrix(world, e),
                     viewport::model_bounds(world, e),
                 ));
         }
@@ -731,7 +730,7 @@ impl Editor {
         }
 
         if let Some(entity) = to_delete {
-            world.entity_mut(entity).insert(melon_core::PendingDelete);
+            mark_for_delete(world, entity);
             if self.selected == Some(entity) {
                 self.clear_selection();
             }
@@ -871,9 +870,11 @@ impl Editor {
     /// After an inspector edit of `Transform`: push it into rapier and snap
     /// `PreviousTransform`, like the gizmo does, so paused edits survive resume.
     fn after_transform_edit(&self, world: &mut World, entity: Entity) {
-        let Some(t) = world.get::<Transform>(entity).copied() else {
+        if world.get::<Transform>(entity).is_none() {
             return;
-        };
+        }
+        // The Inspector edits the local transform; rapier wants the world pose.
+        let t = Transform::from_mat4(world_matrix(world, entity));
         self.write_to_physics_body(world, entity, Some(t.translation), Some(t.rotation));
         snap_previous_transform(world, entity);
     }
@@ -891,11 +892,11 @@ impl Editor {
             None => return,
         };
 
-        // Guard M5: skip if no Transform
-        let transform = match world.get::<Transform>(entity) {
-            Some(t) => *t,
-            None => return,
-        };
+        // Guard M5: skip if no Transform. The gizmo works on the world pose.
+        if world.get::<Transform>(entity).is_none() {
+            return;
+        }
+        let transform = Transform::from_mat4(world_matrix(world, entity));
 
         let camera = match world.get_resource::<Camera>() {
             Some(c) => *c,
@@ -971,9 +972,14 @@ impl Editor {
                                 axis_delta = snap_value(axis_delta, SNAP_MOVE);
                             }
                             let new_translation = drag.initial_translation + drag.axis * axis_delta;
-                            if let Some(mut t) = world.get_mut::<Transform>(entity) {
-                                t.translation = new_translation;
-                            }
+                            set_world_transform(
+                                world,
+                                entity,
+                                Transform {
+                                    translation: new_translation,
+                                    ..transform
+                                },
+                            );
                             snap_previous_transform(world, entity);
                             self.write_to_physics_body(world, entity, Some(new_translation), None);
                         }
@@ -998,9 +1004,14 @@ impl Editor {
                             }
                             let new_rotation = glam::Quat::from_axis_angle(drag.axis, delta_angle)
                                 * drag.initial_rotation;
-                            if let Some(mut t) = world.get_mut::<Transform>(entity) {
-                                t.rotation = new_rotation;
-                            }
+                            set_world_transform(
+                                world,
+                                entity,
+                                Transform {
+                                    rotation: new_rotation,
+                                    ..transform
+                                },
+                            );
                             snap_previous_transform(world, entity);
                             self.write_to_physics_body(world, entity, None, Some(new_rotation));
                         }
@@ -1029,9 +1040,14 @@ impl Editor {
                                     2 => new_scale.z = drag.initial_scale.z * scale_factor,
                                     _ => {}
                                 }
-                                if let Some(mut t) = world.get_mut::<Transform>(entity) {
-                                    t.scale = new_scale;
-                                }
+                                set_world_transform(
+                                    world,
+                                    entity,
+                                    Transform {
+                                        scale: new_scale,
+                                        ..transform
+                                    },
+                                );
                                 snap_previous_transform(world, entity);
                             }
                         }
@@ -1676,6 +1692,20 @@ fn snap_previous_transform(world: &mut World, entity: Entity) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delete_selected_marks_subtree() {
+        let mut world = World::new();
+        let parent = world.spawn(Transform::default()).id();
+        let child = world
+            .spawn((Transform::default(), melon_core::ChildOf(parent)))
+            .id();
+        let mut editor = Editor::new();
+        editor.set_selected(Some(parent));
+        editor.delete_selected(&mut world);
+        assert!(world.get::<melon_core::PendingDelete>(parent).is_some());
+        assert!(world.get::<melon_core::PendingDelete>(child).is_some());
+    }
 
     #[test]
     fn snap_previous_transform_matches_current() {

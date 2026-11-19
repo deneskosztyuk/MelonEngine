@@ -4,7 +4,8 @@
 
 use bevy_ecs::entity::Entity;
 use bevy_ecs::world::World;
-use melon_core::glam::{Vec2, Vec3};
+use melon_core::glam::{Mat4, Vec2, Vec3};
+use melon_core::hierarchy::world_matrix;
 use melon_core::{AssetServer, Camera, Handle, Model, Transform};
 use melon_render::LineVertex;
 
@@ -172,16 +173,17 @@ impl EditorCamera {
 }
 
 /// Nearest entity with a mesh hit by the ray, tested against the mesh's local
-/// bounds in the entity's own space, so rotated and scaled boxes are exact.
+/// bounds in the entity's own space (world matrix, parents included), so
+/// rotated and scaled boxes are exact.
 pub fn pick(world: &mut World, origin: Vec3, dir: Vec3) -> Option<Entity> {
-    let mut query = world.query::<(Entity, &Transform, &Handle<Model>)>();
+    let mut query = world.query_filtered::<(Entity, &Handle<Model>), melon_core::With<Transform>>();
     let world: &World = world;
     let server = world.get_resource::<AssetServer>();
     query
         .iter(world)
-        .filter_map(|(entity, transform, model)| {
+        .filter_map(|(entity, model)| {
             let (min, max) = server.and_then(|s| s.bounds(*model)).unwrap_or(UNIT_BOUNDS);
-            let inverse = transform.to_mat4().inverse();
+            let inverse = world_matrix(world, entity).inverse();
             if !inverse.is_finite() {
                 return None; // zero scale
             }
@@ -219,11 +221,12 @@ fn ray_box(o: Vec3, d: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
 /// Centre and bounding-sphere radius of an entity's mesh, for framing.
 /// `None` if the entity no longer exists.
 pub fn frame_target(world: &World, entity: Entity) -> Option<(Vec3, f32)> {
-    let transform = world.get::<Transform>(entity)?;
+    world.get::<Transform>(entity)?;
+    let m = world_matrix(world, entity);
     let (min, max) = model_bounds(world, entity);
     Some((
-        transform.to_mat4().transform_point3((min + max) * 0.5),
-        ((max - min) * 0.5 * transform.scale.abs()).length(),
+        m.transform_point3((min + max) * 0.5),
+        ((max - min) * 0.5 * Transform::from_mat4(m).scale.abs()).length(),
     ))
 }
 
@@ -323,9 +326,8 @@ pub fn grid_lines() -> Vec<LineVertex> {
     vertices
 }
 
-/// Orange wire box around the model bounds under `transform` (12 edges).
-pub fn selection_box_lines(transform: &Transform, (min, max): (Vec3, Vec3)) -> Vec<LineVertex> {
-    let m = transform.to_mat4();
+/// Orange wire box around the model bounds under world matrix `m` (12 edges).
+pub fn selection_box_lines(m: Mat4, (min, max): (Vec3, Vec3)) -> Vec<LineVertex> {
     let corner = |i: usize| {
         let pick = |bit: usize, axis: usize| if i & bit != 0 { max[axis] } else { min[axis] };
         m.transform_point3(Vec3::new(pick(1, 0), pick(2, 1), pick(4, 2)))
@@ -527,6 +529,37 @@ mod tests {
         world.spawn((Name("Box".to_string()), t, cube)).id()
     }
 
+    fn child_box(world: &mut World) -> Entity {
+        let parent = world
+            .spawn(Transform::from_translation(Vec3::new(10.0, 0.0, 0.0)))
+            .id();
+        let child = spawn_box(world, Transform::default());
+        world.entity_mut(child).insert(melon_core::ChildOf(parent));
+        child
+    }
+
+    #[test]
+    fn pick_child_at_world_position() {
+        let mut world = World::new();
+        let child = child_box(&mut world);
+        assert_eq!(
+            pick(&mut world, Vec3::new(10.0, 5.0, 0.0), Vec3::NEG_Y),
+            Some(child)
+        );
+        assert_eq!(
+            pick(&mut world, Vec3::new(0.0, 5.0, 0.0), Vec3::NEG_Y),
+            None
+        );
+    }
+
+    #[test]
+    fn frame_target_uses_world_position() {
+        let mut world = World::new();
+        let child = child_box(&mut world);
+        let (centre, _) = frame_target(&world, child).unwrap();
+        assert!(approx(centre, Vec3::new(10.0, 0.0, 0.0)), "{centre}");
+    }
+
     #[test]
     fn pick_nearest_of_two_boxes() {
         let mut world = World::new();
@@ -716,9 +749,6 @@ mod tests {
 
     #[test]
     fn selection_box_has_12_edges() {
-        assert_eq!(
-            selection_box_lines(&Transform::default(), UNIT_BOUNDS).len(),
-            24
-        );
+        assert_eq!(selection_box_lines(Mat4::IDENTITY, UNIT_BOUNDS).len(), 24);
     }
 }
