@@ -40,6 +40,50 @@ pub fn list_dir(path: &Path) -> Vec<ContentEntry> {
     entries
 }
 
+/// A file the asset pipeline can load as a model.
+pub fn is_model_path(path: &str) -> bool {
+    let path = path.to_lowercase();
+    path.ends_with(".glb") || path.ends_with(".gltf")
+}
+
+/// Every model the Inspector can assign: `builtin:cube`, then each
+/// `.glb` / `.gltf` under `<project>/assets/models` (recursive) as a
+/// project-relative, forward-slash path, sorted.
+pub fn model_list(project_root: &Path) -> Vec<String> {
+    let mut models = Vec::new();
+    collect_models(
+        &project_root.join("assets/models"),
+        project_root,
+        &mut models,
+    );
+    models.sort();
+    models.insert(0, "builtin:cube".to_string());
+    models
+}
+
+fn collect_models(dir: &Path, project_root: &Path, out: &mut Vec<String>) {
+    for entry in list_dir(dir) {
+        if entry.is_dir {
+            collect_models(&entry.path, project_root, out);
+        } else if is_model_path(&entry.name)
+            && let Some(path) = project_relative(project_root, &entry.path)
+        {
+            out.push(path);
+        }
+    }
+}
+
+/// `path` relative to `root`, with forward slashes (asset path form).
+fn project_relative(root: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(root).ok()?;
+    Some(
+        rel.components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
 /// Folder navigation inside a fixed root (the assets folder).
 pub struct ContentBrowser {
     root: PathBuf,
@@ -123,8 +167,26 @@ impl ContentBrowser {
                     } else {
                         ("🗋", format_size(entry.size))
                     };
+                    // Model files drag into the Scene or Hierarchy as their
+                    // project-relative asset path.
+                    let model_path = (!entry.is_dir && is_model_path(&entry.name))
+                        .then(|| {
+                            self.root
+                                .parent()
+                                .and_then(|p| project_relative(p, &entry.path))
+                        })
+                        .flatten();
+                    let label = format!("{icon} {}", entry.name);
                     let row = ui.horizontal(|ui| {
-                        let response = ui.selectable_label(false, format!("{icon} {}", entry.name));
+                        let response = match model_path {
+                            Some(path) => {
+                                ui.dnd_drag_source(egui::Id::new(&entry.path), path, |ui| {
+                                    ui.selectable_label(false, &label)
+                                })
+                                .inner
+                            }
+                            None => ui.selectable_label(false, &label),
+                        };
                         if !detail.is_empty() {
                             ui.weak(detail);
                         }
@@ -170,6 +232,33 @@ mod tests {
         let names: Vec<String> = list_dir(&dir).into_iter().map(|e| e.name).collect();
         assert_eq!(names, ["A", "c", "a.txt", "b.txt"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_model_path_accepts_glb_gltf_only() {
+        assert!(is_model_path("assets/models/a.GLB"));
+        assert!(is_model_path("assets/models/b.gltf"));
+        assert!(!is_model_path("assets/README.md"));
+        assert!(!is_model_path("assets/shaders/mesh.wgsl"));
+    }
+
+    #[test]
+    fn model_list_sorted_builtin_first() {
+        let root = temp_dir("models");
+        let models = root.join("assets/models");
+        std::fs::create_dir_all(models.join("sub")).unwrap();
+        std::fs::write(models.join("b.glb"), "").unwrap();
+        std::fs::write(models.join("sub/a.gltf"), "").unwrap();
+        std::fs::write(models.join("notes.txt"), "").unwrap();
+        assert_eq!(
+            model_list(&root),
+            [
+                "builtin:cube",
+                "assets/models/b.glb",
+                "assets/models/sub/a.gltf"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

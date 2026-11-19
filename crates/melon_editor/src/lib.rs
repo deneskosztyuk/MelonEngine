@@ -97,6 +97,8 @@ pub struct Editor {
     content: content::ContentBrowser,
     /// Where the dock layout is saved (under the project root).
     layout_file: std::path::PathBuf,
+    /// Project folder: asset paths are relative to it.
+    project_root: std::path::PathBuf,
     hierarchy_query: String,
     /// Scene file last saved or loaded; File > Save writes here.
     current_scene: Option<std::path::PathBuf>,
@@ -126,6 +128,7 @@ impl Default for Editor {
             dock: layout::default_layout(),
             content: content::ContentBrowser::new("assets".into()),
             layout_file: layout::layout_path(),
+            project_root: ".".into(),
             hierarchy_query: String::new(),
             current_scene: None,
             flying: false,
@@ -145,6 +148,7 @@ impl Editor {
     pub fn set_project_root(&mut self, root: &std::path::Path) {
         self.content = content::ContentBrowser::new(root.join("assets"));
         self.layout_file = root.join(layout::layout_path());
+        self.project_root = root.to_path_buf();
         self.dock = layout::load_layout(&self.layout_file);
     }
 
@@ -544,6 +548,16 @@ impl Editor {
             egui::Image::new((texture, rect.size())).sense(egui::Sense::click_and_drag()),
         );
         let vp = viewport_input(&ctx, &response, rect);
+        // A model dragged from the Content Browser lands on the ground under the cursor.
+        if let Some(path) = response.dnd_release_payload::<String>()
+            && content::is_model_path(&path)
+            && let (Some(pointer), Some(camera)) =
+                (vp.pointer, world.get_resource::<Camera>().copied())
+        {
+            let at = viewport::drop_point(&camera, pointer, vp.size);
+            self.selected = Some(spawn_model(world, &path, at));
+            self.gizmo_drag = None;
+        }
         self.flying = vp.right_down;
         let dt = world
             .get_resource::<melon_core::Time>()
@@ -685,7 +699,7 @@ impl Editor {
 
         ui.separator();
 
-        // Entity list
+        // Entity list (also a drop zone: a dragged model spawns at the origin)
         let mut to_delete: Option<Entity> = None;
         let entities: Vec<(Entity, Name)> = world
             .query::<(Entity, &Name)>()
@@ -693,19 +707,27 @@ impl Editor {
             .map(|(e, n)| (e, n.clone()))
             .collect();
 
-        for (entity, name) in entities {
-            if !layout::hierarchy_matches(&name.0, &self.hierarchy_query) {
-                continue;
+        let (_, dropped) = ui.dnd_drop_zone::<String, _>(egui::Frame::new(), |ui| {
+            ui.set_min_size(ui.available_size());
+            for (entity, name) in entities {
+                if !layout::hierarchy_matches(&name.0, &self.hierarchy_query) {
+                    continue;
+                }
+                let is_selected = self.selected == Some(entity);
+                let response = ui.selectable_label(is_selected, &name.0);
+                if response.clicked() {
+                    self.selected = if is_selected { None } else { Some(entity) };
+                    self.gizmo_drag = None;
+                }
+                if response.secondary_clicked() {
+                    to_delete = Some(entity);
+                }
             }
-            let is_selected = self.selected == Some(entity);
-            let response = ui.selectable_label(is_selected, &name.0);
-            if response.clicked() {
-                self.selected = if is_selected { None } else { Some(entity) };
-                self.gizmo_drag = None;
-            }
-            if response.secondary_clicked() {
-                to_delete = Some(entity);
-            }
+        });
+        if let Some(path) = dropped
+            && content::is_model_path(&path)
+        {
+            self.selected = Some(spawn_model(world, &path, glam::Vec3::ZERO));
         }
 
         if let Some(entity) = to_delete {
@@ -721,6 +743,12 @@ impl Editor {
             ui.weak("Nothing selected");
             return;
         };
+        // Read before borrowing the entity mutably (the server is a world resource).
+        let current_model = world
+            .get::<Handle<Model>>(entity)
+            .zip(world.get_resource::<AssetServer>())
+            .map(|(h, server)| server.path(*h).to_string());
+        let mut new_model: Option<String> = None;
         let Ok(mut entity_mut) = world.get_entity_mut(entity) else {
             self.clear_selection();
             return;
@@ -743,6 +771,29 @@ impl Editor {
                         .num_columns(2)
                         .spacing([8.0, 6.0])
                         .show(ui, |ui| {
+                            if let Some(current) = &current_model {
+                                ui.label("Mesh");
+                                egui::ComboBox::from_id_salt("inspector_mesh")
+                                    .selected_text(model_label(current))
+                                    .width(ui.available_width())
+                                    .show_ui(ui, |ui| {
+                                        // Listed only while the dropdown is open.
+                                        for path in content::model_list(&self.project_root) {
+                                            if ui
+                                                .selectable_label(
+                                                    *current == path,
+                                                    model_label(&path),
+                                                )
+                                                .on_hover_text(&path)
+                                                .clicked()
+                                            {
+                                                new_model = Some(path);
+                                            }
+                                        }
+                                    });
+                                ui.end_row();
+                            }
+
                             ui.label("Position");
                             transform_edited |= vec3_field(ui, &mut t.translation, 0.05, None);
                             ui.end_row();
@@ -810,6 +861,10 @@ impl Editor {
 
         if transform_edited {
             self.after_transform_edit(world, entity);
+        }
+        if let Some(path) = new_model {
+            let handle: Handle<Model> = world.resource_mut::<AssetServer>().load(&path);
+            world.entity_mut(entity).insert(handle);
         }
     }
 
@@ -1415,6 +1470,24 @@ pub enum StatusKind {
     Error,
 }
 
+/// Spawn an entity showing the model at `path`, named after the file.
+pub fn spawn_model(world: &mut World, path: &str, at: glam::Vec3) -> Entity {
+    let name = std::path::Path::new(path)
+        .file_stem()
+        .map_or_else(|| "Model".to_string(), |s| s.to_string_lossy().into_owned());
+    let handle: Handle<Model> = world
+        .get_resource_or_insert_with(|| AssetServer::new(".".into()))
+        .load(path);
+    world
+        .spawn((Name(name), Transform::from_translation(at), handle))
+        .id()
+}
+
+/// Short label for a model path in the Inspector: the file name.
+fn model_label(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 /// Editor keyboard shortcuts (F5/F6/Shift+F5 live in `play_controls`, F in the viewport).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shortcut {
@@ -1816,6 +1889,26 @@ mod tests {
         assert_eq!(
             shortcut_for(egui::Key::Delete, false, false, false),
             Some(Shortcut::Delete)
+        );
+    }
+
+    #[test]
+    fn spawn_model_names_from_stem() {
+        let mut world = World::new();
+        let e = spawn_model(
+            &mut world,
+            "assets/models/sub/Barrel.glb",
+            glam::Vec3::new(1.0, 0.0, 2.0),
+        );
+        assert_eq!(world.get::<Name>(e).unwrap().0, "Barrel");
+        assert_eq!(
+            world.get::<Transform>(e).unwrap().translation,
+            glam::Vec3::new(1.0, 0.0, 2.0)
+        );
+        let h = *world.get::<Handle<Model>>(e).unwrap();
+        assert_eq!(
+            world.resource::<AssetServer>().path(h),
+            "assets/models/sub/Barrel.glb"
         );
     }
 

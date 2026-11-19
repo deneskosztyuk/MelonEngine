@@ -17,6 +17,19 @@ const MIN_DISTANCE: f32 = 0.2;
 const MIN_FLY_SPEED: f32 = 0.5;
 const MAX_FLY_SPEED: f32 = 100.0;
 const SHIFT_MULTIPLIER: f32 = 3.0;
+/// Where a model dropped at `pointer` lands: on the ground (y = 0) under the
+/// cursor, or 5 m along the cursor ray when it doesn't point down at the ground.
+pub fn drop_point(camera: &Camera, pointer: Vec2, size: Vec2) -> Vec3 {
+    let (origin, dir) = camera.screen_to_world_ray(pointer, size);
+    if dir.y < -1e-4 {
+        let t = -origin.y / dir.y;
+        if t > 0.0 {
+            return origin + dir * t;
+        }
+    }
+    origin + dir * 5.0
+}
+
 /// Bounds used until a model's real bounds are known (and for `builtin:cube`).
 pub const UNIT_BOUNDS: (Vec3, Vec3) = (Vec3::splat(-0.5), Vec3::splat(0.5));
 
@@ -613,6 +626,28 @@ mod tests {
         assert!(approx(cam.pivot, Vec3::new(3.0, 1.0, -2.0)));
         let half_fov = melon_core::Camera::default().fov_y_radians / 2.0;
         assert!(cam.distance * half_fov.tan() >= radius - 1e-4);
+    }
+
+    #[test]
+    fn drop_point_hits_ground() {
+        let mut camera = Camera::default();
+        EditorCamera::default().write(&mut camera);
+        let size = Vec2::new(800.0, 600.0);
+        let p = drop_point(&camera, size * 0.5, size);
+        assert!(p.y.abs() < 1e-3, "on the ground: {p}");
+        assert!(p.length() < 0.1, "default camera looks at the origin: {p}");
+    }
+
+    #[test]
+    fn drop_point_above_horizon_falls_back() {
+        let camera = Camera::default(); // eye (0,0,4) looking level along -Z
+        let size = Vec2::new(800.0, 600.0);
+        let p = drop_point(&camera, Vec2::new(400.0, 0.0), size);
+        let (origin, _) = camera.screen_to_world_ray(Vec2::new(400.0, 0.0), size);
+        assert!(
+            (p.distance(origin) - 5.0).abs() < 1e-3,
+            "5 m along the ray: {p}"
+        );
     }
 
     #[test]
