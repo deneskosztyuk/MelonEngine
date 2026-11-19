@@ -31,8 +31,10 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
    in `assets/models` draws whole.
 6. ~~**glTF node tree flattened.**~~ Fixed: a dropped model unpacks into a
    root entity with one child entity per glTF node (`<file>#mesh<N>` handles).
-7. **`melon_host/src/main.rs` does too much.** It builds draw lists, render
-   passes and scene I/O, with three editor UI stacks behind `cfg` branches.
+7. ~~**`melon_host/src/main.rs` does too much.**~~ Fixed: `melon_render`
+   extracts the world (`extract` → `FrameData`) and records the scene passes
+   (`render_scene`, `ui_pass`); the editor runs File Save / Load / Exit. The
+   host is the winit loop, input mapping and frame order.
 8. **Game systems hardcoded in host.** `melon_game` cannot register its own
    systems; signatures are duplicated in the host `hot_module` imports.
 9. **README is stale.** Links deleted LICENSE files, says "v0.1 — released",
@@ -55,7 +57,7 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
 - [x] Transform hierarchy: `ChildOf` / `Children` + `GlobalTransform`
       propagation, world poses everywhere (render, physics, picking, gizmos),
       Hierarchy tree with drag reparenting, scene format v3. Fixes bug 6.
-- [ ] Render extraction moved from `melon_host` into `melon_render`. Fixes bug 7.
+- [x] Render extraction moved from `melon_host` into `melon_render`. Fixes bug 7.
 - [ ] Full input: all keys, `just_pressed` / `just_released`, mouse buttons and
       wheel, action mapping.
 - [ ] Plugin API so `melon_game` registers its own systems. Fixes bug 8.
