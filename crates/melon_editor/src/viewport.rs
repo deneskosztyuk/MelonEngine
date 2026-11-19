@@ -211,6 +211,15 @@ pub fn frame_target(world: &World, entity: Entity) -> Option<(Vec3, f32)> {
     ))
 }
 
+/// Input for the camera: while a gizmo handle is being dragged the left button
+/// belongs to the gizmo, so pressing Alt mid-drag must not also orbit.
+pub fn camera_input(input: &ViewportInput, gizmo_dragging: bool) -> ViewportInput {
+    ViewportInput {
+        left_down: input.left_down && !gizmo_dragging,
+        ..*input
+    }
+}
+
 /// What a left-button click in the viewport does, by priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeftAction {
@@ -583,6 +592,22 @@ mod tests {
             .find(|v| v.color == AXIS_Z_COLOR)
             .expect("z axis line");
         assert!(blue.position[0].abs() < 1e-6);
+    }
+
+    #[test]
+    fn alt_during_gizmo_drag_does_not_orbit() {
+        let vp = ViewportInput {
+            alt: true,
+            left_down: true,
+            pointer_delta: Vec2::new(40.0, 0.0),
+            ..hovered()
+        };
+        let mut cam = EditorCamera::default();
+        let eye0 = cam.eye();
+        cam.apply(&camera_input(&vp, true), 0.016);
+        assert!(approx(cam.eye(), eye0), "camera moved during a gizmo drag");
+        cam.apply(&camera_input(&vp, false), 0.016);
+        assert!(!approx(cam.eye(), eye0), "orbit works without a gizmo drag");
     }
 
     #[test]

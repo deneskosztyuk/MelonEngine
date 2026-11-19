@@ -522,7 +522,8 @@ impl Editor {
             .get_resource::<melon_core::Time>()
             .map_or(1.0 / 60.0, |t| t.delta_seconds);
 
-        self.camera.apply(&vp, dt);
+        self.camera
+            .apply(&viewport::camera_input(&vp, self.gizmo_drag.is_some()), dt);
         if vp.f_pressed
             && let Some((center, radius)) =
                 self.selected.and_then(|e| viewport::frame_target(world, e))
@@ -958,7 +959,11 @@ impl Editor {
             }
         }
 
-        // Picking (only when not dragging and egui doesn't want pointer)
+        // Picking (only when not dragging and egui doesn't want pointer).
+        // Off the viewport, forget the hovered handle so the Grab cursor clears.
+        if self.gizmo_drag.is_none() && wants_pointer {
+            self.hovered_axis = None;
+        }
         if self.gizmo_drag.is_none() && !wants_pointer {
             self.hovered_axis = None;
             if let Some(pp) = pointer_pos {

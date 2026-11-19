@@ -429,6 +429,24 @@ impl ApplicationHandler for App {
                 let gizmo_vertices = self.editor_ui.as_mut().unwrap().take_gizmo_vertices();
                 let world_line_vertices =
                     self.editor_ui.as_mut().unwrap().take_world_line_vertices();
+                // Follow the viewport panel's size: recreate the target, hand it
+                // to the editor UI, and match the camera aspect, before this frame's
+                // 3D pass so the new size is never drawn with the old aspect.
+                let requested_size = self.editor_ui.as_ref().unwrap().requested_viewport_size();
+                if requested_size != self.viewport_target.as_ref().unwrap().size() {
+                    let viewport_target = renderer.create_viewport_target(requested_size);
+                    self.editor
+                        .as_mut()
+                        .unwrap()
+                        .set_viewport_target(renderer.device(), &viewport_target);
+                    self.viewport_target = Some(viewport_target);
+
+                    let aspect = requested_size.width as f32 / requested_size.height as f32;
+                    if let Some(mut camera) = self.core.world.get_resource_mut::<Camera>() {
+                        camera.set_aspect(aspect);
+                    }
+                }
+
                 // The editor may have moved the camera: upload it again so every
                 // pass (and the gizmo it generated) uses this frame's pose.
                 let view_proj = self
@@ -583,23 +601,6 @@ impl ApplicationHandler for App {
                         });
                     let mut pass = pass.forget_lifetime();
                     self.editor.as_mut().unwrap().render(&mut pass);
-                }
-
-                // Follow the viewport panel's size: recreate the target, hand it
-                // to the editor UI, and match the camera aspect.
-                let requested_size = self.editor_ui.as_ref().unwrap().requested_viewport_size();
-                if requested_size != self.viewport_target.as_ref().unwrap().size() {
-                    let viewport_target = renderer.create_viewport_target(requested_size);
-                    self.editor
-                        .as_mut()
-                        .unwrap()
-                        .set_viewport_target(renderer.device(), &viewport_target);
-                    self.viewport_target = Some(viewport_target);
-
-                    let aspect = requested_size.width as f32 / requested_size.height as f32;
-                    if let Some(mut camera) = self.core.world.get_resource_mut::<Camera>() {
-                        camera.set_aspect(aspect);
-                    }
                 }
 
                 renderer.end_frame(frame);

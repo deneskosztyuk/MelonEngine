@@ -1699,6 +1699,9 @@ impl SceneRenderer {
         pass.draw(0..vertices.len() as u32, 0..1);
     }
 
+    /// Writes the shared frame camera buffer. Every write lands before the
+    /// frame is submitted, so all passes see the last value: callers must pass
+    /// this frame's camera `view_proj` (they all do), never a special one.
     fn write_line_camera(&self, view_proj: glam::Mat4) {
         let uniform = CameraUniform {
             view_proj: view_proj.to_cols_array_2d(),
