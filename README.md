@@ -52,9 +52,19 @@ just ship-run   # cargo run -p melon_host --release --no-default-features
 
 ## Controls
 
-- **WASD** — move horizontally
-- **Space / Shift** — move up / down
-- **Right-click + drag** — look around (yaw/pitch)
+Viewport (Unity-style, pointer over the viewport):
+
+- **Right drag** — look around
+- **Right held + W/A/S/D** — fly; **Q / E** down / up; **Shift** ×3 speed
+- **Right held + scroll** — change fly speed
+- **Alt + left drag** — orbit around the pivot
+- **Middle drag** — pan
+- **Scroll** — zoom toward the pivot
+- **F** — frame the selected entity
+- **Left click** — select (click empty space to deselect); drag a gizmo handle to move/rotate/scale
+
+Simulation:
+
 - **F5** — Play / resume, **F6** — Pause, **Shift+F5** — Stop (restores the scene)
 
 The editor opens in edit mode. Pass `--play` to start playing right away:

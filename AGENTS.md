@@ -58,10 +58,16 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   scene, despawn its entities (`load_scene` despawns entities with a
   `Transform`). Never call `World::clear_entities()`: in bevy 0.19 resources
   are entities, so it deletes them too.
+- **Viewport.** `melon_editor/src/viewport.rs` holds the UI-library-independent
+  viewport logic (`EditorCamera`, `pick`, grid/selection lines). UI glue only
+  fills a `ViewportInput` and shows the `ViewportTarget` image; the scene
+  always renders into `ViewportTarget` (MSAA 4x HDR, then tonemap). egui must
+  sample it through `ViewportTarget::ui_view()` (non-sRGB), or it darkens.
 - **Edit mode.** The engine starts in `SimulationState::Editing`: no fixed
   steps, no game systems. Play / Pause / Stop live in `melon_editor::play`
   (F5 / F6 / Shift+F5). Game systems in `Update` need
-  `.run_if(Playing)`. `melon_host --play` starts playing.
+  `.run_if(Playing)`. `melon_host --play` starts playing. The editor camera owns
+  `Camera`; there is no fly-camera system.
 - **Interpolation.** Add `PreviousTransform` to entities moved in
   `FixedUpdate` so they render smoothly. Dynamic physics bodies get it
   automatically. Do not add it to entities moved in `Update`.
