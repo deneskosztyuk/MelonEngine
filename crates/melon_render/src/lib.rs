@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
+mod extract;
 mod models;
+
+pub use extract::{FrameData, blends, extract};
 
 /// Model uniform slots: at most this many entities with a model are drawn.
 pub const MAX_ENTITIES: usize = 1024;
