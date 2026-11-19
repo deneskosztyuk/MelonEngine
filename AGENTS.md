@@ -54,8 +54,10 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   `FixedUpdate` (1/60 s, 0..N times per frame, not while paused), `Update`
   (once per frame, read `Time::delta_seconds`), `PostUpdate`.
 - **Never replace `core.world` after the first frame.** bevy systems are bound
-  to the first `World` they run on and panic on another one. `load_scene`
-  does this today (ROADMAP bug 10).
+  to the first `World` they run on and panic on another one. To reset a
+  scene, despawn its entities (`load_scene` despawns entities with a
+  `Transform`). Never call `World::clear_entities()`: in bevy 0.19 resources
+  are entities, so it deletes them too.
 - **Interpolation.** Add `PreviousTransform` to entities moved in
   `FixedUpdate` so they render smoothly. Dynamic physics bodies get it
   automatically. Do not add it to entities moved in `Update`.

@@ -1,6 +1,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use bevy_ecs::entity::Entity;
+use bevy_ecs::query::With;
 use bevy_ecs::world::World;
 use melon_core::{Aabb, Bob, BodyInfo, BodyKind, MeshRef, Name, NameCounter, Spin, Transform};
 use melon_physics::{ColliderComponent, PhysicsWorld, RigidBodyComponent, RigidBodyType};
@@ -114,41 +116,24 @@ pub fn load_scene(world: &mut World, physics: &mut PhysicsWorld, path: &Path) ->
         validate_entity(entity, i)?;
     }
 
-    // Phase 2: Mutate world
-    // Create a fresh world with preserved resources, then swap.
-    // This avoids the bevy_ecs 0.19 ResourceCache panic that despawn triggers.
-    let mut new_world = World::new();
-
-    // Preserve engine resources
-    if let Some(c) = world.get_resource::<melon_core::Camera>() {
-        new_world.insert_resource(*c);
+    // Phase 2: Mutate world in place.
+    // Despawn only scene entities (those with a Transform). In bevy_ecs 0.19
+    // resources are entities too, so despawning everything would delete them.
+    // Never swap in a new World: systems are bound to the World they first ran on.
+    let scene_entities: Vec<Entity> = world
+        .query_filtered::<Entity, With<Transform>>()
+        .iter(world)
+        .collect();
+    for entity in scene_entities {
+        world.despawn(entity);
     }
-    if let Some(l) = world.get_resource::<melon_core::Light>() {
-        new_world.insert_resource(*l);
-    }
-    if let Some(i) = world.get_resource::<melon_core::Input>() {
-        new_world.insert_resource(i.clone());
-    }
-    if let Some(t) = world.get_resource::<melon_core::Time>() {
-        new_world.insert_resource(*t);
-    }
-    if let Some(s) = world.get_resource::<melon_core::SimulationState>() {
-        new_world.insert_resource(*s);
-    }
-    if let Some(fc) = world.get_resource::<melon_core::FrameCounter>() {
-        new_world.insert_resource(melon_core::FrameCounter { frame: fc.frame });
-    }
-    new_world.insert_resource(NameCounter(data.name_counter));
+    world.insert_resource(NameCounter(data.name_counter));
 
     physics.clear();
 
-    // Spawn entities from scene data into the new world
     for entity in &data.entities {
-        spawn_scene_entity(&mut new_world, physics, entity);
+        spawn_scene_entity(world, physics, entity);
     }
-
-    // Swap the new world in
-    std::mem::swap(world, &mut new_world);
 
     tracing::info!(
         "loaded scene from {}: {} entities",
@@ -285,8 +270,15 @@ mod tests {
         save_scene(&mut world, &tmp).expect("save should succeed");
         assert!(tmp.exists(), "scene file should exist");
 
-        // Clear world
-        world.clear_entities();
+        // Clear scene entities. Not `clear_entities()`: in bevy 0.19 that also
+        // deletes resources and leaves the resource cache stale.
+        let named: Vec<Entity> = world
+            .query_filtered::<Entity, With<Name>>()
+            .iter(&world)
+            .collect();
+        for e in named {
+            world.despawn(e);
+        }
         assert_eq!(world.query::<&Name>().iter(&world).count(), 0);
 
         // Load
@@ -430,6 +422,34 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    fn read_log_interval_system(_interval: bevy_ecs::system::Res<melon_core::LogInterval>) {}
+
+    #[test]
+    fn load_keeps_world_so_systems_and_resources_survive() {
+        let mut world = world_with_entities();
+        world.insert_resource(melon_core::LogInterval { frames_per_log: 7 });
+        let mut physics = PhysicsWorld::new();
+        // Systems bind to the World they first run on; a load must keep that World.
+        let mut schedule = bevy_ecs::schedule::Schedule::default();
+        schedule.add_systems(read_log_interval_system);
+        schedule.run(&mut world);
+        let world_id = world.id();
+
+        let tmp = std::env::temp_dir().join("melon_test_keep_world.ron");
+        save_scene(&mut world, &tmp).unwrap();
+        load_scene(&mut world, &mut physics, &tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        assert_eq!(world.id(), world_id, "load must not swap the World");
+        assert_eq!(
+            world.resource::<melon_core::LogInterval>().frames_per_log,
+            7,
+            "resources must survive a load"
+        );
+        schedule.run(&mut world); // panicked with "mismatched World" before the fix
+        assert_eq!(world.query::<&Name>().iter(&world).count(), 2);
     }
 
     #[test]

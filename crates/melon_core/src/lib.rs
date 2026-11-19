@@ -47,8 +47,8 @@ fn log_frame_system(counter: Res<FrameCounter>, interval: Res<LogInterval>) {
 }
 
 /// The ECS world plus its frame stages.
-/// Known limit (ROADMAP bug 10): bevy systems are bound to the first `World`
-/// they run on, so replacing `world` after a frame panics in `update`.
+/// Never replace `world` after the first frame: bevy systems are bound to the
+/// first `World` they run on, so `update` would panic.
 pub struct Core {
     pub world: World,
     pub schedules: Schedules,
@@ -226,8 +226,8 @@ mod tests {
         assert!(steps(&core) <= 1, "got {}", steps(&core));
     }
 
-    /// Pins ROADMAP bug 10. When scene load stops swapping the World (or
-    /// Core can rebuild its schedules), flip this to assert the stages run.
+    /// Pins the rule that `Core::world` must never be replaced (scene load
+    /// clears entities in place instead).
     #[test]
     #[should_panic(expected = "mismatched World")]
     fn world_swap_after_first_frame_panics() {

@@ -38,11 +38,9 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
    systems; signatures are duplicated in the host `hot_module` imports.
 9. **README is stale.** Links deleted LICENSE files, says "v0.1 — released",
    lists only egui as the editor.
-10. **Scene load crashes the engine.** `load_scene` swaps in a fresh `World`.
-   bevy systems are bound to the first `World` they ran on, so the next
-   `core.update()` panics ("mismatched World"; pinned by the test
-   `world_swap_after_first_frame_panics`). The swap also drops `PhysicsWorld`
-   and `LogInterval`. Fix: clear entities in place instead of swapping.
+10. ~~**Scene load crashes the engine.**~~ Fixed: `load_scene` despawns scene
+   entities in place instead of swapping in a fresh `World`, so systems and
+   all resources survive a load.
 
 ## Missing, in priority order
 
