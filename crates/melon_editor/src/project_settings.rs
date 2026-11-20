@@ -423,6 +423,15 @@ mod tests {
 
     /// One full editor frame with `key` pressed in egui and in `RawPresses`.
     fn editor_key_frame(editor: &mut crate::Editor, world: &mut World, key: egui::Key) {
+        editor_key_frame_with(editor, world, key, egui::Modifiers::NONE);
+    }
+
+    fn editor_key_frame_with(
+        editor: &mut crate::Editor,
+        world: &mut World,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) {
         let ctx = egui::Context::default();
         let input = egui::RawInput {
             events: vec![egui::Event::Key {
@@ -430,8 +439,9 @@ mod tests {
                 physical_key: None,
                 pressed: true,
                 repeat: false,
-                modifiers: egui::Modifiers::NONE,
+                modifiers,
             }],
+            modifiers,
             ..Default::default()
         };
         let _ = ctx.run_ui(input, |ui| editor.build_ui(world, ui));
@@ -466,6 +476,46 @@ mod tests {
             *world.resource::<melon_core::InputFocus>(),
             melon_core::InputFocus::Game
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn captured_play_keys_do_not_play_or_stop() {
+        use melon_core::{InputFocus, SimulationState};
+        let root = temp_root("play_keys");
+        let mut world = world_with(vec![InputButton::Key(KeyCode::F5)]);
+        world.insert_resource(SimulationState::Paused);
+        world.insert_resource(InputFocus::Editor);
+        let mut editor = crate::Editor::new();
+        editor.project_root = root.clone();
+        editor.project_settings.open = true;
+        editor.project_settings.capture = Some(CaptureTarget::Button(jump_index(&world)));
+        editor_key_frame(&mut editor, &mut world, egui::Key::F5);
+        assert_eq!(
+            *world.resource::<SimulationState>(),
+            SimulationState::Paused
+        );
+        assert!(
+            jump(&world)
+                .buttons
+                .contains(&InputButton::Key(KeyCode::F5))
+        );
+
+        // Shift+F5 while playing: the session keeps running with game focus.
+        world.insert_resource(SimulationState::Playing);
+        world.insert_resource(InputFocus::Game);
+        editor.project_settings.capture = Some(CaptureTarget::Button(jump_index(&world)));
+        editor_key_frame_with(
+            &mut editor,
+            &mut world,
+            egui::Key::F5,
+            egui::Modifiers::SHIFT,
+        );
+        assert_eq!(
+            *world.resource::<SimulationState>(),
+            SimulationState::Playing
+        );
+        assert_eq!(*world.resource::<InputFocus>(), InputFocus::Game);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -125,6 +125,8 @@ pub struct Editor {
     flying: bool,
     show_about: bool,
     project_settings: project_settings::ProjectSettings,
+    /// A rebinding capture was waiting when this frame began: its keys are not shortcuts.
+    keys_captured: bool,
     logo: Option<egui::TextureHandle>,
 }
 
@@ -158,6 +160,7 @@ impl Default for Editor {
             flying: false,
             show_about: false,
             project_settings: project_settings::ProjectSettings::default(),
+            keys_captured: false,
             logo: None,
         }
     }
@@ -602,7 +605,9 @@ impl Editor {
         self.tick_frame_time(dt);
         self.poll_dialog(world);
         // A rebinding capture swallows this frame's keys (Esc cancels it, not ReleaseGame).
-        if !self.project_settings.capturing() {
+        // Read before the capture consumes the press later in the frame.
+        self.keys_captured = self.project_settings.capturing();
+        if !self.keys_captured {
             self.handle_shortcuts(world, ui);
         }
         self.viewport_shown = false;
@@ -780,8 +785,8 @@ impl Editor {
             .copied()
             .unwrap_or_default();
         let (mut want_play, mut want_pause, mut want_stop) = (false, false, false);
-        // Shortcuts are ignored while typing in a text field.
-        if !ui.ctx().text_edit_focused() {
+        // Shortcuts are ignored while typing in a text field or capturing a binding.
+        if !ui.ctx().text_edit_focused() && !self.keys_captured {
             ui.input(|i| {
                 if i.key_pressed(egui::Key::F5) {
                     if i.modifiers.shift {
