@@ -3,8 +3,6 @@ use glam::camera::rh::proj::directx;
 use glam::camera::rh::view;
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
-pub use crate::quality::GiMode;
-
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct Camera {
     pub eye: Vec3,
@@ -181,8 +179,10 @@ impl Default for Light {
     }
 }
 
-/// Procedural sky and distance fog. Optional: the renderer uses the default
-/// when no `Environment` resource exists.
+/// The look: procedural sky, distance fog and the strengths and radii of the
+/// lighting passes. Optional: the renderer uses the default when no
+/// `Environment` resource exists. Which passes run is `RenderQuality`'s
+/// call; a strength of 0 here also turns its pass off.
 #[derive(Resource, Debug, Clone, Copy, PartialEq)]
 pub struct Environment {
     /// Sky straight up (linear HDR radiance).
@@ -200,10 +200,9 @@ pub struct Environment {
     /// Bloom: how much of the blurred HDR image is mixed into the scene
     /// colour before tonemapping; 0 = off (the bloom passes are skipped).
     pub bloom_intensity: f32,
-    /// Diffuse GI technique; `gi_intensity` scales whichever runs.
-    pub gi_mode: GiMode,
     /// Strength of the indirect diffuse light that replaces the hemisphere
-    /// ambient (`gi_mode`); 0 = off, like `GiMode::Off` (no GI passes).
+    /// ambient (`RenderQuality::gi_mode` picks the technique); 0 = off, like
+    /// `GiMode::Off` (no GI passes).
     pub gi_intensity: f32,
 }
 
@@ -217,7 +216,6 @@ impl Default for Environment {
             ao_strength: 1.0,
             ao_radius: 0.5,
             bloom_intensity: 0.08,
-            gi_mode: GiMode::Ddgi,
             gi_intensity: 1.0,
         }
     }
@@ -252,8 +250,8 @@ mod tests {
     }
 
     #[test]
-    fn gi_mode_defaults_to_ddgi_and_round_trips() {
-        assert_eq!(Environment::default().gi_mode, GiMode::Ddgi);
+    fn gi_mode_round_trips() {
+        use crate::GiMode;
         for mode in [GiMode::Off, GiMode::Ssgi, GiMode::Ddgi] {
             let text = ron::to_string(&mode).unwrap();
             assert_eq!(ron::from_str::<GiMode>(&text).unwrap(), mode);

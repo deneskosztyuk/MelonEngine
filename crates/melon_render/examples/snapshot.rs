@@ -5,20 +5,25 @@
 // a red/green open-front room at (-13, 0, -13), seen through its opening).
 // Prints the backend and present mode, the mean frame time and the `RenderStats`. The timed frames run
 // before the capture, so the GI probes have converged.
-// Debug flags (any order): --ao-only saves the SSAO term (grey, white =
-// open) instead of the image; --no-ao renders with `ao_strength` 0;
+// Debug flags (any order): --quality low|medium|high|max starts from that
+// `RenderQuality` preset (default high), the flags below override it;
+// --ao-only saves the SSAO term (grey, white =
+// open) instead of the image; --no-ao turns `RenderQuality::ao` off;
 // --no-shadow moves the scene and camera far outside the fixed shadow box, so
 // nothing casts or receives sun shadows (the image is otherwise unchanged);
-// --no-bloom renders with `bloom_intensity` 0; --bloom-only renders with
+// --no-bloom turns `RenderQuality::bloom` off; --bloom-only renders with
 // `bloom_intensity` 1, so the tonemapped image is the bloom alone;
-// --gi off|ssgi|ddgi picks `gi_mode` (default ddgi; --no-gi is --gi off);
+// --gi off|ssgi|ddgi picks `RenderQuality::gi_mode` (--no-gi is --gi off);
 // --gi-only saves the indirect diffuse term of that mode alone (bloom off).
+// After the timed frames it also prints the GPU pass timings (`RenderTimings`).
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use glam::{Mat4, Quat, Vec3};
-use melon_core::{AssetServer, Camera, Environment, GiMode, Handle, Light, Model};
+use melon_core::{
+    AssetServer, Camera, Environment, GiMode, Handle, Light, Model, QualityPreset, RenderQuality,
+};
 use melon_render::{FrameData, RenderStats, Renderer};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -212,7 +217,7 @@ fn render_and_wait(
     renderer: &mut Renderer,
     frame: &FrameData,
     server: &mut AssetServer,
-    target: &melon_render::ViewportTarget,
+    target: &mut melon_render::ViewportTarget,
 ) -> Result<RenderStats> {
     let mut encoder = renderer
         .device()
@@ -241,11 +246,24 @@ fn gi_mode(name: Option<&str>) -> Result<GiMode> {
     }
 }
 
+/// The preset named by `--quality <name>`.
+fn quality_preset(name: Option<&str>) -> Result<QualityPreset> {
+    match name {
+        Some("low") => Ok(QualityPreset::Low),
+        Some("medium") => Ok(QualityPreset::Medium),
+        Some("high") => Ok(QualityPreset::High),
+        Some("max") => Ok(QualityPreset::Max),
+        other => bail!("--quality needs low, medium, high or max, got {other:?}"),
+    }
+}
+
 fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Result<()> {
-    let mut gi = GiMode::Ddgi;
+    let mut gi = None;
+    let mut preset = QualityPreset::High;
     let mut args = flags.iter();
     while let Some(flag) = args.next() {
-        const FLAGS: [&str; 8] = [
+        const FLAGS: [&str; 9] = [
+            "--quality",
             "--ao-only",
             "--no-ao",
             "--no-shadow",
@@ -256,8 +274,9 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
             "--gi-only",
         ];
         match flag.as_str() {
-            "--gi" => gi = gi_mode(args.next().map(String::as_str))?,
-            "--no-gi" => gi = GiMode::Off,
+            "--quality" => preset = quality_preset(args.next().map(String::as_str))?,
+            "--gi" => gi = Some(gi_mode(args.next().map(String::as_str))?),
+            "--no-gi" => gi = Some(GiMode::Off),
             f if FLAGS.contains(&f) => {}
             _ => bail!("unknown flag {flag:?}; expected one of {FLAGS:?}"),
         }
@@ -275,24 +294,25 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
     camera.center += offset;
     let mut renderer = pollster::block_on(Renderer::new(window))?;
     renderer.set_gi_only(gi_only);
-    let target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(WIDTH, HEIGHT));
+    let mut target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(WIDTH, HEIGHT));
+    let mut quality = RenderQuality::preset(preset);
+    quality.gi_mode = gi.unwrap_or(quality.gi_mode);
+    quality.ao &= !has("--no-ao");
+    quality.bloom &= !(has("--no-bloom") || gi_only);
     let mut server = AssetServer::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..").into());
     let mut frame = FrameData {
         view_proj: camera.view_proj(),
         eye: camera.eye,
         light: Light::default(),
         environment: Environment {
-            ao_strength: if has("--no-ao") { 0.0 } else { 1.0 },
-            bloom_intensity: if has("--no-bloom") || gi_only {
-                0.0
-            } else if has("--bloom-only") {
+            bloom_intensity: if has("--bloom-only") {
                 1.0
             } else {
                 Environment::default().bloom_intensity
             },
-            gi_mode: gi,
             ..Default::default()
         },
+        quality,
         models: review_scene(&mut server),
     };
     if view == "crowd" {
@@ -308,10 +328,10 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
     let device = renderer.device().clone();
     let queue = renderer.queue().clone();
     // The first frame loads the models; time the steady state after it.
-    let mut stats = render_and_wait(&mut renderer, &frame, &mut server, &target)?;
+    let mut stats = render_and_wait(&mut renderer, &frame, &mut server, &mut target)?;
     let start = std::time::Instant::now();
     for _ in 0..TIMED_FRAMES {
-        stats = render_and_wait(&mut renderer, &frame, &mut server, &target)?;
+        stats = render_and_wait(&mut renderer, &frame, &mut server, &mut target)?;
     }
     println!(
         "{view}: {:?} {:?}, {} models, {:.2} ms per frame (render_scene + submit + wait, mean of {TIMED_FRAMES})",
@@ -321,11 +341,13 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
         start.elapsed().as_secs_f64() * 1000.0 / f64::from(TIMED_FRAMES)
     );
     println!("{view}: {stats:?}");
+    println!("{view}: {quality:?}, MSAA {}x", target.sample_count());
+    println!("{view}: GPU {:?}", renderer.timings());
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("snapshot"),
     });
-    renderer.render_scene(&mut encoder, &frame, &mut server, &target, &[], &[]);
+    renderer.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
 
     let texture = if ao_only {
         target.ao_texture().clone()
@@ -410,7 +432,7 @@ impl ApplicationHandler for App {
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let out = args.next().context(
-        "usage: snapshot <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only]",
+        "usage: snapshot <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only]",
     )?;
     let view = args.next().unwrap_or_else(|| "overview".into());
     let flags = args.collect();
@@ -452,6 +474,25 @@ mod tests {
         assert_eq!(gi_mode(Some("ddgi")).unwrap(), GiMode::Ddgi);
         assert!(gi_mode(Some("rtgi")).is_err());
         assert!(gi_mode(None).is_err());
+    }
+
+    #[test]
+    fn quality_flag_names_every_preset() {
+        for (name, preset) in [
+            ("low", QualityPreset::Low),
+            ("medium", QualityPreset::Medium),
+            ("high", QualityPreset::High),
+            ("max", QualityPreset::Max),
+        ] {
+            assert_eq!(quality_preset(Some(name)).unwrap(), preset);
+        }
+        assert!(quality_preset(Some("ultra")).is_err());
+        assert!(quality_preset(None).is_err());
+        assert_eq!(
+            RenderQuality::preset(QualityPreset::High),
+            RenderQuality::default(),
+            "no flags = the default quality"
+        );
     }
 
     #[test]

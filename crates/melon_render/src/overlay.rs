@@ -237,10 +237,12 @@ struct ShapeMesh {
     count: u32,
 }
 
-/// The colour targets one viewport's overlay renders into.
+/// The colour targets one viewport's overlay renders into. At 1 sample the
+/// shapes draw into the resolve texture directly.
 pub(crate) struct OverlayTargets {
     msaa_view: wgpu::TextureView,
     resolve_view: wgpu::TextureView,
+    samples: u32,
 }
 
 impl OverlayTargets {
@@ -265,19 +267,26 @@ impl OverlayTargets {
                 view_formats: &[],
             })
         };
-        let msaa = texture(
-            "overlay msaa",
-            samples,
-            wgpu::TextureUsages::RENDER_ATTACHMENT,
-        );
         let resolve = texture(
             "overlay resolve",
             1,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         );
+        let resolve_view = resolve.create_view(&wgpu::TextureViewDescriptor::default());
+        let msaa_view = if samples > 1 {
+            texture(
+                "overlay msaa",
+                samples,
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+            )
+            .create_view(&wgpu::TextureViewDescriptor::default())
+        } else {
+            resolve_view.clone()
+        };
         Self {
-            msaa_view: msaa.create_view(&wgpu::TextureViewDescriptor::default()),
-            resolve_view: resolve.create_view(&wgpu::TextureViewDescriptor::default()),
+            msaa_view,
+            resolve_view,
+            samples,
         }
     }
 }
@@ -286,8 +295,11 @@ impl OverlayTargets {
 /// draw `OverlayDraw`s and composite them onto a viewport's display image.
 pub(crate) struct OverlayRenderer {
     meshes: Vec<ShapeMesh>,
-    opaque: wgpu::RenderPipeline,
-    blended: wgpu::RenderPipeline,
+    shader: wgpu::ShaderModule,
+    layout: wgpu::PipelineLayout,
+    /// (opaque, blended) per sample count (`crate::msaa_slot`), built on
+    /// first use.
+    pipelines: [Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>; crate::MSAA_SLOTS],
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     instances: wgpu::Buffer,
@@ -302,11 +314,7 @@ const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array!
 ];
 
 impl OverlayRenderer {
-    pub(crate) fn new(
-        device: &wgpu::Device,
-        display_format: wgpu::TextureFormat,
-        samples: u32,
-    ) -> Self {
+    pub(crate) fn new(device: &wgpu::Device, display_format: wgpu::TextureFormat) -> Self {
         use wgpu::util::DeviceExt;
         let meshes = OverlayShape::ALL
             .iter()
@@ -363,72 +371,6 @@ impl OverlayRenderer {
             bind_group_layouts: &[Some(&camera_layout)],
             immediate_size: 0,
         });
-        let pipeline = |label, depth_write: bool| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: Default::default(),
-                    buffers: &[
-                        wgpu::VertexBufferLayout {
-                            array_stride: std::mem::size_of::<OverlayVertex>()
-                                as wgpu::BufferAddress,
-                            step_mode: wgpu::VertexStepMode::Vertex,
-                            attributes: &wgpu::vertex_attr_array![
-                                0 => Float32x3,
-                                1 => Float32x3,
-                            ],
-                        },
-                        wgpu::VertexBufferLayout {
-                            array_stride: std::mem::size_of::<OverlayInstance>()
-                                as wgpu::BufferAddress,
-                            step_mode: wgpu::VertexStepMode::Instance,
-                            attributes: &INSTANCE_ATTRIBUTES,
-                        },
-                    ],
-                },
-                primitive: wgpu::PrimitiveState {
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: Some(depth_write),
-                    depth_compare: Some(wgpu::CompareFunction::Less),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: samples,
-                    ..Default::default()
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: OVERLAY_FORMAT,
-                        // Colour straight-alpha over, alpha accumulates: the
-                        // target ends up premultiplied for the composite.
-                        blend: Some(wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::SrcAlpha,
-                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                            alpha: wgpu::BlendComponent::OVER,
-                        }),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let opaque = pipeline("overlay opaque pipeline", true);
-        let blended = pipeline("overlay blended pipeline", false);
 
         let composite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("overlay composite layout"),
@@ -482,8 +424,9 @@ impl OverlayRenderer {
         let instances = Self::instance_buffer(device, instance_capacity);
         Self {
             meshes,
-            opaque,
-            blended,
+            shader,
+            layout,
+            pipelines: Default::default(),
             camera_buffer,
             camera_bind_group,
             instances,
@@ -491,6 +434,76 @@ impl OverlayRenderer {
             composite,
             composite_layout,
         }
+    }
+
+    /// The opaque or blended (`depth_write` false) shape pipeline at `samples`.
+    fn build_pipeline(
+        &self,
+        device: &wgpu::Device,
+        label: &str,
+        depth_write: bool,
+        samples: u32,
+    ) -> wgpu::RenderPipeline {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&self.layout),
+            vertex: wgpu::VertexState {
+                module: &self.shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<OverlayVertex>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![
+                            0 => Float32x3,
+                            1 => Float32x3,
+                        ],
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<OverlayInstance>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &INSTANCE_ATTRIBUTES,
+                    },
+                ],
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(depth_write),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: samples,
+                ..Default::default()
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &self.shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: OVERLAY_FORMAT,
+                    // Colour straight-alpha over, alpha accumulates: the
+                    // target ends up premultiplied for the composite.
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::SrcAlpha,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent::OVER,
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
     }
 
     fn instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
@@ -521,6 +534,15 @@ impl OverlayRenderer {
         if draws.is_empty() {
             return;
         }
+        let slot = crate::msaa_slot(targets.samples);
+        if self.pipelines[slot].is_none() {
+            let samples = targets.samples;
+            self.pipelines[slot] = Some((
+                self.build_pipeline(device, "overlay opaque pipeline", true, samples),
+                self.build_pipeline(device, "overlay blended pipeline", false, samples),
+            ));
+        }
+        let (opaque, blended) = self.pipelines[slot].as_ref().expect("built above");
         // Scene-tested, then on-top; in each, opaque before blended so
         // see-through shapes never hide opaque ones behind them.
         let mut ordered: Vec<&OverlayDraw> = draws.iter().collect();
@@ -552,7 +574,8 @@ impl OverlayRenderer {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &targets.msaa_view,
                     depth_slice: None,
-                    resolve_target: on_top.then_some(&targets.resolve_view),
+                    resolve_target: (on_top && targets.samples > 1)
+                        .then_some(&targets.resolve_view),
                     ops: wgpu::Operations {
                         load: if on_top {
                             wgpu::LoadOp::Load
@@ -587,11 +610,7 @@ impl OverlayRenderer {
                     .position(|s| *s == draw.shape)
                     .unwrap_or(0);
                 let mesh = &self.meshes[shape];
-                pass.set_pipeline(if draw.color[3] < 1.0 {
-                    &self.blended
-                } else {
-                    &self.opaque
-                });
+                pass.set_pipeline(if draw.color[3] < 1.0 { blended } else { opaque });
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint16);
                 let instance = i as u32;

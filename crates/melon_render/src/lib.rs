@@ -4,6 +4,7 @@ mod extract;
 pub mod gi;
 mod models;
 mod overlay;
+mod timings;
 
 pub use extract::{FrameData, blends, extract};
 pub use overlay::{OverlayDepth, OverlayDraw, OverlayShape, TORUS_TUBE};
@@ -495,11 +496,41 @@ const MESH_WGSL: &str = concat!(
 /// Format of the scene colour target. The tonemap pass maps it to the display.
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// MSAA sample count of the 3D scene pass (colour and depth).
+/// Default MSAA sample count of the 3D scene pass (colour and depth);
+/// `RenderQuality::msaa` sets it per frame.
 pub const MSAA_SAMPLES: u32 = 4;
 
-/// Width and height of the sun's shadow map, in texels.
+/// Default width and height of the sun's shadow map, in texels;
+/// `RenderQuality::shadow_map_size` sets it per frame.
 pub const SHADOW_MAP_SIZE: u32 = 2048;
+
+/// Sample counts the pipeline cache has a slot for (1, 2, 4).
+const MSAA_SLOTS: usize = 3;
+
+/// Pipeline cache slot of a sample count from [`effective_msaa`].
+fn msaa_slot(samples: u32) -> usize {
+    samples.trailing_zeros() as usize
+}
+
+/// The sample count used for `requested`: the largest `supported` count not
+/// above it (1 is always supported).
+fn effective_msaa(requested: u32, supported: &[u32]) -> u32 {
+    supported
+        .iter()
+        .copied()
+        .filter(|&n| n <= requested)
+        .max()
+        .unwrap_or(1)
+}
+
+/// The pipelines of the 3D pass whose sample count follows
+/// `RenderQuality::msaa`, built once per count on first use.
+struct MsaaPipelines {
+    /// The mesh pipeline per GI mode (`GI_MODE` override): off, SSGI, DDGI.
+    mesh: [wgpu::RenderPipeline; 3],
+    sky: wgpu::RenderPipeline,
+    world_lines: wgpu::RenderPipeline,
+}
 
 /// Most levels in a view's bloom mip chain.
 pub const BLOOM_LEVELS: usize = 6;
@@ -535,12 +566,13 @@ pub fn directional_light_view_proj(
         * view::look_at_mat4(eye, center, up)
 }
 
-/// Offscreen HDR colour target that the 3D pass renders into. The pass
-/// draws into the multisampled texture and resolves into the single-sample
-/// one, which the tonemap pass reads.
+/// Offscreen HDR colour target that the 3D pass renders into. With MSAA the
+/// pass draws into the multisampled texture and resolves into the
+/// single-sample one, which the tonemap pass reads; with 1 sample it draws
+/// into the single-sample one directly.
 pub struct HdrTarget {
-    msaa_texture: wgpu::Texture,
-    msaa_view: wgpu::TextureView,
+    /// `None` at 1 sample.
+    msaa: Option<(wgpu::Texture, wgpu::TextureView)>,
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
     /// Binds this target as the tonemap pass input.
@@ -554,13 +586,19 @@ impl HdrTarget {
         &self.view
     }
 
-    /// Multisampled colour attachment of the 3D pass. Resolve into `view()`.
+    /// Colour attachment of the 3D pass: the multisampled texture, or
+    /// `view()` at 1 sample. Resolve into `resolve_target()`.
     pub fn msaa_view(&self) -> &wgpu::TextureView {
-        &self.msaa_view
+        self.msaa.as_ref().map_or(&self.view, |(_, view)| view)
+    }
+
+    /// `view()` when multisampled, else `None` (nothing to resolve).
+    pub fn resolve_target(&self) -> Option<&wgpu::TextureView> {
+        self.msaa.as_ref().map(|_| &self.view)
     }
 
     pub fn sample_count(&self) -> u32 {
-        self.msaa_texture.sample_count()
+        self.msaa.as_ref().map_or(1, |(t, _)| t.sample_count())
     }
 
     pub fn size(&self) -> winit::dpi::PhysicalSize<u32> {
@@ -605,10 +643,14 @@ pub struct SceneRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface_format: wgpu::TextureFormat,
-    /// The mesh pipeline per GI mode (`GI_MODE` override): off, SSGI, DDGI.
-    mesh_pipeline: wgpu::RenderPipeline,
-    mesh_ssgi_pipeline: wgpu::RenderPipeline,
-    mesh_ddgi_pipeline: wgpu::RenderPipeline,
+    /// Group 0 layout (also built into the MSAA pipelines later).
+    frame_layout: wgpu::BindGroupLayout,
+    /// Sample counts the adapter renders every 3D pass format at.
+    msaa_counts: Vec<u32>,
+    /// Sample count of the 3D pass now (`set_msaa`).
+    msaa: u32,
+    /// The 3D pass pipelines per sample count (`msaa_slot`), built on first use.
+    msaa_pipelines: [Option<MsaaPipelines>; MSAA_SLOTS],
     tonemap_pipeline: wgpu::RenderPipeline,
     tonemap_bind_group_layout: wgpu::BindGroupLayout,
     /// Bloom: one source texture + sampler per pass, the first (Karis)
@@ -636,13 +678,13 @@ pub struct SceneRenderer {
     /// Light view-proj for the shadow pass (group 0 of `shadow_pipeline`).
     shadow_camera_buffer: wgpu::Buffer,
     shadow_bind_group: wgpu::BindGroup,
-    // Kept alive for `shadow_view`.
-    _shadow_texture: wgpu::Texture,
+    /// The sun's shadow map (`set_shadow_map_size` recreates it).
+    shadow_texture: wgpu::Texture,
     shadow_view: wgpu::TextureView,
+    shadow_sampler: wgpu::Sampler,
     /// `builtin:cube`'s material: the checkerboard as base colour.
     checker_material: wgpu::BindGroup,
-    /// Fullscreen sky behind the meshes (3D pass).
-    sky_pipeline: wgpu::RenderPipeline,
+
     /// SSAO: depth/normal prepass, AO and blur pipelines, their group 1
     /// layouts and the shared kernel/settings uniform.
     prepass_pipeline: wgpu::RenderPipeline,
@@ -661,7 +703,6 @@ pub struct SceneRenderer {
     /// The GI backends (resources, passes) and the last frame's mode.
     gi: gi::Gi,
     /// Depth-tested lines inside the 3D pass (grid, axes, selection box).
-    world_line_pipeline: wgpu::RenderPipeline,
     world_lines: LineBuffer,
     /// Group 1: per-instance records, `instance_capacity` of them.
     instance_buffer: wgpu::Buffer,
@@ -675,8 +716,10 @@ pub struct Renderer {
     surface: wgpu::Surface<'static>,
     size: winit::dpi::PhysicalSize<u32>,
     window: Arc<Window>,
-    /// Chosen once at init (`choose_present_mode`).
+    /// From `RenderQuality::present` (`set_present`, `choose_present_mode`).
     present_mode: wgpu::PresentMode,
+    /// Present modes the surface offers.
+    present_modes: Vec<wgpu::PresentMode>,
     /// The adapter's backend (`backend_order`).
     backend: wgpu::Backend,
     scene: SceneRenderer,
@@ -684,6 +727,8 @@ pub struct Renderer {
     model_cache: ModelCache,
     /// Solid editor shapes drawn after tonemapping.
     overlay: overlay::OverlayRenderer,
+    /// GPU pass timings; `None` without timestamp queries.
+    timer: Option<timings::GpuTimer>,
 }
 
 /// Background of the scene and of the window behind the editor UI.
@@ -713,10 +758,18 @@ impl std::ops::DerefMut for Renderer {
     }
 }
 
-/// `Mailbox` when the surface offers it (no vsync wait in the acquire, no
-/// tearing), else `Fifo`. `MELON_PRESENT=fifo` forces `Fifo` (debug A/B).
-fn choose_present_mode(available: &[wgpu::PresentMode], forced: Option<&str>) -> wgpu::PresentMode {
-    if forced != Some("fifo") && available.contains(&wgpu::PresentMode::Mailbox) {
+/// `Vsync` is `Fifo`. `MailboxCapped` is `Mailbox` when the surface offers
+/// it (no vsync wait in the acquire, no tearing; the host caps the frame
+/// rate), else `Fifo`. `MELON_PRESENT=fifo` forces `Fifo` (debug A/B).
+fn choose_present_mode(
+    preference: melon_core::PresentPreference,
+    available: &[wgpu::PresentMode],
+    forced: Option<&str>,
+) -> wgpu::PresentMode {
+    if preference == melon_core::PresentPreference::MailboxCapped
+        && forced != Some("fifo")
+        && available.contains(&wgpu::PresentMode::Mailbox)
+    {
         wgpu::PresentMode::Mailbox
     } else {
         wgpu::PresentMode::Fifo
@@ -738,6 +791,34 @@ fn backend_order(windows: bool, forced: Option<&str>) -> Vec<wgpu::Backends> {
     } else {
         vec![wgpu::Backends::default()]
     }
+}
+
+/// Sample counts (of 1, 2, 4) the 3D pass formats all support: HDR colour,
+/// depth and the overlay. Without adapter format features, WebGPU's 1 and 4.
+fn msaa_counts(adapter: &wgpu::Adapter, device: &wgpu::Device) -> Vec<u32> {
+    let adapter_specific = device
+        .features()
+        .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES);
+    [1, 2, 4]
+        .into_iter()
+        .filter(|&n| {
+            if !adapter_specific {
+                return n != 2;
+            }
+            [
+                HDR_FORMAT,
+                wgpu::TextureFormat::Depth32Float,
+                overlay::OVERLAY_FORMAT,
+            ]
+            .iter()
+            .all(|&f| {
+                adapter
+                    .get_texture_format_features(f)
+                    .flags
+                    .sample_count_supported(n)
+            })
+        })
+        .collect()
 }
 
 /// Group 1 layout: one read-only storage buffer of `InstanceData`.
@@ -800,10 +881,18 @@ impl Renderer {
         }
         let (instance, adapter) = found.context("no suitable wgpu adapter found")?;
         let backend = adapter.get_info().backend;
+        // Timestamps for `RenderTimings`; adapter format features for MSAA
+        // 2x (WebGPU guarantees only 1 and 4). Both only when offered.
+        let wanted =
+            timings::GpuTimer::FEATURES | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                required_features: adapter.features() & wanted,
+                ..Default::default()
+            })
             .await
             .context("failed to request wgpu device")?;
+        let msaa_counts = msaa_counts(&adapter, &device);
 
         let size = window.inner_size();
         let surface = instance
@@ -816,16 +905,20 @@ impl Renderer {
             .copied()
             .context("surface reported no usable formats")?;
         let present_mode = choose_present_mode(
+            melon_core::RenderQuality::default().present,
             &caps.present_modes,
             std::env::var("MELON_PRESENT").ok().as_deref(),
         );
 
-        let scene = SceneRenderer::new(device, queue, surface_format);
+        let timer = timings::GpuTimer::new(&device, &queue);
+        let scene = SceneRenderer::new(device, queue, surface_format, msaa_counts);
         let model_cache = ModelCache::new(&scene);
-        let overlay = overlay::OverlayRenderer::new(
-            &scene.device,
-            surface_format.add_srgb_suffix(),
-            MSAA_SAMPLES,
+        let overlay =
+            overlay::OverlayRenderer::new(&scene.device, surface_format.add_srgb_suffix());
+        tracing::info!(
+            msaa = ?scene.msaa_counts,
+            timestamps = timer.is_some(),
+            "renderer features"
         );
 
         let renderer = Self {
@@ -834,10 +927,12 @@ impl Renderer {
             size,
             window,
             present_mode,
+            present_modes: caps.present_modes,
             backend,
             scene,
             model_cache,
             overlay,
+            timer,
         };
         renderer.configure_surface();
         Ok(renderer)
@@ -857,10 +952,42 @@ impl Renderer {
         self.backend
     }
 
+    /// Switches the present mode to `preference` (see
+    /// `choose_present_mode`), reconfiguring the surface; true when it
+    /// changed (the host then switches its frame cap). Call between frames.
+    pub fn set_present(&mut self, preference: melon_core::PresentPreference) -> bool {
+        let mode = choose_present_mode(
+            preference,
+            &self.present_modes,
+            std::env::var("MELON_PRESENT").ok().as_deref(),
+        );
+        if mode == self.present_mode {
+            return false;
+        }
+        self.present_mode = mode;
+        self.configure_surface();
+        tracing::info!(?mode, "present mode");
+        true
+    }
+
+    /// Per-pass GPU ms averaged over about a second, `None` where not
+    /// measured (no timestamp support, pass off). `budget_ms` is left to
+    /// the host (monitor refresh).
+    pub fn timings(&self) -> melon_core::RenderTimings {
+        self.timer
+            .as_ref()
+            .map(timings::GpuTimer::timings)
+            .unwrap_or_default()
+    }
+
     /// Record one view of `frame` into `target`: shadow pass, SSAO passes, 3D
     /// pass (HDR, MSAA) with the meshes, the sky and depth-tested
     /// `world_lines`, the bloom passes, the tonemap pass onto the target's
     /// display image, then the `overlay` shapes.
+    /// `frame.quality` picks the passes; a new shadow map size or sample
+    /// count recreates the shadow map, the target's MSAA textures and the
+    /// pipelines first (the display image stays). Timestamps between the
+    /// stages feed `timings` when supported.
     /// Models load (or hot-reload) here on first use. Entities are culled
     /// per view and drawn instanced, one call per (model, part).
     pub fn render_scene(
@@ -868,17 +995,25 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         frame: &FrameData,
         server: &mut melon_core::AssetServer,
-        target: &ViewportTarget,
+        target: &mut ViewportTarget,
         world_lines: &[LineVertex],
         overlay: &[OverlayDraw],
     ) -> RenderStats {
+        let quality = &frame.quality;
         let scene = &mut self.scene;
+        scene.set_shadow_map_size(quality.shadow_map_size);
+        scene.set_msaa(quality.msaa);
+        scene.match_msaa(target);
+        let gi_mode = gi::frame_mode(&frame.environment, quality.gi_mode);
+        scene.match_gi_view(target, gi_mode == melon_core::GiMode::Ssgi);
+        let target = &*target;
         scene.update_camera(frame.view_proj, frame.eye);
         scene.update_environment(&frame.environment);
         scene.update_ssao(&frame.environment);
-        let gi_mode = scene.gi.update(
+        scene.gi.update(
             &scene.queue,
             &frame.environment,
+            gi_mode,
             &target.lighting.gi,
             frame.view_proj,
             frame.eye,
@@ -945,12 +1080,23 @@ impl Renderer {
 
         // The draw lists borrow the model cache; the scene is a separate field.
         let scene = &mut self.scene;
+        let timer = &mut self.timer;
+        let mark = |encoder: &mut wgpu::CommandEncoder, timer: &Option<timings::GpuTimer>, m| {
+            if let Some(timer) = timer {
+                timer.mark(encoder, m);
+            }
+        };
+        if let Some(timer) = timer.as_mut() {
+            timer.begin(encoder);
+        }
         scene.render_shadow_pass(encoder, &shadow_draw_calls);
-        // The depth/normal prepass feeds SSAO and SSGI. AO off: skip the
-        // SSAO passes and bind white, so the image matches the renderer
-        // without SSAO.
-        let ao_on = frame.environment.ao_strength > 0.0;
-        if ao_on || gi_mode == melon_core::GiMode::Ssgi {
+        mark(encoder, timer, timings::Mark::Shadows);
+        // The depth/normal prepass feeds SSAO and SSGI. AO off (quality or
+        // strength 0): skip the SSAO passes and bind white, so the image
+        // matches the renderer without SSAO.
+        let ao_on = quality.ao && frame.environment.ao_strength > 0.0;
+        let ssgi_on = gi_mode == melon_core::GiMode::Ssgi;
+        if ao_on || ssgi_on {
             let prepass_draws: Vec<(&Mesh, std::ops::Range<u32>)> = draw_calls
                 .iter()
                 .map(|(mesh, _, instances)| (*mesh, instances.clone()))
@@ -960,6 +1106,7 @@ impl Renderer {
         if ao_on {
             scene.render_ssao(encoder, &target.ssao);
         }
+        mark(encoder, timer, timings::Mark::Ao);
         // GI off: no GI passes; the mesh shader keeps the hemisphere
         // ambient, so the image matches the renderer without GI.
         scene.gi.render(
@@ -972,6 +1119,7 @@ impl Renderer {
                 view: &target.lighting.gi,
             },
         );
+        mark(encoder, timer, timings::Mark::Gi);
         let lighting = if ao_on {
             &target.lighting.with_ao
         } else {
@@ -985,7 +1133,7 @@ impl Renderer {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: hdr.msaa_view(),
                     depth_slice: None,
-                    resolve_target: Some(hdr.view()),
+                    resolve_target: hdr.resolve_target(),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(CLEAR_COLOR),
                         store: wgpu::StoreOp::Store,
@@ -1007,15 +1155,19 @@ impl Renderer {
             scene.draw_sky(&mut pass);
             scene.draw_world_lines(&mut pass, world_lines, frame.view_proj);
         }
-        // Bloom off (or no level fits): skip the passes and tonemap with the
-        // black bloom image, so the image matches the renderer without bloom.
+        mark(encoder, timer, timings::Mark::Scene);
+        // Bloom off (quality, strength 0, or no level fits): skip the passes
+        // and tonemap with the black bloom image, so the image matches the
+        // renderer without bloom.
+        let bloom_on = quality.bloom && frame.environment.bloom_intensity > 0.0;
         let tonemap_group = match &target.bloom {
-            Some(bloom) if frame.environment.bloom_intensity > 0.0 => {
+            Some(bloom) if bloom_on => {
                 scene.render_bloom(encoder, bloom, frame.environment.bloom_intensity);
                 &bloom.tonemap_bind_group
             }
             _ => &hdr.bind_group,
         };
+        mark(encoder, timer, timings::Mark::Bloom);
         let color_view = target.color_view();
         drop(scene.tonemap_with(encoder, tonemap_group, &color_view));
         self.overlay.render(
@@ -1029,6 +1181,17 @@ impl Renderer {
             frame.eye,
             overlay,
         );
+        if let Some(timer) = self.timer.as_mut() {
+            timer.finish(
+                encoder,
+                timings::Ran {
+                    ao: ao_on,
+                    prepass_for_gi: ssgi_on && !ao_on,
+                    gi: gi_mode != melon_core::GiMode::Off,
+                    bloom: bloom_on && target.bloom.is_some(),
+                },
+            );
+        }
         stats
     }
 
@@ -1062,10 +1225,14 @@ impl Renderer {
 }
 
 impl SceneRenderer {
+    /// `msaa_counts`: the sample counts the adapter supports for the 3D
+    /// pass formats (1 always). Starts at the default quality (MSAA 4x,
+    /// 2048 shadow map).
     pub fn new(
         device: wgpu::Device,
         queue: wgpu::Queue,
         surface_format: wgpu::TextureFormat,
+        msaa_counts: Vec<u32>,
     ) -> Self {
         let uniform_entry = |binding, visibility| wgpu::BindGroupLayoutEntry {
             binding,
@@ -1147,16 +1314,6 @@ impl SceneRenderer {
             label: Some("lighting bind group layout"),
             entries: &lighting_entries,
         });
-        let mesh_layouts = [
-            &frame_layout,
-            &model_layout,
-            &material_layout,
-            &lighting_layout,
-        ];
-        let build_mesh = |mode| Renderer::build_mesh_pipeline(&device, &mesh_layouts, mode);
-        let mesh_pipeline = build_mesh(melon_core::GiMode::Off);
-        let mesh_ssgi_pipeline = build_mesh(melon_core::GiMode::Ssgi);
-        let mesh_ddgi_pipeline = build_mesh(melon_core::GiMode::Ddgi);
 
         let unfilterable_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,
@@ -1277,21 +1434,7 @@ impl SceneRenderer {
             mapped_at_creation: false,
         });
 
-        let shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("shadow map"),
-            size: wgpu::Extent3d {
-                width: SHADOW_MAP_SIZE,
-                height: SHADOW_MAP_SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let shadow_view = shadow_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let (shadow_texture, shadow_view) = create_shadow_map(&device, SHADOW_MAP_SIZE);
         // Linear filtering on a comparison sampler gives 2x2 hardware PCF per tap.
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shadow comparison sampler"),
@@ -1317,32 +1460,13 @@ impl SceneRenderer {
             }],
         });
 
-        let frame_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("frame bind group"),
-            layout: &frame_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: camera_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: light_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&shadow_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&shadow_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: environment_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        let frame_bind_group = frame_bind_group(
+            &device,
+            &frame_layout,
+            [&camera_buffer, &light_buffer, &environment_buffer],
+            &shadow_view,
+            &shadow_sampler,
+        );
 
         let texture_1x1 = |label, rgba: [u8; 4]| {
             let texture = device.create_texture_with_data(
@@ -1420,19 +1544,17 @@ impl SceneRenderer {
         let unoccluded_lighting = lighting("unoccluded lighting bind group", true);
         let voxel_pass_lighting = lighting("gi voxel pass lighting bind group", false);
 
-        let world_line_pipeline = Renderer::build_world_line_pipeline(&device, &frame_layout);
-        let sky_pipeline = Renderer::build_sky_pipeline(&device, &frame_layout);
-
         let (instance_buffer, instance_bind_group) =
             create_instance_buffer(&device, &model_layout, INITIAL_INSTANCE_CAPACITY);
 
-        Self {
+        let mut scene = Self {
             device,
             queue,
             surface_format,
-            mesh_pipeline,
-            mesh_ssgi_pipeline,
-            mesh_ddgi_pipeline,
+            frame_layout,
+            msaa_counts,
+            msaa: 0,
+            msaa_pipelines: Default::default(),
             tonemap_pipeline,
             tonemap_bind_group_layout: tonemap_layout,
             bloom_layout,
@@ -1452,10 +1574,10 @@ impl SceneRenderer {
             shadow_pipeline,
             shadow_camera_buffer,
             shadow_bind_group,
-            _shadow_texture: shadow_texture,
+            shadow_texture,
             shadow_view,
+            shadow_sampler,
             checker_material,
-            sky_pipeline,
             prepass_pipeline,
             ssao_pipeline,
             ssao_blur_pipeline,
@@ -1466,14 +1588,211 @@ impl SceneRenderer {
             unoccluded_lighting,
             voxel_pass_lighting,
             gi,
-            world_line_pipeline,
             world_lines: LineBuffer::default(),
             instance_buffer,
             instance_bind_group,
             instance_capacity: INITIAL_INSTANCE_CAPACITY,
             instance_staging: Vec::new(),
+        };
+        scene.set_msaa(MSAA_SAMPLES);
+        scene
+    }
+
+    /// Recreates the sun shadow map at `size` texels (clamped to 256 up to
+    /// the device limit) and every bind group reading it, when the size
+    /// changed. The shading adapts: mesh.wgsl reads the texel size from the
+    /// texture.
+    pub fn set_shadow_map_size(&mut self, size: u32) {
+        let size = size.clamp(256, self.device.limits().max_texture_dimension_2d);
+        if self.shadow_texture.width() == size {
+            return;
+        }
+        (self.shadow_texture, self.shadow_view) = create_shadow_map(&self.device, size);
+        self.frame_bind_group = frame_bind_group(
+            &self.device,
+            &self.frame_layout,
+            [
+                &self.camera_buffer,
+                &self.light_buffer,
+                &self.environment_buffer,
+            ],
+            &self.shadow_view,
+            &self.shadow_sampler,
+        );
+        self.gi.set_shadow_map(
+            &self.device,
+            &gi::GiInputs {
+                frame_layout: &self.frame_layout,
+                light: &self.light_buffer,
+                shadow_view: &self.shadow_view,
+                shadow_sampler: &self.shadow_sampler,
+                model_layout: &self.model_bind_group_layout,
+                material_layout: &self.material_bind_group_layout,
+                lighting_layout: &self.lighting_layout,
+            },
+        );
+        tracing::debug!(size, "shadow map recreated");
+    }
+
+    /// Edge of the sun shadow map in texels.
+    pub fn shadow_map_size(&self) -> u32 {
+        self.shadow_texture.width()
+    }
+
+    /// Sets the 3D pass sample count to `requested` (or the nearest lower
+    /// count the adapter supports, [`effective_msaa`]), building its
+    /// pipelines on first use. Targets follow in `render_scene`.
+    pub fn set_msaa(&mut self, requested: u32) {
+        let samples = effective_msaa(requested, &self.msaa_counts);
+        self.msaa = samples;
+        let slot = &mut self.msaa_pipelines[msaa_slot(samples)];
+        if slot.is_none() {
+            let layouts = [
+                &self.frame_layout,
+                &self.model_bind_group_layout,
+                &self.material_bind_group_layout,
+                &self.lighting_layout,
+            ];
+            let mesh = |mode| Renderer::build_mesh_pipeline(&self.device, &layouts, mode, samples);
+            use melon_core::GiMode::{Ddgi, Off, Ssgi};
+            *slot = Some(MsaaPipelines {
+                mesh: [mesh(Off), mesh(Ssgi), mesh(Ddgi)],
+                sky: Renderer::build_sky_pipeline(&self.device, &self.frame_layout, samples),
+                world_lines: Renderer::build_world_line_pipeline(
+                    &self.device,
+                    &self.frame_layout,
+                    samples,
+                ),
+            });
+            tracing::debug!(samples, "msaa pipelines built");
         }
     }
+
+    /// Sample count of the 3D pass now.
+    pub fn msaa(&self) -> u32 {
+        self.msaa
+    }
+
+    fn pipelines(&self) -> &MsaaPipelines {
+        self.msaa_pipelines[msaa_slot(self.msaa)]
+            .as_ref()
+            .expect("set_msaa builds the pipelines")
+    }
+
+    /// Recreates `target`'s multisampled textures (HDR colour, depth,
+    /// overlay) when they do not have the current sample count. The display
+    /// image and everything single-sample stay.
+    fn match_msaa(&self, target: &mut ViewportTarget) {
+        if target.sample_count() == self.msaa {
+            return;
+        }
+        let size = target.size;
+        target.hdr_target.msaa = self.create_hdr_msaa(size);
+        (target._depth_texture, target.depth_view) =
+            Renderer::create_depth_target(&self.device, size, self.msaa);
+        target.overlay = overlay::OverlayTargets::new(&self.device, size, self.msaa);
+        tracing::debug!(samples = self.msaa, "viewport msaa targets recreated");
+    }
+
+    /// Creates `target`'s SSGI textures when `ssgi` is on and drops them when
+    /// it is off, rebuilding its group 3 to match.
+    fn match_gi_view(&self, target: &mut ViewportTarget, ssgi: bool) {
+        if target.lighting.gi.ssgi.is_some() == ssgi {
+            return;
+        }
+        let gi = gi::GiView {
+            ssgi: ssgi.then(|| {
+                self.gi.create_ssgi_view(
+                    &self.device,
+                    target.size,
+                    &gi::ssgi::SsgiViewInputs {
+                        depth: &target.ssao.depth_view,
+                        normal: &target.ssao.normal_view,
+                        hdr: target.hdr_target.view(),
+                    },
+                )
+            }),
+        };
+        target.lighting = self.view_lighting(&target.ssao, gi);
+    }
+
+    /// A view's group 3 with its AO and with white AO, over `gi`.
+    fn view_lighting(&self, ssao: &SsaoTargets, gi: gi::GiView) -> ViewLighting {
+        let lighting = |label, ao| {
+            let mut entries = vec![wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(ao),
+            }];
+            entries.extend(self.gi.entries(Some(&gi), true));
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &self.lighting_layout,
+                entries: &entries,
+            })
+        };
+        ViewLighting {
+            with_ao: lighting("lighting bind group", &ssao.ao_view),
+            without_ao: lighting("open lighting bind group", &self.default_textures.white),
+            gi,
+        }
+    }
+}
+
+/// A `Depth32Float` sun shadow map of `size` x `size` texels and its view.
+fn create_shadow_map(device: &wgpu::Device, size: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("shadow map"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+/// Group 0: camera, light, the shadow map + comparison sampler, environment
+/// (`buffers`: camera, light, environment).
+fn frame_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    [camera, light, environment]: [&wgpu::Buffer; 3],
+    shadow_view: &wgpu::TextureView,
+    shadow_sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("frame bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: light.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(shadow_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(shadow_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: environment.as_entire_binding(),
+            },
+        ],
+    })
 }
 
 impl Renderer {
@@ -1483,6 +1802,7 @@ impl Renderer {
         device: &wgpu::Device,
         layouts: &[&wgpu::BindGroupLayout; 4],
         gi: melon_core::GiMode,
+        samples: u32,
     ) -> wgpu::RenderPipeline {
         let constants = [("GI_MODE", gi::shader_mode(gi))];
         let compilation_options = wgpu::PipelineCompilationOptions {
@@ -1530,7 +1850,7 @@ impl Renderer {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
+                count: samples,
                 ..Default::default()
             },
             fragment: Some(wgpu::FragmentState {
@@ -1775,6 +2095,7 @@ impl Renderer {
     fn build_world_line_pipeline(
         device: &wgpu::Device,
         frame_layout: &wgpu::BindGroupLayout,
+        samples: u32,
     ) -> wgpu::RenderPipeline {
         let shader =
             device.create_shader_module(wgpu::include_wgsl!("../../../assets/shaders/line.wgsl"));
@@ -1812,7 +2133,7 @@ impl Renderer {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
+                count: samples,
                 ..Default::default()
             },
             fragment: Some(wgpu::FragmentState {
@@ -1836,6 +2157,7 @@ impl Renderer {
     fn build_sky_pipeline(
         device: &wgpu::Device,
         frame_layout: &wgpu::BindGroupLayout,
+        samples: u32,
     ) -> wgpu::RenderPipeline {
         let shader =
             device.create_shader_module(wgpu::include_wgsl!("../../../assets/shaders/sky.wgsl"));
@@ -1862,7 +2184,7 @@ impl Renderer {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: MSAA_SAMPLES,
+                count: samples,
                 ..Default::default()
             },
             fragment: Some(wgpu::FragmentState {
@@ -1883,6 +2205,7 @@ impl Renderer {
     fn create_depth_target(
         device: &wgpu::Device,
         size: winit::dpi::PhysicalSize<u32>,
+        samples: u32,
     ) -> (wgpu::Texture, wgpu::TextureView) {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("depth texture"),
@@ -1892,7 +2215,7 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: MSAA_SAMPLES,
+            sample_count: samples,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -2181,33 +2504,8 @@ impl SceneRenderer {
         let hdr = self.create_hdr_target(size);
         let bloom = self.create_bloom_targets(hdr.view(), size);
         let ssao = self.create_ssao_targets(size);
-        let gi = self.gi.create_view(
-            &self.device,
-            size,
-            &gi::ssgi::SsgiViewInputs {
-                depth: &ssao.depth_view,
-                normal: &ssao.normal_view,
-                hdr: hdr.view(),
-            },
-        );
-        // Group 3 of the mesh pipeline with this view's AO, or white (AO off).
-        let lighting = |label, ao| {
-            let mut entries = vec![wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(ao),
-            }];
-            entries.extend(self.gi.entries(Some(&gi), true));
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &self.lighting_layout,
-                entries: &entries,
-            })
-        };
-        let lighting = ViewLighting {
-            with_ao: lighting("lighting bind group", &ssao.ao_view),
-            without_ao: lighting("open lighting bind group", &self.default_textures.white),
-            gi,
-        };
+        // No SSGI textures until the view runs SSGI (`match_gi_view`).
+        let lighting = self.view_lighting(&ssao, gi::GiView { ssgi: None });
         ViewportTarget::new(
             &self.device,
             self.surface_format.add_srgb_suffix(),
@@ -2284,7 +2582,34 @@ impl SceneRenderer {
         }
     }
 
-    /// Creates an HDR scene colour target. Zero sizes clamp to 1x1.
+    /// The multisampled HDR colour texture of a `size` target at the
+    /// current sample count; `None` at 1 sample.
+    fn create_hdr_msaa(
+        &self,
+        size: winit::dpi::PhysicalSize<u32>,
+    ) -> Option<(wgpu::Texture, wgpu::TextureView)> {
+        (self.msaa > 1).then(|| {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("hdr scene msaa texture"),
+                size: wgpu::Extent3d {
+                    width: size.width.max(1),
+                    height: size.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: self.msaa,
+                dimension: wgpu::TextureDimension::D2,
+                format: HDR_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            (texture, view)
+        })
+    }
+
+    /// Creates an HDR scene colour target at the current sample count. Zero
+    /// sizes clamp to 1x1.
     pub fn create_hdr_target(&self, size: winit::dpi::PhysicalSize<u32>) -> HdrTarget {
         let size = winit::dpi::PhysicalSize::new(size.width.max(1), size.height.max(1));
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -2302,22 +2627,10 @@ impl SceneRenderer {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let msaa_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("hdr scene msaa texture"),
-            size: texture.size(),
-            mip_level_count: 1,
-            sample_count: MSAA_SAMPLES,
-            dimension: wgpu::TextureDimension::D2,
-            format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let msaa_view = msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group =
             self.tonemap_bind_group(&view, &self.default_textures.black, &self.bloom_off_buffer);
         HdrTarget {
-            msaa_texture,
-            msaa_view,
+            msaa: self.create_hdr_msaa(size),
             _texture: texture,
             view,
             bind_group,
@@ -3125,7 +3438,7 @@ impl SceneRenderer {
         pass: &mut wgpu::RenderPass<'_>,
         draw_calls: &[(&Mesh, std::ops::Range<u32>)],
     ) {
-        pass.set_pipeline(&self.mesh_pipeline);
+        pass.set_pipeline(&self.pipelines().mesh[0]);
         pass.set_bind_group(0, &self.frame_bind_group, &[]);
         pass.set_bind_group(1, &self.instance_bind_group, &[]);
         pass.set_bind_group(2, &self.checker_material, &[]);
@@ -3147,10 +3460,11 @@ impl SceneRenderer {
         draw_calls: &[(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)],
         lighting: &wgpu::BindGroup,
     ) {
+        let mesh = &self.pipelines().mesh;
         pass.set_pipeline(match self.gi.mode {
-            melon_core::GiMode::Off => &self.mesh_pipeline,
-            melon_core::GiMode::Ssgi => &self.mesh_ssgi_pipeline,
-            melon_core::GiMode::Ddgi => &self.mesh_ddgi_pipeline,
+            melon_core::GiMode::Off => &mesh[0],
+            melon_core::GiMode::Ssgi => &mesh[1],
+            melon_core::GiMode::Ddgi => &mesh[2],
         });
         pass.set_bind_group(0, &self.frame_bind_group, &[]);
         pass.set_bind_group(1, &self.instance_bind_group, &[]);
@@ -3166,7 +3480,7 @@ impl SceneRenderer {
     /// Sky into the 3D pass, after the meshes and before the world lines
     /// (lines write no depth, so the sky would cover them).
     pub fn draw_sky(&self, pass: &mut wgpu::RenderPass<'_>) {
-        pass.set_pipeline(&self.sky_pipeline);
+        pass.set_pipeline(&self.pipelines().sky);
         pass.set_bind_group(0, &self.frame_bind_group, &[]);
         pass.draw(0..3, 0..1);
     }
@@ -3184,7 +3498,11 @@ impl SceneRenderer {
         }
         self.write_line_camera(view_proj);
         let (buffer, len) = self.world_lines.upload(&self.device, &self.queue, vertices);
-        pass.set_pipeline(&self.world_line_pipeline);
+        let pipeline = &self.msaa_pipelines[msaa_slot(self.msaa)]
+            .as_ref()
+            .expect("set_msaa builds the pipelines")
+            .world_lines;
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.frame_bind_group, &[]);
         pass.set_vertex_buffer(0, buffer.slice(..len));
         pass.draw(0..vertices.len() as u32, 0..1);
@@ -3279,6 +3597,7 @@ impl ViewportTarget {
         bloom: Option<BloomTargets>,
         lighting: ViewLighting,
     ) -> Self {
+        let samples = hdr_target.sample_count();
         let size = winit::dpi::PhysicalSize::new(size.width.max(1), size.height.max(1));
         let color_texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
             label: Some("editor viewport color texture"),
@@ -3304,8 +3623,8 @@ impl ViewportTarget {
             format: Some(ui_view_format),
             ..Default::default()
         });
-        let (depth_texture, depth_view) = Renderer::create_depth_target(device, size);
-        let overlay = overlay::OverlayTargets::new(device, size, MSAA_SAMPLES);
+        let (depth_texture, depth_view) = Renderer::create_depth_target(device, size, samples);
+        let overlay = overlay::OverlayTargets::new(device, size, samples);
 
         Self {
             color_texture,
@@ -3332,6 +3651,16 @@ impl ViewportTarget {
     /// Scene colour target the 3D pass renders into before tonemapping.
     pub fn hdr_target(&self) -> &HdrTarget {
         &self.hdr_target
+    }
+
+    /// MSAA sample count of the 3D pass targets (colour and depth).
+    pub fn sample_count(&self) -> u32 {
+        self.hdr_target.sample_count()
+    }
+
+    /// Whether the view holds SSGI textures (only while it runs SSGI).
+    pub fn has_ssgi_textures(&self) -> bool {
+        self.lighting.gi.ssgi.is_some()
     }
 
     pub fn color_texture(&self) -> Arc<wgpu::Texture> {
@@ -3391,14 +3720,31 @@ mod tests {
 
     #[test]
     fn present_mode_prefers_mailbox_unless_fifo_is_forced() {
+        use melon_core::PresentPreference::{MailboxCapped, Vsync};
         use wgpu::PresentMode::{Fifo, Immediate, Mailbox};
-        assert_eq!(choose_present_mode(&[Fifo, Mailbox], None), Mailbox);
-        assert_eq!(choose_present_mode(&[Fifo, Immediate], None), Fifo);
-        assert_eq!(choose_present_mode(&[Fifo, Mailbox], Some("fifo")), Fifo);
-        assert_eq!(
-            choose_present_mode(&[Fifo, Mailbox], Some("other")),
-            Mailbox
-        );
+        let capped =
+            |available: &[_], forced| choose_present_mode(MailboxCapped, available, forced);
+        assert_eq!(capped(&[Fifo, Mailbox], None), Mailbox);
+        assert_eq!(capped(&[Fifo, Immediate], None), Fifo);
+        assert_eq!(capped(&[Fifo, Mailbox], Some("fifo")), Fifo);
+        assert_eq!(capped(&[Fifo, Mailbox], Some("other")), Mailbox);
+        assert_eq!(choose_present_mode(Vsync, &[Fifo, Mailbox], None), Fifo);
+    }
+
+    #[test]
+    fn msaa_falls_back_to_the_nearest_lower_supported_count() {
+        assert_eq!(effective_msaa(4, &[1, 2, 4]), 4);
+        assert_eq!(effective_msaa(2, &[1, 4]), 1);
+        assert_eq!(effective_msaa(8, &[1, 2, 4]), 4);
+        assert_eq!(effective_msaa(3, &[1, 2, 4]), 2);
+        assert_eq!(effective_msaa(0, &[1, 4]), 1);
+    }
+
+    #[test]
+    fn msaa_pipeline_cache_has_one_slot_per_sample_count() {
+        let slots = [1, 2, 4].map(msaa_slot);
+        assert_eq!(slots, [0, 1, 2]);
+        assert!(slots.iter().all(|&s| s < MSAA_SLOTS));
     }
 
     #[test]
@@ -3767,7 +4113,7 @@ mod tests {
         let size = winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE);
         let color = test_color_texture(&device, r.surface_format().add_srgb_suffix());
         let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
-        let (_depth, depth_view) = Renderer::create_depth_target(&device, size);
+        let (_depth, depth_view) = Renderer::create_depth_target(&device, size, r.msaa());
 
         let eye = Vec3::new(0.0, if from_below { -10.0 } else { 10.0 }, 0.0);
         r.update_camera(
@@ -3895,18 +4241,20 @@ mod tests {
         models: Vec<(glam::Mat4, melon_core::Handle<melon_core::Model>)>,
         server: &mut melon_core::AssetServer,
     ) -> (Vec<u8>, RenderStats) {
-        let target = r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let mut target =
+            r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
         let frame = FrameData {
             view_proj: camera.view_proj(),
             eye: camera.eye,
             light,
             environment,
+            quality: melon_core::RenderQuality::default(),
             models,
         };
         let mut encoder = r
             .device()
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        let stats = r.render_scene(&mut encoder, &frame, server, &target, &[], &[]);
+        let stats = r.render_scene(&mut encoder, &frame, server, &mut target, &[], &[]);
         (
             read_back(r.device(), r.queue(), encoder, &target.color_texture),
             stats,
@@ -3940,7 +4288,8 @@ mod tests {
     const GI_FRAMES: u32 = 60;
 
     /// `render_frame` into one target, `GI_FRAMES` times when GI is on (once
-    /// when off); returns the last frame's pixels.
+    /// when off), in the default GI mode (DDGI); returns the last frame's
+    /// pixels.
     fn render_converged(
         r: &mut Renderer,
         camera: melon_core::Camera,
@@ -3949,42 +4298,65 @@ mod tests {
         models: &[(glam::Mat4, melon_core::Handle<melon_core::Model>)],
         server: &mut melon_core::AssetServer,
     ) -> Vec<u8> {
-        let frames = if environment.gi_intensity > 0.0 {
+        let quality = melon_core::RenderQuality::default();
+        render_converged_in(r, camera, light, (environment, quality), models, server)
+    }
+
+    /// `render_converged` with these quality settings.
+    fn render_converged_in(
+        r: &mut Renderer,
+        camera: melon_core::Camera,
+        light: melon_core::Light,
+        settings: (melon_core::Environment, melon_core::RenderQuality),
+        models: &[(glam::Mat4, melon_core::Handle<melon_core::Model>)],
+        server: &mut melon_core::AssetServer,
+    ) -> Vec<u8> {
+        let frames = if settings.0.gi_intensity > 0.0 {
             GI_FRAMES
         } else {
             1
         };
-        let environments = vec![environment; frames as usize];
-        render_sequence(r, camera, light, &environments, models, server)
+        let sequence = vec![settings; frames as usize];
+        render_sequence(r, camera, light, &sequence, models, server)
     }
 
-    /// One `render_scene` per environment, consecutive frames into one
-    /// target; returns the last frame's pixels.
+    /// The default quality in GI mode `mode`.
+    fn quality_in(mode: melon_core::GiMode) -> melon_core::RenderQuality {
+        melon_core::RenderQuality {
+            gi_mode: mode,
+            ..Default::default()
+        }
+    }
+
+    /// One `render_scene` per (environment, quality), consecutive frames
+    /// into one target; returns the last frame's pixels.
     fn render_sequence(
         r: &mut Renderer,
         camera: melon_core::Camera,
         light: melon_core::Light,
-        environments: &[melon_core::Environment],
+        frames: &[(melon_core::Environment, melon_core::RenderQuality)],
         models: &[(glam::Mat4, melon_core::Handle<melon_core::Model>)],
         server: &mut melon_core::AssetServer,
     ) -> Vec<u8> {
         // Handle ids restart with every AssetServer: drop models cached for
         // another test's server.
         r.model_cache = ModelCache::new(&r.scene);
-        let target = r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
-        for (i, environment) in environments.iter().enumerate() {
+        let mut target =
+            r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        for (i, &(environment, quality)) in frames.iter().enumerate() {
             let frame = FrameData {
                 view_proj: camera.view_proj(),
                 eye: camera.eye,
                 light,
-                environment: *environment,
+                environment,
+                quality,
                 models: models.to_vec(),
             };
             let mut encoder = r
                 .device()
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-            r.render_scene(&mut encoder, &frame, server, &target, &[], &[]);
-            if i + 1 == environments.len() {
+            r.render_scene(&mut encoder, &frame, server, &mut target, &[], &[]);
+            if i + 1 == frames.len() {
                 return read_back(r.device(), r.queue(), encoder, &target.color_texture);
             }
             r.queue().submit([encoder.finish()]);
@@ -3992,10 +4364,63 @@ mod tests {
         panic!("render_sequence needs at least one environment")
     }
 
-    /// `plain_environment` with `mode` at full strength.
-    fn gi_environment(mode: melon_core::GiMode) -> melon_core::Environment {
+    /// What one frame of `render_qualities` left: its pixels, the target's
+    /// MSAA sample count and whether it held SSGI textures.
+    struct QualityFrame {
+        pixels: Vec<u8>,
+        samples: u32,
+        ssgi_textures: bool,
+    }
+
+    /// One `render_scene` per quality into one target, each read back.
+    /// Fails on any wgpu validation error.
+    fn render_qualities(
+        r: &mut Renderer,
+        camera: melon_core::Camera,
+        light: melon_core::Light,
+        environment: melon_core::Environment,
+        qualities: &[melon_core::RenderQuality],
+        models: &[(glam::Mat4, melon_core::Handle<melon_core::Model>)],
+        server: &mut melon_core::AssetServer,
+    ) -> Result<Vec<QualityFrame>, String> {
+        r.model_cache = ModelCache::new(&r.scene);
+        let scope = r.device().push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut target =
+            r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let mut frames = Vec::new();
+        for &quality in qualities {
+            let frame = FrameData {
+                view_proj: camera.view_proj(),
+                eye: camera.eye,
+                light,
+                environment,
+                quality,
+                models: models.to_vec(),
+            };
+            let mut encoder = r
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            r.render_scene(&mut encoder, &frame, server, &mut target, &[], &[]);
+            frames.push(QualityFrame {
+                pixels: read_back(r.device(), r.queue(), encoder, &target.color_texture),
+                samples: target.sample_count(),
+                ssgi_textures: target.has_ssgi_textures(),
+            });
+        }
+        match pollster::block_on(scope.pop()) {
+            Some(e) => Err(format!("wgpu validation error: {e}")),
+            None => Ok(frames),
+        }
+    }
+
+    /// Pixels that differ between two readbacks.
+    fn differing(a: &[u8], b: &[u8]) -> usize {
+        a.chunks(4).zip(b.chunks(4)).filter(|(a, b)| a != b).count()
+    }
+
+    /// `plain_environment` with GI at full strength.
+    fn gi_environment() -> melon_core::Environment {
         melon_core::Environment {
-            gi_mode: mode,
             gi_intensity: 1.0,
             ..plain_environment()
         }
@@ -4232,7 +4657,7 @@ mod tests {
         let size = winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE);
         let color = test_color_texture(&device, r.surface_format().add_srgb_suffix());
         let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
-        let (_depth, depth_view) = Renderer::create_depth_target(&device, size);
+        let (_depth, depth_view) = Renderer::create_depth_target(&device, size, r.msaa());
         let view_proj = directx::orthographic(-4.0, 4.0, -4.0, 4.0, 0.1, 20.0)
             * view::look_at_mat4(Vec3::new(0.0, 10.0, 0.0), Vec3::ZERO, Vec3::NEG_Z);
         let line = [
@@ -4341,17 +4766,19 @@ mod tests {
                 gi_intensity: 0.0,
                 ..Default::default()
             },
+            quality: melon_core::RenderQuality::default(),
             models: if cube {
                 vec![(glam::Mat4::IDENTITY, h)]
             } else {
                 vec![]
             },
         };
-        let target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(size.0, size.1));
+        let mut target =
+            renderer.create_viewport_target(winit::dpi::PhysicalSize::new(size.0, size.1));
         let mut encoder = renderer
             .device()
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        renderer.render_scene(&mut encoder, &frame, &mut server, &target, &[], overlay);
+        renderer.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], overlay);
         if size != (TEST_SIZE, TEST_SIZE) {
             renderer.queue().submit([encoder.finish()]);
             return [0; 4];
@@ -4467,6 +4894,258 @@ mod tests {
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
             Box::new(|renderer| {
+                // Live quality switches gate like a strength of 0: AO off,
+                // bloom off and GI mode Off each give exactly the image of
+                // the old switch (ao_strength, bloom_intensity, gi_intensity
+                // 0). SSGI textures exist only on SSGI frames.
+                use melon_core::{GiMode, RenderQuality};
+                let mut server = repo_server();
+                let models = test_room(&mut server);
+                let camera = melon_core::Camera {
+                    eye: glam::Vec3::new(0.0, 2.0, -8.5),
+                    center: glam::Vec3::new(0.0, 1.9, 1.0),
+                    aspect: 1.0,
+                    ..Default::default()
+                };
+                let light = test_room_light();
+                let lit = melon_core::Environment {
+                    fog_density: 0.0,
+                    ..Default::default()
+                };
+                let q = RenderQuality::default();
+                let mut one = |env, quality| {
+                    render_qualities(
+                        renderer,
+                        camera,
+                        light,
+                        env,
+                        &[quality],
+                        &models,
+                        &mut server,
+                    )
+                    .map(|mut f| f.remove(0).pixels)
+                };
+                let no_gi = melon_core::Environment {
+                    gi_intensity: 0.0,
+                    ..lit
+                };
+                let pairs = [
+                    (
+                        "AO",
+                        one(
+                            melon_core::Environment {
+                                ao_strength: 0.0,
+                                ..no_gi
+                            },
+                            q,
+                        )?,
+                        one(no_gi, RenderQuality { ao: false, ..q })?,
+                    ),
+                    (
+                        "bloom",
+                        one(
+                            melon_core::Environment {
+                                bloom_intensity: 0.0,
+                                ..no_gi
+                            },
+                            q,
+                        )?,
+                        one(no_gi, RenderQuality { bloom: false, ..q })?,
+                    ),
+                    ("GI", one(no_gi, q)?, one(lit, quality_in(GiMode::Off))?),
+                ];
+                for (name, by_strength, by_quality) in pairs {
+                    let n = differing(&by_strength, &by_quality);
+                    if n > 0 {
+                        return Err(format!(
+                            "{name} off by quality differs from strength 0 in {n} pixels"
+                        ));
+                    }
+                }
+                let ssgi = quality_in(GiMode::Ssgi);
+                let frames = render_qualities(
+                    renderer,
+                    camera,
+                    light,
+                    lit,
+                    &[q, ssgi, ssgi, quality_in(GiMode::Off), q],
+                    &models,
+                    &mut server,
+                )?;
+                let held: Vec<bool> = frames.iter().map(|f| f.ssgi_textures).collect();
+                if held != [false, true, true, false, false] {
+                    return Err(format!(
+                        "SSGI textures should exist only on SSGI frames (DDGI, SSGI, SSGI, Off, DDGI): {held:?}"
+                    ));
+                }
+                Ok(())
+            }),
+            Box::new(|renderer| {
+                // Shadow map size rebuild: 2048, 1024, 4096, then 2048 again
+                // in one target. The map is recreated each time, 1024 moves
+                // the shadow edge, and back at 2048 the image is exactly the
+                // first one.
+                use glam::Vec3;
+                use melon_core::RenderQuality;
+                let mut server = repo_server();
+                let grey = server.load("assets/models/review/grey_cube.glb");
+                let models = [
+                    slab(grey, Vec3::new(8.0, 0.2, 8.0), Vec3::new(0.0, -0.1, 0.0)),
+                    slab(grey, Vec3::splat(1.0), Vec3::new(0.0, 2.0, 0.0)),
+                ];
+                let sized = |shadow_map_size| RenderQuality {
+                    shadow_map_size,
+                    ..Default::default()
+                };
+                let mut sizes = Vec::new();
+                let mut frames = Vec::new();
+                for size in [2048, 1024, 4096, 2048] {
+                    let frame = render_qualities(
+                        renderer,
+                        top_down_camera(),
+                        test_light(),
+                        plain_environment(),
+                        &[sized(size)],
+                        &models,
+                        &mut server,
+                    )?;
+                    sizes.push(renderer.shadow_map_size());
+                    frames.extend(frame);
+                }
+                if sizes != [2048, 1024, 4096, 2048] {
+                    return Err(format!("shadow map sizes {sizes:?}"));
+                }
+                let moved = differing(&frames[0].pixels, &frames[1].pixels);
+                let back = differing(&frames[0].pixels, &frames[3].pixels);
+                if moved == 0 || back > 0 {
+                    return Err(format!(
+                        "shadow map rebuild: 1024 changes {moved} pixels (want > 0), back at 2048 {back} (want 0)"
+                    ));
+                }
+                Ok(())
+            }),
+            Box::new(|renderer| {
+                // MSAA rebuild: 4, 1, 2, 4 in one target. The target follows
+                // each count (2 may fall back to 1 without adapter support),
+                // the red cube's rotated silhouette over the grey floor has
+                // blended edge pixels at 4 and none at 1, and back at 4 the
+                // image is exactly the first one.
+                use glam::{Mat4, Quat, Vec3};
+                use melon_core::RenderQuality;
+                let mut server = repo_server();
+                let grey = server.load("assets/models/review/grey_cube.glb");
+                let red = server.load("assets/models/review/red_panel.glb");
+                let models = [
+                    slab(grey, Vec3::new(8.0, 0.2, 8.0), Vec3::new(0.0, -0.1, 0.0)),
+                    (
+                        Mat4::from_scale_rotation_translation(
+                            Vec3::new(3.0, 0.5, 3.0),
+                            Quat::from_rotation_y(0.5),
+                            Vec3::new(0.0, 0.25, 0.0),
+                        ),
+                        red,
+                    ),
+                ];
+                let light = melon_core::Light {
+                    direction: Vec3::NEG_Y,
+                    ..test_light()
+                };
+                let msaa = |msaa| RenderQuality {
+                    msaa,
+                    ..Default::default()
+                };
+                let frames = render_qualities(
+                    renderer,
+                    top_down_camera(),
+                    light,
+                    plain_environment(),
+                    &[msaa(4), msaa(1), msaa(2), msaa(4)],
+                    &models,
+                    &mut server,
+                )?;
+                let samples: Vec<u32> = frames.iter().map(|f| f.samples).collect();
+                let two = effective_msaa(2, &renderer.scene.msaa_counts);
+                if samples != [4, 1, two, 4] {
+                    return Err(format!("sample counts {samples:?} (want [4, 1, {two}, 4])"));
+                }
+                // Pixels between the floor's and the cube's red/green ratio.
+                let blended = |pixels: &[u8]| {
+                    let ratio = |p: [u8; 4]| f32::from(p[0]) / f32::from(p[1]).max(1.0);
+                    let (floor, cube) = (
+                        ratio(pixel_at(renderer, pixels, (2, 2))),
+                        ratio(pixel_at(renderer, pixels, (TEST_SIZE / 2, TEST_SIZE / 2))),
+                    );
+                    (0..TEST_SIZE * TEST_SIZE)
+                        .map(|i| ratio(pixel_at(renderer, pixels, (i % TEST_SIZE, i / TEST_SIZE))))
+                        .filter(|&q| {
+                            q > floor + 0.15 * (cube - floor) && q < cube - 0.15 * (cube - floor)
+                        })
+                        .count()
+                };
+                let (soft, hard) = (blended(&frames[0].pixels), blended(&frames[1].pixels));
+                let back = differing(&frames[0].pixels, &frames[3].pixels);
+                if soft < hard + 10 || back > 0 {
+                    return Err(format!(
+                        "MSAA: {soft} blended edge pixels at 4x, {hard} at 1x (want 10 more); back at 4x {back} pixels differ (want 0)"
+                    ));
+                }
+                Ok(())
+            }),
+            Box::new(|renderer| {
+                // GPU timings: with timestamp queries the renderer reports
+                // per-pass ms within a few frames (readbacks map after their
+                // submit); without them everything stays `None`.
+                let mut server = repo_server();
+                let models = test_room(&mut server);
+                let camera = melon_core::Camera {
+                    eye: glam::Vec3::new(0.0, 2.0, -8.5),
+                    center: glam::Vec3::new(0.0, 1.9, 1.0),
+                    aspect: 1.0,
+                    ..Default::default()
+                };
+                // A fresh timer: earlier checks' frames (bloom off) would
+                // share its averaging window.
+                renderer.timer = timings::GpuTimer::new(renderer.device(), renderer.queue());
+                let supported = renderer.timer.is_some();
+                let mut timings = renderer.timings();
+                for _ in 0..5 {
+                    render_qualities(
+                        renderer,
+                        camera,
+                        test_room_light(),
+                        melon_core::Environment::default(),
+                        &[melon_core::RenderQuality::default()],
+                        &models,
+                        &mut server,
+                    )?;
+                    timings = renderer.timings();
+                    if timings.total.is_some() {
+                        break;
+                    }
+                }
+                let measured = [
+                    timings.gi,
+                    timings.ao,
+                    timings.shadows,
+                    timings.aa,
+                    timings.bloom,
+                    timings.total,
+                ];
+                let ok = if supported {
+                    measured
+                        .iter()
+                        .all(|t| t.is_some_and(|ms| (0.0..1000.0).contains(&ms)))
+                } else {
+                    measured.iter().all(Option::is_none)
+                };
+                if !ok {
+                    return Err(format!(
+                        "GPU timings (timestamps supported: {supported}): {timings:?}"
+                    ));
+                }
+                Ok(())
+            }),
+            Box::new(|renderer| {
                 // GI sky calibration: an open floor in a pillar's shadow, far
                 // from walls, sees only the sky. With DDGI and with SSGI it
                 // must match the hemisphere ambient they replace (within
@@ -4488,10 +5167,17 @@ mod tests {
                 let mut shade = |mode| {
                     let env = melon_core::Environment {
                         gi_intensity: if mode == GiMode::Off { 0.0 } else { 1.0 },
-                        ..gi_environment(mode)
+                        ..gi_environment()
                     };
-                    let pixels =
-                        render_converged(renderer, camera, light, env, &models, &mut server);
+                    let settings = (env, quality_in(mode));
+                    let pixels = render_converged_in(
+                        renderer,
+                        camera,
+                        light,
+                        settings,
+                        &models,
+                        &mut server,
+                    );
                     pixel_at(renderer, &pixels, px)
                 };
                 let (ddgi, ssgi, off) =
@@ -4539,10 +5225,17 @@ mod tests {
                         zenith_color: Vec3::ZERO,
                         horizon_color: Vec3::ZERO,
                         gi_intensity: if mode == GiMode::Off { 0.0 } else { 1.0 },
-                        ..gi_environment(mode)
+                        ..gi_environment()
                     };
-                    let pixels =
-                        render_converged(renderer, camera, light, env, &models, &mut server);
+                    let settings = (env, quality_in(mode));
+                    let pixels = render_converged_in(
+                        renderer,
+                        camera,
+                        light,
+                        settings,
+                        &models,
+                        &mut server,
+                    );
                     let p = pixel_at(renderer, &pixels, px);
                     f32::from(p[0]) / f32::from(p[1]).max(1.0)
                 };
@@ -4567,13 +5260,19 @@ mod tests {
                     aspect: 1.0,
                     ..Default::default()
                 };
-                let off = melon_core::Environment {
-                    ao_strength: 1.0,
-                    ..plain_environment()
-                };
-                let on = |mode| melon_core::Environment {
-                    ao_strength: 1.0,
-                    ..gi_environment(mode)
+                let off = (
+                    melon_core::Environment {
+                        ao_strength: 1.0,
+                        ..plain_environment()
+                    },
+                    melon_core::RenderQuality::default(),
+                );
+                let on = |mode| {
+                    let env = melon_core::Environment {
+                        ao_strength: 1.0,
+                        ..gi_environment()
+                    };
+                    (env, quality_in(mode))
                 };
                 let light = test_room_light();
                 let switched = render_sequence(
@@ -5377,9 +6076,9 @@ mod tests {
                 let mut server = AssetServer::new(".".into());
                 let cube: Handle<Model> = server.load("builtin:cube");
                 let mut centre = |models: Vec<(glam::Mat4, Handle<Model>)>| {
-                    let target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(
-                        TEST_SIZE, TEST_SIZE,
-                    ));
+                    let mut target = renderer.create_viewport_target(
+                        winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE),
+                    );
                     let frame = FrameData {
                         view_proj: melon_core::Camera::default().view_proj(),
                         eye: melon_core::Camera::default().eye,
@@ -5390,12 +6089,14 @@ mod tests {
                             gi_intensity: 0.0,
                             ..Default::default()
                         },
+                        quality: melon_core::RenderQuality::default(),
                         models,
                     };
                     let mut encoder = renderer
                         .device()
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-                    renderer.render_scene(&mut encoder, &frame, &mut server, &target, &[], &[]);
+                    renderer.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
+
                     let pixels = read_back(
                         renderer.device(),
                         renderer.queue(),

@@ -258,7 +258,10 @@ pub(super) struct Ddgi {
     /// Stands in for `voxels` in the voxel passes' group 3.
     no_voxels: wgpu::Buffer,
     voxel_pipeline: wgpu::RenderPipeline,
-    /// Voxel pass group 0 per axis (X, Y, Z).
+    /// Voxel pass group 0 per axis (X, Y, Z): light, shadow map, voxels,
+    /// axis; rebuilt when the shadow map is (`set_shadow_map`).
+    voxel_layout: wgpu::BindGroupLayout,
+    voxel_axes: [wgpu::Buffer; 3],
     voxel_groups: [wgpu::BindGroup; 3],
     /// Colour attachment the voxel passes need but never write.
     voxel_target: wgpu::TextureView,
@@ -338,42 +341,17 @@ impl Ddgi {
                 entry(6, wgpu::ShaderStages::VERTEX, uniform_ty),
             ],
         });
-        let voxel_groups = [0u32, 1, 2].map(|axis| {
-            let axis_buffer = wgpu::util::DeviceExt::create_buffer_init(
+        let voxel_axes = [0u32, 1, 2].map(|axis| {
+            wgpu::util::DeviceExt::create_buffer_init(
                 device,
                 &wgpu::util::BufferInitDescriptor {
                     label: Some("gi voxel axis buffer"),
                     contents: bytemuck::bytes_of(&[axis, 0, 0, 0]),
                     usage: wgpu::BufferUsages::UNIFORM,
                 },
-            );
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("gi voxel bind group"),
-                layout: &voxel_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: inputs.light.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(inputs.shadow_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::Sampler(inputs.shadow_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: voxels.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: axis_buffer.as_entire_binding(),
-                    },
-                ],
-            })
+            )
         });
+        let voxel_groups = voxel_groups(device, &voxel_layout, &voxel_axes, &voxels, inputs);
         let voxel_target = device
             .create_texture(&wgpu::TextureDescriptor {
                 label: Some("gi voxel pass target"),
@@ -496,6 +474,8 @@ impl Ddgi {
             voxels,
             no_voxels,
             voxel_pipeline,
+            voxel_layout,
+            voxel_axes,
             voxel_groups,
             voxel_target,
             update_group,
@@ -534,6 +514,45 @@ impl Ddgi {
             },
         ]
     }
+}
+
+/// Voxel pass group 0 per axis: the light, the sun shadow map, the voxel
+/// buffer and the axis.
+fn voxel_groups(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    axes: &[wgpu::Buffer; 3],
+    voxels: &wgpu::Buffer,
+    inputs: &GiInputs,
+) -> [wgpu::BindGroup; 3] {
+    std::array::from_fn(|axis| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gi voxel bind group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: inputs.light.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(inputs.shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(inputs.shadow_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: voxels.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: axes[axis].as_entire_binding(),
+                },
+            ],
+        })
+    })
 }
 
 /// The voxel pipeline: mesh.wgsl `vs_voxel` / `fs_voxel`, no culling, no
@@ -588,6 +607,17 @@ fn build_voxel_pipeline(
 }
 
 impl Ddgi {
+    /// Rebinds the voxel passes to `inputs.shadow_view` (a new shadow map size).
+    pub(super) fn set_shadow_map(&mut self, device: &wgpu::Device, inputs: &GiInputs) {
+        self.voxel_groups = voxel_groups(
+            device,
+            &self.voxel_layout,
+            &self.voxel_axes,
+            &self.voxels,
+            inputs,
+        );
+    }
+
     /// Writes the DDGI uniform for this frame. `intensity` 0 turns DDGI off
     /// and restarts convergence for the next frame it is on.
     pub(super) fn update(&mut self, queue: &wgpu::Queue, intensity: f32, gi_only: bool) {

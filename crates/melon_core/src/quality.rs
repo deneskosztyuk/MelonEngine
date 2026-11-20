@@ -44,8 +44,10 @@ impl QualityPreset {
     pub const ALL: [QualityPreset; 4] = [Self::Low, Self::Medium, Self::High, Self::Max];
 }
 
-/// Render quality settings. `Default` is the High preset.
-/// Nothing reads this yet: the renderer wiring is still to come.
+/// Render quality settings. `Default` is the High preset. `extract` hands
+/// them to the renderer each frame: GI, AO and bloom switch on the next
+/// frame; shadow map size and MSAA recreate GPU targets and pipelines before
+/// it; `present` is applied by the host (`Renderer::set_present`).
 /// A field missing from a file takes its `Default` value and unknown fields
 /// are ignored, so adding a setting keeps old files and profiles loading.
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,7 +152,8 @@ impl RenderQuality {
 
 /// Per-pass GPU time in milliseconds, averaged over the last second, and the
 /// frame budget from the monitor refresh. `None` = not measured (no
-/// timestamp support, or the renderer does not fill it yet).
+/// timestamp support, or the pass did not run). Filled by
+/// `Renderer::timings`; the host inserts it each frame.
 #[derive(Resource, Clone, Copy, Debug, Default, PartialEq)]
 pub struct RenderTimings {
     pub gi: Option<f32>,

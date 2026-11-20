@@ -3,7 +3,7 @@
 use glam::Mat4;
 use melon_core::bevy_ecs::world::World;
 use melon_core::hierarchy::render_matrices;
-use melon_core::{Camera, Environment, Handle, Light, Model, SimulationState, Time};
+use melon_core::{Camera, Environment, Handle, Light, Model, RenderQuality, SimulationState, Time};
 
 /// Everything one view needs to draw a frame.
 pub struct FrameData {
@@ -11,8 +11,11 @@ pub struct FrameData {
     /// Camera position (overlay shading).
     pub eye: glam::Vec3,
     pub light: Light,
-    /// Sky and fog.
+    /// The look: sky, fog, pass strengths.
     pub environment: Environment,
+    /// Which passes run and at what cost (GI mode, AO, bloom, shadow map
+    /// size, MSAA).
+    pub quality: RenderQuality,
     /// World matrix and model of every entity with a `Handle<Model>`.
     pub models: Vec<(Mat4, Handle<Model>)>,
 }
@@ -38,6 +41,10 @@ pub fn extract(world: &mut World) -> FrameData {
         .get_resource::<Environment>()
         .copied()
         .unwrap_or_default();
+    let quality = world
+        .get_resource::<RenderQuality>()
+        .copied()
+        .unwrap_or_default();
     let alpha = world.get_resource::<Time>().map_or(1.0, Time::alpha);
     let state = world
         .get_resource::<SimulationState>()
@@ -54,6 +61,7 @@ pub fn extract(world: &mut World) -> FrameData {
         eye,
         light,
         environment,
+        quality,
         models,
     }
 }
@@ -64,7 +72,8 @@ mod tests {
     use glam::Vec3;
     use melon_core::bevy_ecs::world::World;
     use melon_core::{
-        AssetServer, Camera, ChildOf, Environment, Handle, Light, Model, SimulationState, Transform,
+        AssetServer, Camera, ChildOf, Environment, Handle, Light, Model, RenderQuality,
+        SimulationState, Transform,
     };
 
     fn cube(world: &mut World) -> Handle<Model> {
@@ -134,6 +143,15 @@ mod tests {
         };
         world.insert_resource(env);
         assert_eq!(extract(&mut world).environment, env);
+    }
+
+    #[test]
+    fn quality_comes_from_resource_or_default() {
+        let mut world = World::new();
+        assert_eq!(extract(&mut world).quality, RenderQuality::default());
+        let low = RenderQuality::preset(melon_core::QualityPreset::Low);
+        world.insert_resource(low);
+        assert_eq!(extract(&mut world).quality, low);
     }
 
     #[test]
