@@ -11,12 +11,10 @@ pub struct Input {
     pressed: HashSet<InputButton>,
     just_pressed: HashSet<InputButton>,
     just_released: HashSet<InputButton>,
-    /// Mouse motion this frame, in logical points.
+    /// Raw mouse motion this frame, in device counts (`DeviceEvent::MouseMotion`, unaccelerated).
     pub mouse_delta: Vec2,
     /// Wheel notches this frame; positive = away from the user.
     pub wheel: f32,
-    /// Cursor position in the viewport, in logical points, if inside.
-    pub cursor: Option<Vec2>,
 }
 
 /// Who owns keyboard and mouse inside the editor. `Game` only while playing.
@@ -289,8 +287,7 @@ impl Input {
         self.pressed(InputButton::Key(code))
     }
 
-    /// End of frame: edges, mouse delta and wheel start over. Held buttons
-    /// and the cursor position stay.
+    /// End of frame: edges, mouse delta and wheel start over. Held buttons stay.
     pub fn clear_frame(&mut self) {
         self.just_pressed.clear();
         self.just_released.clear();
@@ -365,16 +362,10 @@ mod tests {
         let mut i = Input {
             mouse_delta: Vec2::new(10.0, 20.0),
             wheel: 2.0,
-            cursor: Some(Vec2::new(3.0, 4.0)),
             ..Default::default()
         };
         i.clear_frame();
         assert_eq!(i.mouse_delta, Vec2::ZERO);
         assert_eq!(i.wheel, 0.0);
-        assert_eq!(
-            i.cursor,
-            Some(Vec2::new(3.0, 4.0)),
-            "cursor is a position, not a delta"
-        );
     }
 }

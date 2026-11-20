@@ -15,8 +15,9 @@ and mouse button with per-frame edges.
 - **Raw input (`melon_core::Input`):** every common key (letters, digits,
   F1–F12, arrows, Space, Enter, Escape, Tab, Backspace, Delete, Insert, Home,
   End, PageUp, PageDown, both Shift / Ctrl / Alt, punctuation keys, numpad
-  digits), mouse buttons (Left, Right, Middle, Back, Forward), mouse delta,
-  wheel delta, cursor position in the viewport.
+  digits), mouse buttons (Left, Right, Middle, Back, Forward), mouse delta
+  (raw device motion counts), wheel delta. The cursor position is deferred to a
+  future visible-cursor game mode (the game cursor is hidden and confined).
   `pressed(x)`, `just_pressed(x)`, `just_released(x)` for keys and mouse
   buttons; edges last one frame (`Update`).
 - **Actions:** `InputMap` resource (serialisable) of named actions.
