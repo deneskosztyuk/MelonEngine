@@ -1,0 +1,15 @@
+[package]
+name = "melon_audio"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+melon_core.workspace = true
+bevy_ecs.workspace = true
+glam.workspace = true
+kira.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

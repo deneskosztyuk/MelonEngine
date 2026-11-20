@@ -4,6 +4,7 @@ members = [
     "crates/melon_core",
     "crates/melon_render",
     "crates/melon_physics",
+    "crates/melon_audio",
     "crates/melon_editor",
     "crates/melon_host",
     "crates/melon_game",
@@ -20,6 +21,7 @@ embed-resource = "3"
 melon_core = { path = "crates/melon_core" }
 melon_render = { path = "crates/melon_render" }
 melon_physics = { path = "crates/melon_physics" }
+melon_audio = { path = "crates/melon_audio" }
 melon_editor = { path = "crates/melon_editor" }
 melon_game = { path = "crates/melon_game" }
 
@@ -49,6 +51,7 @@ rfd = "0.14"
 uuid = { version = "1", features = ["v4", "serde"] }
 trash = "5"
 notify = "8"
+kira = "0.12"
 
 [workspace.lints.clippy]
 # clippy::all = correctness + style + complexity + perf lints.
