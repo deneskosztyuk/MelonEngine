@@ -7,11 +7,11 @@ Current state and planned work: `docs/ROADMAP.md`.
 
 | Path | Role |
 |---|---|
-| `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera, scenes (`scene.rs`), asset pack (`pack.rs`), player settings (`player.rs`), packaging (`package.rs`). No GPU or window code. |
+| `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera, scenes (`scene.rs`), asset pack (`pack.rs`), player settings (`player.rs`), packaging (`package.rs`), the `.env` asset (`environment_asset.rs`) and `WorldEnvironment` with its system (`world_environment.rs`). No GPU or window code. |
 | `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache` and `MaterialCache`) records the sun cascade passes and the point / spot shadow atlas pass, depth/normal prepass, SSAO passes, the GI mode's passes (`gi/`: DDGI voxel and probe passes or SSGI), 3D pass into HDR target, bloom passes, tonemap pass; `ui_pass` for the editor. |
 | `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource): component sync (`sync.rs`), scene queries (`queries.rs`), character controller, mesh collider triangles. See "Physics" below. |
 | `crates/melon_audio` | kira playback: `Director` (decisions, tested with a mock `Backend`), `KiraBackend` (device, bus tracks), `spatial` (attenuation, pan), `AudioEngine` (host calls `update` once per frame). The game-facing types are in `melon_core::audio`. |
-| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), Content Drawer (`drawer.rs`), asset `.meta` files (`asset_db.rs`), file operations (`asset_ops.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), scene wrappers that add physics (`scene.rs`; the scene code itself is `melon_core::scene`), undo history (`history.rs`), Project Settings window (`project_settings.rs`, with `quality_settings.rs`, `audio_settings.rs`, `player_settings.rs`), File > Build (`build_window.rs`). |
+| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), Content Drawer (`drawer.rs`), asset `.meta` files (`asset_db.rs`), file operations (`asset_ops.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), scene wrappers that add physics (`scene.rs`; the scene code itself is `melon_core::scene`), undo history (`history.rs`), the `.env` Inspector card (`environment_card.rs`), Project Settings window (`project_settings.rs`, with `quality_settings.rs`, `audio_settings.rs`, `player_settings.rs`), File > Build (`build_window.rs`). |
 | `crates/melon_game` | Game logic as an `rlib` + `dylib`, hot-reloaded in dev builds. |
 | `crates/melon_host` | Binaries. `melon_host`: winit event loop, input mapping, frame order (core update, editor, extract, render_scene, ui pass); with `--no-default-features` it is the player (`player.rs`, no `melon_editor` linked). `melon_package`: `just package`. No render pass code. |
 | `assets/models` | glTF models. `cube.glb` loads at startup. `review/` holds the snapshot scene's material test models (`grey_cube`, `material_spheres`, `normal_panel`, `emissive_cube`, `red_panel`, `green_panel`), written by `cargo run -p melon_render --example gen_review_assets` from the repo root; commit them when regenerated. |
@@ -861,14 +861,42 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   underside, level with the floor, and with the bias light leaks along
   every contact seam (`no_light_leak_at_contact`). Back faces alone without
   the normal offset bring acne on lit faces (`lit_floor_has_no_acne`).
-- **Scene lighting.** `melon_core::SceneLighting` is a registered component
-  (saved in scenes, edited in the Inspector): sun elevation / azimuth in
-  degrees, sun colour, ambient split, sky / ground ambient, zenith /
-  horizon colours, fog, bloom. While an entity carries one,
-  `scene_lighting_system` (PostUpdate) writes it into `Light` and
-  `Environment` (only on change; AO, GI and the sky texture are kept);
-  when it goes, both return to their defaults. `SceneLighting::default()`
-  equals today's defaults. Scenes without one look as before.
+- **World environment.** `melon_core::WorldEnvironment { environment:
+  AssetRef }` (registered component, saved in scenes) points at a `.env` file
+  (`EnvironmentAsset`, RON, `environment_asset.rs`): sections `sun` (elevation
+  / azimuth in degrees, colour), `ambient` (share, sky, ground), `sky` (zenith,
+  horizon, `texture` ref, `texture_intensity`), `fog` (density), `ao`
+  (strength, radius), `gi` (intensity), `bloom` (intensity). Missing fields
+  take today's defaults; colours are linear HDR. `AssetRef { guid, path }`:
+  the GUID wins when it resolves; `AssetRef::for_path` fills it. The file is
+  read through `AssetServer` (`EnvironmentFile` handle; hot reload by version).
+  `world_environment_system` (PostUpdate) writes the winner's asset into
+  `Light` and `Environment`, only when a value changes. No carrier, an empty
+  ref or a missing file = `Light::default()` / `Environment::default()`. With
+  several carriers the first in Hierarchy order wins (bare ones after, by
+  entity index) and one warning names it; `PendingDelete` carriers do not
+  count; one carrier skips the hierarchy walk. A broken file keeps the last
+  good asset, and a failed (handle, version) is not read again until the
+  version changes. `EnvironmentPreview(Some((path, asset)))` overrides the
+  file for that path (the editor sets it while an edit is pending; it is
+  cleared every UI frame). `AssetServer::refresh(path)` is `poll_changes`
+  for one file: the card calls it after a save so the next update reads the
+  new file. Editor: the `.env` card (`environment_card.rs`, also under a
+  `WorldEnvironment` in the Inspector) draws one section per field by
+  reflection, labels in sentence case, number fields from
+  `#[reflect(@EditHint { min, max, speed, suffix, decimals })]` (a drag value;
+  `melon_core::EditHint`), `Vec3` fields as `WidgetKind::HdrColor` (colour
+  over its largest channel + intensity drag, so values above 1 survive;
+  `WidgetKind::Color`, used by point / spot light colours, still clamps to
+  1). It parses the file once per `AssetServer` version (an error too),
+  keeps an unsaved copy in egui memory only while the card is drawn each
+  frame, writes when the pointer is up (not undoable), and shows "File
+  missing" / "Cannot read" for a bad file. Under an inactive carrier it
+  says which one drives the world; an empty ref offers New Environment
+  (`assets/environments/New Environment.env`, assigned as an Inspector
+  edit). GameObject > World Environment and File > New Scene spawn a
+  carrier on `assets/environments/default.env` (written, with its `.meta`,
+  first when missing; on failure New Scene keeps the current scene).
 - **Environment.** Optional `melon_core::Environment` resource (default when
   absent, not registered in `Core::new`): procedural sky (`zenith_color`,
   `horizon_color`) and exponential distance fog (`fog_density`). The fog
@@ -885,7 +913,7 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   the HDR image before bloom (one NaN pixel turns the whole frame black
   through bloom);
   `--scene` renders a scene file through `Core::update` and `extract` (its
-  `SceneLighting` included) from the given camera; quote a leading minus,
+  `WorldEnvironment` included) from the given camera; quote a leading minus,
   e.g. `--eye " -26,22,26"`;
   `--quality` starts from that `RenderQuality` preset (default high), the
   other flags override it; `--ao-only` saves the SSAO term as a grey

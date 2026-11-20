@@ -137,8 +137,9 @@ Status marks:
 
 - 🟡 Post-processing: bloom, SSAO, ACES; no exposure control (auto or
   manual). The default look is hazy (bright horizon colour, fog 0.01,
-  ambient 0.2); scenes can now set their own sun, sky and fog with
-  `SceneLighting` (the Sich demo uses a golden-hour setup).
+  ambient 0.2); scenes set their own sun, sky, fog, AO, GI and bloom with a
+  `WorldEnvironment` component pointing at a `.env` asset (the Sich demo uses
+  a golden-hour one).
 - 🟡 Blended materials cast no shadows and take AO from the surface behind
   them; an HDR sky feeds GI misses as a two-colour approximation.
 - 🟡 Local shadows: more than 512 casters in one shadow tile drop the rest;
@@ -228,7 +229,7 @@ Core features all three share, and where MelonEngine stands.
 | Rendering | Directional, point, spot lights | 🧪 |
 | Rendering | Shadows (cascades, point/spot) | 🧪 |
 | Rendering | Global illumination / ambient | ✅ DDGI or SSGI, IBL 🧪 |
-| Rendering | Sky / environment | ✅ procedural sky, fog; HDR sky 🧪 |
+| Rendering | Sky / environment | ✅ procedural sky, fog; HDR sky 🧪; `WorldEnvironment` + `.env` asset ✅ |
 | Rendering | Post-processing (bloom, AO, exposure) | 🟡 no exposure |
 | Rendering | Anti-aliasing | ✅ MSAA 1/2/4, alpha-to-coverage 🧪 |
 | Rendering | Culling, instancing, LOD | 🧪 |
