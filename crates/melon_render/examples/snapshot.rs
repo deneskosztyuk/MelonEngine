@@ -6,7 +6,9 @@
 // Debug flags (any order): --ao-only saves the SSAO term (grey, white =
 // open) instead of the image; --no-ao renders with `ao_strength` 0;
 // --no-shadow moves the scene and camera far outside the fixed shadow box, so
-// nothing casts or receives sun shadows (the image is otherwise unchanged).
+// nothing casts or receives sun shadows (the image is otherwise unchanged);
+// --no-bloom renders with `bloom_intensity` 0; --bloom-only renders with
+// `bloom_intensity` 1, so the tonemapped image is the bloom alone.
 
 use std::sync::Arc;
 
@@ -23,14 +25,16 @@ const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 
 /// The review scene: grey floor, blocks, a tall pillar and a wall corner,
-/// one checkerboard `builtin:cube`, `cube.glb`, the material spheres and the
-/// normal-mapped panel, all inside the shadow box around the origin.
+/// one checkerboard `builtin:cube`, `cube.glb`, the material spheres, the
+/// normal-mapped panel and the emissive cube, all inside the shadow box
+/// around the origin.
 fn review_scene(server: &mut AssetServer) -> Vec<(Mat4, Handle<Model>)> {
     let checker: Handle<Model> = server.load("builtin:cube");
     let cube: Handle<Model> = server.load("assets/models/review/grey_cube.glb");
     let glb: Handle<Model> = server.load("assets/models/cube.glb");
     let spheres: Handle<Model> = server.load("assets/models/review/material_spheres.glb");
     let panel: Handle<Model> = server.load("assets/models/review/normal_panel.glb");
+    let glow: Handle<Model> = server.load("assets/models/review/emissive_cube.glb");
     let place = |scale: Vec3, yaw_deg: f32, pos: Vec3| {
         Mat4::from_scale_rotation_translation(
             scale,
@@ -79,6 +83,12 @@ fn review_scene(server: &mut AssetServer) -> Vec<(Mat4, Handle<Model>)> {
         (place(Vec3::ONE, 0.0, Vec3::new(0.0, 0.0, 6.5)), spheres),
         // Normal-mapped panel facing -x -z, toward the sun.
         (place(Vec3::ONE, 225.0, Vec3::new(3.8, 1.05, 7.5)), panel),
+        // Emissive cube (HDR orange glow) beside the checker cube, in the
+        // overview and corner views.
+        (
+            place(Vec3::splat(0.6), 15.0, Vec3::new(1.8, 0.3, 1.4)),
+            glow,
+        ),
     ]
 }
 
@@ -178,8 +188,15 @@ const NO_SHADOW_OFFSET: Vec3 = Vec3::new(200.0, 0.0, 0.0);
 
 fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Result<()> {
     for flag in flags {
-        if !["--ao-only", "--no-ao", "--no-shadow"].contains(&flag.as_str()) {
-            bail!("unknown flag {flag:?}; expected --ao-only, --no-ao or --no-shadow");
+        const FLAGS: [&str; 5] = [
+            "--ao-only",
+            "--no-ao",
+            "--no-shadow",
+            "--no-bloom",
+            "--bloom-only",
+        ];
+        if !FLAGS.contains(&flag.as_str()) {
+            bail!("unknown flag {flag:?}; expected one of {FLAGS:?}");
         }
     }
     let has = |f: &str| flags.iter().any(|x| x == f);
@@ -201,6 +218,13 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
         light: Light::default(),
         environment: Environment {
             ao_strength: if has("--no-ao") { 0.0 } else { 1.0 },
+            bloom_intensity: if has("--no-bloom") {
+                0.0
+            } else if has("--bloom-only") {
+                1.0
+            } else {
+                Environment::default().bloom_intensity
+            },
             ..Default::default()
         },
         models: review_scene(&mut server),
@@ -315,7 +339,7 @@ impl ApplicationHandler for App {
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let out = args.next().context(
-        "usage: snapshot <out.png> [overview|low|sun|materials|corner|crowd] [--ao-only] [--no-ao] [--no-shadow]",
+        "usage: snapshot <out.png> [overview|low|sun|materials|corner|crowd] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only]",
     )?;
     let view = args.next().unwrap_or_else(|| "overview".into());
     let flags = args.collect();

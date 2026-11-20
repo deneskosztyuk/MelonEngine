@@ -195,6 +195,9 @@ pub struct Environment {
     pub ao_strength: f32,
     /// SSAO sampling radius in metres.
     pub ao_radius: f32,
+    /// Bloom: how much of the blurred HDR image is mixed into the scene
+    /// colour before tonemapping; 0 = off (the bloom passes are skipped).
+    pub bloom_intensity: f32,
 }
 
 impl Default for Environment {
@@ -206,6 +209,7 @@ impl Default for Environment {
             fog_density: 0.01,
             ao_strength: 1.0,
             ao_radius: 0.5,
+            bloom_intensity: 0.04,
         }
     }
 }
@@ -231,6 +235,11 @@ mod tests {
     fn environment_ao_defaults() {
         let env = Environment::default();
         assert_eq!((env.ao_strength, env.ao_radius), (1.0, 0.5));
+    }
+
+    #[test]
+    fn environment_bloom_default() {
+        assert_eq!(Environment::default().bloom_intensity, 0.04);
     }
 
     #[test]

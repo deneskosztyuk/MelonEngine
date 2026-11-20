@@ -5,6 +5,8 @@
 //   top row a red dielectric, bottom row gold metal. One node and material each.
 // - normal_panel.glb: 2x2 m panel facing +Z with a tiled-bump normal map and
 //   no TANGENT attribute, so the loader generates tangents.
+// - emissive_cube.glb: unit cube, dark base, emissive (4, 2, 0.5) HDR
+//   (emissiveFactor x KHR_materials_emissive_strength), for bloom.
 // Run from the repository root: cargo run -p melon_render --example gen_review_assets
 
 use std::f32::consts::PI;
@@ -244,6 +246,18 @@ fn grey_cube(path: &str) {
     );
 }
 
+fn emissive_cube(path: &str) {
+    let mut glb = Glb::default();
+    let a = glb.mesh(&cube());
+    glb.write(
+        path,
+        &format!(
+            r#""extensionsUsed":["KHR_materials_emissive_strength"],"scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0,"name":"EmissiveCube"}}],"meshes":[{{"primitives":[{}]}}],"materials":[{{"name":"Glow","pbrMetallicRoughness":{{"baseColorFactor":[0.05,0.05,0.05,1.0],"metallicFactor":0.0,"roughnessFactor":0.6}},"emissiveFactor":[1.0,0.5,0.125],"extensions":{{"KHR_materials_emissive_strength":{{"emissiveStrength":4.0}}}}}}]"#,
+            primitive(&a, 0)
+        ),
+    );
+}
+
 fn material_spheres(path: &str) {
     let mut glb = Glb::default();
     let a = glb.mesh(&sphere(0.4, 48, 24));
@@ -318,4 +332,5 @@ fn main() {
     grey_cube(&format!("{dir}/grey_cube.glb"));
     material_spheres(&format!("{dir}/material_spheres.glb"));
     normal_panel(&format!("{dir}/normal_panel.glb"));
+    emissive_cube(&format!("{dir}/emissive_cube.glb"));
 }

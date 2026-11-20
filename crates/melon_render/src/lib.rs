@@ -292,7 +292,7 @@ fn generate_tangents(vertices: &mut [Vertex], indices: &[u32]) {
 
 /// glTF metallic-roughness factors of one material (group 2, binding 5).
 /// Each factor multiplies its texture; missing textures bind 1x1 defaults
-/// (white, flat normal, black emissive).
+/// (white, flat normal, white emissive: the factors alone).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct MaterialUniform {
@@ -313,7 +313,9 @@ impl MaterialUniform {
         let pbr = material.pbr_metallic_roughness();
         Self {
             base_color: pbr.base_color_factor(),
-            emissive: material.emissive_factor(),
+            emissive: material
+                .emissive_factor()
+                .map(|c| c * material.emissive_strength().unwrap_or(1.0)),
             metallic: pbr.metallic_factor(),
             roughness: pbr.roughness_factor(),
             normal_scale: material.normal_texture().map_or(1.0, |n| n.scale()),
@@ -331,11 +333,11 @@ pub struct LineVertex {
 
 /// 1x1 textures bound where a material has none.
 struct DefaultTextures {
-    /// Base colour and metallic-roughness: the factors alone.
+    /// Base colour, metallic-roughness and emissive: the factors alone.
     white: wgpu::TextureView,
     /// Normal map (0.5, 0.5, 1): the vertex normal unchanged.
     flat_normal: wgpu::TextureView,
-    /// Emissive: none.
+    /// Bloom of a target without a bloom chain: no glow.
     black: wgpu::TextureView,
 }
 
@@ -382,7 +384,7 @@ fn material_bind_group(
             },
             view(2, metallic_roughness.unwrap_or(&defaults.white)),
             view(3, normal.unwrap_or(&defaults.flat_normal)),
-            view(4, emissive.unwrap_or(&defaults.black)),
+            view(4, emissive.unwrap_or(&defaults.white)),
             wgpu::BindGroupEntry {
                 binding: 5,
                 resource: uniform.as_entire_binding(),
@@ -488,6 +490,21 @@ pub const MSAA_SAMPLES: u32 = 4;
 /// Width and height of the sun's shadow map, in texels.
 pub const SHADOW_MAP_SIZE: u32 = 2048;
 
+/// Most levels in a view's bloom mip chain.
+pub const BLOOM_LEVELS: usize = 6;
+
+/// Bloom mip chain sizes for a `width` x `height` view: half resolution
+/// first, each next level half the last (rounded down), at most
+/// `BLOOM_LEVELS`, stopping before a side would drop below 1 px.
+pub fn bloom_mip_sizes(width: u32, height: u32) -> Vec<(u32, u32)> {
+    std::iter::successors(Some((width / 2, height / 2)), |&(w, h)| {
+        Some((w / 2, h / 2))
+    })
+    .take_while(|&(w, h)| w >= 1 && h >= 1)
+    .take(BLOOM_LEVELS)
+    .collect()
+}
+
 /// World -> shadow clip space for a directional light. An orthographic box of
 /// half-size `radius` around `center`, seen from `to_light`.
 pub fn directional_light_view_proj(
@@ -580,6 +597,15 @@ pub struct SceneRenderer {
     mesh_pipeline: wgpu::RenderPipeline,
     tonemap_pipeline: wgpu::RenderPipeline,
     tonemap_bind_group_layout: wgpu::BindGroupLayout,
+    /// Bloom: one source texture + sampler per pass, the first (Karis)
+    /// downsample, the other downsamples and the additive upsample.
+    bloom_layout: wgpu::BindGroupLayout,
+    bloom_sampler: wgpu::Sampler,
+    bloom_first_pipeline: wgpu::RenderPipeline,
+    bloom_down_pipeline: wgpu::RenderPipeline,
+    bloom_up_pipeline: wgpu::RenderPipeline,
+    /// Tonemap bloom uniform of zeros (intensity 0), for targets without bloom.
+    bloom_off_buffer: wgpu::Buffer,
     /// Group 1 layout: the instance storage buffer (rebuilt on growth).
     model_bind_group_layout: wgpu::BindGroupLayout,
     material_bind_group_layout: wgpu::BindGroupLayout,
@@ -753,9 +779,10 @@ impl Renderer {
         &self.scene
     }
 
-    /// Record one view of `frame` into `target`: shadow pass, 3D pass (HDR,
-    /// MSAA) with the meshes, the sky and depth-tested `world_lines`, the tonemap pass
-    /// onto the target's display image, then the `overlay` shapes.
+    /// Record one view of `frame` into `target`: shadow pass, SSAO passes, 3D
+    /// pass (HDR, MSAA) with the meshes, the sky and depth-tested
+    /// `world_lines`, the bloom passes, the tonemap pass onto the target's
+    /// display image, then the `overlay` shapes.
     /// Models load (or hot-reload) here on first use. Entities are culled
     /// per view and drawn instanced, one call per (model, part).
     pub fn render_scene(
@@ -865,8 +892,17 @@ impl Renderer {
             scene.draw_sky(&mut pass);
             scene.draw_world_lines(&mut pass, world_lines, frame.view_proj);
         }
+        // Bloom off (or no level fits): skip the passes and tonemap with the
+        // black bloom image, so the image matches the renderer without bloom.
+        let tonemap_group = match &target.bloom {
+            Some(bloom) if frame.environment.bloom_intensity > 0.0 => {
+                scene.render_bloom(encoder, bloom, frame.environment.bloom_intensity);
+                &bloom.tonemap_bind_group
+            }
+            _ => &hdr.bind_group,
+        };
         let color_view = target.color_view();
-        drop(scene.tonemap_pass(encoder, hdr, &color_view));
+        drop(scene.tonemap_with(encoder, tonemap_group, &color_view));
         self.overlay.render(
             &self.scene.device,
             &self.scene.queue,
@@ -1051,21 +1087,56 @@ impl SceneRenderer {
             mapped_at_creation: false,
         });
 
+        let sampler_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
+        // Tonemap: scene HDR (textureLoad), bloom mip 0 + sampler, bloom uniform.
         let tonemap_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tonemap bind group layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            }],
+            entries: &[
+                unfilterable_entry(0),
+                texture_entry(1),
+                sampler_entry(2),
+                uniform_entry(3, wgpu::ShaderStages::FRAGMENT),
+            ],
         });
         let tonemap_pipeline =
             Renderer::build_tonemap_pipeline(&device, surface_format, &tonemap_layout);
+        let bloom_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bloom bind group layout"),
+            entries: &[texture_entry(0), sampler_entry(1)],
+        });
+        let bloom_pipeline =
+            |entry, blend| Renderer::build_bloom_pipeline(&device, &bloom_layout, entry, blend);
+        let bloom_first_pipeline = bloom_pipeline("fs_downsample_first", None);
+        let bloom_down_pipeline = bloom_pipeline("fs_downsample", None);
+        // Upsample adds onto the level's own downsample.
+        let add = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let bloom_up_pipeline = bloom_pipeline(
+            "fs_upsample",
+            Some(wgpu::BlendState {
+                color: add,
+                alpha: add,
+            }),
+        );
+        let bloom_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("bloom sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let bloom_off_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("bloom off uniform buffer"),
+            contents: bytemuck::bytes_of(&[0.0f32; 4]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
 
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera uniform buffer"),
@@ -1224,6 +1295,12 @@ impl SceneRenderer {
             mesh_pipeline,
             tonemap_pipeline,
             tonemap_bind_group_layout: tonemap_layout,
+            bloom_layout,
+            bloom_sampler,
+            bloom_first_pipeline,
+            bloom_down_pipeline,
+            bloom_up_pipeline,
+            bloom_off_buffer,
             model_bind_group_layout: model_layout,
             material_bind_group_layout: material_layout,
             material_sampler,
@@ -1439,6 +1516,47 @@ impl Renderer {
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format.add_srgb_suffix(),
                     blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
+    }
+
+    /// A fullscreen bloom pass (`entry` in bloom.wgsl) into one HDR mip.
+    fn build_bloom_pipeline(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        entry: &str,
+        blend: Option<wgpu::BlendState>,
+    ) -> wgpu::RenderPipeline {
+        let shader =
+            device.create_shader_module(wgpu::include_wgsl!("../../../assets/shaders/bloom.wgsl"));
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("bloom pipeline layout"),
+            bind_group_layouts: &[Some(layout)],
+            immediate_size: 0,
+        });
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(entry),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -1909,12 +2027,15 @@ impl SceneRenderer {
     }
 
     pub fn create_viewport_target(&self, size: winit::dpi::PhysicalSize<u32>) -> ViewportTarget {
+        let hdr = self.create_hdr_target(size);
+        let bloom = self.create_bloom_targets(hdr.view(), size);
         ViewportTarget::new(
             &self.device,
             self.surface_format.add_srgb_suffix(),
             size,
-            self.create_hdr_target(size),
+            hdr,
             self.create_ssao_targets(size),
+            bloom,
         )
     }
 
@@ -2018,14 +2139,8 @@ impl SceneRenderer {
             view_formats: &[],
         });
         let msaa_view = msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("tonemap bind group"),
-            layout: &self.tonemap_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            }],
-        });
+        let bind_group =
+            self.tonemap_bind_group(&view, &self.default_textures.black, &self.bloom_off_buffer);
         HdrTarget {
             msaa_texture,
             msaa_view,
@@ -2036,12 +2151,175 @@ impl SceneRenderer {
         }
     }
 
-    /// Begins a pass on `target` that tonemaps `hdr` over it. The pass stays
-    /// open so callers can draw overlays (gizmo lines) on the display image.
+    /// Tonemap group 0: the scene image `hdr`, the `bloom` image and the
+    /// bloom uniform `settings` (intensity, 1 / levels).
+    fn tonemap_bind_group(
+        &self,
+        hdr: &wgpu::TextureView,
+        bloom: &wgpu::TextureView,
+        settings: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tonemap bind group"),
+            layout: &self.tonemap_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(hdr),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(bloom),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.bloom_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: settings.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// One view's bloom chain over its resolved HDR image `hdr`; `None` when
+    /// the view is too small for one level.
+    fn create_bloom_targets(
+        &self,
+        hdr: &wgpu::TextureView,
+        size: winit::dpi::PhysicalSize<u32>,
+    ) -> Option<BloomTargets> {
+        let sizes = bloom_mip_sizes(size.width.max(1), size.height.max(1));
+        let &(width, height) = sizes.first()?;
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("bloom texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            // Mip k is (width >> k, height >> k): the sizes above.
+            mip_level_count: sizes.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: HDR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let mip_views: Vec<wgpu::TextureView> = (0..sizes.len() as u32)
+            .map(|mip| {
+                texture.create_view(&wgpu::TextureViewDescriptor {
+                    base_mip_level: mip,
+                    mip_level_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let source = |view: &wgpu::TextureView| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("bloom source bind group"),
+                layout: &self.bloom_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.bloom_sampler),
+                    },
+                ],
+            })
+        };
+        let settings = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bloom uniform buffer"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Some(BloomTargets {
+            hdr_source: source(hdr),
+            mip_sources: mip_views.iter().map(source).collect(),
+            tonemap_bind_group: self.tonemap_bind_group(hdr, &mip_views[0], &settings),
+            mip_views,
+            settings,
+        })
+    }
+
+    /// The bloom chain of one view: downsample the resolved HDR image level
+    /// by level, then upsample back, adding each level, into mip 0. Writes
+    /// the tonemap's bloom uniform (`intensity`, 1 / levels).
+    fn render_bloom(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bloom: &BloomTargets,
+        intensity: f32,
+    ) {
+        let levels = bloom.mip_views.len();
+        self.queue.write_buffer(
+            &bloom.settings,
+            0,
+            bytemuck::bytes_of(&[intensity, 1.0 / levels as f32, 0.0, 0.0]),
+        );
+        // (target mip, source, pipeline, clear first)
+        let downs = (0..levels).map(|i| match i {
+            0 => (0, &bloom.hdr_source, &self.bloom_first_pipeline, true),
+            _ => (
+                i,
+                &bloom.mip_sources[i - 1],
+                &self.bloom_down_pipeline,
+                true,
+            ),
+        });
+        let ups = (0..levels - 1)
+            .rev()
+            .map(|i| (i, &bloom.mip_sources[i + 1], &self.bloom_up_pipeline, false));
+        for (mip, source, pipeline, clear) in downs.chain(ups) {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("melon_render bloom pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &bloom.mip_views[mip],
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // Downsamples overwrite every pixel; upsamples add.
+                        load: if clear {
+                            wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, source, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
+    /// Begins a pass on `target` that tonemaps `hdr` over it (no bloom).
+    /// The pass stays open so callers can draw overlays (gizmo lines) on the
+    /// display image.
     pub fn tonemap_pass<'e>(
         &self,
         encoder: &'e mut wgpu::CommandEncoder,
         hdr: &HdrTarget,
+        target: &wgpu::TextureView,
+    ) -> wgpu::RenderPass<'e> {
+        self.tonemap_with(encoder, &hdr.bind_group, target)
+    }
+
+    /// `tonemap_pass` with a tonemap group 0 (scene image, bloom, settings).
+    fn tonemap_with<'e>(
+        &self,
+        encoder: &'e mut wgpu::CommandEncoder,
+        bind_group: &wgpu::BindGroup,
         target: &wgpu::TextureView,
     ) -> wgpu::RenderPass<'e> {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2062,7 +2340,7 @@ impl SceneRenderer {
             multiview_mask: None,
         });
         pass.set_pipeline(&self.tonemap_pipeline);
-        pass.set_bind_group(0, &hdr.bind_group, &[]);
+        pass.set_bind_group(0, bind_group, &[]);
         pass.draw(0..3, 0..1);
         pass
     }
@@ -2338,7 +2616,8 @@ impl SceneRenderer {
     /// A material bind group (group 2) from `factors` and optional
     /// textures: base colour (sRGB), metallic-roughness (linear, G =
     /// roughness, B = metallic), tangent-space normal (linear) and emissive
-    /// (sRGB). Missing textures bind white, flat normal and black.
+    /// (sRGB). Missing textures bind white (normal: flat), so the factors
+    /// apply alone.
     pub fn create_material_bind_group(
         &self,
         factors: &MaterialUniform,
@@ -2764,8 +3043,25 @@ pub struct ViewportTarget {
     depth_view: wgpu::TextureView,
     hdr_target: HdrTarget,
     ssao: SsaoTargets,
+    /// `None` when the view is too small for one bloom level.
+    bloom: Option<BloomTargets>,
     overlay: overlay::OverlayTargets,
     size: winit::dpi::PhysicalSize<u32>,
+}
+
+/// One view's bloom chain: an `HDR_FORMAT` texture at half resolution with
+/// one mip per level (`bloom_mip_sizes`), and the bind groups reading it.
+struct BloomTargets {
+    /// Render target view of each mip.
+    mip_views: Vec<wgpu::TextureView>,
+    /// Bloom source: the view's resolved HDR image (first downsample).
+    hdr_source: wgpu::BindGroup,
+    /// Bloom source: mip i.
+    mip_sources: Vec<wgpu::BindGroup>,
+    /// Tonemap group 0: the HDR image, mip 0 and `settings`.
+    tonemap_bind_group: wgpu::BindGroup,
+    /// Tonemap bloom uniform (intensity, 1 / levels), written per frame.
+    settings: wgpu::Buffer,
 }
 
 /// One view's SSAO targets: the single-sample depth/normal prepass, the raw
@@ -2789,6 +3085,7 @@ impl ViewportTarget {
         size: winit::dpi::PhysicalSize<u32>,
         hdr_target: HdrTarget,
         ssao: SsaoTargets,
+        bloom: Option<BloomTargets>,
     ) -> Self {
         let size = winit::dpi::PhysicalSize::new(size.width.max(1), size.height.max(1));
         let color_texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
@@ -2827,6 +3124,7 @@ impl ViewportTarget {
             depth_view,
             hdr_target,
             ssao,
+            bloom,
             overlay,
             size,
         }
@@ -2960,6 +3258,35 @@ mod tests {
         assert_eq!(m.base_color, [1.0; 4]);
         assert_eq!((m.metallic, m.roughness, m.normal_scale), (1.0, 1.0, 1.0));
         assert_eq!(m.emissive, [0.0; 3]);
+    }
+
+    #[test]
+    fn gltf_emissive_strength_scales_emissive() {
+        let json = r#"{"asset":{"version":"2.0"},"extensionsUsed":["KHR_materials_emissive_strength"],
+            "materials":[{"emissiveFactor":[1.0,0.5,0.125],
+            "extensions":{"KHR_materials_emissive_strength":{"emissiveStrength":4.0}}}]}"#;
+        let gltf = gltf::Gltf::from_slice(json.as_bytes()).unwrap();
+        let m = MaterialUniform::from_gltf(&gltf.document.materials().next().unwrap());
+        assert_eq!(m.emissive, [4.0, 2.0, 0.5]);
+    }
+
+    #[test]
+    fn bloom_mip_sizes_halve_and_stop_above_one_pixel() {
+        assert_eq!(
+            bloom_mip_sizes(1279, 719),
+            [
+                (639, 359),
+                (319, 179),
+                (159, 89),
+                (79, 44),
+                (39, 22),
+                (19, 11)
+            ]
+        );
+        assert_eq!(bloom_mip_sizes(64, 64).len(), BLOOM_LEVELS);
+        assert_eq!(bloom_mip_sizes(5, 3), [(2, 1)]);
+        assert!(bloom_mip_sizes(1, 1).is_empty());
+        assert!(bloom_mip_sizes(1, 1000).is_empty());
     }
 
     #[test]
@@ -3381,6 +3708,7 @@ mod tests {
         melon_core::Environment {
             fog_density: 0.0,
             ao_strength: 0.0,
+            bloom_intensity: 0.0,
             ..Default::default()
         }
     }
@@ -3426,6 +3754,7 @@ mod tests {
         let env = melon_core::Environment {
             fog_density: 0.0,
             ao_strength,
+            bloom_intensity: 0.0,
             ..Default::default()
         };
         let models = vec![(floor, cube), (Mat4::from_translation(Vec3::Y * 0.5), cube)];
@@ -3651,6 +3980,7 @@ mod tests {
             light: melon_core::Light::default(),
             environment: melon_core::Environment {
                 ao_strength: 0.0,
+                bloom_intensity: 0.0,
                 ..Default::default()
             },
             models: if cube {
@@ -3778,6 +4108,85 @@ mod tests {
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
+            Box::new(|renderer| {
+                // The review emissive cube 8 m away on black: about 8 pixels
+                // wide and HDR bright (4, 2, 0.5). Bloom lights up the black
+                // pixels beside it.
+                use glam::{Mat4, Vec3};
+                let mut server = melon_core::AssetServer::new(
+                    concat!(env!("CARGO_MANIFEST_DIR"), "/../..").into(),
+                );
+                let cube: melon_core::Handle<melon_core::Model> =
+                    server.load("assets/models/review/emissive_cube.glb");
+                let camera = melon_core::Camera {
+                    aspect: 1.0,
+                    ..Default::default()
+                };
+                let light = melon_core::Light {
+                    color: Vec3::ZERO,
+                    sky_color: Vec3::ZERO,
+                    ground_color: Vec3::ZERO,
+                    ..Default::default()
+                };
+                let at = camera.eye + Vec3::NEG_Z * 8.0;
+                let edge = screen_px(camera.view_proj(), at + Vec3::X * 0.5);
+                let beside = (edge.0 + 4, edge.1);
+                let mut px = |bloom_intensity| {
+                    let env = melon_core::Environment {
+                        zenith_color: Vec3::ZERO,
+                        horizon_color: Vec3::ZERO,
+                        bloom_intensity,
+                        ..plain_environment()
+                    };
+                    let models = vec![(Mat4::from_translation(at), cube)];
+                    let px = render_frame(renderer, camera, light, env, models, &mut server);
+                    pixel_at(renderer, &px, beside)
+                };
+                let (off, on) = (px(0.0), px(0.04));
+                if off[0] <= 2 && on[0] >= off[0] + 8 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "bloom_spreads_bright_spot: {beside:?} off {off:?}, on {on:?}"
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
+                // Sunlit floor far from the cube and its shadow: no bright
+                // source near, so bloom leaves it as it was (no haze).
+                use glam::{Mat4, Quat, Vec3};
+                let mut server = melon_core::AssetServer::new(".".into());
+                let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+                let floor = Mat4::from_scale_rotation_translation(
+                    Vec3::new(8.0, 0.2, 8.0),
+                    Quat::IDENTITY,
+                    Vec3::new(0.0, -0.1, 0.0),
+                );
+                let models = vec![(floor, cube), (Mat4::from_translation(Vec3::Y * 0.5), cube)];
+                let camera = top_down_camera();
+                let at = screen_px(camera.view_proj(), Vec3::new(2.5, 0.0, 2.5));
+                let mut px = |bloom_intensity| {
+                    let env = melon_core::Environment {
+                        bloom_intensity,
+                        ..plain_environment()
+                    };
+                    let px = render_frame(
+                        renderer,
+                        camera,
+                        test_light(),
+                        env,
+                        models.clone(),
+                        &mut server,
+                    );
+                    pixel_at(renderer, &px, at)
+                };
+                let (off, on) = (px(0.0), px(0.04));
+                if off.iter().zip(on).all(|(&a, b)| a.abs_diff(b) <= 2) {
+                    Ok(())
+                } else {
+                    Err(format!("bloom_adds_no_haze: {at:?} off {off:?}, on {on:?}"))
+                }
+            }),
             Box::new(|renderer| {
                 // 2999 tiny cubes in a grid plus a lone 1 m cube, instance
                 // 3000 of the batch: past the old 1024 cap and the initial
@@ -4170,6 +4579,7 @@ mod tests {
                         light: melon_core::Light::default(),
                         environment: melon_core::Environment {
                             ao_strength: 0.0,
+                            bloom_intensity: 0.0,
                             ..Default::default()
                         },
                         models,
@@ -4203,6 +4613,7 @@ mod tests {
                     horizon_color: glam::Vec3::X,
                     fog_density: 0.0,
                     ao_strength: 0.0,
+                    bloom_intensity: 0.0,
                     ..Default::default()
                 };
                 let light = melon_core::Light {
@@ -4241,6 +4652,7 @@ mod tests {
                     horizon_color: glam::Vec3::splat(0.5),
                     fog_density: 0.0,
                     ao_strength: 0.0,
+                    bloom_intensity: 0.0,
                     ..Default::default()
                 };
                 let light = melon_core::Light {
@@ -4270,6 +4682,7 @@ mod tests {
                     horizon_color: glam::Vec3::splat(0.02),
                     fog_density: 0.0,
                     ao_strength: 0.0,
+                    bloom_intensity: 0.0,
                     ..Default::default()
                 };
                 let light = melon_core::Light::default();
@@ -4310,6 +4723,7 @@ mod tests {
                         horizon_color: glam::Vec3::Z,
                         fog_density,
                         ao_strength: 0.0,
+                        bloom_intensity: 0.0,
                         ..Default::default()
                     };
                     let light = melon_core::Light::default();

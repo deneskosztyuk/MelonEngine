@@ -1,8 +1,14 @@
-// Tonemap pass: maps the HDR scene colour into display range. Draws one
-// fullscreen triangle and reads one texel per pixel (textureLoad, no sampler).
+// Tonemap pass: mixes bloom into the HDR scene colour, then maps it into
+// display range. Draws one fullscreen triangle and reads one scene texel per
+// pixel (textureLoad); bloom (half resolution) is sampled bilinearly.
 // The output target is an sRGB view, so the hardware applies the sRGB encode.
 
 @group(0) @binding(0) var hdr_tex: texture_2d<f32>;
+// Mip 0 of the view's bloom chain (sum of all levels); black without bloom.
+@group(0) @binding(1) var bloom_tex: texture_2d<f32>;
+@group(0) @binding(2) var bloom_sampler: sampler;
+// x = bloom intensity (0 = off), y = 1 / bloom level count.
+@group(0) @binding(3) var<uniform> bloom: vec4f;
 
 @vertex
 fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
@@ -20,6 +26,10 @@ fn tonemap(hdr: vec3f) -> vec3f {
 
 @fragment
 fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
-    let hdr = textureLoad(hdr_tex, vec2i(pos.xy), 0).rgb;
+    let scene = textureLoad(hdr_tex, vec2i(pos.xy), 0).rgb;
+    let uv = pos.xy / vec2f(textureDimensions(hdr_tex));
+    let glow = textureSampleLevel(bloom_tex, bloom_sampler, uv, 0.0).rgb * bloom.y;
+    // Intensity 0 returns `scene` exactly, so bloom off matches no bloom.
+    let hdr = mix(scene, glow, bloom.x);
     return vec4f(clamp(tonemap(hdr), vec3f(0.0), vec3f(1.0)), 1.0);
 }
