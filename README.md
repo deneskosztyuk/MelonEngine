@@ -85,12 +85,18 @@ Editor:
 
 - **W / E / R** — Move / Rotate / Scale tool
 - **Delete** — delete the selected entity
-- **Ctrl+S** — save the scene (File ▸ Save As… the first time)
+- **Ctrl+S** — save the scene (File ▸ Save As… the first time; it starts in
+  `assets/scenes`)
 - **Content Browser:** folder tree (right-click a folder to add it to
   Favorites), clickable path, Back / Forward (also mouse buttons 4 / 5),
   search (this folder and below), type filter chips, and a size slider whose
-  far left switches tiles to a list. Click selects, double-click opens a
-  folder. Favorites, size, folder and tree width are saved to
+  far left switches tiles to a list. Click selects; double-click (or Enter)
+  opens a folder, asks Save / Don't Save / Cancel and loads a scene (`.ron`
+  in `assets/`), or opens any other file in its default app. Right-click:
+  New Folder, Rename (**F2**), Duplicate (**Ctrl+D**), Delete (**Del**, to the
+  Recycle Bin; the dialog lists scenes that use it), Show in Explorer. Drag
+  an item onto a folder to move it; drag files from Explorer onto the window
+  to copy them into the current folder. Each `.meta` moves with its file. Favorites, size, folder and tree width are saved to
   `.melon/content_browser.ron`.
 - **Models:** drag a `.glb` / `.gltf` from the Content Browser into the Scene
   (lands on the ground under the cursor) or the Hierarchy (at the origin, or

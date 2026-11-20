@@ -65,6 +65,14 @@ struct GizmoDrag {
 }
 
 /// Pending scene operation for the host to execute.
+/// The answer to "Open <scene>?".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenChoice {
+    Save,
+    DontSave,
+    Cancel,
+}
+
 /// What the delete dialog shows.
 struct DeleteConfirm {
     path: std::path::PathBuf,
@@ -103,6 +111,11 @@ pub struct Editor {
     pending_operation: Option<PendingOperation>,
     /// A Content Browser delete waiting for Delete / Cancel.
     delete_confirm: Option<DeleteConfirm>,
+    /// A scene opened from the Content Browser, waiting for Save / Don't
+    /// Save / Cancel.
+    confirm_open: Option<std::path::PathBuf>,
+    /// The Content Browser tab was drawn last frame (it takes OS file drops).
+    content_shown: bool,
     status_message: Option<(String, StatusKind, std::time::Instant)>,
     /// egui texture showing the scene (set by `EditorOverlay`).
     viewport_texture: Option<egui::TextureId>,
@@ -154,6 +167,8 @@ impl Default for Editor {
             pending_dialog: None,
             pending_operation: None,
             delete_confirm: None,
+            confirm_open: None,
+            content_shown: false,
             status_message: None,
             viewport_texture: None,
             viewport_size: winit::dpi::PhysicalSize::new(1, 1),
@@ -226,10 +241,18 @@ impl Editor {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
+        // Scenes live in assets/scenes so the Content Browser shows them.
+        let scenes = self.project_root.join("assets/scenes");
+        if save && let Err(error) = std::fs::create_dir_all(&scenes) {
+            tracing::warn!("could not create {}: {error}", scenes.display());
+        }
         std::thread::spawn(move || {
             let dialog = rfd::FileDialog::new().add_filter("RON", &["ron"]);
             let path = if save {
-                dialog.set_file_name("scene.ron").save_file()
+                dialog
+                    .set_directory(&scenes)
+                    .set_file_name("scene.ron")
+                    .save_file()
             } else {
                 dialog.pick_file()
             };
@@ -667,6 +690,8 @@ impl Editor {
             Request::Open(path) => {
                 if path.is_dir() {
                     self.content.open(path);
+                } else if content::is_scene_path(&self.project_root, &path) {
+                    self.confirm_open = Some(path);
                 } else {
                     asset_ops::open_external(&path);
                 }
@@ -678,6 +703,98 @@ impl Editor {
             self.content.select(Some(path));
         }
         Ok(())
+    }
+
+    /// Save is offered only when the open scene has a file to save to.
+    pub fn open_scene_can_save(&self) -> bool {
+        self.current_scene.is_some()
+    }
+
+    /// Act on the answer to "Open <scene>?": Save writes the current scene
+    /// first; both Save and Don't Save then load (only while editing).
+    pub fn resolve_open(&mut self, world: &mut World, choice: OpenChoice) {
+        let Some(path) = self.confirm_open.take() else {
+            return;
+        };
+        match choice {
+            OpenChoice::Cancel => return,
+            OpenChoice::Save => {
+                let Some(current) = self.current_scene.clone() else {
+                    self.set_status_error("Use File \u{25b8} Save As first".into());
+                    return;
+                };
+                if let Err(e) = scene::save_scene(world, &current) {
+                    self.set_status_error(format!("Save failed: {e}"));
+                    return;
+                }
+            }
+            OpenChoice::DontSave => {}
+        }
+        match dialog_operation(false, path, sim_state(world)) {
+            Some(operation) => self.pending_operation = Some(operation),
+            None => self.set_status_error("Stop playing to open a scene".into()),
+        }
+    }
+
+    /// Save / Don't Save / Cancel before a scene opened from the browser.
+    fn open_scene_dialog(&mut self, world: &mut World, ui: &egui::Ui) {
+        let Some(path) = &self.confirm_open else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let can_save = self.open_scene_can_save();
+        let mut choice = None;
+        let modal = egui::Modal::new(egui::Id::new("content_open_scene")).show(ui.ctx(), |ui| {
+            ui.heading(format!("Open {name}?"));
+            ui.label("Unsaved changes in the current scene are lost.");
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(can_save, egui::Button::new("Save"))
+                    .on_disabled_hover_text("Use File \u{25b8} Save As first")
+                    .clicked()
+                {
+                    choice = Some(OpenChoice::Save);
+                }
+                if ui.button("Don't Save").clicked() {
+                    choice = Some(OpenChoice::DontSave);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(OpenChoice::Cancel);
+                }
+            });
+        });
+        if choice.is_none() && modal.should_close() {
+            choice = Some(OpenChoice::Cancel);
+        }
+        if let Some(choice) = choice {
+            self.resolve_open(world, choice);
+        }
+    }
+
+    /// Files dropped on the window from the OS go into the Content Browser's
+    /// folder (winit gives no drop position on Windows, so the visible
+    /// browser takes them).
+    fn take_dropped_files(&mut self, ui: &egui::Ui) {
+        let dropped: Vec<std::path::PathBuf> = ui.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        let shown = std::mem::take(&mut self.content_shown);
+        if dropped.is_empty() {
+            return;
+        }
+        if shown {
+            let folder = self.content.current().to_path_buf();
+            self.content
+                .request(content::BrowserRequest::Import(dropped, folder));
+        } else {
+            self.set_status_warning("Open the Content Browser to import files".into());
+        }
     }
 
     /// Delete / Cancel for a Content Browser delete, listing what uses it.
@@ -814,6 +931,8 @@ impl Editor {
         self.about_window(ui);
         self.project_settings_window(world, ui);
         self.delete_dialog(world, ui);
+        self.open_scene_dialog(world, ui);
+        self.take_dropped_files(ui);
 
         // Dockable panels fill the rest of the window.
         self.overlay_draws.clear();
@@ -2053,6 +2172,7 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                     .show(ui, |ui| self.editor.build_inspector(self.world, ui));
             }
             EditorTab::ContentBrowser => {
+                self.editor.content_shown = true;
                 self.editor.content.ui(ui);
                 self.editor.apply_content_requests(self.world);
             }
@@ -3317,6 +3437,117 @@ mod tests {
             .map(|(m, ..)| m.clone())
             .unwrap_or_default();
         assert!(status.contains("cannot contain"), "{status}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_scene_path_only_ron_under_assets() {
+        let root = std::path::Path::new("project");
+        assert!(content::is_scene_path(
+            root,
+            &root.join("assets/scenes/a.RON")
+        ));
+        assert!(!content::is_scene_path(
+            root,
+            &root.join("config/input.ron")
+        ));
+        assert!(!content::is_scene_path(
+            root,
+            &root.join("assets/models/a.glb")
+        ));
+    }
+
+    fn scene_file(root: &std::path::Path) -> std::path::PathBuf {
+        let scene = root.join("assets/scenes/level.ron");
+        std::fs::create_dir_all(scene.parent().unwrap()).unwrap();
+        std::fs::write(&scene, "(version: 4, entities: [], name_counter: 0)").unwrap();
+        scene
+    }
+
+    #[test]
+    fn opening_a_scene_asks_first_and_dont_save_loads() {
+        let (mut editor, mut world, root) = browser_project("open_scene");
+        let scene = scene_file(&root);
+        editor
+            .content
+            .request(content::BrowserRequest::Open(scene.clone()));
+        editor.apply_content_requests(&mut world);
+        assert_eq!(editor.confirm_open, Some(scene.clone()));
+        assert!(editor.pending_operation.is_none());
+        editor.resolve_open(&mut world, OpenChoice::DontSave);
+        assert!(
+            matches!(editor.take_pending_operation(), Some(PendingOperation::Load(p)) if p == scene)
+        );
+        assert!(editor.confirm_open.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn opening_a_scene_while_playing_is_refused() {
+        let (mut editor, mut world, root) = browser_project("open_playing");
+        let scene = scene_file(&root);
+        world.insert_resource(SimulationState::Playing);
+        editor.content.request(content::BrowserRequest::Open(scene));
+        editor.apply_content_requests(&mut world);
+        editor.resolve_open(&mut world, OpenChoice::DontSave);
+        assert!(editor.take_pending_operation().is_none());
+        let status = editor
+            .status_message
+            .as_ref()
+            .map(|(m, ..)| m.clone())
+            .unwrap_or_default();
+        assert!(status.contains("Stop playing"), "{status}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_choice_needs_a_current_scene() {
+        let (mut editor, mut world, root) = browser_project("open_save");
+        let scene = scene_file(&root);
+        editor
+            .content
+            .request(content::BrowserRequest::Open(scene.clone()));
+        editor.apply_content_requests(&mut world);
+        assert!(!editor.open_scene_can_save());
+        editor.resolve_open(&mut world, OpenChoice::Save);
+        assert!(editor.take_pending_operation().is_none());
+        // With a current scene, Save writes it and then loads.
+        let current = root.join("assets/scenes/current.ron");
+        editor.set_current_scene(current.clone());
+        editor
+            .content
+            .request(content::BrowserRequest::Open(scene.clone()));
+        editor.apply_content_requests(&mut world);
+        assert!(editor.open_scene_can_save());
+        editor.resolve_open(&mut world, OpenChoice::Save);
+        assert!(current.exists());
+        assert!(
+            matches!(editor.take_pending_operation(), Some(PendingOperation::Load(p)) if p == scene)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dropped_files_import_into_current_folder() {
+        let (mut editor, mut world, root) = browser_project("dropped");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("crate.glb"), b"x").unwrap();
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            editor.build_ui(&mut world, ui)
+        });
+        let input = egui::RawInput {
+            dropped_files: vec![egui::DroppedFile {
+                path: Some(outside.join("crate.glb")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| editor.build_ui(&mut world, ui));
+        let imported = root.join("assets/crate.glb");
+        assert!(imported.exists());
+        assert!(melon_core::meta_path(&imported).exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -10,7 +10,7 @@ Current state and planned work: `docs/ROADMAP.md`.
 | `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera. No GPU or window code. |
 | `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache`) records sun shadow pass, 3D pass into HDR target, tonemap pass; `ui_pass` for the editor. |
 | `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource) and ECS sync systems. |
-| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), asset `.meta` files (`asset_db.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), Project Settings window (`project_settings.rs`). |
+| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), asset `.meta` files (`asset_db.rs`), file operations (`asset_ops.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), Project Settings window (`project_settings.rs`). |
 | `crates/melon_game` | Game logic as an `rlib` + `dylib`, hot-reloaded in dev builds. |
 | `crates/melon_host` | Binary: winit event loop, input mapping, frame order (core update, editor, extract, render_scene, ui pass). No render pass code. |
 | `assets/models` | glTF models. `cube.glb` loads at startup. |
@@ -129,7 +129,9 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   asset. Rename or move an asset only together with its `.meta` (in the
   editor, or both files in Explorer), or references to it break. The
   editor's `asset_db::reconcile` writes missing `.meta` files at startup;
-  `melon_core` only reads them (`AssetServer::scan_metas`).
+  `melon_core` only reads them (`AssetServer::scan_metas`). Editor file
+  operations go through `melon_editor::asset_ops` (moves the `.meta`, keeps
+  the `AssetServer` paths, then `reconcile`). Scenes live in `assets/scenes`.
 - **Scene format.** RON, `SCENE_VERSION = 4` in `melon_editor/src/scene.rs`:
   `parent` is an index into `entities`, `transform` is local (versions 1 and 2
   still load, all roots). `model` is the path (`#mesh<N>` included) and

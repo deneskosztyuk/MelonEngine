@@ -136,6 +136,14 @@ pub struct AssetDrag {
     pub model: Option<String>,
 }
 
+/// A scene file: `.ron` (any case) under `<project_root>/assets`.
+pub fn is_scene_path(project_root: &Path, path: &Path) -> bool {
+    path.starts_with(project_root.join("assets"))
+        && path
+            .extension()
+            .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("ron"))
+}
+
 /// A file the asset pipeline can load as a model.
 pub fn is_model_path(path: &str) -> bool {
     let path = path.to_lowercase();
