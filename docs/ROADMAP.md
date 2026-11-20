@@ -1,38 +1,215 @@
 # MelonEngine Roadmap
 
-State of the engine as of 2026-11-20 (commit `e7df3e6`), and what is still
-missing for a core 3D engine that can make 3D games. Update this file when
-an item lands.
+State of the engine as of 2026-11-20 (`roadmap` branch), and what is still
+missing for a core 3D engine that can make and ship 3D games. Update this
+file when an item lands. Details of how each feature works live in
+`AGENTS.md`.
+
+Each roadmap item keeps its priority number (P1-P10): P1-P6 are the minimum
+to make any 3D game, P7-P9 are needed to ship one, P10 comes after.
+
+Status marks:
+
+- ✅ done: built, covered by automated tests, reviewed.
+- 🧪 done, manual check pending: the 2026-11-20 orchestrated run (P2, P3,
+  P4, P6, P9); every automated test passes, but nobody has used it in the
+  editor yet.
+- 🟡 partial: usable, with the named pieces missing.
+- ❌ not started.
 
 ## Done
 
-| Crate | What exists |
-|---|---|
-| `melon_core` | `Core` wraps a bevy_ecs `World` + stage schedules (`PreUpdate`, `FixedUpdate` at 1/60 s, `Update`, `PostUpdate`) with interpolated rendering. Transform hierarchy (`ChildOf` / `Children`, `GlobalTransform`). Assets: `Handle<Model>`, `AssetServer` (GUIDs from `.meta` sidecars, file hot reload). Input: all keys, mouse buttons and wheel, `just_pressed` / `just_released`, action mapping (`Actions` / `InputMap`), editor/game input focus. Plugin API (`App`, `Plugin`) with an ABI fingerprint. One `Camera` resource, one directional `Light`, `Environment` (sky, fog, GI/AO/bloom look), `RenderQuality` (presets, profiles in `config/quality.ron`), `Time`, `SimulationState`. |
-| `melon_render` | wgpu forward renderer. Frame: sun shadow pass (directional shadow map, 3x3 PCF), GI (DDGI voxel probes or SSGI, modular), SSAO (depth/normal prepass), sky, 3D pass into an HDR target (MSAA 1/2/4 from `RenderQuality`), bloom, ACES tonemap, overlay pass (gizmos). glTF metallic-roughness PBR (normal maps, emissive), instanced draws from a storage buffer with CPU frustum culling, GPU pass timings. glTF loading (node tree, multiple meshes, materials), bounds from accessors, model thumbnails (auxiliary views). `extract` → `FrameData`, offscreen `ViewportTarget`. |
-| `melon_physics` | rapier3d under data components (`RigidBody`, `Collider` box / sphere / capsule / mesh with layers and triggers, `CharacterController`, `Joint`) kept in sync by `sync_components`; ray, sphere-cast and overlap queries (`PhysicsQueries`) and collision / trigger events for game code; green collider outlines in the Scene view. |
-| `melon_audio` | kira playback: `AudioSource` / `AudioListener`, distance attenuation and pan, buses with volume and mute, one-shots, editor clip preview; silent without a device. |
-| `melon_editor` | egui + egui_dock editor: dockable panels (Hierarchy, Scene, Inspector, Content Browser, Console) with a saved layout, menu bar, toolbar, status bar, theme. Move / Rotate / Scale gizmos with plane handles and snapping. Play / Pause / Step / Stop with a scene snapshot. RON scenes (version 6, GUID + path references). Project Settings (input mapping, quality, audio buses). Audio clip preview in the Content Browser. Content Browser: folder tree, tiles/list, search, type filter, favorites, file operations carrying `.meta`, references check, live updates, Asset card in the Inspector, thumbnails, Ctrl+Space Content Drawer. |
-| `melon_game` | Game plugin with two demo systems, live-reloaded in dev builds. |
-| `melon_host` | winit event loop, frame order, game plugin loader (dev) / static plugin (ship). |
+### Core & ECS
 
-Tooling: `just gate` (fmt + clippy `-D warnings` + check), `unsafe_code` denied
-outside the plugin loader, unit tests, headless egui tests and GPU tests.
+- ✅ `Core`: bevy_ecs `World` + stage schedules (`PreUpdate`, `FixedUpdate`
+  at 1/60 s, `PhysicsStep`, `FixedPostUpdate`, `Update`, `PostUpdate`) with
+  interpolated rendering (`PreviousTransform`).
+- ✅ Transform hierarchy (`ChildOf` / `Children`, `GlobalTransform`, world
+  poses everywhere), explicit root order (`RootOrder`).
+- ✅ Input: all keys, mouse buttons and wheel, action mapping (`Actions` /
+  `InputMap`, `config/input.ron`), editor / game input focus.
+- ✅ Plugin API with an ABI fingerprint; the game plugin live-reloads in dev
+  builds and links statically in ship builds.
+- ✅ P1 Component reflection / registry: one registry drives the Inspector
+  (cards, Add / Remove Component, payload enums with per-variant defaults)
+  and scene files; an agent can build levels as RON data.
+- 🧪 Runtime scenes (P9): scene save / load in `melon_core::scene` (format
+  v6, per-entity `uid`, GUID + path references, v1-v5 still load), game
+  code requests scene changes (`SceneRequests`), `KeepOnSceneLoad`, `Cursor`
+  and `AppExit` for games.
 
-## Known bugs
+### Editor
 
-1. **README is stale.** Says "v0.1 — released" and links `LICENSE-MIT` /
-   `LICENSE-APACHE`, which do not exist.
+- ✅ egui + `egui_dock` (ADR-0001): dockable panels with a saved layout,
+  menu bar, toolbar, status bar, theme tokens.
+- ✅ Scene view: Unity camera controls, click select, grid, axes, selection
+  box, Move / Rotate / Scale gizmos with plane handles and snapping, FPS and
+  orientation overlays.
+- ✅ Play / Pause / Step / Stop with a scene snapshot and restore.
+- ✅ Hierarchy with search; Inspector built from the registry.
+- ✅ Content Browser: GUID `.meta` files, folder tree, tiles / list, search,
+  type filter, favorites, file operations, live updates, Asset card,
+  thumbnails, Ctrl+Space Content Drawer.
+- ✅ Console: readable rows, search, collapse, selection, copy, a log file
+  (`.melon/logs/editor.log`).
+- ✅ Project Settings: input mapping, Quality (presets, profiles, cost bar).
+- 🧪 P2 Undo / Redo: snapshot history for every edit, History panel,
+  Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z; inline rename (F2, double-click);
+  duplicate (Ctrl+D, `Name (N)`); Hierarchy right-click menu (Rename,
+  Duplicate, Delete, Create Child).
+- ✅ Frame pacing: Mailbox with a refresh-rate cap (FIFO fallback), DX12
+  first on Windows, frames drawn from `about_to_wait` and from overdue
+  event callbacks (a moving 1000 Hz mouse no longer stalls frames),
+  `MELON_FRAME_STATS=1` with per-frame stall timelines.
+
+### Rendering
+
+- ✅ wgpu forward renderer: HDR target, ACES tonemap, MSAA 1/2/4, overlay
+  pass, GPU pass timings, instanced draws with CPU frustum culling (no
+  entity cap), model thumbnails.
+- ✅ PBR metallic-roughness (glTF factors and textures, normal maps,
+  emissive with `KHR_materials_emissive_strength`).
+- ✅ GI: DDGI (voxel probes) or SSGI, switchable per frame; SSAO; bloom;
+  procedural sky with fog.
+- ✅ Quality settings: `RenderQuality` presets and profiles, live switches
+  and in-place rebuilds (shadow map size, MSAA), `Environment` is the look
+  only.
+- 🧪 P3 Materials and textures: `Handle<Texture>` / `Handle<Material>`
+  (`.mat` files, GUID texture references), mipmaps and 8x anisotropy,
+  `MeshMaterials` per part, alpha Mask (alpha-to-coverage under MSAA) and
+  sorted Blend; editor: Create > Material, live material card with texture
+  pickers and colour pickers, material thumbnails, drag-drop assignment,
+  glTF "Extract Materials".
+- 🧪 P3 Point and spot lights: components, clustered forward (16x9x24
+  froxels, per-cluster sphere culling, overflow reported), up to 256 / 512
+  lights per quality, viewport icons and range outlines.
+- 🧪 P3 Image-based ambient: SH9 irradiance, prefiltered specular, BRDF LUT,
+  from the procedural sky or an HDR equirect.
+- 🧪 P3 Shadows: 1-4 cascaded sun shadows (texel snapping, blended
+  transitions, shadow distance); point / spot shadows in an atlas with a
+  per-quality cap; DDGI injects the sun through its own volume-fitted
+  shadow map and injects shadowed local lights.
+- 🧪 P3 LOD: `Lod` component with screen-height levels, hysteresis and
+  culling below the last level.
+
+### Physics
+
+- 🧪 P4 Data components kept in sync with rapier3d: `RigidBody`
+  (dynamic / fixed / kinematic), `Collider` (box, sphere, capsule, mesh;
+  friction, restitution, sensor, named layers), children colliders on the
+  nearest ancestor body.
+- 🧪 P4 Queries (ray cast, ray cast all, sphere cast, overlaps) and
+  collision / trigger events for game code; `Velocity`, impulses, forces,
+  teleport.
+- 🧪 P4 Character controller (grounded, steps, slopes) and joints (fixed,
+  hinge, ball, slider; auto anchors).
+- 🧪 P4 Project Settings > Physics (gravity, 32 named layers); collider and
+  sensor outlines in the Scene view.
+
+### Audio
+
+- 🧪 P6 kira playback: `AudioSource` / `AudioListener`, 3D attenuation and
+  pan, buses with volume and mute (`config/audio.ron`, Project Settings >
+  Audio), one-shots for game code, clip preview in the Content Browser,
+  bus dropdown and clip picker in the Inspector; silent without a device.
+
+### Assets & Packaging
+
+- ✅ `AssetServer`: handles, GUIDs from `.meta` sidecars, file hot reload,
+  glTF node trees and per-mesh unpacking.
+- 🧪 P9 Ship builds: player mode (no editor linked), Project Settings >
+  Player (`config/player.ron`), `game.pak` asset pack (`.gltf` with external
+  files supported), File > Build (cancel, remembered output folder, Open
+  Folder / Run) and `just package <out>`, FXC shaders and a static C
+  runtime so the game runs without the Windows SDK, `--frames N` smoke run.
+
+### Tooling & Agent-friendliness
+
+- ✅ `just gate` (fmt, clippy `-D warnings`, check, also for the player
+  build), `just test`, `just test-fxc`; `unsafe_code` denied outside the
+  plugin loader; unit, headless egui and GPU tests.
+- ✅ `AGENTS.md` with architecture, commands, conventions and gotchas.
+- ✅ Render `snapshot` example (review scenes, quality flags, GPU timings).
+
+## Partially done
+
+### Rendering
+
+- 🟡 Post-processing: bloom, SSAO, ACES; no exposure control (auto or
+  manual). The default look is hazy (bright horizon colour, fog 0.01,
+  ambient 0.2); worth a look-pass with exposure.
+- 🟡 Blended materials cast no shadows and take AO from the surface behind
+  them; an HDR sky feeds GI misses as a two-colour approximation.
+- 🟡 Local shadows: more than 512 casters in one shadow tile drop the rest;
+  per-view instance lists still repeat matrices per view.
+
+### Editor
+
+- 🟡 Profiler: GPU pass timings and `MELON_FRAME_STATS`; no profiler view
+  over the `tracing` spans.
+- 🟡 Light components have no intensity units and no 3D gizmo handles for
+  range or cone angle.
+
+### Assets & Packaging
+
+- 🟡 Import pipeline: glTF, images, audio with fixed rules; no per-asset
+  import settings.
+- 🟡 Packaging: Windows only; no custom exe icon or version stamp; each
+  build also compiles the unused `melon_game` dylib.
+
+### Tooling & Agent-friendliness
+
+- 🟡 Headless runner + screenshot capture: the render `snapshot` example and
+  the player's `--frames N` exist; no general headless run of a scene file.
+
+## Not done
+
+### Core & ECS
+
+- ❌ Prefabs (built on the component registry).
+
+### Rendering
+
+- ❌ P8 Cameras as components, several cameras, and a Game view next to the
+  Scene view (needs per-view uniform and instance buffers first; see
+  AGENTS.md "One main render_scene per submit").
+- ❌ P10 Particles.
+- ❌ P10 Shader hot reload.
+
+### Animation
+
+- ❌ P5 glTF skinning, animation clips, blending.
+
+### UI
+
+- ❌ P7 In-game UI and text, plus a debug-draw API.
+
+### Editor
+
+- ❌ P10 Gizmo local / world toggle.
+
+### Gameplay
+
+- ❌ P10 Navigation mesh.
+- ❌ P10 Networking (not core for a first game).
+
+### Tooling & Agent-friendliness
+
+- ❌ Runtime console (stdin or socket) to query and edit world state.
+
+### Docs & known bugs
+
+- ❌ README is stale: says "v0.1 — released" and links `LICENSE-MIT` /
+  `LICENSE-APACHE`, which do not exist.
 
 Fixed earlier: Play/Pause unreachable, physics tied to frame rate, demo
 systems ignoring `Time`, no asset system, flattened glTF tree, host doing too
-much, game systems in the host, scene load crash, 1024 entity cap (instance
-storage buffer).
+much, game systems in the host, scene load crash, 1024 entity cap, editor
+frames stalled 100-400 ms while the mouse moved (blamed on SSGI at first).
 
 ## Compared with Unreal, Unity and Godot
 
-Core features all three share, and where MelonEngine stands (✅ done,
-🟡 partial, ❌ missing).
+Core features all three share, and where MelonEngine stands.
 
 | Area | Feature | MelonEngine |
 |---|---|---|
@@ -41,172 +218,35 @@ Core features all three share, and where MelonEngine stands (✅ done,
 | Runtime | Gameplay code with hot reload | ✅ Rust plugin |
 | Runtime | Input action mapping | ✅ |
 | Runtime | Reflection / component registry | ✅ |
-| Runtime | Scene save / load | ✅ |
+| Runtime | Scene save / load, runtime scene changes | 🧪 |
 | Runtime | Prefabs | ❌ |
 | Assets | Stable asset IDs, watched folder | ✅ |
-| Assets | Import pipeline with settings | 🟡 glTF only, no settings |
-| Rendering | PBR materials, normal maps | ✅ |
-| Rendering | Directional, point, spot lights | 🟡 one directional |
-| Rendering | Shadows (cascades, point/spot) | 🟡 one fixed sun map |
-| Rendering | Global illumination / ambient | ✅ DDGI or SSGI, hemisphere sky |
-| Rendering | Sky / environment | ✅ procedural sky, fog |
-| Rendering | Post-processing (bloom, AO, exposure) | 🟡 bloom, SSAO, ACES; no exposure |
-| Rendering | Anti-aliasing | ✅ MSAA 1/2/4 |
-| Rendering | Culling, instancing, LOD | 🟡 no LOD |
+| Assets | Import pipeline with settings | 🟡 fixed rules, no settings |
+| Rendering | PBR materials, textures, material assets | 🧪 |
+| Rendering | Directional, point, spot lights | 🧪 |
+| Rendering | Shadows (cascades, point/spot) | 🧪 |
+| Rendering | Global illumination / ambient | ✅ DDGI or SSGI, IBL 🧪 |
+| Rendering | Sky / environment | ✅ procedural sky, fog; HDR sky 🧪 |
+| Rendering | Post-processing (bloom, AO, exposure) | 🟡 no exposure |
+| Rendering | Anti-aliasing | ✅ MSAA 1/2/4, alpha-to-coverage 🧪 |
+| Rendering | Culling, instancing, LOD | 🧪 |
 | Rendering | Particles | ❌ |
 | Rendering | Shader hot reload | ❌ |
 | Rendering | Cameras as components, several cameras | ❌ |
 | Animation | Skeletal animation, blending | ❌ |
-| Physics | Rigid bodies, shapes | ✅ |
-| Physics | Ray casts, triggers, collision events | ✅ |
-| Physics | Character controller, joints | ✅ |
-| Audio | Playback, 3D sound, mixing | ✅ (no effects, no reverb zones) |
+| Physics | Rigid bodies, shapes | 🧪 |
+| Physics | Ray casts, triggers, collision events | 🧪 |
+| Physics | Character controller, joints | 🧪 |
+| Audio | Playback, 3D sound, mixing | 🧪 (no effects, no reverb zones) |
 | UI | In-game UI and text | ❌ |
 | Gameplay | Navigation mesh | ❌ |
 | Gameplay | Networking | ❌ (not core for a first game) |
 | Editor | Viewport, gizmos, snapping | ✅ (no local/world toggle) |
 | Editor | Hierarchy, inspector | ✅ |
 | Editor | Content browser | ✅ |
-| Editor | Undo / redo | ✅ |
+| Editor | Undo / redo | 🧪 |
 | Editor | Play in editor | ✅ |
 | Editor | Game view | ❌ |
 | Editor | Console / log | ✅ |
 | Editor | Profiler | 🟡 GPU pass timings only |
-| Shipping | Release build, asset packaging | ✅ player mode, `game.pak`, File > Build, `just package` |
-
-## Missing, in priority order
-
-Priorities 1–6 are the minimum to make any 3D game; 7–9 are needed to ship
-one; 10 comes after.
-
-1. - [x] **Component reflection / registry.** One registry drives the
-      Inspector (cards, Add / Remove Component) and scene files (format v5,
-      no hand-listed `SceneEntity`); an agent can build levels as RON data.
-      Next step: prefabs, built on the same registry.
-2. - [x] **Undo / Redo** (snapshot history, `history.rs`), plus entity rename and duplicate.
-3. - [x] **Rendering:** `Handle<Texture>` / `Handle<Material>` assets (`.mat`
-      files, `MeshMaterials` per part, alpha mask / blend); point and spot
-      lights (clustered forward); image-based ambient (procedural or HDR
-      sky); cascaded sun shadows; point/spot shadows (atlas, DDGI
-      injection); `Lod` component. Editor: material-on-sphere thumbnails,
-      drag-drop assignment, glTF "Extract Materials". (Done; see AGENTS.md
-      "Rendering" notes.)
-4. - [x] **Physics:** sphere / capsule / trimesh shapes, ray cast and query
-      API, triggers and collision events, character controller, joints.
-      (Done; see AGENTS.md "Physics".)
-5. - [ ] **Animation:** glTF skinning, clips, blending.
-6. - [x] **Audio:** `AudioSource` / `AudioListener` components, 3D
-      attenuation and pan, buses (`config/audio.ron`), clip preview, kira.
-7. - [ ] **In-game UI and text**, plus a debug-draw API.
-8. - [ ] **Cameras as components**, several cameras, and a Game view next to
-      the Scene view.
-9. - [x] **Asset packaging** for ship builds: scenes in `melon_core`, player mode
-      (`--no-default-features`), `config/player.ron`, `game.pak`, File > Build
-      and `just package`, `--frames N` smoke run (spec
-      `docs/superpowers/specs/2026-11-20-packaging-design.md`).
-10. - [ ] **Later:** particles, navigation mesh, profiler integration
-      (tracing spans exist), shader hot reload, exposure, gizmo local/world toggle, networking.
-
-### Foundation (done)
-
-- [x] Fixed-timestep stages with interpolated rendering.
-- [x] Play / Pause / Stop with scene snapshot and restore.
-- [x] Asset handles, `AssetServer`, hot reload, GUIDs in `.meta` files.
-- [x] Transform hierarchy with world poses everywhere, scene format v4.
-- [x] Render extraction in `melon_render`.
-- [x] Full input with action mapping and editor/game focus.
-- [x] Plugin API; the game plugin live-reloads in dev builds.
-- [x] One editor UI: egui + `egui_dock` (ADR-0001).
-- [x] Content Browser (`docs/superpowers/specs/2026-11-20-content-browser-design.md`):
-      GUIDs, tree / tiles / search / filter / favorites, file operations,
-      live updates and Inspector, thumbnails, Content Drawer.
-
-### Graphics tier (done)
-
-- [x] PBR metallic-roughness materials, normal maps: glTF factors and
-      textures per primitive (base colour, metallic-roughness, normal,
-      emissive), tangents read or generated, Cook-Torrance sun plus sky
-      ambient specular.
-- [x] Directional (sun) shadow map with 3x3 PCF, no culling, slope bias and
-      normal-offset sampling (no light leaks at contact seams).
-- [x] Hemisphere ambient: sky and ground colours on `Light`.
-- [x] HDR target + ACES tonemap pass.
-- [x] Bloom: no threshold, 13-tap downsample (Karis average first) and
-      3x3 tent upsample over a half-resolution mip chain of up to 6
-      levels, mixed into the HDR colour before tonemapping.
-      `Environment::bloom_intensity` (default 0.08, 0 skips the passes).
-      glTF emissive strength (`KHR_materials_emissive_strength`).
-- [x] MSAA 1/2/4 from `RenderQuality::msaa` (default 4).
-- [x] DDGI (dynamic diffuse GI), software voxel tracing: 128x64x128 voxel
-      radiance volume (0.3125 m) voxelised each frame in three orthographic
-      passes, 16x8x16 probes (2.5 m) tracing 64 rays each per frame (3D
-      DDA), octahedral irradiance (8x8) and distance moments (16x16) with
-      hysteresis 0.97, Chebyshev plus voxel-march visibility, multi-bounce
-      through the voxels; ray misses read the hemisphere sky light, so open
-      surfaces match GI off. Replaces the hemisphere diffuse inside the
-      volume.
-      `Environment::gi_intensity` (default 1, 0 skips the passes). Limits:
-      fixed 40 x 20 x 40 m volume at the origin; walls under 0.35 m leak;
-      hard edges where one probe dominates; about +2.2 to 2.4 ms on the dev GPU.
-- [x] GI modes: `RenderQuality::gi_mode` (`Off`, `Ssgi`, `Ddgi`, default
-      `Ddgi`), switchable frame to frame; `gi/` front with one module per
-      backend and one mesh pipeline variant per mode.
-- [x] SSGI: half-resolution screen-space diffuse GI, 6 cosine rays per
-      pixel marching the prepass, hits read last frame's HDR colour
-      (reprojected), misses the hemisphere sky light; reprojected history
-      with disocclusion rejection, 5x5 depth/normal-aware denoise. About
-      +0.5 to 0.9 ms on the dev GPU. Limits: only what is on screen
-      bounces; one frame of lag.
-- [x] SSAO: single-sample depth/normal prepass, 16-sample hemisphere AO
-      with range check, 4x4 depth-aware blur, full resolution; occludes
-      ambient diffuse and specular only. `Environment::ao_strength` /
-      `ao_radius`; strength 0 skips the passes.
-- [x] Skybox: procedural sky (horizon/zenith gradient, sun disc) from the
-      `Environment` resource, plus exponential distance fog in the horizon
-      colour.
-- [x] Instancing: group 1 is a growable storage buffer of per-instance
-      records; one instanced draw per (model, part) in the prepass, shadow
-      and 3D passes. CPU frustum culling (camera planes for the camera
-      passes, the shadow box for the shadow pass). `render_scene` returns
-      `RenderStats`. Fixed the 1024 entity cap.
-
-### Editor rendering and pacing
-
-- [x] Viewport basics: scene renders inside its panel, Unity camera controls,
-      click select, grid + axes + selection box, MSAA, FPS and
-      orientation overlays.
-- [x] Pick the UI library: egui + `egui_dock` (see `docs/adr/0001-editor-ui-library.md`).
-- [x] Layout redesign: dockable tabbed panels (saved layout), menu bar,
-      toolbar, status bar, theme, console from `tracing`, content browser,
-      hierarchy search, Step.
-- [x] Editor frame pacing: raw device events only while the game has
-      input, Mailbox present with a refresh-rate frame cap (FIFO fallback,
-      `MELON_PRESENT=fifo`), `MELON_FRAME_STATS=1` timing line; DX12
-      first on Windows for Mailbox (`MELON_BACKEND=vulkan|dx12|auto`).
-- [x] Quality settings (part a): `RenderQuality` presets, profiles,
-      `config/quality.ron`, Project Settings ▸ Quality panel.
-- [x] Quality settings part b: the renderer reads `RenderQuality` (GI/AO/bloom
-      live; shadow map 1024/2048/4096 and MSAA 1/2/4 rebuilt in place,
-      pipelines cached per sample count; present mode Vsync / Mailbox +
-      cap); `Environment` is the look only; SSGI textures allocated only
-      while SSGI runs; default = High.
-- [x] GPU timings: timestamp queries between the passes, async readback
-      ring, 1 s averages into `RenderTimings` (Quality panel cost bar).
-- [x] Frame cap sleeps at the frame start instead of `WaitUntil` (drag
-      stutter with Mailbox).
-- [x] SSGI at editor size: `RenderQuality::ssgi_resolution` (Half / Quarter,
-      Medium = Quarter), geometry pass + `R16Float` march texture; at
-      2880x1659 GI 3.6-5.8 ms -> 1.5-2.4 (half), 0.35-0.55 (quarter).
-      `MELON_FRAME_STATS` splits `other` into events / sleep / rest and
-      prints the GPU total; snapshot `--size WxH`, `--ssgi-res`.
-- [ ] Find the 100-330 ms SSGI stalls from a run with the split stats.
-
-## Agent-friendliness
-
-- [x] `AGENTS.md` with architecture, commands and conventions.
-- [ ] Headless runner + screenshot capture command, so an agent can verify
-      rendering. `Core` already runs without a window. Partly done: the
-      `snapshot` example renders a fixed review scene to a PNG offscreen
-      (no world or scene file yet).
-- [x] Component registry so an agent can build levels as RON data (priority 1).
-- [ ] Runtime console (stdin or socket) to query and edit world state.
+| Shipping | Release build, asset packaging | 🧪 player mode, `game.pak`, File > Build |
