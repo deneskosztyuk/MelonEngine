@@ -6348,6 +6348,15 @@ mod tests {
         server: &mut melon_core::AssetServer,
         slabs: &[(glam::Vec3, glam::Vec3, Option<&str>)],
     ) -> Vec<u8> {
+        render_slabs_in(r, server, slabs, plain_environment())
+    }
+
+    fn render_slabs_in(
+        r: &mut Renderer,
+        server: &mut melon_core::AssetServer,
+        slabs: &[(glam::Vec3, glam::Vec3, Option<&str>)],
+        environment: melon_core::Environment,
+    ) -> Vec<u8> {
         r.materials = Default::default();
         r.model_cache = ModelCache::new(&r.scene);
         let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
@@ -6355,7 +6364,7 @@ mod tests {
             view_proj: top_down_camera().view_proj(),
             eye: top_down_camera().eye,
             light: test_light(),
-            environment: plain_environment(),
+            environment,
             ..Default::default()
         };
         for (i, (size, at, material)) in slabs.iter().enumerate() {
@@ -7022,6 +7031,103 @@ mod tests {
             return Err(format!(
                 "packed assets: material {built}, texture {loaded}, sky {sky} (want all true)"
             ));
+        }
+        Ok(())
+    }
+
+    /// A masked-out slab must also vanish from the prepass: with AO on it
+    /// would otherwise darken the floor beside it.
+    fn check_masked_out_leaves_no_ao(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("mat_mask_ao");
+        write_mat(
+            &root,
+            "green",
+            "(base_color: (0.0, 0.8, 0.0, 1.0), metallic: 0.0, roughness: 0.8)",
+        );
+        write_mat(
+            &root,
+            "cut",
+            "(base_color: (0.8, 0.0, 0.0, 0.3), metallic: 0.0, roughness: 0.8, alpha_mode: Mask(cutoff: 0.5))",
+        );
+        let mut server = fresh_ids_server(root.clone(), 7800);
+        let floor = (
+            glam::Vec3::new(8.0, 0.2, 8.0),
+            glam::Vec3::new(0.0, -0.1, 0.0),
+            Some("green"),
+        );
+        let slab = (
+            glam::Vec3::new(3.0, 0.1, 3.0),
+            glam::Vec3::new(0.0, 0.3, 0.0),
+            Some("cut"),
+        );
+        let environment = melon_core::Environment {
+            ao_strength: 1.0,
+            ..plain_environment()
+        };
+        let probe = screen_px(top_down_camera().view_proj(), glam::Vec3::new(1.7, 0.0, 0.0));
+        let mut px = |slabs: &[_]| {
+            let pixels = render_slabs_in(r, &mut server, slabs, environment);
+            pixel_at(r, &pixels, probe)
+        };
+        let (ground, masked) = (px(&[floor]), px(&[floor, slab]));
+        let _ = std::fs::remove_dir_all(&root);
+        if ground != masked {
+            return Err(format!(
+                "a masked-out slab darkened the floor beside it: {ground:?} vs {masked:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Two blend panels submitted near first: the sort draws the far one
+    /// first, so the near (blue) one dominates the mix.
+    fn check_blend_sorted_far_to_near(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("mat_blend_sort");
+        let glass = |rgb: &str| {
+            format!(
+                "(base_color: ({rgb}, 0.5), metallic: 0.0, roughness: 0.8, alpha_mode: Blend)"
+            )
+        };
+        write_mat(&root, "blue", &glass("0.0, 0.0, 0.8"));
+        write_mat(&root, "red", &glass("0.8, 0.0, 0.0"));
+        let mut server = fresh_ids_server(root.clone(), 7900);
+        let panel = |height: f32, material| {
+            (
+                glam::Vec3::new(3.0, 0.1, 3.0),
+                glam::Vec3::new(0.0, height, 0.0),
+                Some(material),
+            )
+        };
+        let pixels = render_slabs(r, &mut server, &[panel(2.0, "blue"), panel(1.0, "red")]);
+        let [red, _, blue, _] = pixel_at(r, &pixels, CENTRE_PX);
+        let _ = std::fs::remove_dir_all(&root);
+        if blue <= red {
+            return Err(format!(
+                "the near blue panel should dominate: red {red}, blue {blue}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// A light off the view centre lights the floor under it, not its
+    /// mirror image (cluster tile rows and columns match the shader's).
+    fn check_off_centre_light_lights_its_own_floor(r: &mut Renderer) -> Result<(), String> {
+        let quality = melon_core::RenderQuality::default();
+        let view_proj = top_down_camera().view_proj();
+        let under = glam::Vec3::new(3.0, 0.0, -3.0);
+        let light = point_light(glam::Vec3::new(3.0, 1.5, -3.0), 20.0, 3.0);
+        let (pixels, _) = render_lit(r, vec![light], quality);
+        let lit = value_at(&pixels, screen_px(view_proj, under));
+        for (name, mirror) in [
+            ("x", glam::Vec3::new(-3.0, 0.0, -3.0)),
+            ("z", glam::Vec3::new(3.0, 0.0, 3.0)),
+        ] {
+            let other = value_at(&pixels, screen_px(view_proj, mirror));
+            if lit < other.saturating_add(50) {
+                return Err(format!(
+                    "light at (3, -3): floor under it {lit}, mirrored in {name} {other}"
+                ));
+            }
         }
         Ok(())
     }
@@ -8835,6 +8941,9 @@ mod tests {
                 }
             }),
             Box::new(check_packed_materials_textures_and_sky),
+            Box::new(check_masked_out_leaves_no_ao),
+            Box::new(check_blend_sorted_far_to_near),
+            Box::new(check_off_centre_light_lights_its_own_floor),
         ];
 
         #[cfg(target_os = "windows")]

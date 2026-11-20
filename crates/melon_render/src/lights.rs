@@ -206,7 +206,13 @@ pub fn build(
     let mut visible: Vec<(usize, [u32; 6], f32)> = lights
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.range > 0.0)
+        .filter(|(_, l)| {
+            l.range > 0.0
+                && l.range.is_finite()
+                && l.position.is_finite()
+                && l.color.is_finite()
+                && l.direction.is_finite()
+        })
         .filter_map(|(i, l)| {
             let range = grid.range_of(l.position, l.range)?;
             let importance = l.color.max_element() / (l.position.distance_squared(grid.eye) + 1.0);
@@ -529,6 +535,74 @@ mod tests {
         let at = |angle: f32| (angle.cos() * l.spot[0] + l.spot[1]).clamp(0.0, 1.0);
         assert!((at(0.3) - 1.0).abs() < 1e-4 && at(0.6).abs() < 1e-4 && at(0.45) > 0.3);
         assert_eq!(l.spot[2], 1.0);
+    }
+
+
+    #[test]
+    fn tiles_follow_the_screen_right_is_high_x_up_is_low_y() {
+        let g = grid();
+        let at = |p: Vec3| g.range_of(p, 0.5).unwrap();
+        let (right, left) = (at(Vec3::new(5.0, 0.0, -10.0)), at(Vec3::new(-5.0, 0.0, -10.0)));
+        assert!(left[1] < right[0], "left {left:?} right {right:?}");
+        let (up, down) = (at(Vec3::new(0.0, 3.0, -10.0)), at(Vec3::new(0.0, -3.0, -10.0)));
+        assert!(up[3] < down[2], "up {up:?} down {down:?}");
+    }
+
+    #[test]
+    fn a_light_straddling_a_slice_boundary_is_in_both_slices() {
+        let g = grid();
+        // Depth where slice 3 starts: near * exp(3 / depth_scale).
+        let boundary = g.near * (3.0 / g.depth_scale).exp();
+        let [.., z0, z1] = g.range_of(Vec3::new(0.0, 0.0, -boundary), 0.2).unwrap();
+        assert!(z0 <= 2 && z1 >= 3, "{z0}..{z1} at boundary depth {boundary}");
+    }
+
+    #[test]
+    fn broken_lights_are_dropped_not_shaded() {
+        let g = grid();
+        let good = point(Vec3::new(0.0, 0.0, -10.0), 3.0);
+        let bad = [
+            LocalLight { color: Vec3::splat(f32::NAN), ..good },
+            LocalLight { color: Vec3::splat(f32::INFINITY), ..good },
+            LocalLight { position: Vec3::new(f32::NAN, 0.0, -10.0), ..good },
+            LocalLight { range: f32::NAN, ..good },
+            LocalLight { range: f32::INFINITY, ..good },
+            LocalLight { range: 0.0, ..good },
+        ];
+        for l in bad {
+            let data = build(&g, &[l, good], 16, 4);
+            assert_eq!(data.source, [1], "{l:?}");
+            assert!(data.lights.iter().all(|l| l.color.iter().all(|c| c.is_finite())));
+        }
+    }
+
+    #[test]
+    fn a_spot_with_inner_at_or_past_outer_stays_finite() {
+        let g = grid();
+        for (inner, outer) in [(0.5, 0.5), (0.8, 0.4), (0.0, 0.0)] {
+            let spot = LocalLight {
+                spot: Some((inner, outer)),
+                ..point(Vec3::new(0.0, 0.0, -10.0), 5.0)
+            };
+            let l = build(&g, &[spot], 4, 0).lights[0];
+            assert!(l.spot.iter().all(|v| v.is_finite()), "{inner} {outer}: {:?}", l.spot);
+        }
+    }
+
+    #[test]
+    fn no_lights_and_one_over_the_cap() {
+        let g = grid();
+        let none = build(&g, &[], 16, 4);
+        assert!(none.lights.is_empty() && none.indices.is_empty() && none.dropped == 0);
+        assert_eq!(none.ranges.len(), CLUSTER_COUNT);
+        let many: Vec<_> = (0..=LIGHT_CAPACITY)
+            .map(|i| point(Vec3::new(i as f32 * 0.001, 0.0, -10.0), 1.0))
+            .collect();
+        let data = build(&g, &many, usize::MAX, 4);
+        assert_eq!(data.lights.len(), LIGHT_CAPACITY);
+        assert_eq!(data.dropped, 1);
+        assert!(data.indices.len() <= INDEX_CAPACITY);
+        assert!(data.indices.iter().all(|&i| (i as usize) < LIGHT_CAPACITY));
     }
 
     #[test]
