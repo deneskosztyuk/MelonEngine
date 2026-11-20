@@ -15,6 +15,7 @@ use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::query::{With, Without};
 use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
+use bevy_ecs::resource::Resource;
 use bevy_ecs::world::World;
 use ron::value::RawValue;
 use serde::de::DeserializeSeed;
@@ -572,6 +573,71 @@ pub fn save_scene(world: &mut World, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Scene changes game code asks for. A system calls `load`; `scene_requests_system`
+/// (first thing in `PreUpdate`, so the change lands between frames) replaces
+/// the scene with the file at that project-relative path, read through the
+/// `AssetServer` (the pack in a packaged game). A broken request is logged
+/// and the current scene stays.
+#[derive(Resource, Default)]
+pub struct SceneRequests {
+    pending: Option<String>,
+}
+
+impl SceneRequests {
+    /// Ask for `assets/scenes/level2.scene` (or any scene path) next frame.
+    /// A later request in the same frame replaces an earlier one.
+    pub fn load(&mut self, path: &str) {
+        self.pending = Some(path.to_string());
+    }
+
+    pub fn pending(&self) -> Option<&str> {
+        self.pending.as_deref()
+    }
+}
+
+/// Read a scene through the `AssetServer` (pack or disk) and parse it.
+pub fn read_scene_asset(server: &AssetServer, path: &str) -> Result<SceneData> {
+    let bytes = server
+        .read(path)
+        .with_context(|| format!("failed to read scene file: {path}"))?;
+    let text = std::str::from_utf8(&bytes).context("scene file is not UTF-8")?;
+    ron::from_str(text).context("failed to deserialize scene from RON")
+}
+
+/// Apply the pending `SceneRequests` entry, if any. Returns whether a scene
+/// was loaded.
+pub fn apply_scene_requests(world: &mut World) -> bool {
+    let Some(path) = world
+        .get_resource_mut::<SceneRequests>()
+        .and_then(|mut r| r.pending.take())
+    else {
+        return false;
+    };
+    let result = match world.get_resource::<AssetServer>() {
+        Some(server) => read_scene_asset(server, &path),
+        None => Err(anyhow!("no AssetServer")),
+    }
+    .and_then(|data| apply_scene(world, &data));
+    match result {
+        Ok(()) => {
+            tracing::info!("loaded scene {path}");
+            true
+        }
+        Err(error) => {
+            tracing::error!(
+                ?error,
+                "scene request {path} failed; keeping the current scene"
+            );
+            false
+        }
+    }
+}
+
+/// Exclusive `PreUpdate` system behind `SceneRequests`.
+pub fn scene_requests_system(world: &mut World) {
+    apply_scene_requests(world);
+}
+
 /// Read and parse a scene file (no world change).
 pub fn read_scene(path: &Path) -> Result<SceneData> {
     let contents = std::fs::read_to_string(path)
@@ -701,6 +767,7 @@ pub fn restore_entity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Core;
     use crate::bevy_reflect::{self, Reflect, std_traits::ReflectDefault};
     use crate::glam::{Quat, Vec3};
     use bevy_ecs::world::World;
@@ -876,6 +943,46 @@ mod tests {
             model_path_of(&mut world, "Ghost"),
             "assets/models/does_not_exist.glb"
         );
+    }
+    #[test]
+    fn requested_scene_applies_next_frame_and_replaces_the_old_one() {
+        use crate::Update;
+        let root = std::env::temp_dir().join(format!("melon_scene_req_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("assets/scenes")).unwrap();
+        // The scene to switch to: one entity "B".
+        let mut other = Core::new();
+        other.world.insert_resource(AssetServer::new(".".into()));
+        other.world.spawn((Name("B".into()), Transform::default()));
+        save_scene(&mut other.world, &root.join("assets/scenes/b.scene")).unwrap();
+
+        let mut core = Core::new();
+        core.world.insert_resource(AssetServer::new(root.clone()));
+        core.world.spawn((Name("A".into()), Transform::default()));
+        core.add_systems(Update, |mut r: bevy_ecs::system::ResMut<SceneRequests>| {
+            r.load("assets/scenes/b.scene");
+        });
+        let names = |w: &mut World| -> Vec<String> {
+            w.query::<&Name>().iter(w).map(|n| n.0.clone()).collect()
+        };
+
+        core.update(); // the system requests B during this frame
+        assert_eq!(names(&mut core.world), ["A"], "not applied mid-frame");
+        core.update(); // applied first thing in the next frame
+        assert_eq!(names(&mut core.world), ["B"], "A despawned, B spawned");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn broken_scene_request_keeps_the_current_scene() {
+        let mut core = Core::new();
+        core.world.spawn((Name("A".into()), Transform::default()));
+        core.world
+            .resource_mut::<SceneRequests>()
+            .load("assets/scenes/nope.scene");
+        core.update();
+        assert_eq!(core.world.query::<&Name>().iter(&core.world).count(), 1);
+        assert!(core.world.resource::<SceneRequests>().pending().is_none());
     }
     #[test]
     fn save_load_roundtrip() {

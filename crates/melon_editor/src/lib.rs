@@ -33,6 +33,7 @@ pub mod inspect;
 pub mod layout;
 pub mod physics_settings;
 pub mod play;
+pub mod player_settings;
 pub mod project_settings;
 pub mod quality_settings;
 pub mod scene;
@@ -798,6 +799,10 @@ impl Editor {
     /// The host loaded a broken `config/physics.ron`: the first Apply backs it up.
     pub fn set_physics_broken(&mut self, broken: bool) {
         self.project_settings.set_physics_broken(broken);
+    }
+    /// The host loaded a broken `config/player.ron`: the first Apply backs it up.
+    pub fn set_player_broken(&mut self, broken: bool) {
+        self.project_settings.set_player_broken(broken);
     }
 
     /// The host loaded a broken `config/audio.ron`: the first Apply backs it up.
