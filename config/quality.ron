@@ -1,0 +1,14 @@
+(
+    gi_mode: Ddgi,
+    ssgi_resolution: Half,
+    ao: true,
+    shadow_map_size: 1024,
+    msaa: 2,
+    bloom: true,
+    present: Vsync,
+    max_lights: 256,
+    cascades: 4,
+    shadow_distance: 60,
+    shadowed_lights: 16,
+    local_shadow_size: 1024,
+)

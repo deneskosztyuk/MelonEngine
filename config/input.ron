@@ -1,0 +1,43 @@
+(
+    version: 1,
+    actions: [
+        (
+            name: "MoveForward",
+            kind: Axis,
+            buttons: [],
+            axes: [
+                (
+                    positive: Key(W),
+                    negative: Key(S),
+                ),
+            ],
+        ),
+        (
+            name: "MoveRight",
+            kind: Axis,
+            buttons: [],
+            axes: [
+                (
+                    positive: Key(D),
+                    negative: Key(A),
+                ),
+            ],
+        ),
+        (
+            name: "Jump",
+            kind: Button,
+            buttons: [
+                Key(Space),
+            ],
+            axes: [],
+        ),
+        (
+            name: "Fire",
+            kind: Button,
+            buttons: [
+                Mouse(Left),
+            ],
+            axes: [],
+        ),
+    ],
+)

@@ -31,29 +31,29 @@
             model_guid: Some("761adfaa-d08c-483d-b4c2-3f5d51cfe5f4"),
             components: {
                 "melon_core::components::Aabb": (half_extents: (x: 2.13, y: 2.19, z: 2.235)),
-                "melon_core::components::Transform": (translation: (x: -18.0, y: 0.0, z: -16.0), rotation: (x: 0.0, y: 0.0, z: 0.0, w: 1.0), scale: (x: 2.3, y: 2.3, z: 2.3)),
+                "melon_core::components::Transform": (translation: (x: -17.221626, y: 0.0, z: -16.0), rotation: (x: 0.0, y: 0.0, z: 0.0, w: 1.0), scale: (x: 2.3, y: 2.3, z: 2.3)),
             },
             uid: Some("78e5b90d-3feb-411f-abd6-3d51f84eb253"),
         ),
         (
             name: "Oak",
-            parent: None,
+            parent: Some(2),
             model: Some("assets/demo/sich/oak_tree.glb"),
             model_guid: Some("761adfaa-d08c-483d-b4c2-3f5d51cfe5f4"),
             components: {
                 "melon_core::components::Aabb": (half_extents: (x: 2.13, y: 2.19, z: 2.235)),
-                "melon_core::components::Transform": (translation: (x: 17.5, y: 0.0, z: -18.0), rotation: (x: 0.0, y: 0.57357645, z: 0.0, w: 0.81915206), scale: (x: 2.1, y: 2.1, z: 2.1)),
+                "melon_core::components::Transform": (translation: (x: 15.434782, y: 0.0, z: -0.869565), rotation: (x: 0.0, y: 0.57357645, z: 0.0, w: 0.819152), scale: (x: 0.91304356, y: 0.9130435, z: 0.91304356)),
             },
             uid: Some("2010b6c9-ec40-43c7-9482-167d66176bc1"),
         ),
         (
             name: "Oak",
-            parent: None,
+            parent: Some(2),
             model: Some("assets/demo/sich/oak_tree.glb"),
             model_guid: Some("761adfaa-d08c-483d-b4c2-3f5d51cfe5f4"),
             components: {
                 "melon_core::components::Aabb": (half_extents: (x: 2.13, y: 2.19, z: 2.235)),
-                "melon_core::components::Transform": (translation: (x: -18.5, y: 0.0, z: 15.5), rotation: (x: 0.0, y: 0.9396926, z: 0.0, w: 0.34202015), scale: (x: 2.4, y: 2.4, z: 2.4)),
+                "melon_core::components::Transform": (translation: (x: -0.21739244, y: 0.0, z: 13.695652), rotation: (x: 0.0, y: 0.9396926, z: 0.0, w: 0.34202018), scale: (x: 1.0434784, y: 1.0434784, z: 1.0434784)),
             },
             uid: Some("a6519580-9105-48b4-9ee4-22c7ef0386e5"),
         ),
@@ -185,7 +185,7 @@
             model_guid: Some("c81bd0e0-f0bf-4a21-beea-a764fee97c0c"),
             components: {
                 "melon_core::components::Aabb": (half_extents: (x: 0.455, y: 0.52, z: 0.46)),
-                "melon_core::components::Transform": (translation: (x: -8.5, y: 0.0, z: 15.0), rotation: (x: 0.0, y: 0.25881904, z: 0.0, w: 0.9659258), scale: (x: 1.2, y: 1.2, z: 1.2)),
+                "melon_core::components::Transform": (translation: (x: -10.76818, y: 0.0, z: 16.309534), rotation: (x: 0.0, y: 0.2588191, z: 0.0, w: 0.9659258), scale: (x: 1.1999999, y: 1.2, z: 1.1999999)),
             },
             uid: Some("95e26916-06a0-47d0-9d3f-516389a8c353"),
         ),
@@ -448,8 +448,8 @@
             model: None,
             model_guid: None,
             components: {
-                "melon_core::components::Transform": (translation: (x: 1.8, y: 1.9, z: 1.4), rotation: (x: 0.0, y: 0.0, z: 0.0, w: 1.0), scale: (x: 1.0, y: 1.0, z: 1.0)),
-                "melon_core::local_lights::PointLight": (color: (x: 1.0, y: 0.62, z: 0.3), intensity: 34.0, range: 9.0, cast_shadows: true),
+                "melon_core::components::Transform": (translation: (x: 1.3312997, y: 1.9, z: 2.2001643), rotation: (x: 0.0, y: 0.0, z: 0.0, w: 1.0), scale: (x: 1.0, y: 1.0, z: 1.0)),
+                "melon_core::local_lights::PointLight": (color: (x: 0.3, y: 0.51127267, z: 1.0), intensity: 34.0, range: 3.0, cast_shadows: true),
             },
             uid: Some("a0cdb0a5-e19b-4936-95d9-e216ed107f10"),
         ),
@@ -459,8 +459,8 @@
             model: None,
             model_guid: None,
             components: {
-                "melon_core::components::Transform": (translation: (x: -5.6, y: 2.1, z: -1.8), rotation: (x: 0.0, y: 0.0, z: 0.0, w: 1.0), scale: (x: 1.0, y: 1.0, z: 1.0)),
-                "melon_core::local_lights::PointLight": (color: (x: 1.0, y: 0.62, z: 0.3), intensity: 34.0, range: 9.0, cast_shadows: true),
+                "melon_core::components::Transform": (translation: (x: -5.5012136, y: 2.1281996, z: -1.4758918), rotation: (x: 0.0, y: 0.0, z: 0.0, w: 1.0), scale: (x: 1.0, y: 1.0, z: 1.0)),
+                "melon_core::local_lights::PointLight": (color: (x: 1.0, y: 0.62, z: 0.3), intensity: 34.0, range: 4.0, cast_shadows: true),
             },
             uid: Some("4204af30-484f-413e-b2a5-7e7805a8ce61"),
         ),
@@ -481,7 +481,7 @@
             model: None,
             model_guid: None,
             components: {
-                "melon_core::components::Transform": (translation: (x: 7.5, y: 5.5, z: -6.0), rotation: (x: -0.57357645, y: 0.0, z: 0.0, w: 0.81915206), scale: (x: 1.0, y: 1.0, z: 1.0)),
+                "melon_core::components::Transform": (translation: (x: 7.5, y: 9.402054, z: -3.7234137), rotation: (x: -0.5735765, y: 0.0, z: 0.0, w: 0.819152), scale: (x: 1.0, y: 1.0, z: 1.0)),
                 "melon_core::local_lights::SpotLight": (color: (x: 1.0, y: 0.85, z: 0.6), intensity: 80.0, range: 14.0, inner_angle: 0.3, outer_angle: 0.55, cast_shadows: true),
             },
             uid: Some("ca37281e-e446-403c-b5b5-95d46c47d840"),
@@ -564,7 +564,7 @@
             model_guid: Some("7c6f2c99-0320-4fb0-a42c-51855a4c62dc"),
             components: {
                 "melon_core::components::Aabb": (half_extents: (x: 0.715, y: 0.68, z: 0.94)),
-                "melon_core::components::Transform": (translation: (x: -10.0, y: 0.0, z: -6.0), rotation: (x: 0.0, y: 0.25881904, z: 0.0, w: 0.9659258), scale: (x: 4.5, y: 4.5, z: 4.5)),
+                "melon_core::components::Transform": (translation: (x: -9.937796, y: -0.12531331, z: -6.0359135), rotation: (x: 0.0, y: 0.25881904, z: 0.0, w: 0.9659259), scale: (x: 4.5, y: 4.5, z: 4.5)),
                 "melon_core::physics::Collider": (shape: Mesh, friction: 0.5, restitution: 0.0, sensor: false, membership: 4294967295, filter: 4294967295),
             },
             uid: Some("df1ab9b9-02c1-4c8d-b18e-684c78bf1f38"),
@@ -624,7 +624,7 @@
             model_guid: Some("cdaf66d3-93ee-4155-9940-3e8767200562"),
             components: {
                 "melon_core::components::Aabb": (half_extents: (x: 1.735, y: 0.125, z: 0.83)),
-                "melon_core::components::Transform": (translation: (x: -6.5, y: 0.0, z: 10.5), rotation: (x: 0.0, y: 0.17364818, z: 0.0, w: 0.9848077), scale: (x: 1.6, y: 1.6, z: 1.6)),
+                "melon_core::components::Transform": (translation: (x: -5.1081867, y: 0.0, z: 14.323976), rotation: (x: 0.0, y: 0.1736482, z: 0.0, w: 0.9848078), scale: (x: 1.6, y: 1.6, z: 1.6)),
                 "melon_core::physics::Collider": (shape: Mesh, friction: 0.5, restitution: 0.0, sensor: false, membership: 4294967295, filter: 4294967295),
             },
             uid: Some("34d0edfd-c9b1-46f4-b5ac-9eb16af5e645"),

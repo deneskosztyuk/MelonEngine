@@ -1,0 +1,9 @@
+(
+    gi_mode: Ssgi,
+    ssgi_resolution: Half,
+    ao: true,
+    shadow_map_size: 2048,
+    msaa: 4,
+    bloom: true,
+    present: Vsync,
+)
