@@ -1332,6 +1332,7 @@ impl Renderer {
         material: melon_core::Handle<melon_core::Material>,
         target: &mut ViewportTarget,
     ) -> Option<wgpu::Texture> {
+        let was_cached = self.materials.contains(material);
         let sphere: melon_core::Handle<melon_core::Model> = server.load("builtin:sphere");
         self.model_cache.prepare(&self.scene, server, sphere);
         let (min, max) = server.bounds(sphere)?;
@@ -1343,7 +1344,12 @@ impl Renderer {
             ..Default::default()
         };
         frame.overrides.insert(0, vec![Some(material)]);
-        Some(self.thumbnail_of(&frame, server, target))
+        let texture = self.thumbnail_of(&frame, server, target);
+        // A material only the thumbnail needed is freed with its textures.
+        if !was_cached {
+            self.materials.evict(material);
+        }
+        Some(texture)
     }
 
     /// Record `frame` as an auxiliary view into `target`, copy the result
@@ -1619,6 +1625,11 @@ impl Renderer {
         }
         for handle in frame.overrides.values().flatten().flatten() {
             self.materials.prepare(&self.scene, server, *handle);
+        }
+        if main {
+            // The scene is the owner: what it no longer references is freed.
+            let used = frame.overrides.values().flatten().flatten();
+            self.materials.retain_used(used.map(|h| h.id()).collect());
         }
 
         // Cull per view (the shadow pass against the shadow box, so casters
@@ -7603,6 +7614,63 @@ mod tests {
         Ok(())
     }
 
+    /// Materials and textures the scene no longer references are freed, and
+    /// a material only a thumbnail needed is freed after it.
+    fn check_material_cache_evicts(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("mat_evict");
+        write_mat(
+            &root,
+            "tex",
+            "(metallic: 0.0, roughness: 0.8, base_color_texture: Some((guid: None, path: \"assets/textures/t.png\")))",
+        );
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .save(root.join("assets/textures/t.png"))
+            .unwrap();
+        let mut server = fresh_ids_server(root.clone(), 9100);
+        r.materials = Default::default();
+        r.model_cache = ModelCache::new(&r.scene);
+        let material: melon_core::Handle<melon_core::Material> =
+            server.load("assets/materials/tex.mat");
+        let mut thumb = r.create_viewport_target(winit::dpi::PhysicalSize::new(
+            THUMBNAIL_SIZE,
+            THUMBNAIL_SIZE,
+        ));
+        r.render_material_thumbnail_texture(&mut server, material, &mut thumb)
+            .ok_or("no thumbnail")?;
+        let after_thumbnail = r.materials.counts();
+        let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+        let mut frame = FrameData {
+            view_proj: top_down_camera().view_proj(),
+            eye: top_down_camera().eye,
+            light: test_light(),
+            environment: plain_environment(),
+            models: vec![(glam::Mat4::IDENTITY, cube)],
+            ..Default::default()
+        };
+        let mut target =
+            r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let mut draw = |r: &mut Renderer, frame: &FrameData| {
+            let mut encoder = r
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            r.render_scene(&mut encoder, frame, &mut server, &mut target, &[], &[]);
+            r.queue().submit([encoder.finish()]);
+        };
+        frame.overrides.insert(0, vec![Some(material)]);
+        draw(r, &frame);
+        let in_use = r.materials.counts();
+        frame.overrides.clear();
+        draw(r, &frame);
+        let unused = r.materials.counts();
+        let _ = std::fs::remove_dir_all(&root);
+        if (after_thumbnail, in_use, unused) != ((0, 0), (1, 1), (0, 0)) {
+            return Err(format!(
+                "(materials, textures) after a thumbnail {after_thumbnail:?}, in use {in_use:?}, unused {unused:?}; want (0, 0), (1, 1), (0, 0)"
+            ));
+        }
+        Ok(())
+    }
+
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
@@ -9419,6 +9487,7 @@ mod tests {
             Box::new(check_blend_material_thumbnail),
             Box::new(check_material_bad_texture_refs),
             Box::new(check_ibl_updates_in_place),
+            Box::new(check_material_cache_evicts),
             Box::new(check_gi_sun_injection_ignores_the_camera),
         ];
 

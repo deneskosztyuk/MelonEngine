@@ -52,6 +52,44 @@ impl MaterialCache {
             .map(|m| (&m.group, m.surface))
     }
 
+    /// Whether `handle` is built.
+    pub fn contains(&self, handle: Handle<Material>) -> bool {
+        self.materials.contains_key(&handle.id())
+    }
+
+    /// Free `handle` and the textures no other material uses.
+    pub fn evict(&mut self, handle: Handle<Material>) {
+        self.materials.remove(&handle.id());
+        self.failed.retain(|(id, _)| *id != handle.id());
+        self.free_unused_textures();
+    }
+
+    /// Free every material not in `used` (material ids) and the textures
+    /// that leaves unused.
+    pub fn retain_used(&mut self, used: HashSet<u32>) {
+        let before = self.materials.len();
+        self.materials.retain(|id, _| used.contains(id));
+        self.failed.retain(|(id, _)| used.contains(id));
+        if self.materials.len() != before {
+            self.free_unused_textures();
+        }
+    }
+
+    fn free_unused_textures(&mut self) {
+        let live: HashSet<u32> = self
+            .materials
+            .values()
+            .flat_map(|m| m.deps.iter().map(|(h, _)| h.id()))
+            .collect();
+        self.textures.retain(|(id, _), _| live.contains(id));
+    }
+
+    /// Built (materials, textures).
+    #[cfg(test)]
+    pub fn counts(&self) -> (usize, usize) {
+        (self.materials.len(), self.textures.len())
+    }
+
     fn load_texture(
         &mut self,
         scene: &SceneRenderer,
