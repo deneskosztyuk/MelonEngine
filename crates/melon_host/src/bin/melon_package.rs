@@ -44,7 +44,11 @@ fn run(out: &Path, build: bool) -> anyhow::Result<()> {
         anyhow::bail!("config/player.ron is broken ({message}): fix it or delete it");
     }
     let exe = if build {
-        build_player(&root, &mut |line| eprintln!("{line}"))?
+        build_player(
+            &root,
+            &mut |line| eprintln!("{line}"),
+            &std::sync::atomic::AtomicBool::new(false),
+        )?
     } else {
         root.join("target/package/release")
             .join(format!("melon_host{}", std::env::consts::EXE_SUFFIX))

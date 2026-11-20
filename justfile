@@ -71,3 +71,8 @@ ship-run:
 # Extra flags pass through: `just package "D:/My Games" --no-build`.
 package out *flags:
     cargo run -p melon_host --no-default-features --bin melon_package -- "{{out}}" {{flags}}
+
+# Run the renderer's GPU tests with the DX12 FXC shader compiler, the one the
+# packaged player uses (the default looks for the Windows SDK's dxcompiler.dll).
+test-fxc:
+    $env:WGPU_DX12_COMPILER = 'fxc'; cargo test -p melon_render

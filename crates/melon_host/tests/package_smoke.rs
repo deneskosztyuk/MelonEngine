@@ -6,6 +6,7 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use melon_core::PlayerSettings;
@@ -33,7 +34,12 @@ const SCENE: &str = r#"(
 #[ignore = "needs a GPU and a full release build; run with --ignored"]
 fn packaged_game_starts_loads_its_scene_and_exits_cleanly() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let exe = build_player(&workspace, &mut |line| eprintln!("{line}")).expect("player builds");
+    let exe = build_player(
+        &workspace,
+        &mut |line| eprintln!("{line}"),
+        &AtomicBool::new(false),
+    )
+    .expect("player builds");
 
     let root = std::env::temp_dir().join(format!("melon_smoke_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -84,7 +90,8 @@ fn packaged_game_starts_loads_its_scene_and_exits_cleanly() {
 /// Package a project whose `config/player.ron` is `player_ron` and run it.
 fn run_packaged(name: &str, player_ron: &str) -> (std::process::ExitStatus, String) {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let exe = build_player(&workspace, &mut |_| {}).expect("player builds");
+    let exe =
+        build_player(&workspace, &mut |_| {}, &AtomicBool::new(false)).expect("player builds");
     let root = std::env::temp_dir().join(format!("melon_smoke_{name}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("config")).unwrap();

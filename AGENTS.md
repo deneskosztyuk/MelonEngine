@@ -23,7 +23,7 @@ Dependency direction: `core` <- `render`, `physics`, `audio`; `render`, `physics
 ## Commands
 
 ```powershell
-just gate        # fmt-check + clippy -D warnings + check. Run before every commit.
+just gate        # fmt-check + clippy -D warnings + check, also of the player build. Run before every commit.
 just test        # gate, then cargo test --workspace
 just dev-run     # debug build with melon_game live reload
 just game        # rebuild only melon_game; a running dev-run reloads it
@@ -439,15 +439,25 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   `Transform` and spawns the new scene; so a request made in frame N lands
   at the start of frame N+1. A broken file is logged and the old scene
   stays. Physics bodies of the old scene go through the component hooks,
-  the new ones come from `sync_components_system` in `PostUpdate`.
+  the new ones come from `sync_components_system` in `PostUpdate`. Entities
+  with the `KeepOnSceneLoad` marker (and their children) survive a request
+  (Unity's DontDestroyOnLoad; not saved in scenes); the editor's Play / Stop
+  rebuilds do not keep them. The system runs `.before(update_actions_system)`.
 - **Player mode.** `cargo run -p melon_host --no-default-features` is the
   player: no editor, game plugin linked statically (`core.add_plugin`),
   `Playing` from frame 1, `GameInputGate` open, Esc is the game's, the
-  cursor is grabbed while the window has focus. Window title, mode and size,
+  cursor follows the `Cursor` resource (default free and visible; a game
+  sets `*cursor = Cursor::locked()` for mouse look; the player applies it when
+  it changes and again on focus regain, and frees it while unfocused). Window title, mode and size,
   startup scene come from `config/player.ron` (`PlayerSettings`, edited in
   Edit > Project Settings > Player; vsync is `RenderQuality::present`).
   `--frames N` renders N frames, logs `rendered N frames; exiting` and exits
-  0 (1 on a startup error). The project root is the executable's folder when
+  0 (1 on a startup error). A game quits with
+  `world.resource_mut::<AppExit>().request()` (the player closes at the end of
+  the frame; the editor's Play stops Play instead and stays open; the editor
+  applies the game's `Cursor` only while the game has input, and its own free
+  cursor after Esc / Stop). A missing or broken startup scene logs an error
+  and the game runs an empty world (exit 0). The project root is the executable's folder when
   `game.pak` lies beside it, else the source tree. Features of `melon_host`:
   `editor` (links `melon_editor`), `hot-reload` (implies `editor`); the
   editor builds need `--no-default-features --features editor` (the
@@ -463,7 +473,9 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   (`*` in a segment, `**` across, `?`). `AssetServer::set_pack` serves
   `read` and the GUID index from the pack and stops hot reload; models
   (`melon_render::models::Source`) and audio (`PlayParams::data`) read bytes
-  from it, so packed glTF needs embedded buffers (`.glb`). Settings loaders
+  from it. A packed `.gltf` also reads its external `.bin` / image files
+  through the `AssetServer` (`packed_gltf.rs`: URIs are percent-decoded and
+  resolved against the model's pack path). Settings loaders
   (`ron_file::load`) read `config/*.ron` from the installed pack
   (`pack::install`) without a disk fallback.
 - **Packaging.** `just package <out>` (binary `melon_package`) and the
@@ -478,6 +490,17 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   Windows) instead of `Auto`, which looks for `dxcompiler.dll` / `dxil.dll`
   (Windows SDK files, redistributable only under their own licence). Set
   `WGPU_DX12_COMPILER` to override. The editor's own DX12 stays on `Auto`.
+  Safety: `package_game` refuses an output that is, holds or lies inside
+  the project folder, `assets/`, `config/`, `crates/` or `.git/`, and only
+  replaces a game folder that holds `game.pak` and `build.manifest` (written
+  by a previous build). `build_player` finds cargo via `$CARGO`, PATH, then
+  `~/.cargo/bin`; File > Build can cancel (kills cargo and its children),
+  remembers the output folder in `.melon/build_output.txt` and offers Open
+  Folder / Run. cargo also builds the `melon_game` dylib in that build (it
+  builds every crate type of a dependency); harmless, not shipped.
+  `just test-fxc` runs the renderer GPU tests under FXC (all pass). First
+  start of the player under FXC took about 2.5 s to "renderer ready"
+  (about 1.0 s with DXC), then 60 frames in 0.5 s.
   End-to-end check: `cargo test -p melon_host --test package_smoke --
   --ignored` (builds the player, packages a temp project, runs it with
   `--frames 30`).

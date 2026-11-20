@@ -9,6 +9,9 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -141,36 +144,115 @@ version: {}
     Ok(PackageReport { dir, exe, files })
 }
 
-/// Build the player (release, no editor, static C runtime) in
-/// `<workspace>/target/package` and return its path. `log` gets cargo's
-/// output line by line. The separate target folder keeps the flags change
-/// from rebuilding the normal release build.
-pub fn build_player(workspace: &Path, log: &mut dyn FnMut(&str)) -> Result<PathBuf> {
-    let target = workspace.join("target").join("package");
-    let mut child = Command::new("cargo")
-        .args([
-            "build",
-            "-p",
-            "melon_host",
-            "--release",
-            "--no-default-features",
-        ])
-        .arg("--target-dir")
-        .arg(&target)
-        .current_dir(workspace)
-        .env("RUSTFLAGS", "-C target-feature=+crt-static")
+/// Pure part of `find_cargo`: `env_cargo` is `$CARGO`, `home` the user's home
+/// folder, `on_path` whether `cargo` runs from PATH.
+fn find_cargo_with(
+    env_cargo: Option<PathBuf>,
+    home: Option<PathBuf>,
+    on_path: bool,
+) -> Result<PathBuf> {
+    if let Some(path) = env_cargo.filter(|p| p.is_file()) {
+        return Ok(path);
+    }
+    if on_path {
+        return Ok(PathBuf::from("cargo"));
+    }
+    let installed = home.map(|h| {
+        h.join(".cargo")
+            .join("bin")
+            .join(format!("cargo{}", std::env::consts::EXE_SUFFIX))
+    });
+    if let Some(path) = installed.filter(|p| p.is_file()) {
+        return Ok(path);
+    }
+    bail!(
+        "cargo was not found: install Rust (https://rustup.rs) or set the CARGO environment variable to cargo's path"
+    )
+}
+
+/// `$CARGO`, else `cargo` on PATH, else `~/.cargo/bin/cargo`.
+pub fn find_cargo() -> Result<PathBuf> {
+    let on_path = Command::new("cargo")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    find_cargo_with(std::env::var_os("CARGO").map(PathBuf::from), home, on_path)
+}
+
+/// Run `cmd`, sending its stderr to `log` line by line. Setting `cancel`
+/// kills the child and returns an error.
+pub fn run_logged(mut cmd: Command, log: &mut dyn FnMut(&str), cancel: &AtomicBool) -> Result<()> {
+    let mut child = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .context("cannot run cargo")?;
-    if let Some(stderr) = child.stderr.take() {
+        .context("cannot start the command")?;
+    let stderr = child.stderr.take().context("no stderr")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            log(&line);
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => log(&line),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        if cancel.load(Ordering::Relaxed) {
+            // cargo starts rustc and linkers: end the whole tree on Windows.
+            #[cfg(windows)]
+            let _ = Command::new("taskkill")
+                .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("cancelled");
         }
     }
-    if !child.wait().context("cargo did not finish")?.success() {
-        bail!("cargo build of the player failed");
+    if !child
+        .wait()
+        .context("the command did not finish")?
+        .success()
+    {
+        bail!("the command failed");
     }
+    Ok(())
+}
+
+/// Build the player (release, no editor, static C runtime) in
+/// `<workspace>/target/package` and return its path. `log` gets cargo's
+/// output line by line; `cancel` stops the build. The separate target folder
+/// keeps the flags change from rebuilding the normal release build.
+pub fn build_player(
+    workspace: &Path,
+    log: &mut dyn FnMut(&str),
+    cancel: &AtomicBool,
+) -> Result<PathBuf> {
+    let target = workspace.join("target").join("package");
+    let mut cmd = Command::new(find_cargo()?);
+    cmd.args([
+        "build",
+        "-p",
+        "melon_host",
+        "--release",
+        "--no-default-features",
+    ])
+    .arg("--target-dir")
+    .arg(&target)
+    .current_dir(workspace)
+    .env("RUSTFLAGS", "-C target-feature=+crt-static");
+    run_logged(cmd, log, cancel).context("cargo build of the player")?;
     let name = format!("melon_host{}", std::env::consts::EXE_SUFFIX);
     Ok(target.join("release").join(name))
 }
@@ -361,5 +443,77 @@ mod tests {
         package_game(&root, &exe, &out, &game("Game")).unwrap();
         assert!(!out.join("Game/stale.txt").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cargo_is_found_from_env_then_path_then_the_home_folder() {
+        let dir = temp("cargo");
+        let named = dir.join("my-cargo");
+        std::fs::write(&named, "").unwrap();
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".cargo/bin")).unwrap();
+        let installed = home
+            .join(".cargo/bin")
+            .join(format!("cargo{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&installed, "").unwrap();
+
+        assert_eq!(
+            find_cargo_with(Some(named.clone()), Some(home.clone()), true).unwrap(),
+            named
+        );
+        assert_eq!(
+            find_cargo_with(None, Some(home.clone()), true).unwrap(),
+            PathBuf::from("cargo")
+        );
+        assert_eq!(
+            find_cargo_with(None, Some(home.clone()), false).unwrap(),
+            installed
+        );
+        let message = find_cargo_with(Some(dir.join("gone")), Some(dir.join("nohome")), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("CARGO") && message.contains("Rust"),
+            "{message}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancelling_kills_the_child_and_returns_quickly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let mut cmd = Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"]);
+        let started = std::time::Instant::now();
+        let error = run_logged(cmd, &mut |_| {}, &cancel).unwrap_err();
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn child_output_goes_to_the_log_and_failure_is_an_error() {
+        use std::sync::atomic::AtomicBool;
+        let mut cmd = Command::new("powershell.exe");
+        cmd.args([
+            "-NoProfile",
+            "-Command",
+            "[Console]::Error.WriteLine('hello'); exit 3",
+        ]);
+        let mut lines = Vec::new();
+        let result = run_logged(
+            cmd,
+            &mut |l| lines.push(l.to_string()),
+            &AtomicBool::new(false),
+        );
+        assert!(result.is_err());
+        assert_eq!(lines, ["hello"]);
     }
 }
