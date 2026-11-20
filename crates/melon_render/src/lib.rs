@@ -488,6 +488,7 @@ const MESH_WGSL: &str = concat!(
     include_str!("../../../assets/shaders/gi_common.wgsl"),
     include_str!("../../../assets/shaders/ddgi_common.wgsl"),
     include_str!("../../../assets/shaders/gi_ddgi.wgsl"),
+    include_str!("../../../assets/shaders/gi_ssgi.wgsl"),
     include_str!("../../../assets/shaders/mesh.wgsl")
 );
 
@@ -604,8 +605,9 @@ pub struct SceneRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface_format: wgpu::TextureFormat,
-    /// The mesh pipeline per GI mode (`GI_MODE` override): off, DDGI.
+    /// The mesh pipeline per GI mode (`GI_MODE` override): off, SSGI, DDGI.
     mesh_pipeline: wgpu::RenderPipeline,
+    mesh_ssgi_pipeline: wgpu::RenderPipeline,
     mesh_ddgi_pipeline: wgpu::RenderPipeline,
     tonemap_pipeline: wgpu::RenderPipeline,
     tonemap_bind_group_layout: wgpu::BindGroupLayout,
@@ -837,7 +839,13 @@ impl Renderer {
         scene.update_camera(frame.view_proj, frame.eye);
         scene.update_environment(&frame.environment);
         scene.update_ssao(&frame.environment);
-        let gi_mode = scene.gi.update(&scene.queue, &frame.environment);
+        let gi_mode = scene.gi.update(
+            &scene.queue,
+            &frame.environment,
+            &target.lighting.gi,
+            frame.view_proj,
+            frame.eye,
+        );
         let light_view_proj =
             directional_light_view_proj(frame.light.to_light(), SHADOW_CENTER, SHADOW_RADIUS);
         scene.update_light(&frame.light, light_view_proj);
@@ -901,27 +909,36 @@ impl Renderer {
         // The draw lists borrow the model cache; the scene is a separate field.
         let scene = &mut self.scene;
         scene.render_shadow_pass(encoder, &shadow_draw_calls);
+        // The depth/normal prepass feeds SSAO and SSGI. AO off: skip the
+        // SSAO passes and bind white, so the image matches the renderer
+        // without SSAO.
+        let ao_on = frame.environment.ao_strength > 0.0;
+        if ao_on || gi_mode == melon_core::GiMode::Ssgi {
+            let prepass_draws: Vec<(&Mesh, std::ops::Range<u32>)> = draw_calls
+                .iter()
+                .map(|(mesh, _, instances)| (*mesh, instances.clone()))
+                .collect();
+            scene.render_prepass(encoder, &prepass_draws, &target.ssao);
+        }
+        if ao_on {
+            scene.render_ssao(encoder, &target.ssao);
+        }
         // GI off: no GI passes; the mesh shader keeps the hemisphere
         // ambient, so the image matches the renderer without GI.
         scene.gi.render(
             encoder,
             &gi::GiPasses {
+                frame: &scene.frame_bind_group,
                 instances: &scene.instance_bind_group,
                 voxel_lighting: &scene.voxel_pass_lighting,
                 voxel_draws: &voxel_draw_calls,
+                view: &target.lighting.gi,
             },
         );
-        // AO off: skip the SSAO passes and bind white, so the image matches
-        // the renderer without SSAO.
-        let lighting = if frame.environment.ao_strength > 0.0 {
-            let prepass_draws: Vec<(&Mesh, std::ops::Range<u32>)> = draw_calls
-                .iter()
-                .map(|(mesh, _, instances)| (*mesh, instances.clone()))
-                .collect();
-            scene.render_ssao(encoder, &prepass_draws, &target.ssao);
-            &target.ssao.lighting_bind_group
+        let lighting = if ao_on {
+            &target.lighting.with_ao
         } else {
-            &scene.unoccluded_lighting
+            &target.lighting.without_ao
         };
 
         let hdr = target.hdr_target();
@@ -1101,6 +1118,7 @@ impl SceneRenderer {
         ];
         let build_mesh = |mode| Renderer::build_mesh_pipeline(&device, &mesh_layouts, mode);
         let mesh_pipeline = build_mesh(melon_core::GiMode::Off);
+        let mesh_ssgi_pipeline = build_mesh(melon_core::GiMode::Ssgi);
         let mesh_ddgi_pipeline = build_mesh(melon_core::GiMode::Ddgi);
 
         let unfilterable_entry = |binding| wgpu::BindGroupLayoutEntry {
@@ -1340,6 +1358,7 @@ impl SceneRenderer {
         let gi = gi::Gi::new(
             &device,
             &gi::GiInputs {
+                frame_layout: &frame_layout,
                 light: &light_buffer,
                 shadow_view: &shadow_view,
                 shadow_sampler: &shadow_sampler,
@@ -1354,7 +1373,7 @@ impl SceneRenderer {
         };
         let lighting = |label, voxels| {
             let mut entries = vec![white_ao.clone()];
-            entries.extend(gi.entries(voxels));
+            entries.extend(gi.entries(None, voxels));
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
                 layout: &lighting_layout,
@@ -1375,6 +1394,7 @@ impl SceneRenderer {
             queue,
             surface_format,
             mesh_pipeline,
+            mesh_ssgi_pipeline,
             mesh_ddgi_pipeline,
             tonemap_pipeline,
             tonemap_bind_group_layout: tonemap_layout,
@@ -2123,13 +2143,42 @@ impl SceneRenderer {
     pub fn create_viewport_target(&self, size: winit::dpi::PhysicalSize<u32>) -> ViewportTarget {
         let hdr = self.create_hdr_target(size);
         let bloom = self.create_bloom_targets(hdr.view(), size);
+        let ssao = self.create_ssao_targets(size);
+        let gi = self.gi.create_view(
+            &self.device,
+            size,
+            &gi::ssgi::SsgiViewInputs {
+                depth: &ssao.depth_view,
+                normal: &ssao.normal_view,
+                hdr: hdr.view(),
+            },
+        );
+        // Group 3 of the mesh pipeline with this view's AO, or white (AO off).
+        let lighting = |label, ao| {
+            let mut entries = vec![wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(ao),
+            }];
+            entries.extend(self.gi.entries(Some(&gi), true));
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &self.lighting_layout,
+                entries: &entries,
+            })
+        };
+        let lighting = ViewLighting {
+            with_ao: lighting("lighting bind group", &ssao.ao_view),
+            without_ao: lighting("open lighting bind group", &self.default_textures.white),
+            gi,
+        };
         ViewportTarget::new(
             &self.device,
             self.surface_format.add_srgb_suffix(),
             size,
             hdr,
-            self.create_ssao_targets(size),
+            ssao,
             bloom,
+            lighting,
         )
     }
 
@@ -2187,13 +2236,6 @@ impl SceneRenderer {
             layout: &self.ssao_blur_layout,
             entries: &[entry(1, &normal_view), uniform, entry(3, &raw_view)],
         });
-        let mut lighting_entries = vec![entry(0, &ao_view)];
-        lighting_entries.extend(self.gi.entries(true));
-        let lighting_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("lighting bind group"),
-            layout: &self.lighting_layout,
-            entries: &lighting_entries,
-        });
         SsaoTargets {
             depth_view,
             normal_view,
@@ -2202,7 +2244,6 @@ impl SceneRenderer {
             ao_view,
             ssao_bind_group,
             blur_bind_group,
-            lighting_bind_group,
         }
     }
 
@@ -2542,48 +2583,51 @@ impl SceneRenderer {
             .write_buffer(&self.ssao_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
-    /// Depth/normal prepass of every mesh, then the SSAO and blur passes into
-    /// `ssao`'s AO texture. Call after `update_camera`, `update_ssao` and
+    /// Depth/normal prepass of every mesh into `ssao`'s prepass targets
+    /// (read by SSAO and SSGI). Call after `update_camera` and
     /// `update_instances`, before the 3D pass.
-    fn render_ssao(
+    fn render_prepass(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         draw_calls: &[(&Mesh, std::ops::Range<u32>)],
         ssao: &SsaoTargets,
     ) {
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("melon_render ssao prepass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &ssao.normal_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &ssao.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("melon_render ssao prepass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &ssao.normal_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &ssao.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
                 }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.prepass_pipeline);
-            pass.set_bind_group(0, &self.frame_bind_group, &[]);
-            pass.set_bind_group(1, &self.instance_bind_group, &[]);
-            for (mesh, instances) in draw_calls {
-                pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
-                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                pass.draw_indexed(0..mesh.index_count, 0, instances.clone());
-            }
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.prepass_pipeline);
+        pass.set_bind_group(0, &self.frame_bind_group, &[]);
+        pass.set_bind_group(1, &self.instance_bind_group, &[]);
+        for (mesh, instances) in draw_calls {
+            pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.draw_indexed(0..mesh.index_count, 0, instances.clone());
         }
+    }
+
+    /// The SSAO and blur passes into `ssao`'s AO texture. Call after
+    /// `update_ssao` and `render_prepass`, before the 3D pass.
+    fn render_ssao(&self, encoder: &mut wgpu::CommandEncoder, ssao: &SsaoTargets) {
         for (label, view, pipeline, bind_group) in [
             (
                 "melon_render ssao pass",
@@ -3068,6 +3112,7 @@ impl SceneRenderer {
     ) {
         pass.set_pipeline(match self.gi.mode {
             melon_core::GiMode::Off => &self.mesh_pipeline,
+            melon_core::GiMode::Ssgi => &self.mesh_ssgi_pipeline,
             melon_core::GiMode::Ddgi => &self.mesh_ddgi_pipeline,
         });
         pass.set_bind_group(0, &self.frame_bind_group, &[]);
@@ -3145,6 +3190,7 @@ pub struct ViewportTarget {
     ssao: SsaoTargets,
     /// `None` when the view is too small for one bloom level.
     bloom: Option<BloomTargets>,
+    lighting: ViewLighting,
     overlay: overlay::OverlayTargets,
     size: winit::dpi::PhysicalSize<u32>,
 }
@@ -3164,6 +3210,16 @@ struct BloomTargets {
     settings: wgpu::Buffer,
 }
 
+/// One view's lighting inputs: its GI resources (SSGI textures and
+/// history) and group 3 of the mesh pipeline with them.
+struct ViewLighting {
+    gi: gi::GiView,
+    /// Group 3 with the view's AO texture.
+    with_ao: wgpu::BindGroup,
+    /// Group 3 with a white AO texture (AO off).
+    without_ao: wgpu::BindGroup,
+}
+
 /// One view's SSAO targets: the single-sample depth/normal prepass, the raw
 /// and blurred AO (full resolution), and the bind groups reading them.
 struct SsaoTargets {
@@ -3174,8 +3230,6 @@ struct SsaoTargets {
     ao_view: wgpu::TextureView,
     ssao_bind_group: wgpu::BindGroup,
     blur_bind_group: wgpu::BindGroup,
-    /// Group 3 of the mesh pipeline, with `ao_view`.
-    lighting_bind_group: wgpu::BindGroup,
 }
 
 impl ViewportTarget {
@@ -3186,6 +3240,7 @@ impl ViewportTarget {
         hdr_target: HdrTarget,
         ssao: SsaoTargets,
         bloom: Option<BloomTargets>,
+        lighting: ViewLighting,
     ) -> Self {
         let size = winit::dpi::PhysicalSize::new(size.width.max(1), size.height.max(1));
         let color_texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
@@ -3225,6 +3280,7 @@ impl ViewportTarget {
             hdr_target,
             ssao,
             bloom,
+            lighting,
             overlay,
             size,
         }
@@ -3843,33 +3899,56 @@ mod tests {
         models: &[(glam::Mat4, melon_core::Handle<melon_core::Model>)],
         server: &mut melon_core::AssetServer,
     ) -> Vec<u8> {
-        // Handle ids restart with every AssetServer: drop models cached for
-        // another test's server.
-        r.model_cache = ModelCache::new(&r.scene);
-        let target = r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
-        let frame = FrameData {
-            view_proj: camera.view_proj(),
-            eye: camera.eye,
-            light,
-            environment,
-            models: models.to_vec(),
-        };
         let frames = if environment.gi_intensity > 0.0 {
             GI_FRAMES
         } else {
             1
         };
-        for i in 0..frames {
+        let environments = vec![environment; frames as usize];
+        render_sequence(r, camera, light, &environments, models, server)
+    }
+
+    /// One `render_scene` per environment, consecutive frames into one
+    /// target; returns the last frame's pixels.
+    fn render_sequence(
+        r: &mut Renderer,
+        camera: melon_core::Camera,
+        light: melon_core::Light,
+        environments: &[melon_core::Environment],
+        models: &[(glam::Mat4, melon_core::Handle<melon_core::Model>)],
+        server: &mut melon_core::AssetServer,
+    ) -> Vec<u8> {
+        // Handle ids restart with every AssetServer: drop models cached for
+        // another test's server.
+        r.model_cache = ModelCache::new(&r.scene);
+        let target = r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        for (i, environment) in environments.iter().enumerate() {
+            let frame = FrameData {
+                view_proj: camera.view_proj(),
+                eye: camera.eye,
+                light,
+                environment: *environment,
+                models: models.to_vec(),
+            };
             let mut encoder = r
                 .device()
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
             r.render_scene(&mut encoder, &frame, server, &target, &[], &[]);
-            if i + 1 == frames {
+            if i + 1 == environments.len() {
                 return read_back(r.device(), r.queue(), encoder, &target.color_texture);
             }
             r.queue().submit([encoder.finish()]);
         }
-        unreachable!("frames >= 1")
+        panic!("render_sequence needs at least one environment")
+    }
+
+    /// `plain_environment` with `mode` at full strength.
+    fn gi_environment(mode: melon_core::GiMode) -> melon_core::Environment {
+        melon_core::Environment {
+            gi_mode: mode,
+            gi_intensity: 1.0,
+            ..plain_environment()
+        }
     }
 
     /// A box of `size` centred at `center` in model `model`.
@@ -4339,10 +4418,11 @@ mod tests {
         let assertions: Vec<GpuAssertion> = vec![
             Box::new(|renderer| {
                 // GI sky calibration: an open floor in a pillar's shadow, far
-                // from walls, sees only the sky. With GI it must match the
-                // hemisphere ambient it replaces (within 10%), not the
-                // brighter background sky.
+                // from walls, sees only the sky. With DDGI and with SSGI it
+                // must match the hemisphere ambient they replace (within
+                // 10%), not the brighter background sky.
                 use glam::Vec3;
+                use melon_core::GiMode;
                 let mut server = repo_server();
                 let grey = server.load("assets/models/review/grey_cube.glb");
                 let models = [
@@ -4355,20 +4435,122 @@ mod tests {
                 };
                 let camera = top_down_camera();
                 let px = screen_px(camera.view_proj(), Vec3::new(-1.0, 0.0, 0.0));
-                let mut shade = |gi_intensity| {
+                let mut shade = |mode| {
                     let env = melon_core::Environment {
-                        gi_intensity,
-                        ..plain_environment()
+                        gi_intensity: if mode == GiMode::Off { 0.0 } else { 1.0 },
+                        ..gi_environment(mode)
                     };
                     let pixels =
                         render_converged(renderer, camera, light, env, &models, &mut server);
                     pixel_at(renderer, &pixels, px)
                 };
-                let (on, off) = (shade(1.0), shade(0.0));
-                let ratio = rgb_sum(on) as f32 / rgb_sum(off).max(1) as f32;
-                if (ratio - 1.0).abs() > 0.1 {
+                let (ddgi, ssgi, off) =
+                    (shade(GiMode::Ddgi), shade(GiMode::Ssgi), shade(GiMode::Off));
+                for (name, on) in [("DDGI", ddgi), ("SSGI", ssgi)] {
+                    let ratio = rgb_sum(on) as f32 / rgb_sum(off).max(1) as f32;
+                    if (ratio - 1.0).abs() > 0.1 {
+                        return Err(format!(
+                            "{name} should keep a shaded open floor at the hemisphere level: {on:?} with it, {off:?} without (ratio {ratio:.3})"
+                        ));
+                    }
+                }
+                Ok(())
+            }),
+            Box::new(|renderer| {
+                // SSGI colour bleeding: the red-wall scene of the DDGI bleed
+                // check, seen from the wall's sunlit side so the wall is on
+                // screen (SSGI only bounces what it sees). The floor in
+                // front of the lit face turns red with SSGI, stays grey
+                // without.
+                use glam::Vec3;
+                use melon_core::GiMode;
+                let mut server = repo_server();
+                let grey = server.load("assets/models/review/grey_cube.glb");
+                let red = server.load("assets/models/review/red_panel.glb");
+                let models = [
+                    slab(grey, Vec3::new(8.0, 0.2, 8.0), Vec3::new(0.0, -0.1, 0.0)),
+                    slab(red, Vec3::new(0.4, 2.0, 4.0), Vec3::new(-0.2, 1.0, 0.0)),
+                ];
+                let camera = melon_core::Camera {
+                    eye: Vec3::new(3.5, 2.5, 0.0),
+                    center: Vec3::new(0.0, 0.6, 0.0),
+                    aspect: 1.0,
+                    ..Default::default()
+                };
+                let px = screen_px(camera.view_proj(), Vec3::new(0.3, 0.0, 0.0));
+                let light = melon_core::Light {
+                    direction: -Vec3::new(1.0, 0.25, 0.0).normalize(),
+                    sky_color: Vec3::ZERO,
+                    ground_color: Vec3::ZERO,
+                    ..test_light()
+                };
+                let mut ratio = |mode| {
+                    let env = melon_core::Environment {
+                        zenith_color: Vec3::ZERO,
+                        horizon_color: Vec3::ZERO,
+                        gi_intensity: if mode == GiMode::Off { 0.0 } else { 1.0 },
+                        ..gi_environment(mode)
+                    };
+                    let pixels =
+                        render_converged(renderer, camera, light, env, &models, &mut server);
+                    let p = pixel_at(renderer, &pixels, px);
+                    f32::from(p[0]) / f32::from(p[1]).max(1.0)
+                };
+                let (on, off) = (ratio(GiMode::Ssgi), ratio(GiMode::Off));
+                if on < off + 0.05 {
                     return Err(format!(
-                        "GI should keep a shaded open floor at the hemisphere level: {on:?} with GI, {off:?} without (ratio {ratio:.3})"
+                        "SSGI should bleed red onto the floor: R/G {on:.3} with SSGI, {off:.3} without"
+                    ));
+                }
+                Ok(())
+            }),
+            Box::new(|renderer| {
+                // Mode switching frame to frame: Off, SSGI, DDGI, then Off
+                // again in one target gives exactly the Off image of a view
+                // that never switched (AO on, so the shared prepass runs).
+                use melon_core::GiMode;
+                let mut server = repo_server();
+                let models = test_room(&mut server);
+                let camera = melon_core::Camera {
+                    eye: glam::Vec3::new(0.0, 2.0, -8.5),
+                    center: glam::Vec3::new(0.0, 1.9, 1.0),
+                    aspect: 1.0,
+                    ..Default::default()
+                };
+                let off = melon_core::Environment {
+                    ao_strength: 1.0,
+                    ..plain_environment()
+                };
+                let on = |mode| melon_core::Environment {
+                    ao_strength: 1.0,
+                    ..gi_environment(mode)
+                };
+                let light = test_room_light();
+                let switched = render_sequence(
+                    renderer,
+                    camera,
+                    light,
+                    &[
+                        off,
+                        on(GiMode::Ssgi),
+                        on(GiMode::Ssgi),
+                        on(GiMode::Ddgi),
+                        on(GiMode::Ddgi),
+                        on(GiMode::Ssgi),
+                        off,
+                    ],
+                    &models,
+                    &mut server,
+                );
+                let never = render_sequence(renderer, camera, light, &[off], &models, &mut server);
+                let differing = switched
+                    .chunks(4)
+                    .zip(never.chunks(4))
+                    .filter(|(a, b)| a != b)
+                    .count();
+                if differing > 0 {
+                    return Err(format!(
+                        "switching GI modes changed the final Off frame: {differing} pixels differ"
                     ));
                 }
                 Ok(())

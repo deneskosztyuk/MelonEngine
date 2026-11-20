@@ -11,14 +11,14 @@
 // nothing casts or receives sun shadows (the image is otherwise unchanged);
 // --no-bloom renders with `bloom_intensity` 0; --bloom-only renders with
 // `bloom_intensity` 1, so the tonemapped image is the bloom alone;
-// --no-gi renders with `gi_intensity` 0; --gi-only saves the indirect
-// diffuse term alone (bloom off).
+// --gi off|ssgi|ddgi picks `gi_mode` (default ddgi; --no-gi is --gi off);
+// --gi-only saves the indirect diffuse term of that mode alone (bloom off).
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use glam::{Mat4, Quat, Vec3};
-use melon_core::{AssetServer, Camera, Environment, Handle, Light, Model};
+use melon_core::{AssetServer, Camera, Environment, GiMode, Handle, Light, Model};
 use melon_render::{FrameData, RenderStats, Renderer};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -231,19 +231,35 @@ fn render_and_wait(
 /// Debug offset for `--no-shadow`: far outside the shadow box around the origin.
 const NO_SHADOW_OFFSET: Vec3 = Vec3::new(200.0, 0.0, 0.0);
 
+/// The GI mode named by `--gi <mode>`.
+fn gi_mode(name: Option<&str>) -> Result<GiMode> {
+    match name {
+        Some("off") => Ok(GiMode::Off),
+        Some("ssgi") => Ok(GiMode::Ssgi),
+        Some("ddgi") => Ok(GiMode::Ddgi),
+        other => bail!("--gi needs off, ssgi or ddgi, got {other:?}"),
+    }
+}
+
 fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Result<()> {
-    for flag in flags {
-        const FLAGS: [&str; 7] = [
+    let mut gi = GiMode::Ddgi;
+    let mut args = flags.iter();
+    while let Some(flag) = args.next() {
+        const FLAGS: [&str; 8] = [
             "--ao-only",
             "--no-ao",
             "--no-shadow",
             "--no-bloom",
             "--bloom-only",
+            "--gi",
             "--no-gi",
             "--gi-only",
         ];
-        if !FLAGS.contains(&flag.as_str()) {
-            bail!("unknown flag {flag:?}; expected one of {FLAGS:?}");
+        match flag.as_str() {
+            "--gi" => gi = gi_mode(args.next().map(String::as_str))?,
+            "--no-gi" => gi = GiMode::Off,
+            f if FLAGS.contains(&f) => {}
+            _ => bail!("unknown flag {flag:?}; expected one of {FLAGS:?}"),
         }
     }
     let has = |f: &str| flags.iter().any(|x| x == f);
@@ -274,7 +290,7 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
             } else {
                 Environment::default().bloom_intensity
             },
-            gi_intensity: if has("--no-gi") { 0.0 } else { 1.0 },
+            gi_mode: gi,
             ..Default::default()
         },
         models: review_scene(&mut server),
@@ -392,7 +408,7 @@ impl ApplicationHandler for App {
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let out = args.next().context(
-        "usage: snapshot <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--no-gi] [--gi-only]",
+        "usage: snapshot <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only]",
     )?;
     let view = args.next().unwrap_or_else(|| "overview".into());
     let flags = args.collect();
@@ -425,6 +441,15 @@ mod tests {
     fn unpad_rows_drops_row_padding() {
         let data = [1, 2, 0, 0, 3, 4, 0, 0];
         assert_eq!(unpad_rows(&data, 4, 2), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn gi_flag_names_every_mode() {
+        assert_eq!(gi_mode(Some("off")).unwrap(), GiMode::Off);
+        assert_eq!(gi_mode(Some("ssgi")).unwrap(), GiMode::Ssgi);
+        assert_eq!(gi_mode(Some("ddgi")).unwrap(), GiMode::Ddgi);
+        assert!(gi_mode(Some("rtgi")).is_err());
+        assert!(gi_mode(None).is_err());
     }
 
     #[test]

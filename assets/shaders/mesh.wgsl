@@ -4,7 +4,7 @@
 // metallic-roughness, normal and emissive textures, one sampler, factors).
 // Group 3: per-view lighting inputs (the SSAO texture) and every GI
 // backend's bindings. gi_common.wgsl, ddgi_common.wgsl and the backends'
-// shading (gi_ddgi.wgsl) are prepended.
+// shading (gi_ddgi.wgsl, gi_ssgi.wgsl) are prepended.
 // Sun: Cook-Torrance (GGX, height-correlated Smith, Schlick Fresnel), shadowed.
 // Ambient: diffuse from this pipeline's GI mode (`indirect_diffuse`; the
 // hemisphere with GI off) plus a sky-gradient specular, both occluded by
@@ -96,6 +96,7 @@ const PI: f32 = 3.14159265;
 // GI mode of this mesh pipeline variant (gi/mod.rs `shader_mode`): each
 // variant compiles only its own `indirect_diffuse` path.
 const GI_OFF: u32 = 0u;
+const GI_SSGI: u32 = 1u;
 const GI_DDGI: u32 = 2u;
 override GI_MODE: u32 = GI_DDGI;
 
@@ -192,14 +193,21 @@ fn specular_occlusion(ndv: f32, ao: f32, roughness: f32) -> f32 {
     return clamp(pow(ndv + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao, 0.0, 1.0);
 }
 
-// Diffuse light at `p` (normal `n`, `v` toward the viewer) from this
-// pipeline's GI backend, in place of the hemisphere ambient `hemi`.
-fn indirect_diffuse(p: vec3f, n: vec3f, v: vec3f, hemi: vec3f) -> vec3f {
-    return ddgi_diffuse(p, n, v, hemi);
+// Diffuse light at fragment `in` (shading normal `n`, `v` toward the
+// viewer) from this pipeline's GI backend, in place of the hemisphere
+// ambient `hemi`. A new backend adds its branch here.
+fn indirect_diffuse(in: VsOut, n: vec3f, v: vec3f, hemi: vec3f) -> vec3f {
+    if (GI_MODE == GI_SSGI) {
+        return ssgi_diffuse(in.world_pos, normalize(in.world_normal), in.clip_pos.xy, hemi);
+    }
+    return ddgi_diffuse(in.world_pos, n, v, hemi);
 }
 
 // Debug flag of this pipeline's GI backend: output indirect diffuse only.
 fn gi_only() -> bool {
+    if (GI_MODE == GI_SSGI) {
+        return ssgi.gi_only != 0u;
+    }
     return gi.gi_only != 0u;
 }
 
@@ -255,7 +263,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     // compiles away and the image matches the renderer without GI exactly
     // (a runtime branch alone shifts a few pixels by one step).
     if (GI_MODE != GI_OFF) {
-        let diffuse_light = indirect_diffuse(in.world_pos, n, v, hemi);
+        let diffuse_light = indirect_diffuse(in, n, v, hemi);
         let diffuse = (1.0 - f_amb) * (1.0 - metallic) * base * diffuse_light * ao;
         if (gi_only()) {
             return vec4f(diffuse, 1.0);

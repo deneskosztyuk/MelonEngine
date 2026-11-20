@@ -211,6 +211,9 @@ pub struct Environment {
 pub enum GiMode {
     /// Hemisphere ambient only.
     Off,
+    /// Screen-space GI at half resolution: cheaper, but only what is on
+    /// screen bounces light.
+    Ssgi,
     /// DDGI probes over a voxel scene: world-space, costlier.
     #[default]
     Ddgi,
@@ -263,11 +266,11 @@ mod tests {
     #[test]
     fn gi_mode_defaults_to_ddgi_and_round_trips() {
         assert_eq!(Environment::default().gi_mode, GiMode::Ddgi);
-        for mode in [GiMode::Off, GiMode::Ddgi] {
+        for mode in [GiMode::Off, GiMode::Ssgi, GiMode::Ddgi] {
             let text = ron::to_string(&mode).unwrap();
             assert_eq!(ron::from_str::<GiMode>(&text).unwrap(), mode);
         }
-        assert_eq!(ron::to_string(&GiMode::Ddgi).unwrap(), "Ddgi");
+        assert_eq!(ron::to_string(&GiMode::Ssgi).unwrap(), "Ssgi");
     }
 
     #[test]
