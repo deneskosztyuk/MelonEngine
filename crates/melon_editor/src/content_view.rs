@@ -45,16 +45,44 @@ fn kind_glyph(kind: AssetKind) -> &'static str {
     }
 }
 
-/// A clickable widget with a fixed id (`ui.add` ids are positional), so
-/// tests and other code can find it with `Context::read_response`.
+/// A selectable label with a fixed id (`ui.add` ids are positional), so
+/// tests and other code can find it with `Context::read_response`. Painted
+/// like egui's selectable label; it is the only widget on its rect, so it
+/// gets hover.
 fn id_label(
     ui: &mut egui::Ui,
     id: Id,
     text: impl Into<egui::WidgetText>,
     selected: bool,
 ) -> egui::Response {
-    let shown = ui.selectable_label(selected, text);
-    ui.interact(shown.rect, id, Sense::click()).union(shown)
+    let padding = ui.spacing().button_padding;
+    let galley = text.into().into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Button,
+    );
+    let size = (galley.size() + 2.0 * padding).max(egui::vec2(0.0, ui.spacing().interact_size.y));
+    let (_, rect) = ui.allocate_space(size);
+    let response = ui.interact(rect, id, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&response, selected);
+        if selected || response.hovered() || response.has_focus() {
+            ui.painter().rect(
+                rect.expand(visuals.expansion),
+                visuals.corner_radius,
+                visuals.weak_bg_fill,
+                visuals.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        let text_pos = egui::pos2(
+            rect.min.x + padding.x,
+            rect.center().y - galley.size().y / 2.0,
+        );
+        ui.painter().galley(text_pos, galley, visuals.text_color());
+    }
+    response
 }
 
 impl ContentBrowser {
@@ -529,6 +557,50 @@ mod tests {
             click(pos, egui::PointerButton::Primary),
         );
         assert_eq!(browser.current(), dir.join("a"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hovered_path_segment_paints_a_highlight() {
+        let dir = temp_dir("hover");
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.open(dir.join("a"));
+        let ctx = egui::Context::default();
+        frame(&mut browser, &ctx, 0.0, Vec::new());
+        let rect = ctx
+            .read_response(egui::Id::new(("content_crumb", 0usize)))
+            .unwrap()
+            .rect;
+        let mut output = None;
+        for t in [0.1, 0.2] {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 500.0),
+                )),
+                time: Some(t),
+                events: vec![egui::Event::PointerMoved(rect.center())],
+                ..Default::default()
+            };
+            output = Some(ctx.run_ui(input, |ui| browser.ui(ui)));
+        }
+        let highlighted = output
+            .unwrap()
+            .shapes
+            .iter()
+            .any(|clipped| match &clipped.shape {
+                egui::Shape::Rect(r) => {
+                    r.fill != egui::Color32::TRANSPARENT
+                        && r.rect.contains(rect.center())
+                        && r.rect.width() <= rect.width() + 8.0
+                }
+                _ => false,
+            });
+        assert!(
+            highlighted,
+            "hovering a path segment paints a fill under it"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

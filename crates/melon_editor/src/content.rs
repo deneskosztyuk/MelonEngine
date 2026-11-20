@@ -153,6 +153,7 @@ const SETTINGS_VERSION: u32 = 1;
 
 /// Saved per project. Folders are root-relative with `/` (`""` = root).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
 pub struct ContentSettings {
     version: u32,
     favorites: Vec<String>,
@@ -302,7 +303,8 @@ impl ContentBrowser {
     /// Pop `from` until an existing folder; the old current goes onto `to`.
     fn step(from: &mut Vec<PathBuf>, to: &mut Vec<PathBuf>, current: &mut PathBuf) {
         while let Some(dir) = from.pop() {
-            if dir.is_dir() {
+            // A refresh walk-up can leave the current folder on the stack.
+            if dir.is_dir() && dir != *current {
                 to.push(std::mem::replace(current, dir));
                 return;
             }
@@ -831,6 +833,33 @@ mod tests {
         assert_eq!(browser.favorites(), [dir.join("a")]);
         browser.remove_favorite(&dir.join("a"));
         assert!(browser.favorites().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_missing_field_keeps_the_rest() {
+        let dir = temp_dir("settings_partial");
+        touch(&dir, "a/");
+        let file = dir.join("content_browser.ron");
+        std::fs::write(&file, r#"(version: 1, favorites: ["a"])"#).unwrap();
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.load_settings(&file);
+        assert_eq!(browser.favorites(), [dir.join("a")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn back_after_refresh_walk_up_skips_the_current_folder() {
+        let dir = temp_dir("refresh_dup");
+        touch(&dir, "a/x/");
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.open(dir.join("a"));
+        browser.open(dir.join("a/x"));
+        std::fs::remove_dir_all(dir.join("a/x")).unwrap();
+        browser.refresh();
+        assert_eq!(browser.current(), dir.join("a"));
+        browser.go_back();
+        assert_eq!(browser.current(), dir, "Back leaves the folder we are in");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
