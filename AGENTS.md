@@ -61,6 +61,15 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   it from `InputFocus`: `Game` while playing, Esc gives it back to `Editor`).
   `RawPresses` sees every press whatever the focus and is cleared after the
   editor UI (rebinding capture).
+- **Render quality vs look.** `RenderQuality` (`melon_core::quality`) is
+  what the GPU spends time on: GI mode, AO and bloom on/off, shadow map
+  size, MSAA, present mode. `Environment` is the look (sky, fog, strengths,
+  radii). Presets are data (`RenderQuality::preset`, `matching_preset`;
+  `Default` = High = today's renderer). Saved as `config/quality.ron`
+  (loaded by the host), named profiles as `config/quality_profiles/<name>.ron`;
+  edited in Edit ▸ Project Settings ▸ Quality, pending until Apply.
+  `RenderTimings` holds per-pass GPU ms (`None` = not measured).
+  Part b pending: nothing reads `RenderQuality` or fills `RenderTimings` yet.
 - **Frame pacing (`melon_host/src/pacing.rs`).** Raw device events are off
   (`DeviceEvents::Never`) and turn on (`WhenFocused`) only while
   `GameInputGate` is open: mouse look is their only user, and while the

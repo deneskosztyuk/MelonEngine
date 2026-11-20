@@ -135,6 +135,11 @@ Goal: an editor that looks and works like Unity / Unreal / Godot.
 - [x] Editor frame pacing: raw device events only while the game has
       input, Mailbox present with a refresh-rate frame cap (FIFO fallback,
       `MELON_PRESENT=fifo`), `MELON_FRAME_STATS=1` timing line.
+- [x] Quality settings (part a): `RenderQuality` presets, profiles,
+      `config/quality.ron`, Project Settings ▸ Quality panel.
+- [ ] Quality settings part b: renderer reads `RenderQuality` (GI/AO/bloom
+      switches, shadow map and MSAA rebuilds, present mode) and GPU
+      timestamp timings fill `RenderTimings`.
 - [ ] Undo / Redo (command history), rename, duplicate.
 - [ ] Game view (game camera) next to the Scene view.
 - [ ] Gizmo upgrades: plane handles, local/world toggle.
