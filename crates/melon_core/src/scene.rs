@@ -22,6 +22,12 @@ use serde::de::DeserializeSeed;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Marker: the entity (and its children) survives a scene request, like
+/// Unity's DontDestroyOnLoad. For music players, score keepers, a persistent
+/// camera rig. Not saved in scenes.
+#[derive(Component, Default, Clone, Copy, Debug)]
+pub struct KeepOnSceneLoad;
+
 /// Stable id of a scene entity. Assigned when first needed (`ensure_ids`,
 /// editor `capture`) and saved with the scene.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -404,6 +410,13 @@ pub fn capture_entity(
 /// come from the physics sync systems afterwards (an owner of a `PhysicsWorld`
 /// clears it before and syncs after).
 pub fn apply_scene(world: &mut World, data: &SceneData) -> Result<()> {
+    apply_scene_keeping(world, data, false)
+}
+
+/// `apply_scene`; with `keep` the entities marked `KeepOnSceneLoad` (and their
+/// descendants) stay in the world. Scene requests keep them; the editor's
+/// Play / Stop rebuilds do not (they restore a snapshot of everything).
+pub fn apply_scene_keeping(world: &mut World, data: &SceneData, keep: bool) -> Result<()> {
     // Phase 1: Validate (no world mutation)
     if !(1..=SCENE_VERSION).contains(&data.version) {
         bail!(
@@ -428,10 +441,27 @@ pub fn apply_scene(world: &mut World, data: &SceneData) -> Result<()> {
     // Despawn only scene entities (those with a Transform). In bevy_ecs 0.19
     // resources are entities too, so despawning everything would delete them.
     // Never swap in a new World: systems are bound to the World they first ran on.
-    let scene_entities: Vec<Entity> = world
+    let mut scene_entities: Vec<Entity> = world
         .query_filtered::<Entity, With<Transform>>()
         .iter(world)
         .collect();
+    let mut kept: Vec<Entity> = Vec::new();
+    if keep {
+        kept = world
+            .query_filtered::<Entity, With<KeepOnSceneLoad>>()
+            .iter(world)
+            .collect();
+        let mut all = std::collections::HashSet::new();
+        let mut stack = kept.clone();
+        while let Some(e) = stack.pop() {
+            if all.insert(e)
+                && let Some(children) = world.get::<crate::Children>(e)
+            {
+                stack.extend(children.iter());
+            }
+        }
+        scene_entities.retain(|e| !all.contains(e));
+    }
     for entity in scene_entities {
         // Children may already be gone with their parent (`linked_spawn`).
         if let Ok(e) = world.get_entity_mut(entity) {
@@ -488,6 +518,11 @@ pub fn apply_scene(world: &mut World, data: &SceneData) -> Result<()> {
         .filter(|(e, _)| e.parent.is_none())
         .map(|(_, &id)| id)
         .collect();
+    let mut roots = roots;
+    roots.extend(
+        kept.into_iter()
+            .filter(|e| world.get::<ChildOf>(*e).is_none()),
+    );
     world.insert_resource(crate::hierarchy::RootOrder(roots));
     Ok(())
 }
@@ -617,7 +652,7 @@ pub fn apply_scene_requests(world: &mut World) -> bool {
         Some(server) => read_scene_asset(server, &path),
         None => Err(anyhow!("no AssetServer")),
     }
-    .and_then(|data| apply_scene(world, &data));
+    .and_then(|data| apply_scene_keeping(world, &data, true));
     match result {
         Ok(()) => {
             tracing::info!("loaded scene {path}");
@@ -970,6 +1005,45 @@ mod tests {
         assert_eq!(names(&mut core.world), ["A"], "not applied mid-frame");
         core.update(); // applied first thing in the next frame
         assert_eq!(names(&mut core.world), ["B"], "A despawned, B spawned");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn keep_on_scene_load_entities_and_their_children_survive_a_scene_request() {
+        let root = std::env::temp_dir().join(format!("melon_scene_keep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("assets/scenes")).unwrap();
+        let mut other = Core::new();
+        other.world.insert_resource(AssetServer::new(".".into()));
+        other.world.spawn((Name("B".into()), Transform::default()));
+        save_scene(&mut other.world, &root.join("assets/scenes/b.ron")).unwrap();
+
+        let mut core = Core::new();
+        core.world.insert_resource(AssetServer::new(root.clone()));
+        let music = core
+            .world
+            .spawn((Name("Music".into()), Transform::default(), KeepOnSceneLoad))
+            .id();
+        core.world
+            .spawn((Name("Track".into()), Transform::default(), ChildOf(music)));
+        core.world.spawn((Name("A".into()), Transform::default()));
+        core.world
+            .resource_mut::<SceneRequests>()
+            .load("assets/scenes/b.ron");
+        core.update();
+        let mut names: Vec<String> = core
+            .world
+            .query::<&Name>()
+            .iter(&core.world)
+            .map(|n| n.0.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["B", "Music", "Track"]);
+        let roots = &core.world.resource::<crate::hierarchy::RootOrder>().0;
+        assert!(
+            roots.contains(&music),
+            "a kept root stays in the root order"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

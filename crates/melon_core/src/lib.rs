@@ -63,7 +63,7 @@ pub use reflect::{
     Vec2Reflect, Vec3Reflect, Vec4Reflect, display_name, registered_components,
 };
 pub use resources::{Camera, Environment, Light, NameCounter, SimulationState, Time};
-pub use scene::SceneRequests;
+pub use scene::{KeepOnSceneLoad, SceneRequests};
 pub use stages::{FixedPostUpdate, FixedUpdate, PhysicsStep, PostUpdate, PreUpdate, Update};
 
 /// What a game crate needs to define and register components:
@@ -173,8 +173,13 @@ impl Core {
             schedules: stage_schedules(),
             plugin_schedules: stage_schedules(),
         };
-        core.add_systems(PreUpdate, scene::scene_requests_system);
-        core.add_systems(PreUpdate, update_actions_system);
+        core.add_systems(
+            PreUpdate,
+            (
+                scene::scene_requests_system.before(update_actions_system),
+                update_actions_system,
+            ),
+        );
         core.add_systems(Update, (frame_counter_system, log_frame_system));
         core.add_systems(
             PostUpdate,

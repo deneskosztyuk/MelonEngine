@@ -18,6 +18,70 @@ use crate::pack::build_pack;
 /// File name of the pack beside the executable.
 pub const PACK_FILE: &str = "game.pak";
 
+/// Written into every packaged folder; only a folder holding it (and the
+/// pack) is ever replaced by a later build.
+pub const MANIFEST_FILE: &str = "build.manifest";
+
+/// `p` made absolute, without `.` / `..`, with the deepest existing part
+/// resolved (symlinks, true case), so two spellings of a folder compare equal.
+fn resolve(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut clean = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::ParentDir => {
+                clean.pop();
+            }
+            Component::CurDir => {}
+            other => clean.push(other),
+        }
+    }
+    let (mut tail, mut cur) = (Vec::new(), clean.clone());
+    loop {
+        if let Ok(mut found) = cur.canonicalize() {
+            found.extend(tail.iter().rev());
+            return found;
+        }
+        match (cur.file_name().map(|n| n.to_owned()), cur.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                cur = parent.to_path_buf();
+            }
+            _ => return clean,
+        }
+    }
+}
+
+/// `path` equals or lies inside `base` (case-insensitive: Windows paths).
+fn inside(path: &Path, base: &Path) -> bool {
+    let lower = |p: &Path| p.to_string_lossy().to_lowercase();
+    let (path, base) = (PathBuf::from(lower(path)), PathBuf::from(lower(base)));
+    path.starts_with(base)
+}
+
+/// Refuse a target (the output folder or the game folder in it) that is the
+/// project folder, holds it, or is / lies inside its `assets`, `config`,
+/// `crates` or `.git`: packaging would write into, or delete, project files.
+fn check_target(root: &Path, target: &Path) -> Result<()> {
+    let (root, target) = (resolve(root), resolve(target));
+    if inside(&root, &target) {
+        bail!(
+            "{} is the project folder or holds it; pick another output folder",
+            target.display()
+        );
+    }
+    for protected in ["assets", "config", "crates", ".git"] {
+        if inside(&target, &root.join(protected)) {
+            bail!(
+                "{} is inside the project's {protected} folder; pick another output folder",
+                target.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// What `package_game` wrote.
 #[derive(Debug)]
 pub struct PackageReport {
@@ -44,7 +108,15 @@ pub fn package_game(
         );
     }
     let dir = out.join(&settings.game_name);
+    check_target(root, out)?;
+    check_target(root, &dir)?;
     if dir.exists() {
+        if !dir.join(PACK_FILE).is_file() || !dir.join(MANIFEST_FILE).is_file() {
+            bail!(
+                "{} exists but was not written by a build; remove it or pick another output folder",
+                dir.display()
+            );
+        }
         std::fs::remove_dir_all(&dir)
             .with_context(|| format!("cannot replace {}", dir.display()))?;
     }
@@ -56,6 +128,16 @@ pub fn package_game(
     let exe = dir.join(exe_name);
     std::fs::copy(player_exe, &exe).with_context(|| format!("cannot copy to {}", exe.display()))?;
     let files = build_pack(root, &settings.exclude, &dir.join(PACK_FILE))?;
+    std::fs::write(
+        dir.join(MANIFEST_FILE),
+        format!(
+            "melon build 1
+game: {}
+version: {}
+",
+            settings.game_name, settings.version
+        ),
+    )?;
     Ok(PackageReport { dir, exe, files })
 }
 
@@ -130,7 +212,7 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        assert_eq!(names, ["Space Melon.exe", "game.pak"]);
+        assert_eq!(names, ["Space Melon.exe", "build.manifest", "game.pak"]);
 
         let pack = Pack::open(&report.dir.join(PACK_FILE)).unwrap();
         assert_eq!(report.files, 2);
@@ -213,6 +295,71 @@ mod tests {
         };
         assert!(package_game(&root, &exe, &out, &bad).is_err());
         assert!(!out.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn project_with_player(name: &str) -> (PathBuf, PathBuf) {
+        let root = temp(name);
+        for d in ["assets", "config", "crates", ".git"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+            std::fs::write(root.join(d).join("keep.txt"), "precious").unwrap();
+        }
+        let exe = root.join("p.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        (root, exe)
+    }
+
+    fn game(name: &str) -> PlayerSettings {
+        PlayerSettings {
+            game_name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn outputs_that_would_touch_project_folders_are_refused() {
+        let (root, exe) = project_with_player("protect");
+        let parent = root.parent().unwrap().to_path_buf();
+        let root_name = root.file_name().unwrap().to_string_lossy().into_owned();
+        let cases: Vec<(PathBuf, String)> = vec![
+            (root.clone(), "assets".into()),
+            (root.clone(), "config".into()),
+            (root.clone(), "crates".into()),
+            (root.clone(), ".git".into()),
+            (root.join("assets"), "Game".into()),
+            (root.join("assets/sub"), "Game".into()),
+            (root.join(".git"), "Game".into()),
+            (root.join("crates"), "Game".into()),
+            (root.join("config"), "Game".into()),
+            (root.join("out/../assets"), "Game".into()),
+            (root.join("assets/.."), "assets".into()),
+            (parent, root_name),
+        ];
+        for (out, name) in cases {
+            let result = package_game(&root, &exe, &out, &game(&name));
+            assert!(result.is_err(), "{} + {name} was accepted", out.display());
+            for d in ["assets", "config", "crates", ".git"] {
+                assert!(root.join(d).join("keep.txt").is_file(), "{d} lost");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_a_folder_a_previous_build_wrote_is_replaced() {
+        let (root, exe) = project_with_player("marker");
+        let out = root.join("Builds");
+        std::fs::create_dir_all(out.join("Game")).unwrap();
+        std::fs::write(out.join("Game/keep.txt"), "mine").unwrap();
+        assert!(package_game(&root, &exe, &out, &game("Game")).is_err());
+        assert!(out.join("Game/keep.txt").is_file());
+
+        std::fs::remove_dir_all(out.join("Game")).unwrap();
+        package_game(&root, &exe, &out, &game("Game")).unwrap();
+        // The second build replaces the first one (it carries the marker).
+        std::fs::write(out.join("Game/stale.txt"), "x").unwrap();
+        package_game(&root, &exe, &out, &game("Game")).unwrap();
+        assert!(!out.join("Game/stale.txt").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
