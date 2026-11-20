@@ -161,7 +161,7 @@ mod tests {
                 "Spin",
                 "Transform"
             ]
-        assert_eq!(names, ["Aabb", "Bob", "Body Info", "Spin", "Transform"]);
+        );
     }
 
     #[test]
