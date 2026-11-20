@@ -338,6 +338,63 @@ fn ssgi_resolution(name: Option<&str>) -> Result<SsgiResolution> {
     }
 }
 
+/// Print how many pixels of the HDR scene image (before bloom and
+/// tonemapping) are NaN or infinite, the largest finite value, and where the
+/// first bad pixels are.
+fn hdr_stats(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Result<()> {
+    let (w, h) = (texture.width(), texture.height());
+    let row = w * 8;
+    let padded = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("hdr stats readback"),
+        size: (padded * h) as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: None,
+            },
+        },
+        texture.size(),
+    );
+    queue.submit([encoder.finish()]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    buffer.map_async(wgpu::MapMode::Read, .., move |r| {
+        let _ = tx.send(r);
+    });
+    device.poll(wgpu::PollType::wait_indefinitely())?;
+    rx.recv()?.context("hdr readback failed")?;
+    let data = unpad_rows(&buffer.get_mapped_range(..), padded as usize, row as usize);
+    let (mut nan, mut inf, mut max) = (0usize, 0usize, 0f32);
+    let mut first = Vec::new();
+    for (i, px) in data.chunks_exact(8).enumerate() {
+        for c in px.chunks_exact(2).take(3) {
+            let v = half::f16::from_le_bytes([c[0], c[1]]).to_f32();
+            if v.is_nan() || v.is_infinite() {
+                if v.is_nan() {
+                    nan += 1
+                } else {
+                    inf += 1
+                }
+                if first.len() < 8 {
+                    first.push((i as u32 % w, i as u32 / w));
+                }
+            } else {
+                max = max.max(v);
+            }
+        }
+    }
+    println!("hdr: {nan} NaN, {inf} Inf channels, max finite {max:.1}, first bad pixels {first:?}");
+    Ok(())
+}
+
 /// A point named as `x,y,z` (for `--eye` / `--look`).
 fn vec3(text: Option<&str>) -> Result<Vec3> {
     let parts: Vec<f32> = text
@@ -386,7 +443,9 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
     let mut pan = None;
     let mut args = flags.iter();
     while let Some(flag) = args.next() {
-        const FLAGS: [&str; 17] = [
+        const FLAGS: [&str; 19] = [
+            "--hdr-stats",
+            "--no-local-shadows",
             "--pan",
             "--fog",
             "--scene",
@@ -460,6 +519,9 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
     quality.gi_mode = gi.unwrap_or(quality.gi_mode);
     quality.ssgi_resolution = ssgi_res.unwrap_or(quality.ssgi_resolution);
     quality.ao &= !has("--no-ao");
+    if has("--no-local-shadows") {
+        quality.shadowed_lights = 0;
+    }
     quality.bloom &= !(has("--no-bloom") || gi_only);
     let mut server = AssetServer::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..").into());
     let mut frame = FrameData {
@@ -501,6 +563,9 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
         };
         if let Some(fog) = fog {
             frame.environment.fog_density = fog;
+        }
+        if has("--no-lights") {
+            frame.lights.clear();
         }
         server = core
             .world
@@ -553,6 +618,9 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
     });
     renderer.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
 
+    if has("--hdr-stats") {
+        hdr_stats(&device, &queue, target.hdr_target().texture())?;
+    }
     let texture = if ao_only {
         target.ao_texture().clone()
     } else {

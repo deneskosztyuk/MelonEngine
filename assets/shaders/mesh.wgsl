@@ -268,13 +268,15 @@ fn ibl_prefiltered(dir: vec3f, roughness: f32) -> vec3f {
     return textureSampleLevel(ibl_specular, ibl_sampler, uv, roughness * ibl.params.x).rgb;
 }
 
+// The cosine is capped at 1: rounding can push dot(h, v) just above it
+// (light behind the camera), and pow() of a negative base is NaN on the GPU.
 fn fresnel_schlick(cos_theta: f32, f0: vec3f) -> vec3f {
-    return f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
+    return f0 + (1.0 - f0) * pow(1.0 - min(cos_theta, 1.0), 5.0);
 }
 
 // Schlick with roughness (Lagarde): rough surfaces brighten less at grazing angles.
 fn fresnel_schlick_roughness(cos_theta: f32, f0: vec3f, roughness: f32) -> vec3f {
-    return f0 + (max(vec3f(1.0 - roughness), f0) - f0) * pow(1.0 - cos_theta, 5.0);
+    return f0 + (max(vec3f(1.0 - roughness), f0) - f0) * pow(1.0 - min(cos_theta, 1.0), 5.0);
 }
 
 // GGX / Trowbridge-Reitz normal distribution, alpha = roughness^2.

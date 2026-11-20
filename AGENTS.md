@@ -685,6 +685,10 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   `create_material_bind_group`. `LoadedModel::material_bind_groups` has one
   per mesh; `builtin:cube` is the checkerboard on a rough white dielectric.
 - **Shading.** Sun: Cook-Torrance (GGX, height-correlated Smith, Schlick).
+  Keep every `pow` base non-negative: Fresnel caps its cosine at 1, since
+  rounding pushes `dot(h, v)` above 1 when a light is behind the camera
+  and a NaN pixel blacks out the frame through bloom
+  (`check_light_at_the_camera_shades_no_nan`).
   `Light::color` is scaled so a white Lambert surface facing the sun shows
   `(1 - ambient) * color` (the shader uses radiance `PI * color`); `ambient`
   still splits light between sun and hemisphere, which keeps the pre-PBR
@@ -875,7 +879,11 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
 - **Camera conventions.** Right-handed, DirectX depth (near = 0, far = 1).
   Screen helpers take logical points.
 - **Checking rendering.** Agents verify rendering with the snapshot example
-  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd|cornell|lights|alpha] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only] [--ssgi-res half|quarter] [--size WxH] [--no-lights] [--scene <file.ron> --eye x,y,z --look x,y,z] [--fog <density>]`;
+  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd|cornell|lights|alpha] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only] [--ssgi-res half|quarter] [--size WxH] [--no-lights] [--scene <file.ron> --eye x,y,z --look x,y,z] [--fog <density>] [--pan <deg>] [--hdr-stats] [--no-local-shadows]`;
+  `--pan` turns the camera each timed frame (temporal bugs such as SSGI
+  history); `--hdr-stats` prints NaN / Inf counts and the largest value of
+  the HDR image before bloom (one NaN pixel turns the whole frame black
+  through bloom);
   `--scene` renders a scene file through `Core::update` and `extract` (its
   `SceneLighting` included) from the given camera; quote a leading minus,
   e.g. `--eye " -26,22,26"`;

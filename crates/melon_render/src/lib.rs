@@ -861,6 +861,11 @@ pub struct HdrTarget {
 }
 
 impl HdrTarget {
+    /// The single-sample scene image (copyable, for diagnostics).
+    pub fn texture(&self) -> &wgpu::Texture {
+        &self._texture
+    }
+
     /// Resolve target: the single-sample image the tonemap pass reads.
     pub fn view(&self) -> &wgpu::TextureView {
         &self.view
@@ -3918,7 +3923,9 @@ impl SceneRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: HDR_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -7502,6 +7509,84 @@ mod tests {
 
     /// A light off the view centre lights the floor under it, not its
     /// mirror image (cluster tile rows and columns match the shader's).
+    /// A light exactly at the camera: `l == v` for every fragment, so
+    /// rounding can push `dot(h, v)` just above 1, and Fresnel's
+    /// `pow(1 - cos, 5)` of a negative base is NaN on the GPU. One such pixel
+    /// blacked out the whole editor view through bloom (and SSGI kept it).
+    fn check_light_at_the_camera_shades_no_nan(r: &mut Renderer) -> Result<(), String> {
+        let mut server = repo_server();
+        r.model_cache = ModelCache::new(&r.scene);
+        let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+        let camera = top_down_camera();
+        let mut frame = FrameData {
+            view_proj: camera.view_proj(),
+            eye: camera.eye,
+            light: melon_core::Light {
+                color: glam::Vec3::ZERO,
+                ambient: 0.0,
+                ..test_light()
+            },
+            environment: plain_environment(),
+            quality: melon_core::RenderQuality::default(),
+            lights: vec![point_light(camera.eye, 80.0, 30.0)],
+            ..Default::default()
+        };
+        frame.models.push((
+            glam::Mat4::from_scale_rotation_translation(
+                glam::Vec3::new(12.0, 0.2, 12.0),
+                glam::Quat::IDENTITY,
+                glam::Vec3::new(0.0, -0.1, 0.0),
+            ),
+            cube,
+        ));
+        let mut target =
+            r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let mut encoder = r
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        r.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
+        let texture = target.hdr_target().texture();
+        let row = texture.width() * 8;
+        let padded = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer = r.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hdr readback"),
+            size: (padded * texture.height()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: None,
+                },
+            },
+            texture.size(),
+        );
+        r.queue().submit([encoder.finish()]);
+        buffer.map_async(wgpu::MapMode::Read, .., |res| res.expect("hdr map failed"));
+        r.device()
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| e.to_string())?;
+        let data = buffer.get_mapped_range(..);
+        let bad = (0..texture.height() as usize)
+            .flat_map(|y| {
+                let start = y * padded as usize;
+                data[start..start + row as usize].chunks_exact(2)
+            })
+            .filter(|c| !half::f16::from_le_bytes([c[0], c[1]]).to_f32().is_finite())
+            .count();
+        if bad > 0 {
+            return Err(format!(
+                "light at the camera: {bad} non-finite HDR channels"
+            ));
+        }
+        Ok(())
+    }
+
     fn check_off_centre_light_lights_its_own_floor(r: &mut Renderer) -> Result<(), String> {
         let quality = melon_core::RenderQuality::default();
         let view_proj = top_down_camera().view_proj();
@@ -9846,6 +9931,7 @@ mod tests {
             Box::new(check_masked_out_leaves_no_ao),
             Box::new(check_blend_sorted_far_to_near),
             Box::new(check_off_centre_light_lights_its_own_floor),
+            Box::new(check_light_at_the_camera_shades_no_nan),
             Box::new(check_edge_quality_and_lights),
             Box::new(check_blend_material_thumbnail),
             Box::new(check_material_bad_texture_refs),
