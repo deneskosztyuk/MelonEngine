@@ -150,6 +150,19 @@ impl ContentBrowser {
             self.renaming = None;
         }
         self.shortcut_keys(ui, &mut actions);
+        // A ping flashes for PING_SECONDS from its first draw.
+        let now = ui.input(|i| i.time);
+        self.ping_scroll = false;
+        if let Some((_, start)) = &mut self.pinged {
+            match start {
+                None => {
+                    *start = Some(now);
+                    self.ping_scroll = true;
+                }
+                Some(t) if now - *t >= sizes::PING_SECONDS => self.pinged = None,
+                Some(_) => {}
+            }
+        }
 
         self.toolbar(ui, &mut actions);
         ui.separator();
@@ -612,6 +625,18 @@ impl ContentBrowser {
         };
         let painter = ui.painter().with_clip_rect(rect);
         painter.rect_filled(rect, sizes::RADIUS, fill);
+        if self.pinged.as_ref().is_some_and(|(p, _)| *p == entry.path) {
+            if self.ping_scroll {
+                response.scroll_to_me(Some(egui::Align::Center));
+            }
+            painter.rect_stroke(
+                rect,
+                sizes::RADIUS,
+                egui::Stroke::new(sizes::PING_STROKE, colors::ACCENT),
+                egui::StrokeKind::Inside,
+            );
+            ui.ctx().request_repaint();
+        }
         let glyph = kind_glyph(entry.kind);
         let tint = kind_color(entry.kind);
         let text = colors::TEXT;

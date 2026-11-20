@@ -308,6 +308,11 @@ pub struct ContentBrowser {
     pub(crate) renaming: Option<Renaming>,
     /// An editor dialog is open: the browser's keys wait.
     pub(crate) blocked: bool,
+    /// A file to flash (from the Inspector's "show"), and when its flash
+    /// started (set by the view on the first draw).
+    pub(crate) pinged: Option<(PathBuf, Option<f64>)>,
+    /// Scroll the pinged item into view this frame.
+    pub(crate) ping_scroll: bool,
 }
 
 impl ContentBrowser {
@@ -332,6 +337,8 @@ impl ContentBrowser {
             focused: false,
             renaming: None,
             blocked: false,
+            pinged: None,
+            ping_scroll: false,
         };
         browser.refresh();
         browser
@@ -349,6 +356,22 @@ impl ContentBrowser {
     /// The browser owns the keyboard shortcuts it shares with other panels.
     pub fn has_focus(&self) -> bool {
         self.focused
+    }
+
+    /// Jump to `file`: open its folder, clear the search, select it and
+    /// flash it. `false` (nothing changes) if it is gone or outside the root.
+    pub fn ping(&mut self, file: &Path) -> bool {
+        let Some(parent) = file.parent() else {
+            return false;
+        };
+        if !file.is_file() || !self.inside_root(file) {
+            return false;
+        }
+        self.open(parent.to_path_buf());
+        self.set_search(String::new());
+        self.select(Some(file.to_path_buf()));
+        self.pinged = Some((file.to_path_buf(), None));
+        true
     }
 
     /// Show a text field in place of the item's name.
@@ -1150,5 +1173,34 @@ mod tests {
         assert_eq!(format_modified(t), "2025-11-20 12:00 UTC");
         let leap = std::time::UNIX_EPOCH + std::time::Duration::from_secs(951_782_400); // 2000-02-29
         assert_eq!(format_modified(leap), "2000-02-29 00:00 UTC");
+    }
+
+    #[test]
+    fn ping_opens_folder_selects_and_clears_search() {
+        let dir = temp_dir("ping");
+        touch(&dir, "a/x.glb");
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.set_search("zzz".into());
+        assert!(browser.ping(&dir.join("a/x.glb")));
+        assert_eq!(browser.current(), dir.join("a"));
+        assert_eq!(browser.selected(), Some(dir.join("a/x.glb").as_path()));
+        assert_eq!(browser.search(), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ping_missing_file_does_nothing() {
+        let dir = temp_dir("ping_missing");
+        touch(&dir, "a/");
+        let mut browser = ContentBrowser::new(dir.clone());
+        assert!(!browser.ping(&dir.join("nope.glb")));
+        let outside =
+            std::env::temp_dir().join(format!("melon_ping_out_{}.glb", std::process::id()));
+        std::fs::write(&outside, "x").unwrap();
+        assert!(!browser.ping(&outside));
+        assert_eq!(browser.current(), dir);
+        assert_eq!(browser.selected(), None);
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

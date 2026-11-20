@@ -1426,6 +1426,7 @@ impl Editor {
             .zip(world.get_resource::<AssetServer>())
             .map(|(h, server)| server.path(*h).to_string());
         let mut new_model: Option<String> = None;
+        let mut ping: Option<std::path::PathBuf> = None;
         let Ok(mut entity_mut) = world.get_entity_mut(entity) else {
             self.clear_selection();
             return;
@@ -1445,21 +1446,49 @@ impl Editor {
             inspector_card(ui, &mut card_fills, "Transform", |ui| {
                 if let Some(current) = &current_model {
                     ui.label("Mesh");
-                    egui::ComboBox::from_id_salt("inspector_mesh")
-                        .selected_text(model_label(current))
-                        .width(ui.available_width())
-                        .show_ui(ui, |ui| {
-                            // Listed only while the dropdown is open.
-                            for path in content::model_list(&self.project_root) {
-                                if ui
-                                    .selectable_label(*current == path, model_label(&path))
-                                    .on_hover_text(&path)
-                                    .clicked()
-                                {
-                                    new_model = Some(path);
+                    // The model's file, for "show" (none for `builtin:` or a missing file).
+                    let file = self
+                        .project_root
+                        .join(melon_core::assets::split_mesh_fragment(current).0);
+                    let file = (!current.starts_with(melon_core::assets::BUILTIN_PREFIX)
+                        && file.is_file())
+                    .then_some(file);
+                    ui.horizontal(|ui| {
+                        let show = ui
+                            .add_enabled(file.is_some(), egui::Button::new("Show"))
+                            .on_hover_text("Show the model in the Content Browser")
+                            .on_disabled_hover_text("No file to show");
+                        if show.clicked() {
+                            ping = file.clone();
+                        }
+                        let combo = egui::ComboBox::from_id_salt("inspector_mesh")
+                            .selected_text(model_label(current))
+                            .width(ui.available_width())
+                            .show_ui(ui, |ui| {
+                                // Listed only while the dropdown is open.
+                                for path in content::model_list(&self.project_root) {
+                                    if ui
+                                        .selectable_label(*current == path, model_label(&path))
+                                        .on_hover_text(&path)
+                                        .clicked()
+                                    {
+                                        new_model = Some(path);
+                                    }
                                 }
-                            }
-                        });
+                            });
+                        // A model dragged from the Content Browser replaces it.
+                        let drop = ui.interact(
+                            combo.response.rect,
+                            egui::Id::new("inspector_mesh_drop"),
+                            egui::Sense::hover(),
+                        );
+                        if let Some(drag) = drop.dnd_release_payload::<content::AssetDrag>()
+                            && let Some(model) = &drag.model
+                            && content::is_model_path(model)
+                        {
+                            new_model = Some(model.clone());
+                        }
+                    });
                     ui.end_row();
                 }
 
@@ -1529,6 +1558,12 @@ impl Editor {
         if let Some(path) = new_model {
             let handle: Handle<Model> = world.resource_mut::<AssetServer>().load(&path);
             world.entity_mut(entity).insert(handle);
+        }
+        if let Some(file) = ping {
+            self.content.ping(&file);
+            if let Some(path) = self.dock.find_tab(&layout::EditorTab::ContentBrowser) {
+                let _ = self.dock.set_active_tab(path);
+            }
         }
     }
 
@@ -3901,5 +3936,72 @@ mod tests {
                 .is_some()
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Release `drag` over the Inspector's Mesh field for a selected cube.
+    fn drop_on_mesh_field(drag: content::AssetDrag) -> String {
+        let (mut editor, mut world, root) = browser_project("mesh_drop");
+        let cube: Handle<Model> = world.resource_mut::<AssetServer>().load("builtin:cube");
+        let entity = world
+            .spawn((Name("Cube".to_string()), Transform::default(), cube))
+            .id();
+        editor.set_selected(Some(entity));
+        let ctx = egui::Context::default();
+        let run = |editor: &mut Editor, world: &mut World, events| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| editor.build_inspector(world, ui));
+        };
+        run(&mut editor, &mut world, Vec::new());
+        let pos = ctx
+            .read_response(egui::Id::new("inspector_mesh_drop"))
+            .expect("mesh field drawn")
+            .rect
+            .center();
+        run(
+            &mut editor,
+            &mut world,
+            vec![egui::Event::PointerMoved(pos)],
+        );
+        egui::DragAndDrop::set_payload(&ctx, drag);
+        let release = egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        run(
+            &mut editor,
+            &mut world,
+            vec![egui::Event::PointerMoved(pos), release],
+        );
+        let handle = *world.get::<Handle<Model>>(entity).unwrap();
+        let path = world.resource::<AssetServer>().path(handle).to_string();
+        let _ = std::fs::remove_dir_all(&root);
+        path
+    }
+
+    #[test]
+    fn mesh_field_takes_a_model_drop() {
+        let path = drop_on_mesh_field(content::AssetDrag {
+            path: "assets/models/x.glb".into(),
+            model: Some("assets/models/x.glb".to_string()),
+        });
+        assert_eq!(path, "assets/models/x.glb");
+    }
+
+    #[test]
+    fn mesh_field_ignores_non_model_drop() {
+        let path = drop_on_mesh_field(content::AssetDrag {
+            path: "assets/x.png".into(),
+            model: None,
+        });
+        assert_eq!(path, "builtin:cube");
     }
 }

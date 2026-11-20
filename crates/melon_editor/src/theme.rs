@@ -62,6 +62,9 @@ pub mod sizes {
     pub const TILE_MAX: f32 = 128.0;
     pub const TILE_LIST_BELOW: f32 = 48.0;
     pub const CONTENT_TREE_MIN: f32 = 120.0;
+    /// How long a pinged browser item flashes, and its outline width.
+    pub const PING_SECONDS: f64 = 1.0;
+    pub const PING_STROKE: f32 = 2.0;
     /// Largest share of the Content Browser width the folder tree takes.
     pub const CONTENT_TREE_MAX_SHARE: f32 = 0.5;
     /// Folder tree indent per depth level.

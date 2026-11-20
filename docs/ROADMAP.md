@@ -101,6 +101,10 @@ Goal: an editor that looks and works like Unity / Unreal / Godot.
 - [x] Layout redesign: dockable tabbed panels (saved layout), menu bar,
       toolbar, status bar, theme, console from `tracing`, content browser,
       hierarchy search, Step.
+- [ ] Content Browser (`docs/superpowers/specs/2026-11-20-content-browser-design.md`):
+      [x] asset GUIDs (`.meta`), [x] tree / tiles / search / filter / favorites,
+      [x] file operations and opening files, [x] live updates and Inspector,
+      [ ] thumbnails, [ ] Content Drawer.
 - [ ] Undo / Redo (command history), rename, duplicate.
 - [ ] Game view (game camera) next to the Scene view.
 - [ ] Gizmo upgrades: plane handles, local/world toggle.

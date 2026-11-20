@@ -101,8 +101,13 @@ Editor:
 - **Models:** drag a `.glb` / `.gltf` from the Content Browser into the Scene
   (lands on the ground under the cursor) or the Hierarchy (at the origin, or
   under the row you drop it on). It unpacks into an entity per glTF node. Or
-  pick a whole file in the Inspector's **Mesh** field. Edit and re-export a model and
-  the editor reloads it within about a second.
+  pick a whole file in the Inspector's **Mesh** field, or drop one from the
+  Content Browser onto it; **Show** jumps the browser to the model's file.
+  Edit and re-export a model and the editor reloads it within about a second.
+- Files added, moved or deleted under `assets/` outside the editor show up
+  in the Content Browser within about half a second (move a file together
+  with its `.meta` to keep references). Selecting a file in the browser shows
+  its details (path, size, GUID, meshes, bounds) in the Inspector.
 - **Hierarchy:** drag an entity onto another to make it a child (it keeps its
   place in the world), or onto the empty space below to make it a root.
   Deleting an entity deletes its children.
