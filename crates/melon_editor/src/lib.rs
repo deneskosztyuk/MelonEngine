@@ -697,10 +697,7 @@ impl Editor {
                 (vp.pointer, world.get_resource::<Camera>().copied())
         {
             let at = viewport::drop_point(&camera, pointer, vp.size);
-            match spawn_model(world, &self.project_root, &path, at, None) {
-                Ok(e) => self.selected = Some(e),
-                Err(message) => self.set_status_warning(message),
-            }
+            self.selected = Some(spawn_model(world, &self.project_root, &path, at, None));
             self.gizmo_drag = None;
         }
         self.flying = vp.right_down;
@@ -1016,10 +1013,13 @@ impl Editor {
         if let Some((path, parent)) = model_drop
             && content::is_model_path(&path)
         {
-            match spawn_model(world, &self.project_root, &path, glam::Vec3::ZERO, parent) {
-                Ok(e) => self.selected = Some(e),
-                Err(message) => self.set_status_warning(message),
-            }
+            self.selected = Some(spawn_model(
+                world,
+                &self.project_root,
+                &path,
+                glam::Vec3::ZERO,
+                parent,
+            ));
         }
 
         if let Some(entity) = to_delete {
@@ -1684,31 +1684,19 @@ pub enum StatusKind {
 /// (local to `parent`, if given) with the file's glTF node tree as children,
 /// each node with a mesh drawing `<path>#mesh<N>`. A file that can't be read
 /// spawns one entity drawing the whole file (placeholder until it loads).
-/// `Err` (nothing spawned) if the meshes would pass `MAX_ENTITIES`.
 pub fn spawn_model(
     world: &mut World,
     project_root: &std::path::Path,
     path: &str,
     at: glam::Vec3,
     parent: Option<Entity>,
-) -> Result<Entity, String> {
+) -> Entity {
     let name = std::path::Path::new(path)
         .file_stem()
         .map_or_else(|| "Model".to_string(), |s| s.to_string_lossy().into_owned());
     let nodes = (!path.starts_with(melon_core::assets::BUILTIN_PREFIX))
         .then(|| melon_render::gltf_nodes(&project_root.join(path)).ok())
         .flatten();
-    let meshes = nodes
-        .as_ref()
-        .map_or(1, |n| n.iter().filter(|n| n.mesh.is_some()).count());
-    let used = world.query::<&Handle<Model>>().iter(world).count();
-    if used + meshes > melon_render::MAX_ENTITIES {
-        return Err(format!(
-            "{name} has {meshes} meshes: the scene would pass the {} model limit ({used} used)",
-            melon_render::MAX_ENTITIES
-        ));
-    }
-
     world.get_resource_or_insert_with(|| AssetServer::new(".".into()));
     let root = world
         .spawn((Name(name), Transform::from_translation(at)))
@@ -1719,7 +1707,7 @@ pub fn spawn_model(
     let Some(nodes) = nodes else {
         let handle: Handle<Model> = world.resource_mut::<AssetServer>().load(path);
         world.entity_mut(root).insert(handle);
-        return Ok(root);
+        return root;
     };
     let mut ids = Vec::with_capacity(nodes.len());
     for (i, node) in nodes.iter().enumerate() {
@@ -1745,7 +1733,7 @@ pub fn spawn_model(
         }
         ids.push(id);
     }
-    Ok(root)
+    root
 }
 
 /// Hierarchy drag-and-drop: put `dragged` under `target` (or make it a root)
@@ -2685,7 +2673,7 @@ mod tests {
         let root_dir = two_node_project("tree");
         let mut world = World::new();
         let at = glam::Vec3::new(1.0, 0.0, 2.0);
-        let root = spawn_model(&mut world, &root_dir, "assets/models/two.gltf", at, None).unwrap();
+        let root = spawn_model(&mut world, &root_dir, "assets/models/two.gltf", at, None);
         assert_eq!(world.get::<Name>(root).unwrap().0, "two");
         assert_eq!(world.get::<Transform>(root).unwrap().translation, at);
         assert!(model_path(&world, root).is_none());
@@ -2726,8 +2714,7 @@ mod tests {
             "assets/models/flat.gltf",
             glam::Vec3::ZERO,
             None,
-        )
-        .unwrap();
+        );
         let data = scene::scene_to_data(&mut world);
         let mut physics = melon_physics::PhysicsWorld::new();
         scene::apply_scene(&mut world, &mut physics, &data).unwrap();
@@ -2745,8 +2732,7 @@ mod tests {
             "assets/models/bad.glb",
             glam::Vec3::ZERO,
             None,
-        )
-        .unwrap();
+        );
         assert_eq!(
             model_path(&world, e).as_deref(),
             Some("assets/models/bad.glb")
@@ -2771,8 +2757,7 @@ mod tests {
             "assets/models/two.gltf",
             glam::Vec3::ZERO,
             Some(row),
-        )
-        .unwrap();
+        );
         assert_eq!(
             world.get::<melon_core::ChildOf>(root).unwrap().parent(),
             row
@@ -2785,25 +2770,25 @@ mod tests {
     }
 
     #[test]
-    fn drop_past_entity_cap_is_refused() {
-        let root_dir = two_node_project("cap");
+    fn large_scene_still_takes_a_model() {
+        // There is no model cap: a drop into a scene with 5000 models spawns.
+        let root_dir = two_node_project("no_cap");
         let mut world = World::new();
         let cube: Handle<Model> = world
             .get_resource_or_insert_with(|| AssetServer::new(".".into()))
             .load("builtin:cube");
-        for _ in 0..melon_render::MAX_ENTITIES - 1 {
+        for _ in 0..5000 {
             world.spawn((Transform::default(), cube));
         }
-        let before = world.query::<Entity>().iter(&world).count();
-        let result = spawn_model(
+        let before = world.query::<&Handle<Model>>().iter(&world).count();
+        spawn_model(
             &mut world,
             &root_dir,
             "assets/models/two.gltf",
             glam::Vec3::ZERO,
             None,
         );
-        assert!(result.is_err());
-        assert_eq!(world.query::<Entity>().iter(&world).count(), before);
+        assert!(world.query::<&Handle<Model>>().iter(&world).count() > before);
         let _ = std::fs::remove_dir_all(&root_dir);
     }
 
@@ -2825,8 +2810,7 @@ mod tests {
             "assets/models/sub/Barrel.glb",
             glam::Vec3::new(1.0, 0.0, 2.0),
             None,
-        )
-        .unwrap();
+        );
         assert_eq!(world.get::<Name>(e).unwrap().0, "Barrel");
         assert_eq!(
             world.get::<Transform>(e).unwrap().translation,

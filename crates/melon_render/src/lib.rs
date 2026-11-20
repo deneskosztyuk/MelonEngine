@@ -7,9 +7,6 @@ mod overlay;
 pub use extract::{FrameData, blends, extract};
 pub use overlay::{OverlayDepth, OverlayDraw, OverlayShape, TORUS_TUBE};
 
-/// Model uniform slots: at most this many entities with a model are drawn.
-pub const MAX_ENTITIES: usize = 1024;
-
 /// One node of a glTF file's scene, as the editor spawns it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GltfNode {
@@ -130,11 +127,102 @@ const AO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 /// eye (w).
 const PREPASS_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// One record of the instance storage buffer (group 1), read by the vertex
+/// shaders at `instance_index`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct ModelUniform {
+struct InstanceData {
     model: [[f32; 4]; 4],
     normal_matrix: [[f32; 4]; 4],
+}
+
+/// Records the instance buffer holds before its first growth.
+const INITIAL_INSTANCE_CAPACITY: u64 = 256;
+
+/// Capacity (in records) for `needed` records: `capacity` doubled until it
+/// fits.
+fn grown_capacity(capacity: u64, needed: u64) -> u64 {
+    let mut capacity = capacity.max(1);
+    while capacity < needed {
+        capacity *= 2;
+    }
+    capacity
+}
+
+/// The six planes of a view-proj frustum (DirectX depth, 0..1): left,
+/// right, bottom, top, near, far. A point `p` is inside a plane where
+/// `plane.xyz . p + plane.w >= 0` (normals point inward, unnormalised).
+struct Frustum {
+    planes: [glam::Vec4; 6],
+}
+
+impl Frustum {
+    fn from_view_proj(m: glam::Mat4) -> Self {
+        let (x, y, z, w) = (m.row(0), m.row(1), m.row(2), m.row(3));
+        Self {
+            planes: [w + x, w - x, w + y, w - y, z, w - z],
+        }
+    }
+
+    /// Whether the world-space box `min..max` may touch the frustum. Never
+    /// false for a visible box; a box just outside a corner can pass.
+    fn intersects_aabb(&self, min: glam::Vec3, max: glam::Vec3) -> bool {
+        let center = (min + max) * 0.5;
+        let half = (max - min) * 0.5;
+        self.planes.iter().all(|p| {
+            let n = p.truncate();
+            n.dot(center) + p.w >= -n.abs().dot(half)
+        })
+    }
+}
+
+/// World-space bounds of the local box `(min, max)` under `m`.
+fn world_aabb(m: glam::Mat4, (min, max): (glam::Vec3, glam::Vec3)) -> (glam::Vec3, glam::Vec3) {
+    let center = m.transform_point3((min + max) * 0.5);
+    let half = glam::Mat3::from_mat4(m).abs() * ((max - min) * 0.5);
+    (center - half, center + half)
+}
+
+/// Groups `items` by key: each key's values land contiguously at the end of
+/// `out` (keys in order of first appearance, values in input order). Returns
+/// each key with its range in `out`.
+fn batch<K: Copy + Eq + std::hash::Hash, T>(
+    items: impl IntoIterator<Item = (K, T)>,
+    out: &mut Vec<T>,
+) -> Vec<(K, std::ops::Range<u32>)> {
+    let mut groups: Vec<(K, Vec<T>)> = Vec::new();
+    let mut index = std::collections::HashMap::new();
+    for (key, value) in items {
+        let i = *index.entry(key).or_insert_with(|| {
+            groups.push((key, Vec::new()));
+            groups.len() - 1
+        });
+        groups[i].1.push(value);
+    }
+    groups
+        .into_iter()
+        .map(|(key, values)| {
+            let start = out.len() as u32;
+            out.extend(values);
+            (key, start..out.len() as u32)
+        })
+        .collect()
+}
+
+/// What `render_scene` drew. The SSAO prepass draws the camera's batches
+/// again (same counts as the 3D pass).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderStats {
+    /// Instanced draws in the 3D pass: one per (model, part) seen.
+    pub draw_calls: u32,
+    /// Instances drawn in the 3D pass (entities times model parts).
+    pub instances_drawn: u32,
+    /// Entities outside the camera frustum.
+    pub culled: u32,
+    /// Instanced draws into the shadow map.
+    pub shadow_draw_calls: u32,
+    /// Entities outside the shadow box.
+    pub shadow_culled: u32,
 }
 
 #[repr(C)]
@@ -492,7 +580,7 @@ pub struct SceneRenderer {
     mesh_pipeline: wgpu::RenderPipeline,
     tonemap_pipeline: wgpu::RenderPipeline,
     tonemap_bind_group_layout: wgpu::BindGroupLayout,
-    #[allow(dead_code)]
+    /// Group 1 layout: the instance storage buffer (rebuilt on growth).
     model_bind_group_layout: wgpu::BindGroupLayout,
     material_bind_group_layout: wgpu::BindGroupLayout,
     /// The one sampler every material binds (repeat, linear).
@@ -530,10 +618,11 @@ pub struct SceneRenderer {
     /// Depth-tested lines inside the 3D pass (grid, axes, selection box).
     world_line_pipeline: wgpu::RenderPipeline,
     world_lines: LineBuffer,
-    model_uniform_buffer: wgpu::Buffer,
-    model_bind_group: wgpu::BindGroup,
-    model_uniform_stride: wgpu::BufferAddress,
-    model_staging: Vec<u8>,
+    /// Group 1: per-instance records, `instance_capacity` of them.
+    instance_buffer: wgpu::Buffer,
+    instance_bind_group: wgpu::BindGroup,
+    instance_capacity: u64,
+    instance_staging: Vec<InstanceData>,
 }
 
 pub struct Renderer {
@@ -575,20 +664,44 @@ impl std::ops::DerefMut for Renderer {
     }
 }
 
-fn dynamic_uniform_buffer_layout(device: &wgpu::Device, label: &str) -> wgpu::BindGroupLayout {
+/// Group 1 layout: one read-only storage buffer of `InstanceData`.
+fn instance_buffer_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some(label),
+        label: Some("instance bind group layout"),
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::VERTEX,
             ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: true,
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
                 min_binding_size: None,
             },
             count: None,
         }],
     })
+}
+
+/// An instance buffer of `capacity` records and its group 1 bind group.
+fn create_instance_buffer(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    capacity: u64,
+) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("instance buffer"),
+        size: capacity * std::mem::size_of::<InstanceData>() as wgpu::BufferAddress,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("instance bind group"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buffer.as_entire_binding(),
+        }],
+    });
+    (buffer, bind_group)
 }
 
 impl Renderer {
@@ -600,13 +713,7 @@ impl Renderer {
             .await
             .context("no suitable wgpu adapter found")?;
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                required_limits: wgpu::Limits {
-                    max_uniform_buffer_binding_size: 256 * 1024, // 256 KB for model uniform buffer
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
+            .request_device(&wgpu::DeviceDescriptor::default())
             .await
             .context("failed to request wgpu device")?;
 
@@ -649,7 +756,8 @@ impl Renderer {
     /// Record one view of `frame` into `target`: shadow pass, 3D pass (HDR,
     /// MSAA) with the meshes, the sky and depth-tested `world_lines`, the tonemap pass
     /// onto the target's display image, then the `overlay` shapes.
-    /// Models load (or hot-reload) here on first use.
+    /// Models load (or hot-reload) here on first use. Entities are culled
+    /// per view and drawn instanced, one call per (model, part).
     pub fn render_scene(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -658,39 +766,71 @@ impl Renderer {
         target: &ViewportTarget,
         world_lines: &[LineVertex],
         overlay: &[OverlayDraw],
-    ) {
+    ) -> RenderStats {
         let scene = &mut self.scene;
         scene.update_camera(frame.view_proj, frame.eye);
         scene.update_environment(&frame.environment);
         scene.update_ssao(&frame.environment);
-        scene.update_light(
-            &frame.light,
-            directional_light_view_proj(frame.light.to_light(), SHADOW_CENTER, SHADOW_RADIUS),
-        );
-        let matrices: Vec<glam::Mat4> = frame.models.iter().map(|(m, _)| *m).collect();
-        scene.update_model_uniforms(&matrices);
-
-        // Every part of each entity's model shares the entity's uniform slot.
+        let light_view_proj =
+            directional_light_view_proj(frame.light.to_light(), SHADOW_CENTER, SHADOW_RADIUS);
+        scene.update_light(&frame.light, light_view_proj);
         for (_, handle) in &frame.models {
             self.model_cache.prepare(&self.scene, server, *handle);
         }
-        let mut draw_calls: Vec<(usize, &Mesh, &wgpu::BindGroup)> =
-            Vec::with_capacity(frame.models.len());
-        for (i, (_, handle)) in frame.models.iter().enumerate() {
-            let model = self.model_cache.model(server, *handle);
-            for (mesh, material) in model.meshes.iter().zip(&model.material_bind_groups) {
-                draw_calls.push((i, mesh, material));
+
+        // Cull per view (the shadow pass against the shadow box, so casters
+        // off screen still shade the view), then batch by model: every part
+        // of a model draws its instances in one call.
+        let camera = Frustum::from_view_proj(frame.view_proj);
+        let shadow_box = Frustum::from_view_proj(light_view_proj);
+        let mut stats = RenderStats::default();
+        let (mut seen, mut casters) = (Vec::new(), Vec::new());
+        for (matrix, handle) in &frame.models {
+            let (min, max) = world_aabb(*matrix, self.model_cache.model(server, *handle).bounds);
+            if camera.intersects_aabb(min, max) {
+                seen.push((*handle, *matrix));
+            } else {
+                stats.culled += 1;
+            }
+            if shadow_box.intersects_aabb(min, max) {
+                casters.push((*handle, *matrix));
+            } else {
+                stats.shadow_culled += 1;
             }
         }
-        // The draw list borrows the model cache; the scene is a separate field.
+        let mut matrices = Vec::with_capacity(seen.len() + casters.len());
+        let seen = batch(seen, &mut matrices);
+        let casters = batch(casters, &mut matrices);
+        self.scene.update_instances(&matrices);
+
+        let mut draw_calls: Vec<(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)> = Vec::new();
+        for (handle, instances) in &seen {
+            let model = self.model_cache.model(server, *handle);
+            for (mesh, material) in model.meshes.iter().zip(&model.material_bind_groups) {
+                draw_calls.push((mesh, material, instances.clone()));
+            }
+        }
+        let mut shadow_draw_calls: Vec<(&Mesh, std::ops::Range<u32>)> = Vec::new();
+        for (handle, instances) in &casters {
+            for mesh in &self.model_cache.model(server, *handle).meshes {
+                shadow_draw_calls.push((mesh, instances.clone()));
+            }
+        }
+        stats.draw_calls = draw_calls.len() as u32;
+        stats.instances_drawn = draw_calls.iter().map(|(_, _, r)| r.len() as u32).sum();
+        stats.shadow_draw_calls = shadow_draw_calls.len() as u32;
+
+        // The draw lists borrow the model cache; the scene is a separate field.
         let scene = &mut self.scene;
-        let shadow_draw_calls: Vec<(usize, &Mesh)> =
-            draw_calls.iter().map(|(i, mesh, _)| (*i, *mesh)).collect();
         scene.render_shadow_pass(encoder, &shadow_draw_calls);
         // AO off: skip the SSAO passes and bind white, so the image matches
         // the renderer without SSAO.
         let lighting = if frame.environment.ao_strength > 0.0 {
-            scene.render_ssao(encoder, &shadow_draw_calls, &target.ssao);
+            let prepass_draws: Vec<(&Mesh, std::ops::Range<u32>)> = draw_calls
+                .iter()
+                .map(|(mesh, _, instances)| (*mesh, instances.clone()))
+                .collect();
+            scene.render_ssao(encoder, &prepass_draws, &target.ssao);
             &target.ssao.lighting_bind_group
         } else {
             &scene.unoccluded_lighting
@@ -738,6 +878,7 @@ impl Renderer {
             frame.eye,
             overlay,
         );
+        stats
     }
 
     /// The pass the editor UI draws into: the swapchain image cleared to
@@ -811,7 +952,7 @@ impl SceneRenderer {
                 uniform_entry(4, wgpu::ShaderStages::FRAGMENT),
             ],
         });
-        let model_layout = dynamic_uniform_buffer_layout(&device, "model bind group layout");
+        let model_layout = instance_buffer_layout(&device);
         let shadow_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shadow camera bind group layout"),
             entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX)],
@@ -1073,31 +1214,8 @@ impl SceneRenderer {
         let world_line_pipeline = Renderer::build_world_line_pipeline(&device, &frame_layout);
         let sky_pipeline = Renderer::build_sky_pipeline(&device, &frame_layout);
 
-        // Reusable model uniform buffer with dynamic offsets.
-        // Stride = max(ModelUniform size, min_uniform_buffer_offset_alignment).
-        // This avoids creating a new buffer+bind group per entity per frame (memory leak fix).
-        let model_uniform_size = std::mem::size_of::<ModelUniform>() as wgpu::BufferAddress;
-        let min_alignment =
-            device.limits().min_uniform_buffer_offset_alignment as wgpu::BufferAddress;
-        let model_uniform_stride = model_uniform_size.max(min_alignment);
-        let model_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("model uniform buffer"),
-            size: model_uniform_stride * MAX_ENTITIES as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let model_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("model bind group"),
-            layout: &model_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &model_uniform_buffer,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(model_uniform_size),
-                }),
-            }],
-        });
+        let (instance_buffer, instance_bind_group) =
+            create_instance_buffer(&device, &model_layout, INITIAL_INSTANCE_CAPACITY);
 
         Self {
             device,
@@ -1131,10 +1249,10 @@ impl SceneRenderer {
             unoccluded_lighting,
             world_line_pipeline,
             world_lines: LineBuffer::default(),
-            model_uniform_buffer,
-            model_bind_group,
-            model_uniform_stride,
-            model_staging: Vec::new(),
+            instance_buffer,
+            instance_bind_group,
+            instance_capacity: INITIAL_INSTANCE_CAPACITY,
+            instance_staging: Vec::new(),
         }
     }
 }
@@ -1751,33 +1869,31 @@ impl SceneRenderer {
         }
     }
 
-    /// Write all model uniforms to the shared buffer in one call.
-    /// Each matrix is written at stride `model_uniform_stride` (aligned to device's
-    /// min_uniform_buffer_offset_alignment). Use `model_uniform_offset(index)` to
-    /// get the dynamic offset for `set_bind_group`.
-    pub fn update_model_uniforms(&mut self, matrices: &[glam::Mat4]) {
-        let stride = self.model_uniform_stride as usize;
-        self.model_staging.clear();
-        self.model_staging.reserve(matrices.len() * stride);
-        for mat in matrices {
-            let normal = mat.inverse().transpose();
-            let uniform = ModelUniform {
-                model: mat.to_cols_array_2d(),
-                normal_matrix: normal.to_cols_array_2d(),
-            };
-            let uniform_bytes: [u8; std::mem::size_of::<ModelUniform>()] = bytemuck::cast(uniform);
-            self.model_staging.extend_from_slice(&uniform_bytes);
-            // Pad to stride
-            let pad = stride - uniform_bytes.len();
-            self.model_staging.extend(std::iter::repeat_n(0u8, pad));
+    /// Write the instance records (group 1) for this frame: one per matrix,
+    /// in order; draw instance `i` with instance range `i..i + 1`. The
+    /// buffer doubles until it fits.
+    pub fn update_instances(&mut self, matrices: &[glam::Mat4]) {
+        self.instance_staging.clear();
+        self.instance_staging
+            .extend(matrices.iter().map(|m| InstanceData {
+                model: m.to_cols_array_2d(),
+                normal_matrix: m.inverse().transpose().to_cols_array_2d(),
+            }));
+        let needed = matrices.len() as u64;
+        if needed > self.instance_capacity {
+            self.instance_capacity = grown_capacity(self.instance_capacity, needed);
+            (self.instance_buffer, self.instance_bind_group) = create_instance_buffer(
+                &self.device,
+                &self.model_bind_group_layout,
+                self.instance_capacity,
+            );
+            tracing::debug!(capacity = self.instance_capacity, "instance buffer grown");
         }
-        self.queue
-            .write_buffer(&self.model_uniform_buffer, 0, &self.model_staging);
-    }
-
-    /// Get the dynamic offset for entity at `index` in the model uniform buffer.
-    pub fn model_uniform_offset(&self, index: usize) -> u32 {
-        (index as wgpu::BufferAddress * self.model_uniform_stride) as u32
+        self.queue.write_buffer(
+            &self.instance_buffer,
+            0,
+            bytemuck::cast_slice(&self.instance_staging),
+        );
     }
 
     pub fn device(&self) -> &wgpu::Device {
@@ -2050,11 +2166,11 @@ impl SceneRenderer {
 
     /// Depth/normal prepass of every mesh, then the SSAO and blur passes into
     /// `ssao`'s AO texture. Call after `update_camera`, `update_ssao` and
-    /// `update_model_uniforms`, before the 3D pass.
+    /// `update_instances`, before the 3D pass.
     fn render_ssao(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        draw_calls: &[(usize, &Mesh)],
+        draw_calls: &[(&Mesh, std::ops::Range<u32>)],
         ssao: &SsaoTargets,
     ) {
         {
@@ -2083,12 +2199,11 @@ impl SceneRenderer {
             });
             pass.set_pipeline(&self.prepass_pipeline);
             pass.set_bind_group(0, &self.frame_bind_group, &[]);
-            for (entity_index, mesh) in draw_calls {
-                let offset = self.model_uniform_offset(*entity_index);
-                pass.set_bind_group(1, &self.model_bind_group, &[offset]);
+            pass.set_bind_group(1, &self.instance_bind_group, &[]);
+            for (mesh, instances) in draw_calls {
                 pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                pass.draw_indexed(0..mesh.index_count, 0, instances.clone());
             }
         }
         for (label, view, pipeline, bind_group) in [
@@ -2129,12 +2244,12 @@ impl SceneRenderer {
         }
     }
 
-    /// Renders every mesh into the sun's shadow map. Call before the 3D pass,
-    /// after `update_light` and `update_model_uniforms`.
+    /// Renders each `(mesh, instance range)` into the sun's shadow map. Call
+    /// before the 3D pass, after `update_light` and `update_instances`.
     pub fn render_shadow_pass(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        draw_calls: &[(usize, &Mesh)],
+        draw_calls: &[(&Mesh, std::ops::Range<u32>)],
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("melon_render shadow pass"),
@@ -2153,12 +2268,11 @@ impl SceneRenderer {
         });
         pass.set_pipeline(&self.shadow_pipeline);
         pass.set_bind_group(0, &self.shadow_bind_group, &[]);
-        for (entity_index, mesh) in draw_calls {
-            let offset = self.model_uniform_offset(*entity_index);
-            pass.set_bind_group(1, &self.model_bind_group, &[offset]);
+        pass.set_bind_group(1, &self.instance_bind_group, &[]);
+        for (mesh, instances) in draw_calls {
             pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            pass.draw_indexed(0..mesh.index_count, 0, instances.clone());
         }
     }
 
@@ -2543,42 +2657,44 @@ impl Renderer {
 
 impl SceneRenderer {
     /// Draw 3D meshes into an existing render pass.
-    /// Each draw call is `(entity_index, mesh)` where `entity_index` is the index
-    /// into the model uniform buffer (see `update_model_uniforms`). Every
-    /// mesh gets the checkerboard material, without ambient occlusion.
-    pub fn draw_meshes(&self, pass: &mut wgpu::RenderPass<'_>, draw_calls: &[(usize, &Mesh)]) {
+    /// Each draw call is `(mesh, instance range)`, the range indexing the
+    /// records of `update_instances`. Every mesh gets the checkerboard
+    /// material, without ambient occlusion.
+    pub fn draw_meshes(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        draw_calls: &[(&Mesh, std::ops::Range<u32>)],
+    ) {
         pass.set_pipeline(&self.mesh_pipeline);
         pass.set_bind_group(0, &self.frame_bind_group, &[]);
+        pass.set_bind_group(1, &self.instance_bind_group, &[]);
         pass.set_bind_group(2, &self.checker_material, &[]);
         pass.set_bind_group(3, &self.unoccluded_lighting, &[]);
-        for (entity_index, mesh) in draw_calls {
-            let offset = self.model_uniform_offset(*entity_index);
-            pass.set_bind_group(1, &self.model_bind_group, &[offset]);
+        for (mesh, instances) in draw_calls {
             pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            pass.draw_indexed(0..mesh.index_count, 0, instances.clone());
         }
     }
 
     /// Draw 3D meshes with per-draw-call materials.
-    /// Each draw call is `(entity_index, mesh, material_bind_group)`;
+    /// Each draw call is `(mesh, material_bind_group, instance range)`;
     /// `lighting` is the view's group 3 (per-view lighting inputs).
     pub fn draw_meshes_textured(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
-        draw_calls: &[(usize, &Mesh, &wgpu::BindGroup)],
+        draw_calls: &[(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)],
         lighting: &wgpu::BindGroup,
     ) {
         pass.set_pipeline(&self.mesh_pipeline);
         pass.set_bind_group(0, &self.frame_bind_group, &[]);
+        pass.set_bind_group(1, &self.instance_bind_group, &[]);
         pass.set_bind_group(3, lighting, &[]);
-        for (entity_index, mesh, material) in draw_calls {
-            let offset = self.model_uniform_offset(*entity_index);
-            pass.set_bind_group(1, &self.model_bind_group, &[offset]);
+        for (mesh, material, instances) in draw_calls {
             pass.set_bind_group(2, *material, &[]);
             pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            pass.draw_indexed(0..mesh.index_count, 0, instances.clone());
         }
     }
 
@@ -2908,8 +3024,95 @@ mod tests {
     }
 
     #[test]
-    fn model_uniform_size_is_128() {
-        assert_eq!(std::mem::size_of::<ModelUniform>(), 128);
+    fn instance_data_size_is_128() {
+        assert_eq!(std::mem::size_of::<InstanceData>(), 128);
+    }
+
+    /// Camera at (0, 0, 5) looking down -Z, near 0.1, far 100.
+    fn test_frustum() -> Frustum {
+        use glam::camera::rh::{proj::directx, view};
+        let view_proj = directx::perspective(60f32.to_radians(), 1.0, 0.1, 100.0)
+            * view::look_at_mat4(
+                glam::Vec3::new(0.0, 0.0, 5.0),
+                glam::Vec3::ZERO,
+                glam::Vec3::Y,
+            );
+        Frustum::from_view_proj(view_proj)
+    }
+
+    #[test]
+    fn frustum_planes_keep_points_in_front_only() {
+        let f = test_frustum();
+        let inside = |p: glam::Vec3| f.intersects_aabb(p, p);
+        assert!(inside(glam::Vec3::ZERO), "in front");
+        assert!(inside(glam::Vec3::new(0.0, 0.0, -90.0)), "before far");
+        assert!(!inside(glam::Vec3::new(0.0, 0.0, 6.0)), "behind the eye");
+        assert!(!inside(glam::Vec3::new(0.0, 0.0, -96.0)), "beyond far");
+        assert!(!inside(glam::Vec3::new(50.0, 0.0, 0.0)), "off to the right");
+    }
+
+    #[test]
+    fn frustum_aabb_inside_outside_straddling() {
+        let f = test_frustum();
+        let v = glam::Vec3::splat;
+        assert!(f.intersects_aabb(v(-0.5), v(0.5)), "inside");
+        assert!(
+            !f.intersects_aabb(
+                glam::Vec3::new(40.0, -1.0, -1.0),
+                glam::Vec3::new(42.0, 1.0, 1.0)
+            ),
+            "outside"
+        );
+        // Mostly right of the view, one end inside.
+        assert!(
+            f.intersects_aabb(
+                glam::Vec3::new(1.0, -1.0, -1.0),
+                glam::Vec3::new(40.0, 1.0, 1.0)
+            ),
+            "straddling the right plane"
+        );
+        // Through the eye: half behind it.
+        assert!(
+            f.intersects_aabb(
+                glam::Vec3::new(-1.0, -1.0, 3.0),
+                glam::Vec3::new(1.0, 1.0, 8.0)
+            ),
+            "straddling the near plane"
+        );
+    }
+
+    #[test]
+    fn world_aabb_follows_rotation_and_scale() {
+        let m = glam::Mat4::from_scale_rotation_translation(
+            glam::Vec3::new(2.0, 1.0, 1.0),
+            glam::Quat::from_rotation_y(90f32.to_radians()),
+            glam::Vec3::new(10.0, 0.0, 0.0),
+        );
+        let (min, max) = world_aabb(m, (glam::Vec3::splat(-0.5), glam::Vec3::splat(0.5)));
+        assert!(
+            min.abs_diff_eq(glam::Vec3::new(9.5, -0.5, -1.0), 1e-5),
+            "{min}"
+        );
+        assert!(
+            max.abs_diff_eq(glam::Vec3::new(10.5, 0.5, 1.0), 1e-5),
+            "{max}"
+        );
+    }
+
+    #[test]
+    fn batch_groups_keys_and_keeps_instance_order() {
+        let mut out = vec![100];
+        let batches = batch([(7, 1), (3, 2), (7, 3), (7, 4), (3, 5)], &mut out);
+        assert_eq!(batches, vec![(7, 1..4), (3, 4..6)]);
+        assert_eq!(out, vec![100, 1, 3, 4, 2, 5]);
+    }
+
+    #[test]
+    fn instance_capacity_doubles_until_it_fits() {
+        assert_eq!(grown_capacity(256, 256), 256);
+        assert_eq!(grown_capacity(256, 257), 512);
+        assert_eq!(grown_capacity(256, 3000), 4096);
+        assert_eq!(grown_capacity(0, 3), 4);
     }
 
     #[test]
@@ -3030,7 +3233,7 @@ mod tests {
             light,
             directional_light_view_proj(light.to_light(), shadow_center, shadow_radius),
         );
-        r.update_model_uniforms(&[
+        r.update_instances(&[
             Mat4::from_scale_rotation_translation(
                 Vec3::new(8.0, 0.2, 8.0),
                 Quat::IDENTITY,
@@ -3048,7 +3251,7 @@ mod tests {
 
         let hdr = r.create_hdr_target(size);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        r.render_shadow_pass(&mut encoder, &[(0, &cube), (1, &cube)]);
+        r.render_shadow_pass(&mut encoder, &[(&cube, 0..2)]);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("test scene pass"),
@@ -3076,8 +3279,8 @@ mod tests {
             r.draw_meshes_textured(
                 &mut pass,
                 &[
-                    (0, &cube, floor.unwrap_or(&white_bg)),
-                    (1, &cube, &white_bg),
+                    (&cube, floor.unwrap_or(&white_bg), 0..1),
+                    (&cube, &white_bg, 1..2),
                 ],
                 &r.unoccluded_lighting,
             );
@@ -3128,6 +3331,18 @@ mod tests {
         models: Vec<(glam::Mat4, melon_core::Handle<melon_core::Model>)>,
         server: &mut melon_core::AssetServer,
     ) -> Vec<u8> {
+        render_frame_stats(r, camera, light, environment, models, server).0
+    }
+
+    /// `render_frame`, plus what `render_scene` drew.
+    fn render_frame_stats(
+        r: &mut Renderer,
+        camera: melon_core::Camera,
+        light: melon_core::Light,
+        environment: melon_core::Environment,
+        models: Vec<(glam::Mat4, melon_core::Handle<melon_core::Model>)>,
+        server: &mut melon_core::AssetServer,
+    ) -> (Vec<u8>, RenderStats) {
         let target = r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
         let frame = FrameData {
             view_proj: camera.view_proj(),
@@ -3139,8 +3354,31 @@ mod tests {
         let mut encoder = r
             .device()
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        r.render_scene(&mut encoder, &frame, server, &target, &[], &[]);
-        read_back(r.device(), r.queue(), encoder, &target.color_texture)
+        let stats = r.render_scene(&mut encoder, &frame, server, &target, &[], &[]);
+        (
+            read_back(r.device(), r.queue(), encoder, &target.color_texture),
+            stats,
+        )
+    }
+
+    /// Looking straight down at the origin from 10 m (sees about +-4 m).
+    fn top_down_camera() -> melon_core::Camera {
+        melon_core::Camera {
+            eye: glam::Vec3::new(0.0, 10.0, 0.0),
+            center: glam::Vec3::ZERO,
+            up: glam::Vec3::NEG_Z,
+            aspect: 1.0,
+            ..Default::default()
+        }
+    }
+
+    /// No fog, no AO: thresholds keep their meaning.
+    fn plain_environment() -> melon_core::Environment {
+        melon_core::Environment {
+            fog_density: 0.0,
+            ao_strength: 0.0,
+            ..Default::default()
+        }
     }
 
     /// Pixel of a TEST_SIZE target that world point `p` projects to.
@@ -3536,6 +3774,113 @@ mod tests {
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
+            Box::new(|renderer| {
+                // 2999 tiny cubes in a grid plus a lone 1 m cube, instance
+                // 3000 of the batch: past the old 1024 cap and the initial
+                // instance buffer, so the buffer grows.
+                use glam::{Mat4, Vec3};
+                let mut server = melon_core::AssetServer::new(".".into());
+                let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+                let mut models: Vec<(Mat4, _)> = (0..2999)
+                    .map(|i| {
+                        let at = Vec3::new(
+                            -3.0 + 0.1 * (i % 60) as f32,
+                            0.0,
+                            0.5 + 0.06 * (i / 60) as f32,
+                        );
+                        (
+                            Mat4::from_scale_rotation_translation(
+                                Vec3::splat(0.04),
+                                glam::Quat::IDENTITY,
+                                at,
+                            ),
+                            cube,
+                        )
+                    })
+                    .collect();
+                let lone = Vec3::new(-2.0, 0.5, -2.0);
+                models.push((Mat4::from_translation(lone), cube));
+                let camera = top_down_camera();
+                let px = screen_px(camera.view_proj(), lone);
+                let (sky, _) = render_frame_stats(
+                    renderer,
+                    camera,
+                    test_light(),
+                    plain_environment(),
+                    vec![],
+                    &mut server,
+                );
+                let (crowd, stats) = render_frame_stats(
+                    renderer,
+                    camera,
+                    test_light(),
+                    plain_environment(),
+                    models,
+                    &mut server,
+                );
+                let (sky, crowd) = (pixel_at(renderer, &sky, px), pixel_at(renderer, &crowd, px));
+                if sky != crowd
+                    && stats.instances_drawn == 3000
+                    && stats.culled == 0
+                    && stats.draw_calls == 1
+                {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "instances_past_old_cap: pixel {crowd:?} vs sky {sky:?} at the 3000th instance, stats {stats:?} (want 3000 drawn, 0 culled, 1 draw)"
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
+                // A wall right of the view (x = 8, 10 m tall) inside the
+                // shadow box: culled for the camera, its shadow (sun from +X,
+                // 45 degrees) still falls on the floor in view.
+                use glam::{Mat4, Quat, Vec3};
+                let mut server = melon_core::AssetServer::new(".".into());
+                let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+                let floor = (
+                    Mat4::from_scale_rotation_translation(
+                        Vec3::new(40.0, 0.2, 40.0),
+                        Quat::IDENTITY,
+                        Vec3::new(0.0, -0.1, 0.0),
+                    ),
+                    cube,
+                );
+                let wall = (
+                    Mat4::from_scale_rotation_translation(
+                        Vec3::new(0.6, 10.0, 2.0),
+                        Quat::IDENTITY,
+                        Vec3::new(8.0, 5.0, 0.0),
+                    ),
+                    cube,
+                );
+                let camera = top_down_camera();
+                let px = screen_px(camera.view_proj(), Vec3::new(2.0, 0.0, 0.0));
+                let (open, _) = render_frame_stats(
+                    renderer,
+                    camera,
+                    test_light(),
+                    plain_environment(),
+                    vec![floor],
+                    &mut server,
+                );
+                let (shaded, stats) = render_frame_stats(
+                    renderer,
+                    camera,
+                    test_light(),
+                    plain_environment(),
+                    vec![floor, wall],
+                    &mut server,
+                );
+                let (open, shaded) = (value_at(&open, px), value_at(&shaded, px));
+                if shaded + 30 < open && stats.culled == 1 && stats.shadow_culled == 0 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "offscreen_caster_still_casts: floor {shaded} with the wall vs {open} without (want 30+ darker), stats {stats:?} (want the wall culled for the camera only)"
+                    ))
+                }
+            }),
             Box::new(|renderer| {
                 let (contact_on, open_on) = ao_scene_pixels(renderer, 1.0);
                 let (contact_off, open_off) = ao_scene_pixels(renderer, 0.0);

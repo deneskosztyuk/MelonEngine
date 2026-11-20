@@ -8,7 +8,8 @@ struct CameraUniform {
     eye: vec3f,
 };
 
-struct ModelUniform {
+// One record per drawn instance (group 1), indexed by instance_index.
+struct Instance {
     model: mat4x4f,
     normal_matrix: mat4x4f,
 };
@@ -20,10 +21,15 @@ struct VsOut {
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
-@group(1) @binding(0) var<uniform> model: ModelUniform;
+@group(1) @binding(0) var<storage, read> instances: array<Instance>;
 
 @vertex
-fn vs_main(@location(0) position: vec3f, @location(1) normal: vec3f) -> VsOut {
+fn vs_main(
+    @location(0) position: vec3f,
+    @location(1) normal: vec3f,
+    @builtin(instance_index) instance: u32,
+) -> VsOut {
+    let model = instances[instance];
     var out: VsOut;
     let world_pos = model.model * vec4f(position, 1.0);
     out.clip_pos = camera.view_proj * world_pos;

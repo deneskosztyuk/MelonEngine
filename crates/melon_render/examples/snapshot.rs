@@ -1,6 +1,8 @@
 // Renders the fixed review scene offscreen and saves it as a PNG.
 // Run: cargo run -p melon_render --example snapshot -- <out.png> [view] [flag]
-// Views: overview (default), low, sun, materials, corner.
+// Views: overview (default), low, sun, materials, corner, crowd (overview
+// plus about 10,000 grey cubes and spheres). Prints the mean frame time and
+// the `RenderStats`.
 // Debug flags: --ao-only saves the SSAO term (grey, white = open) instead of
 // the image; --no-ao renders with `ao_strength` 0.
 
@@ -9,7 +11,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use glam::{Mat4, Quat, Vec3};
 use melon_core::{AssetServer, Camera, Environment, Handle, Light, Model};
-use melon_render::{FrameData, Renderer};
+use melon_render::{FrameData, RenderStats, Renderer};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -78,11 +80,35 @@ fn review_scene(server: &mut AssetServer) -> Vec<(Mat4, Handle<Model>)> {
     ]
 }
 
+/// About 10,000 grey cubes and single spheres (`#mesh` of the sphere rows)
+/// in a 1.2 m grid around the review floor, most of it outside the view.
+fn crowd(server: &mut AssetServer) -> Vec<(Mat4, Handle<Model>)> {
+    let cube: Handle<Model> = server.load("assets/models/review/grey_cube.glb");
+    let sphere: Handle<Model> = server.load("assets/models/review/material_spheres.glb#mesh7");
+    (0..100 * 100)
+        .filter_map(|i| {
+            let at = Vec3::new(
+                -60.0 + 1.2 * (i % 100) as f32,
+                0.4,
+                -60.0 + 1.2 * (i / 100) as f32,
+            );
+            let on_floor = at.x.abs() < 11.0 && at.z.abs() < 11.0;
+            let model = if i % 2 == 0 { cube } else { sphere };
+            (!on_floor).then(|| {
+                (
+                    Mat4::from_scale_rotation_translation(Vec3::splat(0.8), Quat::IDENTITY, at),
+                    model,
+                )
+            })
+        })
+        .collect()
+}
+
 /// Named camera presets.
 fn camera(view: &str) -> Result<Camera> {
     let (eye, center) = match view {
         // Three-quarter view from above.
-        "overview" => (Vec3::new(-11.0, 9.0, 12.0), Vec3::new(0.5, 0.5, -1.0)),
+        "overview" | "crowd" => (Vec3::new(-11.0, 9.0, 12.0), Vec3::new(0.5, 0.5, -1.0)),
         // Near the floor, looking toward the horizon.
         "low" => (Vec3::new(-9.0, 0.6, 9.0), Vec3::new(9.0, 1.2, -9.0)),
         // From the +x +z side, up toward the default sun (disc near the top
@@ -101,7 +127,9 @@ fn camera(view: &str) -> Result<Camera> {
         "materials" => (Vec3::new(0.0, 2.4, 0.0), Vec3::new(1.0, 0.9, 6.5)),
         // Close over the cubes at the origin toward the two-wall corner.
         "corner" => (Vec3::new(-2.5, 3.0, 4.0), Vec3::new(3.0, 0.2, -3.0)),
-        _ => bail!("unknown view {view:?}; expected overview, low, sun, materials or corner"),
+        _ => {
+            bail!("unknown view {view:?}; expected overview, low, sun, materials, corner or crowd")
+        }
     };
     Ok(Camera {
         eye,
@@ -119,6 +147,30 @@ fn unpad_rows(data: &[u8], padded: usize, row: usize) -> Vec<u8> {
         .collect()
 }
 
+/// Frames timed per run, after one warm-up frame.
+const TIMED_FRAMES: u32 = 100;
+
+/// One frame: `render_scene`, submit, then wait for the GPU.
+fn render_and_wait(
+    renderer: &mut Renderer,
+    frame: &FrameData,
+    server: &mut AssetServer,
+    target: &melon_render::ViewportTarget,
+) -> Result<RenderStats> {
+    let mut encoder = renderer
+        .device()
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("snapshot timing"),
+        });
+    let stats = renderer.render_scene(&mut encoder, frame, server, target, &[], &[]);
+    renderer.queue().submit([encoder.finish()]);
+    renderer
+        .device()
+        .poll(wgpu::PollType::wait_indefinitely())
+        .context("timing poll failed")?;
+    Ok(stats)
+}
+
 fn render(window: Arc<Window>, out: &str, view: &str, flag: Option<&str>) -> Result<()> {
     let ao_only = match flag {
         None | Some("--no-ao") => false,
@@ -129,7 +181,7 @@ fn render(window: Arc<Window>, out: &str, view: &str, flag: Option<&str>) -> Res
     let mut renderer = pollster::block_on(Renderer::new(window))?;
     let target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(WIDTH, HEIGHT));
     let mut server = AssetServer::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..").into());
-    let frame = FrameData {
+    let mut frame = FrameData {
         view_proj: camera.view_proj(),
         eye: camera.eye,
         light: Light::default(),
@@ -139,9 +191,25 @@ fn render(window: Arc<Window>, out: &str, view: &str, flag: Option<&str>) -> Res
         },
         models: review_scene(&mut server),
     };
+    if view == "crowd" {
+        frame.models.extend(crowd(&mut server));
+    }
 
     let device = renderer.device().clone();
     let queue = renderer.queue().clone();
+    // The first frame loads the models; time the steady state after it.
+    let mut stats = render_and_wait(&mut renderer, &frame, &mut server, &target)?;
+    let start = std::time::Instant::now();
+    for _ in 0..TIMED_FRAMES {
+        stats = render_and_wait(&mut renderer, &frame, &mut server, &target)?;
+    }
+    println!(
+        "{view}: {} models, {:.2} ms per frame (render_scene + submit + wait, mean of {TIMED_FRAMES})",
+        frame.models.len(),
+        start.elapsed().as_secs_f64() * 1000.0 / f64::from(TIMED_FRAMES)
+    );
+    println!("{view}: {stats:?}");
+
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("snapshot"),
     });
@@ -230,7 +298,7 @@ impl ApplicationHandler for App {
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let out = args.next().context(
-        "usage: snapshot <out.png> [overview|low|sun|materials|corner] [--ao-only|--no-ao]",
+        "usage: snapshot <out.png> [overview|low|sun|materials|corner|crowd] [--ao-only|--no-ao]",
     )?;
     let view = args.next().unwrap_or_else(|| "overview".into());
     let flag = args.next();
@@ -268,7 +336,7 @@ mod tests {
     #[test]
     fn unknown_view_is_an_error() {
         assert!(camera("sideways").is_err());
-        for view in ["overview", "low", "sun", "materials", "corner"] {
+        for view in ["overview", "low", "sun", "materials", "corner", "crowd"] {
             assert!(camera(view).is_ok(), "{view}");
         }
     }

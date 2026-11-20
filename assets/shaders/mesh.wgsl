@@ -22,7 +22,8 @@ struct EnvironmentUniform {
     horizon_color: vec3f,
 };
 
-struct ModelUniform {
+// One record per drawn instance (group 1), indexed by instance_index.
+struct Instance {
     model: mat4x4f,
     normal_matrix: mat4x4f,
 };
@@ -69,7 +70,7 @@ struct VsOut {
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
-@group(1) @binding(0) var<uniform> model: ModelUniform;
+@group(1) @binding(0) var<storage, read> instances: array<Instance>;
 @group(0) @binding(1) var<uniform> light: LightUniform;
 @group(0) @binding(2) var shadow_map: texture_depth_2d;
 @group(0) @binding(3) var shadow_sampler: sampler_comparison;
@@ -87,7 +88,8 @@ struct VsOut {
 const PI: f32 = 3.14159265;
 
 @vertex
-fn vs_main(in: VsIn) -> VsOut {
+fn vs_main(in: VsIn, @builtin(instance_index) instance: u32) -> VsOut {
+    let model = instances[instance];
     var out: VsOut;
     let world_pos = model.model * vec4f(in.position, 1.0);
     out.clip_pos = camera.view_proj * world_pos;
