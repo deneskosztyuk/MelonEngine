@@ -7,7 +7,7 @@ use std::cell::{Cell, RefCell};
 use glam::{EulerRot, Mat4, Quat, Vec3};
 
 use crate::Vertex;
-use crate::fbx::{FbxModel, import};
+use crate::fbx::{FbxModel, Sources, import_plain};
 
 enum P {
     I(i32),
@@ -443,7 +443,7 @@ fn conn(kind: &str, a: i64, b: i64, prop: Option<&str>) -> N {
 }
 
 fn load(spec: &Spec) -> FbxModel {
-    import("assets/models/m.fbx", ascii(&spec.tree()).as_bytes(), None).unwrap()
+    import_plain("assets/models/m.fbx", ascii(&spec.tree()).as_bytes(), None).unwrap()
 }
 
 fn quad() -> Spec {
@@ -490,7 +490,7 @@ fn close(a: Vec3, b: Vec3) -> bool {
 fn ascii_and_binary_7x_load_alike() {
     let spec = quad();
     let a = load(&spec);
-    let b = import("m.fbx", &binary(&spec.tree()), None).unwrap();
+    let b = import_plain("m.fbx", &binary(&spec.tree()), None).unwrap();
     assert_eq!(triangle_count(&a), 2);
     assert_eq!(triangle_count(&b), 2);
     assert_eq!(a.bounds(), b.bounds());
@@ -555,7 +555,7 @@ Connections:  {
 	Connect: \"OO\", \"Model::Tri\", \"Model::Scene\"
 }
 ";
-    let model = import("t.fbx", text.as_bytes(), None).unwrap();
+    let model = import_plain("t.fbx", text.as_bytes(), None).unwrap();
     assert_eq!(triangle_count(&model), 1);
     let (lo, hi) = model.bounds().unwrap();
     assert!(
@@ -751,7 +751,7 @@ fn empty_scene_loads_with_nothing_in_it() {
     let mut tree = spec.tree();
     tree[1].kids.clear();
     tree[2].kids.clear();
-    let model = import("e.fbx", ascii(&tree).as_bytes(), None).unwrap();
+    let model = import_plain("e.fbx", ascii(&tree).as_bytes(), None).unwrap();
     assert!(model.nodes.is_empty() && model.meshes.is_empty());
     assert!(model.bounds().is_none());
 }
@@ -773,6 +773,31 @@ fn tex_spec(textures: Vec<Tex>, materials: usize) -> Spec {
     spec
 }
 
+/// Import `tree` with `files` as the project: every file reads as its own
+/// path; `reads` counts the reads.
+fn import_in_project(tree: &[N], files: &[&str], reads: &Cell<usize>) -> FbxModel {
+    let index: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+    let read = |p: &str| {
+        reads.set(reads.get() + 1);
+        if index.iter().any(|f| f == p) {
+            Ok(p.as_bytes().to_vec())
+        } else {
+            Err(std::io::ErrorKind::NotFound.into())
+        }
+    };
+    let sources = Sources {
+        read: &read,
+        index: &index,
+        warn: &|_, _| {},
+    };
+    import_plain(
+        "assets/models/m.fbx",
+        ascii(tree).as_bytes(),
+        Some(&sources),
+    )
+    .unwrap()
+}
+
 #[test]
 fn foreign_absolute_texture_path_falls_back_to_the_same_folder() {
     for file in [
@@ -787,24 +812,8 @@ fn foreign_absolute_texture_path_falls_back_to_the_same_folder() {
             }],
             1,
         );
-        let tried = RefCell::new(Vec::new());
-        let model = import(
-            "assets/models/m.fbx",
-            ascii(&spec.tree()).as_bytes(),
-            Some(&|p| {
-                tried.borrow_mut().push(p.to_string());
-                if p == "assets/models/skin.png" {
-                    Ok(b"x".to_vec())
-                } else {
-                    Err(std::io::ErrorKind::NotFound.into())
-                }
-            }),
-        )
-        .unwrap();
-        assert!(
-            model.materials[0].textures[0].is_some(),
-            "{file}: tried {tried:?}"
-        );
+        let model = import_in_project(&spec.tree(), &["assets/models/skin.png"], &Cell::new(0));
+        assert!(model.materials[0].textures[0].is_some(), "{file}");
     }
 }
 
@@ -819,18 +828,8 @@ fn spaces_and_non_ascii_in_texture_names_survive() {
         }],
         1,
     );
-    let model = import(
-        "assets/models/m.fbx",
-        ascii(&spec.tree()).as_bytes(),
-        Some(&|p| {
-            if p == format!("assets/models/tex/{name}") {
-                Ok(b"x".to_vec())
-            } else {
-                Err(std::io::ErrorKind::NotFound.into())
-            }
-        }),
-    )
-    .unwrap();
+    let path = format!("assets/models/tex/{name}");
+    let model = import_in_project(&spec.tree(), &[&path], &Cell::new(0));
     assert_eq!(model.textures[0].file_name, name);
 }
 
@@ -849,15 +848,7 @@ fn a_texture_used_by_two_materials_is_read_once() {
         .kids
         .push(conn("OP", 4000, 3001, Some("DiffuseColor")));
     let reads = Cell::new(0);
-    let model = import(
-        "assets/models/m.fbx",
-        ascii(&tree).as_bytes(),
-        Some(&|_| {
-            reads.set(reads.get() + 1);
-            Ok(b"x".to_vec())
-        }),
-    )
-    .unwrap();
+    let model = import_in_project(&tree, &["assets/models/t.png"], &reads);
     assert_eq!(model.textures.len(), 1);
     assert_eq!(
         model.materials[0].textures[0],
@@ -891,7 +882,7 @@ fn big_binary_file_loads_in_reasonable_time() {
     let bytes = binary(&spec.tree());
     assert!(bytes.len() > 4_000_000, "{}", bytes.len());
     let start = std::time::Instant::now();
-    let model = import("big.fbx", &bytes, None).unwrap();
+    let model = import_plain("big.fbx", &bytes, None).unwrap();
     let ms = start.elapsed().as_millis();
     println!(
         "big fbx: {} bytes, {} triangles, {ms} ms",
@@ -935,6 +926,22 @@ fn corpus_loads_without_panics() {
     let mut files = Vec::new();
     walk(&root, &mut files);
     files.sort();
+    fn walk_all(dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk_all(&p, out);
+            } else {
+                out.push(p.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let mut everything = Vec::new();
+    walk_all(&root, &mut everything);
+    everything.sort();
 
     type Loaded = Result<(usize, Option<(Vec3, Vec3)>, usize), String>;
     struct Done {
@@ -957,28 +964,21 @@ fn corpus_loads_without_panics() {
             let full = file.to_string_lossy().to_string();
             if crate::fbx::is_fbx(&full) {
                 let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
-                let found = RefCell::new(BTreeSet::new());
                 let lost = RefCell::new(BTreeSet::new());
-                let model = import(
-                    &full,
-                    &bytes,
-                    Some(&|p| {
-                        let base = p.rsplit('/').next().unwrap_or(p).to_string();
-                        match std::fs::read(p) {
-                            Ok(b) => {
-                                found.borrow_mut().insert(base);
-                                Ok(b)
-                            }
-                            Err(e) => {
-                                lost.borrow_mut().insert(base);
-                                Err(e)
-                            }
-                        }
-                    }),
-                )
-                .map_err(|e| format!("{e:#}"))?;
-                let missing: Vec<String> =
-                    lost.borrow().difference(&found.borrow()).cloned().collect();
+                let read = |p: &str| std::fs::read(p);
+                let warn = |key: &str, message: String| {
+                    if message.contains("not found") {
+                        lost.borrow_mut().insert(key.to_string());
+                    }
+                };
+                let sources = Sources {
+                    read: &read,
+                    index: &everything,
+                    warn: &warn,
+                };
+                let model =
+                    import_plain(&full, &bytes, Some(&sources)).map_err(|e| format!("{e:#}"))?;
+                let missing: Vec<String> = lost.borrow().iter().cloned().collect();
                 for m in &missing {
                     println!(
                         "  missing texture {m} ({})",

@@ -1,16 +1,20 @@
 //! GPU models per asset handle: loaded on first use, reloaded when the
-//! `AssetServer` bumps the file's version (hot reload).
+//! `AssetServer` bumps the file's version (hot reload) or the version of a
+//! texture file the model read.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use melon_core::assets::{BUILTIN_PREFIX, split_mesh_fragment};
-use melon_core::{AssetServer, Handle, Model};
+use melon_core::{AssetServer, Handle, Model, Texture};
 
-use crate::fbx::is_fbx;
+use crate::fbx::{Sources, is_fbx};
 use crate::{LoadedModel, SceneRenderer};
 
 struct CachedModel {
     version: u32,
+    /// The texture files the model read and their versions then.
+    textures: Vec<(Handle<Texture>, u32)>,
     model: LoadedModel,
 }
 
@@ -25,6 +29,37 @@ enum Source {
         files: HashMap<String, Vec<u8>>,
     },
 }
+
+/// (model path, texture file name) pairs already warned about.
+pub(crate) type Warned = RefCell<HashSet<(String, String)>>;
+
+/// Run `f` with the texture sources of the FBX at project path `model`:
+/// reads and the file index through `server`, each warning shown once per
+/// (model, texture).
+fn with_sources<R>(
+    server: &AssetServer,
+    warned: &Warned,
+    model: &str,
+    f: impl FnOnce(&Sources) -> R,
+) -> R {
+    let index = server.file_paths();
+    let read = |p: &str| server.read(p);
+    let warn = |texture: &str, message: String| {
+        if warned
+            .borrow_mut()
+            .insert((model.to_string(), texture.to_string()))
+        {
+            tracing::warn!("{message}");
+        }
+    };
+    f(&Sources {
+        read: &read,
+        index: &index,
+        warn: &warn,
+    })
+}
+
+type FbxBytes<'a> = Option<(String, std::borrow::Cow<'a, [u8]>)>;
 
 impl Source {
     fn of(server: &AssetServer, handle: Handle<Model>, path: &str) -> anyhow::Result<Self> {
@@ -46,43 +81,65 @@ impl Source {
         })
     }
 
+    /// The FBX behind this source: its project path and bytes.
+    fn fbx(&self, path: &str) -> anyhow::Result<FbxBytes<'_>> {
+        let name = split_mesh_fragment(path).0.to_string();
+        Ok(match self {
+            Self::File(file) if is_fbx(&file.to_string_lossy()) => Some((
+                name,
+                std::fs::read(file)
+                    .map_err(|e| anyhow::anyhow!("could not read {}: {e}", file.display()))?
+                    .into(),
+            )),
+            Self::Packed { name, bytes, .. } if is_fbx(name) => {
+                Some((name.clone(), bytes.as_slice().into()))
+            }
+            _ => None,
+        })
+    }
+
+    /// The model and the texture files it read (project paths).
     fn model(
         &self,
         scene: &SceneRenderer,
         server: &AssetServer,
+        warned: &Warned,
         path: &str,
-    ) -> anyhow::Result<LoadedModel> {
+    ) -> anyhow::Result<(LoadedModel, Vec<String>)> {
+        if let Some((name, bytes)) = self.fbx(path)? {
+            let settings = server.import_settings(&name);
+            return with_sources(server, warned, &name, |s| {
+                scene.load_fbx(&name, &bytes, &settings, s)
+            });
+        }
         match self {
-            Self::File(file) if is_fbx(&file.to_string_lossy()) => {
-                let bytes = std::fs::read(file)?;
-                scene.load_fbx(&file.to_string_lossy(), &bytes, &|p| std::fs::read(p))
-            }
             Self::File(file) => scene.load_gltf(&file.to_string_lossy()),
-            Self::Packed { name, bytes, .. } if is_fbx(name) => scene
-                .load_fbx(name, bytes, &|p| server.read(p))
-                .map_err(|e| e.context(format!("packed model {path}"))),
             Self::Packed { name, bytes, files } => scene
                 .load_gltf_packed(name, bytes, files)
                 .map_err(|e| e.context(format!("packed model {path}"))),
         }
+        .map(|m| (m, Vec::new()))
     }
 
+    #[allow(clippy::type_complexity)]
     fn meshes(
         &self,
         scene: &SceneRenderer,
         server: &AssetServer,
-    ) -> anyhow::Result<Vec<anyhow::Result<LoadedModel>>> {
+        warned: &Warned,
+        path: &str,
+    ) -> anyhow::Result<(Vec<anyhow::Result<LoadedModel>>, Vec<String>)> {
+        if let Some((name, bytes)) = self.fbx(path)? {
+            let settings = server.import_settings(&name);
+            return with_sources(server, warned, &name, |s| {
+                scene.load_fbx_meshes(&name, &bytes, &settings, s)
+            });
+        }
         match self {
-            Self::File(file) if is_fbx(&file.to_string_lossy()) => {
-                let bytes = std::fs::read(file)?;
-                scene.load_fbx_meshes(&file.to_string_lossy(), &bytes, &|p| std::fs::read(p))
-            }
             Self::File(file) => scene.load_gltf_meshes(&file.to_string_lossy()),
-            Self::Packed { name, bytes, .. } if is_fbx(name) => {
-                scene.load_fbx_meshes(name, bytes, &|p| server.read(p))
-            }
             Self::Packed { name, bytes, files } => scene.load_gltf_meshes_bytes(name, bytes, files),
         }
+        .map(|m| (m, Vec::new()))
     }
 }
 
@@ -93,12 +150,26 @@ pub struct ModelCache {
     /// (handle id, version) pairs that failed to load, so each failure is
     /// reported once and not retried every frame.
     failed: HashSet<(u32, u32)>,
+    pub(crate) warned: Warned,
 }
 
 impl ModelCache {
+    /// The texture files `paths` with their current versions, registered
+    /// with the server so changes to them are noticed.
+    fn texture_versions(server: &mut AssetServer, paths: &[String]) -> Vec<(Handle<Texture>, u32)> {
+        paths
+            .iter()
+            .map(|p| {
+                let handle: Handle<Texture> = server.load(p);
+                (handle, server.version(handle))
+            })
+            .collect()
+    }
+
     /// Import `file` once and build all its meshes: return mesh `mesh` (for
     /// `handle`) and cache every other mesh under its own `#mesh<i>` handle,
-    /// so a model's fragments don't each import the whole file.
+    /// so a model's fragments don't each import the whole file. Also returns
+    /// the texture files read.
     fn load_fragments(
         &mut self,
         scene: &SceneRenderer,
@@ -107,9 +178,11 @@ impl ModelCache {
         file_path: &str,
         source: &Source,
         mesh: usize,
-    ) -> anyhow::Result<LoadedModel> {
+    ) -> anyhow::Result<(LoadedModel, Vec<String>)> {
+        let (models, deps) = source.meshes(scene, server, &self.warned, file_path)?;
+        let textures = Self::texture_versions(server, &deps);
         let mut ours = None;
-        for (i, model) in source.meshes(scene, server)?.into_iter().enumerate() {
+        for (i, model) in models.into_iter().enumerate() {
             if i == mesh {
                 ours = Some(model);
                 continue;
@@ -122,10 +195,17 @@ impl ModelCache {
             server.set_bounds(sibling, model.bounds.0, model.bounds.1);
             server.set_part_bounds(sibling, model.part_bounds.clone());
             let version = server.version(sibling);
-            self.models
-                .insert(sibling.id(), CachedModel { version, model });
+            self.models.insert(
+                sibling.id(),
+                CachedModel {
+                    version,
+                    textures: textures.clone(),
+                    model,
+                },
+            );
         }
         ours.unwrap_or_else(|| Err(anyhow::anyhow!("{file_path} has no mesh {mesh}")))
+            .map(|m| (m, deps))
     }
 
     pub fn new(scene: &SceneRenderer) -> Self {
@@ -134,6 +214,7 @@ impl ModelCache {
             builtin_cube: scene.builtin_cube_model(),
             builtin_sphere: scene.builtin_sphere_model(),
             failed: HashSet::new(),
+            warned: RefCell::default(),
         }
     }
 
@@ -201,22 +282,32 @@ impl ModelCache {
         }
 
         let version = server.version(handle);
-        let stale = self.models.get(&id).is_none_or(|m| m.version != version);
+        let stale = self.models.get(&id).is_none_or(|m| {
+            m.version != version || m.textures.iter().any(|(t, v)| server.version(*t) != *v)
+        });
         if stale && !self.failed.contains(&(id, version)) {
             let result = match Source::of(server, handle, &path) {
                 Ok(source) => match split_mesh_fragment(&path) {
                     (file_path, Some(mesh)) => {
                         self.load_fragments(scene, server, handle, file_path, &source, mesh)
                     }
-                    (_, None) => source.model(scene, server, &path),
+                    (_, None) => source.model(scene, server, &self.warned, &path),
                 },
                 Err(error) => Err(error),
             };
             match result {
-                Ok(model) => {
+                Ok((model, deps)) => {
                     server.set_bounds(handle, model.bounds.0, model.bounds.1);
                     server.set_part_bounds(handle, model.part_bounds.clone());
-                    self.models.insert(id, CachedModel { version, model });
+                    let textures = Self::texture_versions(server, &deps);
+                    self.models.insert(
+                        id,
+                        CachedModel {
+                            version,
+                            textures,
+                            model,
+                        },
+                    );
                 }
                 Err(error) => {
                     tracing::warn!("could not load model {path}: {error:#}");

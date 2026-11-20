@@ -374,6 +374,21 @@ impl AssetServer {
             .unwrap_or_default()
     }
 
+    /// Every project file path (the pack's, or the files under `<root>/assets`
+    /// without `.meta` sidecars), sorted, `/` separated.
+    pub fn file_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = match &self.pack {
+            Some(pack) => pack.entries().map(|(p, _)| p.to_string()).collect(),
+            None => asset_dir_files(&self.root)
+                .iter()
+                .filter_map(|f| project_relative(&self.root, f))
+                .collect(),
+        };
+        paths.retain(|p| !p.ends_with(".meta"));
+        paths.sort();
+        paths
+    }
+
     pub fn has_pack(&self) -> bool {
         self.pack.is_some()
     }
@@ -834,6 +849,19 @@ mod tests {
         touch_later(&meta_path(&file));
         server.poll_changes();
         assert_eq!(server.version(h), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_paths_lists_assets_without_metas() {
+        let root = temp_root("file_paths");
+        write_asset_with_meta(&root, "assets/models/b.fbx");
+        write_asset_with_meta(&root, "assets/Textures/a.png");
+        let server = AssetServer::new(root.clone());
+        assert_eq!(
+            server.file_paths(),
+            ["assets/Textures/a.png", "assets/models/b.fbx"]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

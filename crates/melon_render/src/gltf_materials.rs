@@ -128,16 +128,54 @@ pub fn extract_materials(model: &Path, rel_dir: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// A file name for `bytes` in `dir` that never overwrites a different file:
+/// `file` itself (or the same file already there), then `<model>_<file>`,
+/// then `<model>_<name>_<n><ext>`.
+fn free_file_name(dir: &Path, model_stem: &str, file: &str, bytes: &[u8]) -> String {
+    let (name, ext) = file
+        .rsplit_once('.')
+        .map_or((file, String::new()), |(n, e)| (n, format!(".{e}")));
+    for n in 0.. {
+        let candidate = match n {
+            0 => file.to_string(),
+            1 => format!("{model_stem}_{file}"),
+            n => format!("{model_stem}_{name}_{n}{ext}"),
+        };
+        match std::fs::read(dir.join(&candidate)) {
+            Ok(existing) if existing != bytes => {}
+            _ => return candidate,
+        }
+    }
+    unreachable!()
+}
+
 /// `extract_materials` for an FBX: textures are copied next to the model by
-/// their own file name (kept as is when the same file is already there).
+/// their own file name (an embedded one without a name becomes
+/// `texture_<n>.<ext>`), kept as is when the same file is already there and
+/// never overwriting a different one. The project root is `rel_dir` above
+/// the model's folder; textures are searched in its `assets` folder.
 fn extract_fbx(model: &Path, rel_dir: &str) -> Result<Vec<String>> {
-    let name = model.to_string_lossy();
-    let bytes = std::fs::read(model).with_context(|| format!("could not read {name}"))?;
-    let fbx = crate::fbx::import(&name, &bytes, Some(&|p| std::fs::read(p)))?;
     let dir = model.parent().unwrap_or_else(|| Path::new("."));
+    let mut root = dir;
+    for _ in rel_dir.split('/').filter(|p| !p.is_empty()) {
+        root = root.parent().unwrap_or(root);
+    }
+    let file = model.file_name().unwrap_or_default().to_string_lossy();
+    let name = format!("{rel_dir}/{file}");
+    let bytes =
+        std::fs::read(model).with_context(|| format!("could not read {}", model.display()))?;
+    let settings = melon_core::ImportSettings::read(model);
+    let index: Vec<String> = melon_core::assets::asset_dir_files(root)
+        .iter()
+        .filter_map(|f| melon_core::assets::project_relative(root, f))
+        .filter(|p| !p.ends_with(".meta"))
+        .collect();
+    let read = |p: &str| std::fs::read(root.join(p));
+    let sources = crate::fbx::Sources::logging(&read, &index);
+    let fbx = crate::fbx::import(&name, &bytes, &settings, Some(&sources))?;
     let stem = file_safe(&model.file_stem().unwrap_or_default().to_string_lossy());
 
-    let mut written: HashMap<usize, String> = HashMap::new();
+    let mut written: HashMap<(usize, bool), String> = HashMap::new();
     let mut files: HashMap<Option<usize>, String> = HashMap::new();
     let mut used_names = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -155,20 +193,35 @@ fn extract_fbx(model: &Path, rel_dir: &str) -> Result<Vec<String>> {
                 &mut asset.normal_texture,
                 &mut asset.emissive_texture,
             ];
-            for (slot, texture) in slots.into_iter().zip(material.textures) {
+            for (i, (slot, texture)) in slots.into_iter().zip(material.textures).enumerate() {
                 let Some(t) = texture else { continue };
-                let texture = &fbx.textures[t];
-                let rel = match written.get(&t) {
+                let flip = i == 2 && settings.normal_y_flip;
+                let rel = match written.get(&(t, flip)) {
                     Some(rel) => rel.clone(),
                     None => {
+                        let texture = &fbx.textures[t];
                         let mut file = texture.file_name.clone();
-                        if std::fs::read(dir.join(&file)).is_ok_and(|b| b != texture.bytes) {
-                            file = format!("{stem}_{file}");
+                        let mut bytes = texture.bytes.clone();
+                        if file.is_empty() {
+                            let ext = image::guess_format(&bytes)
+                                .ok()
+                                .and_then(|f| f.extensions_str().first().copied())
+                                .unwrap_or("png");
+                            file = format!("texture_{t}.{ext}");
                         }
-                        std::fs::write(dir.join(&file), &texture.bytes)
+                        if flip && let Ok(img) = image::load_from_memory(&bytes) {
+                            let mut png = std::io::Cursor::new(Vec::new());
+                            crate::flip_green(&img)
+                                .write_to(&mut png, image::ImageFormat::Png)
+                                .context("could not encode the flipped normal map")?;
+                            bytes = png.into_inner();
+                            file = format!("{}.png", file.rsplit_once('.').map_or(&*file, |p| p.0));
+                        }
+                        let file = free_file_name(dir, &stem, &file, &bytes);
+                        std::fs::write(dir.join(&file), &bytes)
                             .with_context(|| format!("could not write {file}"))?;
                         let rel = format!("{rel_dir}/{file}");
-                        written.insert(t, rel.clone());
+                        written.insert((t, flip), rel.clone());
                         rel
                     }
                 };
@@ -178,14 +231,17 @@ fn extract_fbx(model: &Path, rel_dir: &str) -> Result<Vec<String>> {
                 });
             }
         }
-        let mut name = file_safe(
+        let base = file_safe(
             material
                 .map(|m| m.name.as_str())
                 .filter(|n| !n.is_empty())
                 .unwrap_or("default"),
         );
-        if !used_names.insert(name.clone()) {
-            name = format!("{name}_{}", used_names.len());
+        let mut name = base.clone();
+        let mut n = 1;
+        while !used_names.insert(name.clone()) {
+            n += 1;
+            name = format!("{base}_{n}");
         }
         let file = format!("{stem}_{name}.mat");
         asset.save(&dir.join(&file))?;
@@ -246,9 +302,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A project root with an empty `assets/models`; returns that folder.
     fn extract_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("melon_{name}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let root = std::env::temp_dir().join(format!("melon_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("assets/models");
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -328,5 +386,128 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("t.png")).unwrap(), png);
         assert!(!dir.join("box_t.png").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn first_mat(dir: &std::path::Path, parts: &[String]) -> MaterialAsset {
+        MaterialAsset::read(&dir.join(parts[0].rsplit('/').next().unwrap())).unwrap()
+    }
+
+    #[test]
+    fn fbx_embedded_texture_without_a_file_name_becomes_texture_n() {
+        use crate::fbx::fixture::Cube;
+        let dir = extract_dir("extract_fbx_noname");
+        let png = png_bytes([5, 6, 7, 255]);
+        let cube = Cube {
+            texture: Some(""),
+            embedded: Some(png.clone()),
+            ..Cube::default()
+        };
+        std::fs::write(dir.join("box.fbx"), cube.ascii()).unwrap();
+        let parts = extract_materials(&dir.join("box.fbx"), "assets/models").unwrap();
+        let texture = first_mat(&dir, &parts).base_color_texture.unwrap();
+        assert_eq!(texture.path, "assets/models/texture_0.png");
+        assert_eq!(std::fs::read(dir.join("texture_0.png")).unwrap(), png);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fbx_texture_never_overwrites_any_different_file() {
+        use crate::fbx::fixture::Cube;
+        let dir = extract_dir("extract_fbx_unique");
+        let (a, b, ours) = (
+            png_bytes([1, 1, 1, 255]),
+            png_bytes([2, 2, 2, 255]),
+            png_bytes([9, 9, 9, 255]),
+        );
+        std::fs::write(dir.join("t.png"), &a).unwrap();
+        std::fs::write(dir.join("box_t.png"), &b).unwrap();
+        let cube = Cube {
+            texture: Some("t.png"),
+            embedded: Some(ours.clone()),
+            ..Cube::default()
+        };
+        std::fs::write(dir.join("box.fbx"), cube.ascii()).unwrap();
+        let parts = extract_materials(&dir.join("box.fbx"), "assets/models").unwrap();
+        let texture = first_mat(&dir, &parts).base_color_texture.unwrap();
+        assert_eq!(texture.path, "assets/models/box_t_2.png");
+        assert_eq!(std::fs::read(dir.join("t.png")).unwrap(), a);
+        assert_eq!(std::fs::read(dir.join("box_t.png")).unwrap(), b);
+        assert_eq!(std::fs::read(dir.join("box_t_2.png")).unwrap(), ours);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fbx_materials_with_one_name_get_distinct_files() {
+        use crate::fbx::fixture::Cube;
+        let dir = extract_dir("extract_fbx_names");
+        let cube = Cube {
+            two_materials: true,
+            ..Cube::default()
+        };
+        let text = cube.ascii().replace("Material::Blue", "Material::Red");
+        std::fs::write(dir.join("box.fbx"), text).unwrap();
+        let parts = extract_materials(&dir.join("box.fbx"), "assets/models").unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_ne!(parts[0], parts[1]);
+        assert!(
+            parts
+                .iter()
+                .all(|p| dir.join(p.rsplit('/').next().unwrap()).is_file())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fbx_texture_is_searched_in_the_projects_textures_folder() {
+        use crate::fbx::fixture::Cube;
+        let dir = extract_dir("extract_fbx_search");
+        let png = png_bytes([3, 4, 5, 255]);
+        let textures = dir.parent().unwrap().join("Textures");
+        std::fs::create_dir_all(&textures).unwrap();
+        std::fs::write(textures.join("T.PNG"), &png).unwrap();
+        let cube = Cube {
+            texture: Some("t.png"),
+            ..Cube::default()
+        };
+        std::fs::write(dir.join("box.fbx"), cube.ascii()).unwrap();
+        let parts = extract_materials(&dir.join("box.fbx"), "assets/models").unwrap();
+        let texture = first_mat(&dir, &parts).base_color_texture.unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("t.png")).unwrap(),
+            png,
+            "{texture:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn fbx_extract_flips_the_normal_map_when_the_meta_says_so() {
+        use crate::fbx::fixture::Cube;
+        use melon_core::{AssetGuid, AssetMeta, ImportSettings, META_VERSION, meta_path};
+        let dir = extract_dir("extract_fbx_flip");
+        let cube = Cube {
+            texture: Some("n.png"),
+            embedded: Some(png_bytes([10, 20, 30, 255])),
+            slots: vec!["NormalMap"],
+            ..Cube::default()
+        };
+        let model = dir.join("box.fbx");
+        std::fs::write(&model, cube.ascii()).unwrap();
+        let meta = AssetMeta {
+            version: META_VERSION,
+            guid: AssetGuid::new(),
+        };
+        std::fs::write(meta_path(&model), meta.to_ron()).unwrap();
+        ImportSettings {
+            normal_y_flip: true,
+            ..Default::default()
+        }
+        .write(&model)
+        .unwrap();
+        let parts = extract_materials(&model, "assets/models").unwrap();
+        let texture = first_mat(&dir, &parts).normal_texture.unwrap();
+        let written = image::open(dir.join(texture.path.rsplit('/').next().unwrap())).unwrap();
+        assert_eq!(written.to_rgba8().get_pixel(0, 0).0, [10, 235, 30, 255]);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
     }
 }

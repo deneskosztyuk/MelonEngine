@@ -1,24 +1,63 @@
 //! FBX import with ufbx, into the same CPU parts the glTF path uploads.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use glam::{Mat4, Quat, Vec3, Vec4};
-use melon_core::{AlphaMode, MaterialAsset};
+use melon_core::{AlphaMode, ImportSettings, MaterialAsset};
 
 use crate::{GltfNode, Vertex};
+
+thread_local! {
+    static PARSES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Files parsed by ufbx on this thread so far (tests count parses).
+pub fn parses_on_this_thread() -> usize {
+    PARSES.with(Cell::get)
+}
 
 /// `path` (no `#mesh` suffix) is an FBX file.
 pub(crate) fn is_fbx(path: &str) -> bool {
     path.len() >= 4 && path[path.len() - 4..].eq_ignore_ascii_case(".fbx")
 }
 
-/// Reads a file by path (as built by `texture_candidates`).
+/// Reads a file by project path.
 pub(crate) type Reader<'a> = &'a dyn Fn(&str) -> std::io::Result<Vec<u8>>;
 
-/// A texture file of a model: its name and raw (still encoded) bytes.
+/// Reports a problem with a texture: (texture file name, message). The
+/// caller decides how often a message is shown.
+pub(crate) type Warn<'a> = &'a dyn Fn(&str, String);
+
+/// Where a model's external textures come from: `read` fetches a project
+/// path, `index` lists every project file (`/` separators) for the search.
+pub(crate) struct Sources<'a> {
+    pub read: Reader<'a>,
+    pub index: &'a [String],
+    pub warn: Warn<'a>,
+}
+
+pub(crate) fn log_warn(_: &str, message: String) {
+    tracing::warn!("{message}");
+}
+
+impl<'a> Sources<'a> {
+    /// Warnings go to the log.
+    pub fn logging(read: Reader<'a>, index: &'a [String]) -> Self {
+        Self {
+            read,
+            index,
+            warn: &log_warn,
+        }
+    }
+}
+
+/// A texture file of a model: its name, the project path it was read from
+/// (`None` when embedded) and its raw (still encoded) bytes.
 pub(crate) struct FbxTexture {
     pub file_name: String,
+    pub path: Option<String>,
     pub bytes: Vec<u8>,
 }
 
@@ -47,12 +86,27 @@ pub(crate) struct FbxModel {
     pub worlds: Vec<glam::Mat4>,
 }
 
+/// A world matrix that flattens space (a zero scale): its geometry is not
+/// drawn, and inverting it would give NaN normals.
+fn degenerate(world: &Mat4) -> bool {
+    let det = world.determinant();
+    !det.is_finite() || det.abs() < 1e-18
+}
+
 impl FbxModel {
+    /// Every mesh-carrying node (zero-scale ones left out) with its world matrix.
+    fn drawn(&self) -> impl Iterator<Item = (&GltfNode, &Mat4)> {
+        self.nodes
+            .iter()
+            .zip(&self.worlds)
+            .filter(|(n, w)| n.mesh.is_some() && !degenerate(w))
+    }
+
     /// Every part of every node's mesh with the node's world matrix baked
     /// in: (vertices, indices, material).
     pub fn baked_parts(&self) -> Vec<(Vec<Vertex>, Vec<u32>, Option<usize>)> {
         let mut out = Vec::new();
-        for (node, world) in self.nodes.iter().zip(&self.worlds) {
+        for (node, world) in self.drawn() {
             for part in node.mesh.iter().flat_map(|&m| &self.meshes[m]) {
                 let (vertices, indices) = bake(part, *world);
                 out.push((vertices, indices, part.material));
@@ -63,14 +117,14 @@ impl FbxModel {
 
     /// The material of every part `baked_parts` yields, in the same order.
     pub fn part_materials(&self) -> Vec<Option<usize>> {
-        self.nodes
-            .iter()
-            .flat_map(|n| n.mesh.iter().flat_map(|&m| &self.meshes[m]))
+        self.drawn()
+            .flat_map(|(n, _)| n.mesh.iter().flat_map(|&m| &self.meshes[m]))
             .map(|p| p.material)
             .collect()
     }
 
     /// Bounds of the baked model, `None` without meshes.
+    #[cfg(test)]
     pub fn bounds(&self) -> Option<(Vec3, Vec3)> {
         let mut bounds: Option<(Vec3, Vec3)> = None;
         for (vertices, _, _) in self.baked_parts() {
@@ -139,9 +193,8 @@ fn file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
-/// The texture's file name from whichever path the file stores (some files
-/// have only the absolute one, which ufbx keeps apart from `filename`).
-fn texture_file_name(texture: &ufbx::Texture) -> Option<&str> {
+/// The path a file stores for a texture, whichever of its three it has.
+fn stored_path(texture: &ufbx::Texture) -> &str {
     [
         &*texture.filename,
         &*texture.relative_filename,
@@ -149,19 +202,56 @@ fn texture_file_name(texture: &ufbx::Texture) -> Option<&str> {
     ]
     .into_iter()
     .find(|n| !n.is_empty())
-    .map(file_name)
+    .unwrap_or_default()
 }
 
-/// Where a texture of the FBX at `model` may live: its relative file name
-/// from the FBX's folder, then its file name alone next to the FBX. (The
-/// absolute path the artist's machine wrote is ignored.)
-fn texture_candidates(model: &str, texture: &ufbx::Texture) -> Vec<String> {
+/// The texture's file name from whichever path the file stores (some files
+/// have only the absolute one, which ufbx keeps apart from `filename`).
+fn texture_file_name(texture: &ufbx::Texture) -> Option<&str> {
+    Some(file_name(stored_path(texture))).filter(|n| !n.is_empty())
+}
+
+/// Project files by lower-case path and by lower-case file name, for the
+/// case-insensitive texture search.
+struct Index<'a> {
+    by_path: HashMap<String, &'a str>,
+    by_name: HashMap<String, Vec<&'a str>>,
+}
+
+impl<'a> Index<'a> {
+    fn new(files: &'a [String]) -> Self {
+        let mut by_path = HashMap::new();
+        let mut by_name: HashMap<String, Vec<&str>> = HashMap::new();
+        for f in files {
+            by_path.entry(f.to_lowercase()).or_insert(f.as_str());
+            by_name
+                .entry(file_name(f).to_lowercase())
+                .or_default()
+                .push(f);
+        }
+        Self { by_path, by_name }
+    }
+}
+
+/// Where a texture of the FBX at `model` may live, in the order searched
+/// (Unity's): the stored relative path, the stored file name in the FBX's
+/// folder, then a `Textures` folder in the FBX's folder and in each parent
+/// up to `assets`. (The absolute path another machine wrote is reduced to
+/// its file name.)
+fn texture_candidates(model: &str, relative: &str, name: &str) -> Vec<String> {
     let model = model.replace('\\', "/");
     let mut base: Vec<&str> = model.split('/').collect();
     base.pop();
+    let join = |dir: &[&str], tail: &str| {
+        let mut path = dir.join("/");
+        if !path.is_empty() {
+            path.push('/');
+        }
+        path + tail
+    };
     let mut out = Vec::new();
-    let relative = texture.relative_filename.replace('\\', "/");
-    if !relative.is_empty() {
+    let relative = relative.replace('\\', "/");
+    if !relative.is_empty() && !relative.contains(':') && !relative.starts_with('/') {
         let mut parts = base.clone();
         for part in relative.split('/') {
             match part {
@@ -174,21 +264,60 @@ fn texture_candidates(model: &str, texture: &ufbx::Texture) -> Vec<String> {
         }
         out.push(parts.join("/"));
     }
-    if let Some(name) = texture_file_name(texture) {
-        let mut parts = base;
-        parts.push(name);
-        let same_folder = parts.join("/");
-        if !out.contains(&same_folder) {
-            out.push(same_folder);
+    out.push(join(&base, name));
+    let mut dir = base;
+    loop {
+        out.push(join(&dir, &format!("Textures/{name}")));
+        if dir.last().is_none_or(|d| d.eq_ignore_ascii_case("assets")) {
+            break;
         }
+        dir.pop();
     }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| seen.insert(p.to_lowercase()));
     out
 }
 
-fn load_scene(bytes: &[u8]) -> Result<ufbx::SceneRoot> {
+/// The project path of texture `t` of the model at `model`: the first of the
+/// candidates in the index, else the first file of that name anywhere.
+/// `Err` holds the candidates searched.
+fn find_texture(
+    model: &str,
+    t: &ufbx::Texture,
+    index: &Index,
+    warn: Warn,
+) -> Result<String, Vec<String>> {
+    let name = texture_file_name(t).unwrap_or_default();
+    let candidates = texture_candidates(model, &t.relative_filename, name);
+    if let Some(path) = candidates
+        .iter()
+        .find_map(|c| index.by_path.get(&c.to_lowercase()))
+    {
+        return Ok(path.to_string());
+    }
+    match index.by_name.get(&name.to_lowercase()).map(Vec::as_slice) {
+        Some([first, rest @ ..]) => {
+            if !rest.is_empty() {
+                warn(
+                    name,
+                    format!(
+                        "{model}: texture '{name}' exists in several folders, using {first} (also {})",
+                        rest.join(", ")
+                    ),
+                );
+            }
+            Ok(first.to_string())
+        }
+        _ => Err(candidates),
+    }
+}
+
+fn load_scene(bytes: &[u8], settings: &ImportSettings, content: bool) -> Result<ufbx::SceneRoot> {
+    PARSES.with(|p| p.set(p.get() + 1));
     let opts = ufbx::LoadOpts {
         target_axes: ufbx::CoordinateAxes::right_handed_y_up(),
-        target_unit_meters: 1.0,
+        // 0 keeps the file's own unit: its numbers are taken as metres.
+        target_unit_meters: if settings.use_file_units { 1.0 } else { 0.0 },
         // Meshes and node transforms come out in metres, Y up, mesh by mesh,
         // so `#mesh<N>` and the node tree agree with a glTF of the same object.
         space_conversion: ufbx::SpaceConversion::ModifyGeometry,
@@ -196,9 +325,16 @@ fn load_scene(bytes: &[u8]) -> Result<ufbx::SceneRoot> {
         inherit_mode_handling: ufbx::InheritModeHandling::Compensate,
         pivot_handling: ufbx::PivotHandling::AdjustToPivot,
         generate_missing_normals: true,
+        // Animation is not played yet (skin data is kept): the animation area
+        // turns this back on.
+        ignore_animation: true,
+        ignore_embedded: !content,
         ..Default::default()
     };
-    ufbx::load_memory(bytes, opts).map_err(|e| anyhow::anyhow!("failed to read FBX: {e:?}"))
+    ufbx::load_memory(bytes, opts).map_err(|e| match e.info() {
+        "" => anyhow::anyhow!("{}", e.description),
+        info => anyhow::anyhow!("{}: {info}", e.description),
+    })
 }
 
 fn map_value(map: &ufbx::MaterialMap) -> Option<ufbx::Vec4> {
@@ -212,12 +348,23 @@ fn map_texture(map: &ufbx::MaterialMap) -> Option<&ufbx::Texture> {
         .map(|t| &**t)
 }
 
+/// A converted material plus what needs the loaded textures to finish.
+struct Converted {
+    material: FbxMaterial,
+    /// An opacity / transparency texture is linked (its file name).
+    opacity_texture: Option<String>,
+}
+
 /// Factors from ufbx's PBR mapping (which also maps Phong / Lambert), the
-/// classic diffuse colour where that has nothing.
+/// classic diffuse colour where that has nothing. Colour factors are read
+/// as linear. Where a texture is bound its colour factor is white (Blender
+/// writes 0.8 diffuse and black emission for unlinked sockets).
 fn convert_material(
+    model: &str,
     m: &ufbx::Material,
     texture: &mut dyn FnMut(&ufbx::Texture) -> Option<usize>,
-) -> FbxMaterial {
+    warn: Option<Warn>,
+) -> Converted {
     let (pbr, fbx) = (&m.pbr, &m.fbx);
     let mut asset = MaterialAsset::new_default();
     let base = if pbr.base_color.has_value || pbr.base_color.texture.is_some() {
@@ -225,12 +372,33 @@ fn convert_material(
     } else {
         &fbx.diffuse_color
     };
+    let glossy = m.features.roughness_as_glossiness.enabled;
+    let (metalness, roughness) = (map_texture(&pbr.metalness), map_texture(&pbr.roughness));
+    let metal_rough = match (metalness, roughness) {
+        (Some(a), Some(b)) if a.element.element_id == b.element.element_id && !glossy => Some(a),
+        _ => None,
+    };
+    let normal = [&pbr.normal_map, &fbx.normal_map, &fbx.bump]
+        .into_iter()
+        .find_map(map_texture);
+    let textures = [
+        map_texture(base),
+        metal_rough,
+        normal,
+        map_texture(&pbr.emission_color),
+    ]
+    .map(|t| t.and_then(&mut *texture));
     if let Some(c) = map_value(base) {
         let factor = map_value(&pbr.base_factor).map_or(1.0, |f| f.x);
+        let c = if textures[0].is_some() {
+            [1.0; 3]
+        } else {
+            [c.x, c.y, c.z]
+        };
         asset.base_color = [
-            (c.x * factor) as f32,
-            (c.y * factor) as f32,
-            (c.z * factor) as f32,
+            (c[0] * factor) as f32,
+            (c[1] * factor) as f32,
+            (c[2] * factor) as f32,
             1.0,
         ];
     }
@@ -238,40 +406,66 @@ fn convert_material(
         asset.metallic = v.x as f32;
     }
     if let Some(v) = map_value(&pbr.roughness) {
-        let glossy = m.features.roughness_as_glossiness.enabled;
         asset.roughness = if glossy { 1.0 - v.x } else { v.x } as f32;
     }
     if let Some(c) = map_value(&pbr.emission_color) {
         let factor = map_value(&pbr.emission_factor).map_or(1.0, |f| f.x);
+        let c = if textures[3].is_some() {
+            [1.0; 3]
+        } else {
+            [c.x, c.y, c.z]
+        };
         asset.emissive = [
-            (c.x * factor) as f32,
-            (c.y * factor) as f32,
-            (c.z * factor) as f32,
+            (c[0] * factor) as f32,
+            (c[1] * factor) as f32,
+            (c[2] * factor) as f32,
         ];
     }
-    if let Some(v) = map_value(&pbr.opacity).filter(|v| v.x < 1.0) {
-        asset.base_color[3] = v.x as f32;
+    let opacity_texture = [
+        &pbr.opacity,
+        &fbx.transparency_color,
+        &fbx.transparency_factor,
+    ]
+    .into_iter()
+    .find_map(map_texture)
+    .map(|t| texture_file_name(t).unwrap_or_default().to_string());
+    // ufbx maps `pbr.opacity` for a few shaders only; classic files keep a
+    // transparency factor (1 = see-through).
+    let opacity = map_value(&pbr.opacity)
+        .map(|v| v.x as f32)
+        .or_else(|| map_value(&fbx.transparency_factor).map(|v| 1.0 - v.x as f32));
+    if opacity_texture.is_some() {
+        asset.alpha_mode = AlphaMode::Mask { cutoff: 0.5 };
+    } else if let Some(v) = opacity.filter(|v| *v < 0.999) {
+        asset.base_color[3] = v;
         asset.alpha_mode = AlphaMode::Blend;
     }
     asset.double_sided = m.features.double_sided.enabled;
-    let metal_rough = match (map_texture(&pbr.metalness), map_texture(&pbr.roughness)) {
-        (Some(a), Some(b)) if a.element.element_id == b.element.element_id => Some(a),
-        _ => None,
-    };
-    let textures = [
-        map_texture(base),
-        metal_rough,
-        map_texture(&pbr.normal_map),
-        map_texture(&pbr.emission_color),
-    ]
-    .map(|t| t.and_then(&mut *texture));
-    FbxMaterial {
-        name: m.element.name.to_string(),
-        asset,
-        textures,
+    if let Some(warn) = warn
+        && metal_rough.is_none()
+    {
+        let rough_kind = if glossy { "glossiness" } else { "roughness" };
+        for (kind, t) in [("metalness", metalness), (rough_kind, roughness)] {
+            if let Some(file) = t.and_then(texture_file_name) {
+                warn(
+                    file,
+                    format!(
+                        "{model}: material '{}': {kind} texture '{file}' is not used (only one texture packed like glTF, G roughness and B metallic, is read)",
+                        m.element.name
+                    ),
+                );
+            }
+        }
+    }
+    Converted {
+        material: FbxMaterial {
+            name: m.element.name.to_string(),
+            asset,
+            textures,
+        },
+        opacity_texture,
     }
 }
-
 /// Triangles of `mesh`, one part per material slot used.
 fn convert_mesh(mesh: &ufbx::Mesh) -> Vec<FbxPart> {
     let slots: Vec<(u32, Option<&ufbx::MeshPart>)> = if mesh.material_parts.is_empty() {
@@ -369,42 +563,10 @@ fn convert_mesh(mesh: &ufbx::Mesh) -> Vec<FbxPart> {
     parts
 }
 
-/// Parse `bytes` (the FBX at project path `name`). With `read`, textures are
-/// loaded: embedded content first, then the candidates of
-/// `texture_candidates`; a missing one logs one warning and stays empty.
-pub(crate) fn import(name: &str, bytes: &[u8], read: Option<Reader>) -> Result<FbxModel> {
-    let scene = load_scene(bytes)?;
-    let mut textures: Vec<FbxTexture> = Vec::new();
-    let mut by_element: HashMap<u32, Option<usize>> = HashMap::new();
-    let mut load_texture = |t: &ufbx::Texture| -> Option<usize> {
-        let read = read?;
-        *by_element.entry(t.element.element_id).or_insert_with(|| {
-            let file = texture_file_name(t).unwrap_or_default().to_string();
-            let bytes = if !t.content.is_empty() {
-                Some(t.content.to_vec())
-            } else {
-                texture_candidates(name, t)
-                    .iter()
-                    .find_map(|p| read(p).ok())
-            };
-            let Some(bytes) = bytes else {
-                tracing::warn!("{name}: texture {file} not found, using the default");
-                return None;
-            };
-            textures.push(FbxTexture {
-                file_name: file,
-                bytes,
-            });
-            Some(textures.len() - 1)
-        })
-    };
-    let materials = scene
-        .materials
-        .iter()
-        .map(|m| convert_material(m, &mut load_texture))
-        .collect();
-    let meshes = scene.meshes.iter().map(|m| convert_mesh(m)).collect();
-
+/// The node tree (depth first) and each node's world matrix, with the
+/// scale and forward flip of `settings` applied: positions scale, and the
+/// roots turn about Y.
+fn build_nodes(scene: &ufbx::Scene, settings: &ImportSettings) -> (Vec<GltfNode>, Vec<Mat4>) {
     let mut nodes = Vec::new();
     let mut worlds = Vec::new();
     let mut stack: Vec<(&ufbx::Node, Option<usize>)> = scene
@@ -433,6 +595,156 @@ pub(crate) fn import(name: &str, bytes: &[u8], read: Option<Reader>) -> Result<F
         worlds.push(mat4(&node.geometry_to_world));
         stack.extend(node.children.iter().rev().map(|c| (&**c, Some(index))));
     }
+    let flip = Quat::from_rotation_y(std::f32::consts::PI);
+    for (node, world) in nodes.iter_mut().zip(&mut worlds) {
+        node.translation *= settings.scale;
+        world.w_axis = (world.w_axis.truncate() * settings.scale).extend(1.0);
+        if settings.forward_flip {
+            *world = Mat4::from_quat(flip) * *world;
+            if node.parent.is_none() {
+                node.translation = flip * node.translation;
+                node.rotation = flip * node.rotation;
+            }
+        }
+    }
+    (nodes, worlds)
+}
+
+/// Nodes and bounds of the FBX in `bytes` without converting any mesh:
+/// positions and world matrices only.
+pub(crate) fn summary(bytes: &[u8], settings: &ImportSettings) -> Result<crate::ModelSummary> {
+    let scene = load_scene(bytes, settings, false)?;
+    let (nodes, worlds) = build_nodes(&scene, settings);
+    let mut bounds: Option<(Vec3, Vec3)> = None;
+    for (node, world) in nodes.iter().zip(&worlds) {
+        let Some(mesh) = node.mesh.filter(|_| !degenerate(world)) else {
+            continue;
+        };
+        for v in scene.meshes[mesh].vertex_position.values.iter() {
+            let p = world.transform_point3(vec3(*v) * settings.scale);
+            bounds = Some(bounds.map_or((p, p), |(lo, hi)| (lo.min(p), hi.max(p))));
+        }
+    }
+    Ok(crate::ModelSummary { nodes, bounds })
+}
+
+/// `import` with the default settings.
+#[cfg(test)]
+pub(crate) fn import_plain(
+    name: &str,
+    bytes: &[u8],
+    sources: Option<&Sources>,
+) -> Result<FbxModel> {
+    import(name, bytes, &ImportSettings::default(), sources)
+}
+
+/// Any texel of the encoded image that is not fully opaque.
+fn see_through(bytes: &[u8]) -> bool {
+    image::load_from_memory(bytes)
+        .is_ok_and(|i| i.color().has_alpha() && i.to_rgba8().pixels().any(|p| p[3] < 255))
+}
+
+/// Parse `bytes` (the FBX at project path `name`). With `sources`, textures
+/// are loaded (embedded content first, then `find_texture`); a missing one
+/// is reported through `Sources::warn` and stays empty.
+pub(crate) fn import(
+    name: &str,
+    bytes: &[u8],
+    settings: &ImportSettings,
+    sources: Option<&Sources>,
+) -> Result<FbxModel> {
+    let scene =
+        load_scene(bytes, settings, true).with_context(|| format!("failed to read FBX {name}"))?;
+    let warn: Option<Warn> = sources.map(|s| s.warn);
+    let index = Index::new(sources.map_or(&[], |s| s.index));
+    let mut textures: Vec<FbxTexture> = Vec::new();
+    let mut by_element: HashMap<u32, Option<usize>> = HashMap::new();
+    let mut load_texture = |t: &ufbx::Texture| -> Option<usize> {
+        let sources = sources?;
+        *by_element.entry(t.element.element_id).or_insert_with(|| {
+            let file = texture_file_name(t).unwrap_or_default().to_string();
+            let (bytes, path) = if !t.content.is_empty() {
+                (t.content.to_vec(), None)
+            } else {
+                match find_texture(name, t, &index, sources.warn) {
+                    Ok(path) => match (sources.read)(&path) {
+                        Ok(bytes) => (bytes, Some(path)),
+                        Err(error) => {
+                            (sources.warn)(
+                                &file,
+                                format!("{name}: texture '{file}' at {path} could not be read: {error}; using the default"),
+                            );
+                            return None;
+                        }
+                    },
+                    Err(searched) => {
+                        (sources.warn)(
+                            &file,
+                            format!(
+                                "{name}: texture '{file}' not found (stored as '{}'); searched {}, then every folder of the project; using the default",
+                                stored_path(t),
+                                searched.join(", ")
+                            ),
+                        );
+                        return None;
+                    }
+                }
+            };
+            textures.push(FbxTexture {
+                file_name: file,
+                path,
+                bytes,
+            });
+            Some(textures.len() - 1)
+        })
+    };
+    let converted: Vec<Converted> = scene
+        .materials
+        .iter()
+        .map(|m| convert_material(name, m, &mut load_texture, warn))
+        .collect();
+    let mut alpha: HashMap<usize, bool> = HashMap::new();
+    let materials = converted
+        .into_iter()
+        .map(|c| {
+            let mut material = c.material;
+            let base_alpha = material.textures[0]
+                .is_some_and(|t| *alpha.entry(t).or_insert_with(|| see_through(&textures[t].bytes)));
+            if base_alpha && material.asset.alpha_mode == AlphaMode::Opaque {
+                material.asset.alpha_mode = AlphaMode::Mask { cutoff: 0.5 };
+            }
+            if let (Some(file), Some(warn)) = (c.opacity_texture, warn)
+                && !base_alpha
+            {
+                warn(
+                    &file,
+                    format!(
+                        "{name}: material '{}': opacity texture '{file}' is not used (cutouts read the base colour texture's alpha)",
+                        material.name
+                    ),
+                );
+            }
+            material
+        })
+        .collect();
+    let mut meshes: Vec<Vec<FbxPart>> = scene.meshes.iter().map(|m| convert_mesh(m)).collect();
+    if settings.scale != 1.0 {
+        for v in meshes.iter_mut().flatten().flat_map(|p| &mut p.vertices) {
+            v.position = (Vec3::from_array(v.position) * settings.scale).to_array();
+        }
+    }
+    let (nodes, worlds) = build_nodes(&scene, settings);
+    let flat = nodes
+        .iter()
+        .zip(&worlds)
+        .filter(|(n, w)| n.mesh.is_some() && degenerate(w))
+        .count();
+    if let (true, Some(warn)) = (flat > 0, warn) {
+        warn(
+            "(zero scale)",
+            format!("{name}: {flat} node(s) with a zero scale are not drawn"),
+        );
+    }
     Ok(FbxModel {
         meshes,
         materials,
@@ -457,6 +769,12 @@ pub(crate) mod fixture {
         pub texture: Option<&'static str>,
         /// Embedded content of that texture.
         pub embedded: Option<Vec<u8>>,
+        /// Material properties the texture is linked to (default: DiffuseColor).
+        pub slots: Vec<&'static str>,
+        /// Extra `P:` lines of material 0 (without the leading tab).
+        pub props: Vec<String>,
+        /// Number of mesh nodes (copies of the box sharing the materials).
+        pub meshes: usize,
     }
 
     impl Default for Cube {
@@ -468,6 +786,9 @@ pub(crate) mod fixture {
                 two_materials: false,
                 texture: None,
                 embedded: None,
+                slots: Vec::new(),
+                props: Vec::new(),
+                meshes: 1,
             }
         }
     }
@@ -560,6 +881,7 @@ pub(crate) mod fixture {
             };
             let [tx, ty, tz] = self.conv(self.translation);
             let [sx, sy, sz] = self.scaling;
+            let props: String = self.props.iter().map(|p| format!("\t\t\t{p}\n")).collect();
             let mut text = format!(
                 r#"; FBX 7.3.0 project file
 FBXHeaderExtension:  {{
@@ -634,10 +956,31 @@ Objects:  {{
 		Properties70:  {{
 			P: "DiffuseColor", "Color", "", "A",0.8,0.2,0.1
 			P: "EmissiveColor", "Color", "", "A",0.1,0.2,0.3
+{props}
 		}}
 	}}
 "#
             );
+            let mut extra_connections = String::new();
+            if self.meshes > 1 {
+                let start = text.find("\tGeometry: 1000").unwrap();
+                let end = text.find("\tMaterial: 3000").unwrap();
+                let segment = text[start..end].to_string();
+                for k in 1..self.meshes as i64 {
+                    let copy = segment
+                        .replace("Geometry: 1000", &format!("Geometry: {}", 1000 + 10 * k))
+                        .replace("Model: 2000", &format!("Model: {}", 2000 + 10 * k));
+                    text.insert_str(end, &copy);
+                    extra_connections += &format!(
+                        "\tC: \"OO\",{m},0\n\tC: \"OO\",{g},{m}\n\tC: \"OO\",3000,{m}\n",
+                        m = 2000 + 10 * k,
+                        g = 1000 + 10 * k
+                    );
+                    if self.two_materials {
+                        extra_connections += &format!("\tC: \"OO\",3001,{}\n", 2000 + 10 * k);
+                    }
+                }
+            }
             if self.two_materials {
                 text += r#"	Material: 3001, "Material::Blue", "" {
 		Version: 102
@@ -660,11 +1003,19 @@ Objects:  {{
                 }
             }
             text += "}\nConnections:  {\n\tC: \"OO\",2000,0\n\tC: \"OO\",1000,2000\n\tC: \"OO\",3000,2000\n";
+            text += &extra_connections;
             if self.two_materials {
                 text += "\tC: \"OO\",3001,2000\n";
             }
             if self.texture.is_some() {
-                text += "\tC: \"OP\",4000,3000, \"DiffuseColor\"\n";
+                let slots: &[&str] = if self.slots.is_empty() {
+                    &["DiffuseColor"]
+                } else {
+                    &self.slots
+                };
+                for slot in slots {
+                    text += &format!("\tC: \"OP\",4000,3000, \"{slot}\"\n");
+                }
                 if self.embedded.is_some() {
                     text += "\tC: \"OO\",5000,4000\n";
                 }
@@ -681,7 +1032,7 @@ mod tests {
     use glam::Vec3;
 
     fn load(cube: &Cube) -> FbxModel {
-        import("assets/models/box.fbx", cube.ascii().as_bytes(), None).unwrap()
+        import_plain("assets/models/box.fbx", cube.ascii().as_bytes(), None).unwrap()
     }
 
     /// World-baked vertices of every part, with their triangles.
@@ -784,8 +1135,8 @@ mod tests {
 
     #[test]
     fn garbage_is_an_error_not_a_panic() {
-        assert!(import("a.fbx", b"this is not an fbx file at all", None).is_err());
-        assert!(import("a.fbx", b"", None).is_err());
+        assert!(import_plain("a.fbx", b"this is not an fbx file at all", None).is_err());
+        assert!(import_plain("a.fbx", b"", None).is_err());
     }
 
     fn png() -> Vec<u8> {
@@ -796,50 +1147,135 @@ mod tests {
         out.into_inner()
     }
 
-    fn textured(embedded: Option<Vec<u8>>, read: Reader) -> FbxModel {
+    /// The box with texture `tex/t.png` imported with `files` as the project
+    /// (every file reads as its own path); the model's texture and the warnings.
+    fn resolve(
+        model: &str,
+        embedded: Option<Vec<u8>>,
+        files: &[&str],
+    ) -> (Option<FbxTexture>, Vec<String>) {
         let cube = Cube {
             texture: Some("tex/t.png"),
             embedded,
             ..Cube::default()
         };
-        import("assets/models/box.fbx", cube.ascii().as_bytes(), Some(read)).unwrap()
+        let index: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+        let warnings = std::cell::RefCell::new(Vec::new());
+        let read = |p: &str| {
+            if index.iter().any(|f| f == p) {
+                Ok(p.as_bytes().to_vec())
+            } else {
+                Err(std::io::ErrorKind::NotFound.into())
+            }
+        };
+        let warn = |_: &str, m: String| warnings.borrow_mut().push(m);
+        let sources = Sources {
+            read: &read,
+            index: &index,
+            warn: &warn,
+        };
+        let model = import_plain(model, cube.ascii().as_bytes(), Some(&sources)).unwrap();
+        let slot = model.materials[0].textures[0];
+        let texture = slot.map(|t| model.textures.into_iter().nth(t).unwrap());
+        (texture, warnings.into_inner())
     }
 
-    fn base_texture(model: &FbxModel) -> Option<&FbxTexture> {
-        let slot = model.materials[0].textures[0]?;
-        Some(&model.textures[slot])
+    fn found(model: &str, files: &[&str]) -> Option<String> {
+        resolve(model, None, files).0?.path
     }
 
     #[test]
     fn texture_embedded_content_wins() {
-        let model = textured(Some(png()), &|p| panic!("read {p}"));
-        assert_eq!(base_texture(&model).unwrap().bytes, png());
+        let (texture, _) = resolve(
+            "assets/models/box.fbx",
+            Some(png()),
+            &["assets/models/tex/t.png"],
+        );
+        let texture = texture.unwrap();
+        assert_eq!(texture.bytes, png());
+        assert_eq!(texture.path, None);
     }
 
     #[test]
     fn texture_is_found_relative_to_the_fbx() {
-        let model = textured(None, &|p| {
-            assert_eq!(p, "assets/models/tex/t.png");
-            Ok(b"rel".to_vec())
-        });
-        assert_eq!(base_texture(&model).unwrap().bytes, b"rel");
+        assert_eq!(
+            found("assets/models/box.fbx", &["assets/models/tex/t.png"]).as_deref(),
+            Some("assets/models/tex/t.png")
+        );
     }
 
     #[test]
     fn texture_falls_back_to_the_same_name_next_to_the_fbx() {
-        let model = textured(None, &|p| {
-            if p == "assets/models/t.png" {
-                Ok(b"same".to_vec())
-            } else {
-                Err(std::io::ErrorKind::NotFound.into())
-            }
-        });
-        assert_eq!(base_texture(&model).unwrap().bytes, b"same");
+        assert_eq!(
+            found("assets/models/box.fbx", &["assets/models/t.png"]).as_deref(),
+            Some("assets/models/t.png")
+        );
     }
 
     #[test]
-    fn missing_texture_leaves_the_slot_empty() {
-        let model = textured(None, &|_| Err(std::io::ErrorKind::NotFound.into()));
-        assert!(base_texture(&model).is_none());
+    fn texture_search_ignores_case_in_folders_and_names() {
+        assert_eq!(
+            found("assets/models/box.fbx", &["assets/Models/TEX/T.PNG"]).as_deref(),
+            Some("assets/Models/TEX/T.PNG")
+        );
+    }
+
+    #[test]
+    fn texture_search_tries_textures_folders_up_to_assets() {
+        for file in [
+            "assets/models/Textures/t.png",
+            "assets/models/textures/t.png",
+            "assets/Textures/t.png",
+        ] {
+            assert_eq!(
+                found("assets/models/box.fbx", &[file]).as_deref(),
+                Some(file)
+            );
+        }
+        // The nearest `Textures` folder wins over a farther one.
+        assert_eq!(
+            found(
+                "assets/models/x/box.fbx",
+                &["assets/Textures/t.png", "assets/models/Textures/t.png"]
+            )
+            .as_deref(),
+            Some("assets/models/Textures/t.png")
+        );
+    }
+
+    #[test]
+    fn texture_search_falls_back_to_the_first_file_of_that_name_in_the_project() {
+        let (texture, warnings) = resolve(
+            "assets/models/box.fbx",
+            None,
+            &["assets/props/a/T.png", "assets/props/b/t.png"],
+        );
+        assert_eq!(
+            texture.unwrap().path.as_deref(),
+            Some("assets/props/a/T.png")
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("several folders"), "{warnings:?}");
+        let (texture, warnings) = resolve("assets/models/box.fbx", None, &["assets/props/a/t.png"]);
+        assert!(texture.is_some() && warnings.is_empty());
+    }
+
+    #[test]
+    fn missing_texture_names_the_model_the_stored_path_and_what_was_searched() {
+        let (texture, warnings) = resolve("assets/models/box.fbx", None, &["assets/other.png"]);
+        assert!(texture.is_none());
+        assert_eq!(warnings.len(), 1);
+        let w = &warnings[0];
+        for part in [
+            "assets/models/box.fbx",
+            "'t.png'",
+            "tex/t.png",
+            "assets/models/tex/t.png",
+            "assets/models/Textures/t.png",
+            "assets/Textures/t.png",
+            "every folder of the project",
+        ] {
+            assert!(w.contains(part), "{part} not in {w}");
+        }
     }
 }

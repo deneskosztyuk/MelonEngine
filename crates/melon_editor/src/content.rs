@@ -56,7 +56,7 @@ pub fn asset_kind(path: &Path, is_dir: bool) -> AssetKind {
         .unwrap_or_default();
     match ext.as_str() {
         "glb" | "gltf" | "fbx" => AssetKind::Model,
-        "png" | "jpg" | "jpeg" | "hdr" => AssetKind::Texture,
+        "png" | "jpg" | "jpeg" | "hdr" | "tga" | "bmp" => AssetKind::Texture,
         "mat" => AssetKind::Material,
         "wgsl" => AssetKind::Shader,
         "ron" => AssetKind::Scene,
@@ -905,6 +905,8 @@ mod tests {
         assert_eq!(asset_kind(Path::new("a/b.gltf"), false), AssetKind::Model);
         assert_eq!(asset_kind(Path::new("a/c.FBX"), false), AssetKind::Model);
         assert_eq!(asset_kind(Path::new("t.JPeG"), false), AssetKind::Texture);
+        assert_eq!(asset_kind(Path::new("t.TGA"), false), AssetKind::Texture);
+        assert_eq!(asset_kind(Path::new("t.bmp"), false), AssetKind::Texture);
         assert_eq!(asset_kind(Path::new("s.wgsl"), false), AssetKind::Shader);
         assert_eq!(asset_kind(Path::new("m.MAT"), false), AssetKind::Material);
         assert_eq!(asset_kind(Path::new("level.ron"), false), AssetKind::Scene);

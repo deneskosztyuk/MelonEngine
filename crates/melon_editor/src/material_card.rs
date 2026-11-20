@@ -8,7 +8,7 @@ use std::path::Path;
 use melon_core::{AlphaMode, AssetServer, MaterialAsset, TextureRef};
 
 /// Texture files a material can use.
-const TEXTURE_EXTENSIONS: [&str; 3] = ["png", "jpg", "jpeg"];
+const TEXTURE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "tga", "bmp"];
 
 /// A texture slot: a picker over the project's textures that also takes a
 /// texture dragged from the Content Browser; None clears it. Without a
