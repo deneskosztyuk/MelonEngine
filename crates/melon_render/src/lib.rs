@@ -3,6 +3,8 @@ use std::sync::Arc;
 mod cascades;
 mod extract;
 mod fbx;
+#[cfg(test)]
+mod fbx_edge_tests;
 pub mod gi;
 mod gltf_materials;
 mod ibl;

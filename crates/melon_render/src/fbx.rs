@@ -139,6 +139,19 @@ fn file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
+/// The texture's file name from whichever path the file stores (some files
+/// have only the absolute one, which ufbx keeps apart from `filename`).
+fn texture_file_name(texture: &ufbx::Texture) -> Option<&str> {
+    [
+        &*texture.filename,
+        &*texture.relative_filename,
+        &*texture.absolute_filename,
+    ]
+    .into_iter()
+    .find(|n| !n.is_empty())
+    .map(file_name)
+}
+
 /// Where a texture of the FBX at `model` may live: its relative file name
 /// from the FBX's folder, then its file name alone next to the FBX. (The
 /// absolute path the artist's machine wrote is ignored.)
@@ -161,11 +174,7 @@ fn texture_candidates(model: &str, texture: &ufbx::Texture) -> Vec<String> {
         }
         out.push(parts.join("/"));
     }
-    let name = [&*texture.filename, &*texture.relative_filename]
-        .into_iter()
-        .find(|n| !n.is_empty())
-        .map(file_name);
-    if let Some(name) = name {
+    if let Some(name) = texture_file_name(texture) {
         let mut parts = base;
         parts.push(name);
         let same_folder = parts.join("/");
@@ -370,12 +379,7 @@ pub(crate) fn import(name: &str, bytes: &[u8], read: Option<Reader>) -> Result<F
     let mut load_texture = |t: &ufbx::Texture| -> Option<usize> {
         let read = read?;
         *by_element.entry(t.element.element_id).or_insert_with(|| {
-            let file = file_name(if t.filename.is_empty() {
-                &t.relative_filename
-            } else {
-                &t.filename
-            })
-            .to_string();
+            let file = texture_file_name(t).unwrap_or_default().to_string();
             let bytes = if !t.content.is_empty() {
                 Some(t.content.to_vec())
             } else {
