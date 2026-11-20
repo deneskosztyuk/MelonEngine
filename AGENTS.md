@@ -131,7 +131,8 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   size, MSAA, present mode. `Environment` is the look only (sky, fog,
   strengths, radii; no on/off switches). Presets are data
   (`RenderQuality::preset`, `matching_preset`; `Default` = High = the
-  renderer before quality settings, snapshots byte-identical). Saved as
+  renderer's settings before quality settings; the image has changed since:
+  IBL, mips, alpha to coverage). Saved as
   `config/quality.ron` (loaded by the host), named profiles as
   `config/quality_profiles/<name>.ron`; edited in Edit ▸ Project Settings ▸
   Quality, pending until Apply. `extract` copies it into
@@ -386,10 +387,15 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   GI shaded as Off without `Gi::update` (no DDGI voxelising or probe
   update, `updates` and SSGI history untouched), the current shadow map
   size and sample count (its `FrameData::quality` sizes are ignored, so no
-  rebuild), no GPU timestamps. Its target follows the current sample count
+  rebuild), no GPU timestamps. It also leaves the sky texture, the IBL
+  (`ibl_frozen`: it draws with the IBL the last main view built, and its
+  default light never rebuilds it) and the local shadow atlas alone (it
+  has no local lights), so a thumbnail reallocates nothing
+  (`SceneRenderer::ibl_rebuilds` / `shadow_rebuilds` count rebuilds). Its
+  target follows the current sample count
   (`match_msaa`, that target only). GPU checks
   `thumbnail_does_not_disturb_the_next_scene_frame` (DDGI on) and
-  `thumbnail_keeps_shadow_map_and_msaa`.
+  `thumbnail_keeps_shadow_map_and_msaa` (which also counts the rebuilds).
 - **One main `render_scene` per submit (hard rule).** The camera, light,
   environment, SSAO and GI uniforms and the instance buffer are shared and
   written with `queue.write_buffer`, which applies at the next submit: two
@@ -530,13 +536,29 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   Draw order in the 3D pass: opaque (back faces culled), two-sided, sky, then
   blended draws one instance each, sorted far to near
   (`sort_back_to_front`), no depth write, no shadows (documented limit).
-  Mask: `MaterialUniform::alpha_cutoff` > 0 discards in the main pass, the
-  voxel pass and, through the `vs_mask` / `fs_mask` entry points of
+  Texture quality: every texture made by `create_texture_from_bytes` has a
+  full CPU mip chain (`mip_chain`, 2x2 box, sRGB averaged in linear light),
+  the material sampler is trilinear with 8x anisotropy where the adapter's
+  downlevel flags allow it (`material_sampler_descriptor`, `Renderer::new`
+  passes the clamp). Blend draws sample the SSAO of the opaque backdrop
+  (the prepass has no blended surfaces), so a blended surface gets AO from
+  what is behind it.
+  Mask: `MaterialUniform::alpha_cutoff` > 0 discards in the main pass at 1
+  sample; at MSAA > 1 the main pass draws Mask parts with the `Mask` /
+  `MaskTwoSided` variants (shader override `ALPHA_TO_COVERAGE`: no discard,
+  a one pixel ramp around the cutoff becomes the sample coverage). The
+  voxel pass, prepass and shadow passes keep the cutoff discard. Mask also
+  discards in the voxel pass and, through the `vs_mask` / `fs_mask` entry points of
   prepass.wgsl and shadow.wgsl (group 2 = the material), the prepass and
   every shadow pass. Double-sided and blend mesh pipelines are built lazily
   per (sample count, GI mode) (`ensure_variant`, shader override
   `ALPHA_BLEND`). Editor: Create > New Material (folder menu), `.mat`
-  Inspector card (`material_card.rs`, saves on every change); `.mat` tiles
+  Inspector card (`material_card.rs`: texture slots use
+  `inspect::asset_field`, the picker + drop target of `WidgetKind::Asset`;
+  colour pickers; the edited copy waits in egui memory and the file is
+  written when the pointer is released, not per tick); spot light angles
+  show in degrees (`WidgetKind::Degrees`), light colours get a picker
+  (`WidgetKind::Color`); `.mat` tiles
   get a thumbnail (`Renderer::render_material_thumbnail`: the material on
   `builtin:sphere`, same auxiliary view and own submission as model
   thumbnails; `ThumbnailSubject`); dragging a `.mat` onto an entity in the
@@ -554,13 +576,22 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   `FrameData::lights`. Clustered forward: a 16 x 9 x 24 froxel grid
   (exponential depth slices from the camera near plane, at most 500 m deep),
   built on the CPU per main view (`ClusterGrid`, `build`): each light goes
-  in the clusters its bounding box touches (`range_of`), lists upload to
+  in the clusters whose box its sphere touches (`range_of` gives the
+  candidate box, `cluster_aabbs` the per-cluster world boxes; sphere vs box
+  keeps big lights out of unrelated clusters), lists upload to
   group 3 bindings 9 to 12 (lights, per-cluster (offset, count), indices,
   `ClusterUniform`); `RenderQuality::max_lights` keeps the brightest per
   squared distance. mesh.wgsl `local_light_radiance` loops over the
   fragment's cluster. The per-view groups bind `frame_lights`; the unoccluded
   and voxel groups' lights are an empty set / the frame set. Auxiliary views
-  (thumbnails) write an empty set. `RenderStats::lights`, `lights_dropped`.
+  (thumbnails) write an empty set. The shared index list holds
+  `INDEX_CAPACITY` entries: the overflow is counted
+  (`ClusterData::overflow`, `RenderStats::light_index_overflow`) and warned
+  once per change; those last clusters miss lights.
+  `RenderStats::lights`, `lights_dropped`. `extract` caches resolved LOD
+  and `MeshMaterials` handles in `ResolvedLod` / `ResolvedMaterials`
+  components (re-resolved when the source or `AssetServer::index_epoch`
+  changes) and writes `LodState` only when the level changes.
   Editor: GameObject > Light, viewport icons (pickable spheres), range sphere
   / cone outline for the selected light (`viewport::light_*`).
 - **Image-based ambient (`ibl.rs`).** Diffuse = irradiance as SH9 (CPU,
@@ -569,7 +600,12 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   (split sum), all in group 0 bindings 7 to 10, rebuilt on the CPU when
   `SkyParams` (sky colours, `Light` ambient / hemisphere colours) or the HDR
   image change (`refresh_ibl`, called by `update_environment` /
-  `update_light`, so direct draws work). Procedural source: diffuse = the
+  `update_light`, so direct draws work; the specular texture is rewritten in
+  place, never reallocated, so a dragged sky slider costs CPU only). Rough
+  surfaces blend the prefiltered sky toward the hemisphere irradiance
+  (`smoothstep(0.25, 0.85, roughness)`: the drawn sky is several times
+  brighter than the ambient the scene is lit with) and reflections under
+  the surface's horizon fade out. Procedural source: diffuse = the
   hemisphere ambient (its irradiance equals the old blend; SH9 within 6%),
   specular = the drawn sky without the sun disc. HDR source:
   `Environment::sky_texture` (any image file, `Handle<Texture>`) times
@@ -591,7 +627,10 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   picks the cascade by view depth (`LightUniform::cascade_far`,
   `cascade_forward`), blends the last 15% into the next and fades the last
   cascade to lit at the shadow distance; `shadow_factor_volume` (GI voxel
-  passes, no camera) takes the finest cascade whose box holds the point.
+  passes) reads the DDGI injection shadow map: one fixed cascade (2048,
+  `gi_shadow_matrix`, an ortho box around the volume's bounding sphere,
+  rendered from every caster that touches it) with its own light uniform,
+  so injection never depends on where the camera looks.
   `update_light(light, matrix)` is the one-cascade form for direct draws
   (covers every depth). Thumbnails use one cascade and do not resize the map.
   `SHADOW_RADIUS` now only sizes the DDGI volume.
@@ -602,14 +641,22 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   degrees). `lights::build(.., shadow_cap)` puts the nearest
   `shadowed_lights` casters first in the light list (their `spot.w` = first
   tile, `ClusterUniform::dims.w` = how many); `tile_layout` picks the tile
-  size (power of two, 128 to 1024) so all views fit. One pass
+  size (power of two, 128 to 1024) so all views fit; what does not fit
+  the atlas (`lights_that_fit`: 64 tiles at 1024, so ten point lights) is
+  dropped, farthest first, and drawn unshadowed
+  (`RenderStats::shadowed_lights_dropped`, warned once per change). One
+  pass
   (`render_local_shadows`) draws each tile with a viewport / scissor and its
-  own camera buffer; casters culled per tile. Atlas + tile records are
+  own camera buffer; casters culled per tile, at most `local_shadows::MAX_CASTERS` per tile
+  (`RenderStats::local_casters_dropped`). Atlas + tile records are
   group 0 bindings 11 and 12 (also in the DDGI voxel passes' group 0);
   mesh.wgsl `local_shadow` picks the cube face by the dominant axis, 3x3 PCF,
   normal offset by 1.5 texels. DDGI injects only the shadowed lights (fs_voxel
   loops over the first `dims.w` lights with `local_shadow`); unshadowed
-  local lights are not injected, so no light through walls. The voxel
+  local lights are not injected, so no light through walls. Shadow casters
+  off screen that touch the DDGI volume join the shadowed lights through
+  `build`'s `volume` argument (they sit in no cluster), so their injection
+  does not flicker with the camera. The voxel
   pass lighting group binds the frame light set. `RenderStats::
   shadowed_lights`, `shadow_views`. Alpha-masked casters work, blended ones
   cast nothing.

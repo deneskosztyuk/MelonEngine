@@ -88,9 +88,9 @@ one; 10 comes after.
       files, `MeshMaterials` per part, alpha mask / blend); point and spot
       lights (clustered forward); image-based ambient (procedural or HDR
       sky); cascaded sun shadows; point/spot shadows (atlas, DDGI
-      injection); `Lod` component. (Done; see AGENTS.md "Rendering" notes.
-      Not done: a `Content Browser` material-on-sphere thumbnail, drag-drop
-      assignment and glTF "Extract materials" in the editor.)
+      injection); `Lod` component. Editor: material-on-sphere thumbnails,
+      drag-drop assignment, glTF "Extract Materials". (Done; see AGENTS.md
+      "Rendering" notes.)
 4. - [x] **Physics:** sphere / capsule / trimesh shapes, ray cast and query
       API, triggers and collision events, character controller, joints.
       (Done; see AGENTS.md "Physics".)
@@ -189,7 +189,7 @@ one; 10 comes after.
       live; shadow map 1024/2048/4096 and MSAA 1/2/4 rebuilt in place,
       pipelines cached per sample count; present mode Vsync / Mailbox +
       cap); `Environment` is the look only; SSGI textures allocated only
-      while SSGI runs; default = High, snapshots byte-identical.
+      while SSGI runs; default = High.
 - [x] GPU timings: timestamp queries between the passes, async readback
       ring, 1 s averages into `RenderTimings` (Quality panel cost bar).
 - [x] Frame cap sleeps at the frame start instead of `WaitUntil` (drag
