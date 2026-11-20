@@ -106,12 +106,25 @@ impl ContentBrowser {
 
         self.toolbar(ui, &mut actions);
         ui.separator();
-        let panel = egui::Panel::left(Id::new("content_tree"))
+        let tree_id = Id::new("content_tree");
+        let resizing = ui
+            .ctx()
+            .read_response(tree_id.with("__resize"))
+            .is_some_and(|r| r.dragged() || r.drag_stopped());
+        if !resizing {
+            // egui stores the width clamped by a narrow tab; start from ours.
+            ui.data_mut(|d| d.remove::<egui::containers::panel::PanelState>(tree_id));
+        }
+        let max = ui.available_width() * sizes::CONTENT_TREE_MAX_SHARE;
+        let panel = egui::Panel::left(tree_id)
             .resizable(true)
             .default_size(self.tree_width)
-            .min_size(sizes::CONTENT_TREE_MIN)
+            .min_size(sizes::CONTENT_TREE_MIN.min(max))
+            .max_size(max)
             .show(ui, |ui| self.tree(ui, &mut actions));
-        self.tree_width = panel.response.rect.width();
+        if resizing {
+            self.tree_width = panel.response.rect.width();
+        }
         egui::ScrollArea::vertical()
             .id_salt("content_items")
             .auto_shrink(false)
@@ -234,6 +247,7 @@ impl ContentBrowser {
                 }
                 let root = self.root().to_path_buf();
                 self.tree_node(ui, &root, 0, actions);
+                self.reveal = false;
             });
     }
 
@@ -258,10 +272,11 @@ impl ContentBrowser {
         let open_id = Id::new(("content_tree_open", dir));
         let ancestor = self.current().starts_with(dir);
         let mut open = ui.data_mut(|d| *d.get_temp_mut_or(open_id, ancestor));
+        open |= self.reveal && ancestor && dir != self.current();
         ui.horizontal(|ui| {
-            ui.add_space(depth as f32 * sizes::SPACING * 2.0);
+            ui.add_space(depth as f32 * sizes::CONTENT_TREE_INDENT);
             if children.is_empty() {
-                ui.add_space(sizes::SPACING * 3.0);
+                ui.add_space(sizes::CONTENT_TREE_ARROW);
             } else if ui
                 .add(egui::Button::new(if open { "⏷" } else { "⏵" }).frame(false))
                 .clicked()
@@ -301,13 +316,8 @@ impl ContentBrowser {
 
     fn asset_view(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         let entries = self.visible_entries();
-        if entries.is_empty() {
-            let unfiltered = AssetKind::FILE_KINDS.iter().all(|k| self.kind_enabled(*k));
-            ui.weak(if self.search().is_empty() && unfiltered {
-                "Empty folder"
-            } else {
-                "No assets match"
-            });
+        if let Some(message) = self.empty_message() {
+            ui.weak(message);
             return;
         }
         if self.is_list() {
@@ -425,7 +435,7 @@ impl ContentBrowser {
         } else {
             let icon_rect =
                 egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), rect.width()));
-            let icon_font = egui::FontId::proportional(rect.width() * 0.5);
+            let icon_font = egui::FontId::proportional(rect.width() * sizes::TILE_ICON_SCALE);
             painter.text(
                 icon_rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -557,6 +567,43 @@ mod tests {
             click(pos, egui::PointerButton::Primary),
         );
         assert_eq!(browser.current(), dir.join("a"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tree_reveals_the_current_folder_after_a_collapsed_draw() {
+        let dir = temp_dir("reveal");
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        let mut browser = ContentBrowser::new(dir.clone());
+        let ctx = egui::Context::default();
+        frame(&mut browser, &ctx, 0.0, Vec::new());
+        let row = |path: PathBuf| egui::Id::new(("content_tree_row", path));
+        assert!(ctx.read_response(row(dir.join("a"))).is_some());
+        assert!(
+            ctx.read_response(row(dir.join("a/b"))).is_none(),
+            "a is collapsed"
+        );
+        browser.open(dir.join("a/b"));
+        frame(&mut browser, &ctx, 0.1, Vec::new());
+        assert!(ctx.read_response(row(dir.join("a/b"))).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn narrow_tab_does_not_shrink_the_saved_tree_width() {
+        let dir = temp_dir("narrow");
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.tree_width = 250.0;
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(100.0, 500.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| browser.ui(ui));
+        assert_eq!(browser.tree_width, 250.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

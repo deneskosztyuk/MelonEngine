@@ -188,6 +188,9 @@ pub struct ContentBrowser {
     pub(crate) tree_width: f32,
     /// Sub-folders per folder for the tree view, cleared by `refresh`.
     pub(crate) tree_children: std::collections::HashMap<PathBuf, Vec<PathBuf>>,
+    /// Set by `refresh` (so whenever the current folder changes): the next
+    /// tree draw expands every ancestor of the current folder.
+    pub(crate) reveal: bool,
     /// File kinds shown; folders are always shown outside search.
     filter: HashSet<AssetKind>,
     /// The current folder as read by the last `refresh`.
@@ -213,6 +216,7 @@ impl ContentBrowser {
             tile_size: theme::sizes::TILE_DEFAULT,
             tree_width: theme::sizes::CONTENT_TREE,
             tree_children: std::collections::HashMap::new(),
+            reveal: true,
             filter: AssetKind::FILE_KINDS.into_iter().collect(),
             listing: Vec::new(),
             files: None,
@@ -224,6 +228,18 @@ impl ContentBrowser {
 
     pub fn visible_entries(&self) -> &[ContentEntry] {
         &self.visible
+    }
+
+    /// What the asset view says when it shows nothing; `None` if it shows
+    /// something.
+    pub fn empty_message(&self) -> Option<&'static str> {
+        if !self.visible.is_empty() {
+            None
+        } else if self.search.is_empty() && self.listing.is_empty() {
+            Some("Empty folder")
+        } else {
+            Some("No assets match")
+        }
     }
 
     pub fn search(&self) -> &str {
@@ -483,6 +499,7 @@ impl ContentBrowser {
             }
         }
         self.tree_children.clear();
+        self.reveal = true;
         self.listing = list_dir(&self.current);
         self.files = None;
         self.update_visible();
@@ -718,6 +735,41 @@ mod tests {
         assert!(browser.tree_children.contains_key(&dir), "tree kept");
         browser.refresh();
         assert_eq!(names(&browser), ["ab.glb"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_message_tells_empty_folder_from_filtered() {
+        let dir = temp_dir("empty_message");
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.toggle_kind(AssetKind::Model);
+        assert_eq!(browser.empty_message(), Some("Empty folder"));
+        touch(&dir, "a.glb");
+        browser.refresh();
+        assert_eq!(browser.empty_message(), Some("No assets match"));
+        browser.toggle_kind(AssetKind::Model);
+        assert_eq!(browser.empty_message(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn search_does_not_follow_a_junction_loop() {
+        let dir = temp_dir("junction");
+        touch(&dir, "a/file.glb");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dir.join("a/loop"))
+            .arg(&dir)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !made {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.set_search("file".into());
+        assert_eq!(names(&browser), ["file.glb"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

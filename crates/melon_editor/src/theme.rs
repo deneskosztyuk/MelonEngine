@@ -62,6 +62,14 @@ pub mod sizes {
     pub const TILE_MAX: f32 = 128.0;
     pub const TILE_LIST_BELOW: f32 = 48.0;
     pub const CONTENT_TREE_MIN: f32 = 120.0;
+    /// Largest share of the Content Browser width the folder tree takes.
+    pub const CONTENT_TREE_MAX_SHARE: f32 = 0.5;
+    /// Folder tree indent per depth level.
+    pub const CONTENT_TREE_INDENT: f32 = 2.0 * SPACING;
+    /// Space a folder without sub-folders leaves where the arrow would be.
+    pub const CONTENT_TREE_ARROW: f32 = 3.0 * SPACING;
+    /// Tile glyph size as a share of the tile width.
+    pub const TILE_ICON_SCALE: f32 = 0.5;
     pub const CONTENT_SEARCH: f32 = 160.0;
     /// Height of the name line under a tile.
     pub const TILE_LABEL: f32 = 18.0;
