@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 
-use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::query::{With, Without};
 use bevy_ecs::reflect::AppTypeRegistry;
@@ -22,21 +21,7 @@ use crate::scene::{self, SceneEntity};
 /// Steps kept; the oldest is dropped beyond this.
 pub const MAX_STEPS: usize = 200;
 
-/// Stable id of a scene entity. Assigned when first needed (`ensure_ids`,
-/// `capture`) and saved with the scene.
-#[derive(Component, Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct EditorId(pub Uuid);
-
-/// Give every scene entity an `EditorId`.
-pub fn ensure_ids(world: &mut World) {
-    let missing: Vec<Entity> = world
-        .query_filtered::<Entity, (With<Transform>, Without<EditorId>)>()
-        .iter(world)
-        .collect();
-    for e in missing {
-        world.entity_mut(e).insert(EditorId(Uuid::new_v4()));
-    }
-}
+pub use melon_core::scene::{EditorId, ensure_ids};
 
 fn id_of(world: &mut World, e: Entity) -> Uuid {
     if let Some(id) = world.get::<EditorId>(e) {

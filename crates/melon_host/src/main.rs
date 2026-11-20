@@ -1,29 +1,46 @@
 #[cfg(feature = "hot-reload")]
 mod game_loader;
+#[cfg_attr(not(feature = "editor"), allow(dead_code))]
 mod pacing;
+#[cfg(not(feature = "editor"))]
+mod player;
 
+#[cfg(feature = "editor")]
 use std::sync::Arc;
+#[cfg(feature = "editor")]
 use std::time::Instant;
 
-use melon_core::bevy_ecs::world::{Mut, World};
+#[cfg(any(feature = "editor", test))]
+use melon_core::bevy_ecs::world::Mut;
+use melon_core::bevy_ecs::world::World;
+#[cfg(feature = "editor")]
 use melon_core::glam::{Quat, Vec2, Vec3};
+#[cfg(feature = "editor")]
 use melon_core::{
-    Aabb, Camera, Collider, FrameCounter, GameInputGate, Input, InputButton, KeyCode, Light, Name,
-    RawPresses, RenderQuality, RenderTimings, RigidBody, RigidBodyKind, Time, Transform,
+    Aabb, Camera, Collider, FrameCounter, GameInputGate, Light, Name, RenderQuality, RenderTimings,
+    RigidBody, RigidBodyKind, Time, Transform,
 };
+use melon_core::{Input, InputButton, KeyCode, RawPresses};
+#[cfg(feature = "editor")]
 use melon_editor::Editor;
+#[cfg(feature = "editor")]
 use melon_editor::EditorOverlay;
+#[cfg(feature = "editor")]
 use melon_physics::add_physics_systems;
+#[cfg(feature = "editor")]
 use tracing_subscriber::EnvFilter;
-use winit::event::{
-    DeviceEvent, DeviceId, ElementState, MouseButton as WinitMouseButton, MouseScrollDelta,
-    WindowEvent,
-};
-use winit::keyboard::{KeyCode as WinitKeyCode, PhysicalKey};
+use winit::event::MouseButton as WinitMouseButton;
+#[cfg(feature = "editor")]
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseScrollDelta, WindowEvent};
+use winit::keyboard::KeyCode as WinitKeyCode;
+#[cfg(feature = "editor")]
+use winit::keyboard::PhysicalKey;
+use winit::window::{CursorGrabMode, Window};
+#[cfg(feature = "editor")]
 use winit::{
     application::ApplicationHandler,
     event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop},
-    window::{CursorGrabMode, Window, WindowId},
+    window::WindowId,
 };
 
 fn map_key(code: &WinitKeyCode) -> Option<KeyCode> {
@@ -135,6 +152,7 @@ fn map_mouse(button: WinitMouseButton) -> Option<melon_core::MouseButton> {
     })
 }
 
+#[cfg(any(feature = "editor", test))]
 /// Keys the editor keeps while it runs a game (release focus, play / pause / stop).
 const EDITOR_KEYS: [InputButton; 3] = [
     InputButton::Key(KeyCode::Escape),
@@ -143,7 +161,8 @@ const EDITOR_KEYS: [InputButton; 3] = [
 ];
 
 /// Record one button event: presses always go to `raw`, and to the game's
-/// `input` only through the gate. Key repeats are ignored.
+/// `input` only through the gate, except the `reserved` buttons (the editor's
+/// keys; a packaged game reserves none). Key repeats are ignored.
 fn record_button(
     input: &mut Input,
     raw: &mut RawPresses,
@@ -151,6 +170,7 @@ fn record_button(
     pressed: bool,
     repeat: bool,
     gate: bool,
+    reserved: &[InputButton],
 ) {
     if repeat {
         return;
@@ -158,7 +178,7 @@ fn record_button(
     if pressed {
         raw.0.push(button);
     }
-    if !gate || EDITOR_KEYS.contains(&button) {
+    if !gate || reserved.contains(&button) {
         return;
     }
     if pressed {
@@ -168,6 +188,7 @@ fn record_button(
     }
 }
 
+#[cfg(feature = "editor")]
 /// Apply this frame's `GameInputGate` against the last applied value (the
 /// editor re-inserts it every frame, so change detection would always fire).
 /// Closing the gate releases every held button. Returns true on a change.
@@ -182,6 +203,7 @@ fn apply_gate(input: &mut Input, applied: &mut bool, gate: bool) -> bool {
     true
 }
 
+#[cfg(feature = "editor")]
 /// How an event matters to egui while the game owns the mouse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EguiEvent {
@@ -193,6 +215,7 @@ enum EguiEvent {
     Other,
 }
 
+#[cfg(feature = "editor")]
 fn egui_event(event: &WindowEvent) -> EguiEvent {
     match event {
         WindowEvent::MouseInput {
@@ -214,6 +237,7 @@ fn egui_event(event: &WindowEvent) -> EguiEvent {
     }
 }
 
+#[cfg(feature = "editor")]
 fn forwards_to_egui(kind: EguiEvent, gate_open: bool) -> bool {
     !(gate_open && kind == EguiEvent::Pointer)
 }
@@ -233,21 +257,25 @@ fn clear_raw_presses(world: &mut World) {
     }
 }
 
-/// Hide and confine the cursor for the game, or give it back to the editor.
-fn grab_cursor(window: &Window, grab: bool) {
-    let result = if grab {
-        window
+/// Apply the cursor the game asked for (`melon_core::Cursor`).
+fn apply_cursor(window: &Window, cursor: melon_core::Cursor) {
+    use melon_core::CursorMode;
+    let result = match cursor.mode {
+        CursorMode::Free => window.set_cursor_grab(CursorGrabMode::None),
+        CursorMode::Confined => window
             .set_cursor_grab(CursorGrabMode::Confined)
-            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked))
-    } else {
-        window.set_cursor_grab(CursorGrabMode::None)
+            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked)),
+        CursorMode::Locked => window
+            .set_cursor_grab(CursorGrabMode::Locked)
+            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined)),
     };
     if let Err(error) = result {
-        tracing::warn!(?error, grab, "cursor grab failed");
+        tracing::warn!(?error, ?cursor, "cursor grab failed");
     }
-    window.set_cursor_visible(!grab);
+    window.set_cursor_visible(cursor.visible);
 }
 
+#[cfg(feature = "editor")]
 struct App {
     /// Log buffer shown in the editor's Console panel.
     console: melon_editor::console::ConsoleLog,
@@ -262,6 +290,8 @@ struct App {
     core: melon_core::Core,
     /// Last `GameInputGate` value applied (input routing and cursor grab).
     game_input: bool,
+    /// Last cursor applied to the window.
+    cursor_applied: Option<melon_core::Cursor>,
     /// `config/input.ron` failed to load: the editor backs it up before its first save.
     input_map_broken: bool,
     /// `config/quality.ron` failed to load: the editor backs it up before its first Apply.
@@ -288,6 +318,7 @@ struct App {
 // project path (CLI argument or project file).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
+#[cfg(feature = "editor")]
 fn spawn_default_scene(world: &mut World) {
     let cube: melon_core::Handle<melon_core::Model> = world
         .resource_mut::<melon_core::AssetServer>()
@@ -313,6 +344,7 @@ fn spawn_default_scene(world: &mut World) {
     ));
 }
 
+#[cfg(feature = "editor")]
 impl App {
     fn new(console: melon_editor::console::ConsoleLog) -> Self {
         let mut core = melon_core::Core::new();
@@ -382,6 +414,7 @@ impl App {
             thumbnail_target: None,
             core,
             game_input: false,
+            cursor_applied: None,
             input_map_broken,
             quality_broken,
             audio_broken,
@@ -403,12 +436,21 @@ impl App {
             .world
             .resource_scope(|world, mut raw: Mut<RawPresses>| {
                 if let Some(mut input) = world.get_resource_mut::<Input>() {
-                    record_button(&mut input, &mut raw, button, pressed, repeat, gate);
+                    record_button(
+                        &mut input,
+                        &mut raw,
+                        button,
+                        pressed,
+                        repeat,
+                        gate,
+                        &EDITOR_KEYS,
+                    );
                 }
             });
     }
 }
 
+#[cfg(feature = "editor")]
 impl App {
     /// One editor + render frame. Called from `about_to_wait`, not from
     /// `RedrawRequested`: on Windows winit raises `RedrawRequested` from
@@ -454,6 +496,12 @@ impl App {
         self.game.poll(dt, &mut self.core);
 
         self.core.update();
+        // A game asking to quit stops Play; the editor stays open.
+        if self.core.world.resource_mut::<melon_core::AppExit>().take()
+            && let Err(error) = melon_editor::play::stop(&mut self.core.world)
+        {
+            tracing::error!(?error, "stop after a quit request failed");
+        }
         // Editor requests (clip preview) from the last frame play now.
         self.audio.update(&mut self.core.world);
         self.stats.lap(pacing::Stage::Update);
@@ -500,8 +548,20 @@ impl App {
         if let Some(mut input) = self.core.world.get_resource_mut::<Input>()
             && apply_gate(&mut input, &mut self.game_input, gate)
         {
-            grab_cursor(window, gate);
             event_loop.listen_device_events(pacing::device_events(gate));
+        }
+        // The game's cursor while it has input; the editor's (free) after Esc / Stop.
+        let wanted = if gate {
+            self.core
+                .world
+                .get_resource::<melon_core::Cursor>()
+                .copied()
+                .unwrap_or_default()
+        } else {
+            melon_core::Cursor::default()
+        };
+        if let Some(cursor) = wanted.to_apply(&mut self.cursor_applied, false) {
+            apply_cursor(window, cursor);
         }
         if editor_ui.run_pending_operation(&mut self.core.world) {
             event_loop.exit();
@@ -571,6 +631,7 @@ impl App {
     }
 }
 
+#[cfg(feature = "editor")]
 impl App {
     /// Draw from inside an event callback once a frame is a period late
     /// (`pacing::frame_overdue`): a moving mouse keeps winit's queue full,
@@ -595,6 +656,7 @@ impl App {
     }
 }
 
+#[cfg(feature = "editor")]
 impl ApplicationHandler for App {
     fn new_events(&mut self, _: &ActiveEventLoop, _: winit::event::StartCause) {
         self.stats.mark("new_events");
@@ -795,6 +857,7 @@ impl ApplicationHandler for App {
     }
 }
 
+#[cfg(feature = "editor")]
 /// `CursorMoved { .. }` -> `CursorMoved`: the variant name, for the stall line.
 fn event_name(event: &WindowEvent) -> String {
     let debug = format!("{event:?}");
@@ -805,6 +868,12 @@ fn event_name(event: &WindowEvent) -> String {
         .to_owned()
 }
 
+#[cfg(not(feature = "editor"))]
+fn main() {
+    player::run();
+}
+
+#[cfg(feature = "editor")]
 fn main() {
     use tracing_subscriber::prelude::*;
     let console = melon_editor::console::ConsoleLog::default();
@@ -974,10 +1043,10 @@ mod tests {
     #[test]
     fn repeat_events_do_not_press_again() {
         let (mut input, mut raw) = (Input::default(), RawPresses::default());
-        record_button(&mut input, &mut raw, W, true, false, true);
+        record_button(&mut input, &mut raw, W, true, false, true, &EDITOR_KEYS);
         input.clear_frame();
         raw.0.clear();
-        record_button(&mut input, &mut raw, W, true, true, true);
+        record_button(&mut input, &mut raw, W, true, true, true, &EDITOR_KEYS);
         assert!(input.pressed(W));
         assert!(!input.just_pressed(W));
         assert!(raw.0.is_empty(), "a repeat is not a press");
@@ -986,13 +1055,14 @@ mod tests {
     #[test]
     fn gate_off_records_raw_only() {
         let (mut input, mut raw) = (Input::default(), RawPresses::default());
-        record_button(&mut input, &mut raw, W, true, false, false);
+        record_button(&mut input, &mut raw, W, true, false, false, &EDITOR_KEYS);
         assert!(!input.pressed(W));
         assert_eq!(raw.0, vec![W]);
-        record_button(&mut input, &mut raw, W, false, false, false);
+        record_button(&mut input, &mut raw, W, false, false, false, &EDITOR_KEYS);
         assert_eq!(raw.0, vec![W], "releases are not presses");
     }
 
+    #[cfg(feature = "editor")]
     #[test]
     fn editor_keys_never_reach_the_game() {
         let (mut input, mut raw) = (Input::default(), RawPresses::default());
@@ -1004,12 +1074,22 @@ mod tests {
                 true,
                 false,
                 true,
+                &EDITOR_KEYS,
             );
             assert!(!input.key(key), "{key:?} reached the game");
         }
         assert_eq!(raw.0.len(), 3, "the raw stream still sees them");
     }
 
+    #[test]
+    fn a_game_without_the_editor_gets_escape() {
+        let (mut input, mut raw) = (Input::default(), RawPresses::default());
+        let esc = InputButton::Key(KeyCode::Escape);
+        record_button(&mut input, &mut raw, esc, true, false, true, &[]);
+        assert!(input.pressed(esc), "nothing is reserved in a packaged game");
+    }
+
+    #[cfg(feature = "editor")]
     #[test]
     fn pointer_events_skip_egui_while_the_game_has_input() {
         use EguiEvent::{ButtonRelease, Other, Pointer};
@@ -1033,7 +1113,7 @@ mod tests {
         core.world
             .resource_scope(|world, mut raw: Mut<RawPresses>| {
                 let mut input = world.resource_mut::<Input>();
-                record_button(&mut input, &mut raw, W, true, false, false);
+                record_button(&mut input, &mut raw, W, true, false, false, &EDITOR_KEYS);
             });
         core.update();
         assert_eq!(
@@ -1045,12 +1125,13 @@ mod tests {
         assert!(core.world.resource::<RawPresses>().0.is_empty());
     }
 
+    #[cfg(feature = "editor")]
     #[test]
     fn gate_turning_off_releases_held_keys() {
         let (mut input, mut raw) = (Input::default(), RawPresses::default());
         let mut applied = false;
         assert!(apply_gate(&mut input, &mut applied, true));
-        record_button(&mut input, &mut raw, W, true, false, applied);
+        record_button(&mut input, &mut raw, W, true, false, applied, &EDITOR_KEYS);
         input.clear_frame();
         assert!(!apply_gate(&mut input, &mut applied, true), "same value");
         assert!(input.pressed(W));

@@ -13,15 +13,20 @@ pub mod actions;
 pub mod assets;
 pub mod audio;
 pub mod components;
+pub mod cursor;
 pub mod hierarchy;
 pub mod input;
+pub mod pack;
+pub mod package;
 pub mod physics;
 pub mod physics_settings;
+pub mod player;
 pub mod plugin;
 pub mod quality;
 pub mod reflect;
 pub mod resources;
 mod ron_file;
+pub mod scene;
 pub mod stages;
 
 pub use actions::{
@@ -39,6 +44,7 @@ pub use components::{
     Aabb, Bob, BodyInfo, BodyKind, Name, PendingDelete, PreviousTransform, Spin, Transform,
     store_previous_transforms_system,
 };
+pub use cursor::{AppExit, Cursor, CursorMode};
 pub use glam;
 pub use hierarchy::{ChildOf, Children, GlobalTransform};
 pub use input::{GameInputGate, Input, InputButton, InputFocus, KeyCode, MouseButton, RawPresses};
@@ -48,6 +54,7 @@ pub use physics::{
     RigidBody, RigidBodyKind, Velocity,
 };
 pub use physics_settings::{LAYER_COUNT, PhysicsSettings};
+pub use player::{PlayerSettings, WindowMode};
 pub use plugin::{App, Plugin, abi_fingerprint};
 pub use quality::{
     GiMode, PresentPreference, QualityPreset, QualitySetting, RenderQuality, RenderTimings,
@@ -58,6 +65,7 @@ pub use reflect::{
     Vec2Reflect, Vec3Reflect, Vec4Reflect, display_name, registered_components,
 };
 pub use resources::{Camera, Environment, Light, NameCounter, SimulationState, Time};
+pub use scene::{KeepOnSceneLoad, SceneRequests};
 pub use stages::{FixedPostUpdate, FixedUpdate, PhysicsStep, PostUpdate, PreUpdate, Update};
 
 /// What a game crate needs to define and register components:
@@ -159,13 +167,23 @@ impl Core {
         world.init_resource::<PhysicsQueries>();
         world.init_resource::<PhysicsRequests>();
         world.init_resource::<PhysicsSettings>();
+        world.init_resource::<scene::SceneRequests>();
+        world.init_resource::<PlayerSettings>();
+        world.init_resource::<Cursor>();
+        world.init_resource::<AppExit>();
 
         let mut core = Self {
             world,
             schedules: stage_schedules(),
             plugin_schedules: stage_schedules(),
         };
-        core.add_systems(PreUpdate, update_actions_system);
+        core.add_systems(
+            PreUpdate,
+            (
+                scene::scene_requests_system.before(update_actions_system),
+                update_actions_system,
+            ),
+        );
         core.add_systems(Update, (frame_counter_system, log_frame_system));
         core.add_systems(
             PostUpdate,

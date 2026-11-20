@@ -23,6 +23,7 @@ pub mod asset_db;
 pub mod asset_ops;
 pub mod asset_watch;
 pub mod audio_settings;
+pub mod build_window;
 pub mod console;
 pub mod content;
 mod content_view;
@@ -33,6 +34,7 @@ pub mod inspect;
 pub mod layout;
 pub mod physics_settings;
 pub mod play;
+pub mod player_settings;
 pub mod project_settings;
 pub mod quality_settings;
 pub mod scene;
@@ -192,6 +194,7 @@ pub struct Editor {
     flying: bool,
     show_about: bool,
     project_settings: project_settings::ProjectSettings,
+    build_window: build_window::BuildWindow,
     /// A rebinding capture was waiting when this frame began: its keys are not shortcuts.
     keys_captured: bool,
     logo: Option<egui::TextureHandle>,
@@ -277,6 +280,7 @@ impl Default for Editor {
             flying: false,
             show_about: false,
             project_settings: project_settings::ProjectSettings::default(),
+            build_window: build_window::BuildWindow::default(),
             keys_captured: false,
             logo: None,
             history: history::History::default(),
@@ -588,6 +592,9 @@ impl Editor {
                 {
                     self.open_dialog(true);
                 }
+                if ui.button("Build…").clicked() {
+                    self.build_window.open = true;
+                }
                 ui.separator();
                 if ui.button("Exit").clicked() {
                     self.pending_operation = Some(PendingOperation::Exit);
@@ -773,6 +780,15 @@ impl Editor {
             });
     }
 
+    fn build_window_ui(&mut self, world: &mut World, ui: &egui::Ui) {
+        match self.build_window.ui(ui.ctx(), world, &self.project_root) {
+            Some((StatusKind::Success, message)) => self.set_status(message),
+            Some((StatusKind::Warning, message)) => self.set_status_warning(message),
+            Some((StatusKind::Error, message)) => self.set_status_error(message),
+            None => {}
+        }
+    }
+
     fn project_settings_window(&mut self, world: &mut World, ui: &egui::Ui) {
         match self
             .project_settings
@@ -798,6 +814,10 @@ impl Editor {
     /// The host loaded a broken `config/physics.ron`: the first Apply backs it up.
     pub fn set_physics_broken(&mut self, broken: bool) {
         self.project_settings.set_physics_broken(broken);
+    }
+    /// The host loaded a broken `config/player.ron`: the first Apply backs it up.
+    pub fn set_player_broken(&mut self, broken: bool) {
+        self.project_settings.set_player_broken(broken);
     }
 
     /// The host loaded a broken `config/audio.ron`: the first Apply backs it up.
@@ -1399,6 +1419,7 @@ impl Editor {
             .show(ui, |ui| self.status_bar(world, ui));
         self.about_window(ui);
         self.project_settings_window(world, ui);
+        self.build_window_ui(world, ui);
         self.follow_asset_changes(world, ui, std::time::Instant::now());
         self.delete_dialog(world, ui);
         self.open_scene_dialog(world, ui);
