@@ -7,6 +7,9 @@
 //   no TANGENT attribute, so the loader generates tangents.
 // - emissive_cube.glb: unit cube, dark base, emissive (12, 1.2, 0.14) HDR (a lamp, about 10x a sunlit floor)
 //   (emissiveFactor x KHR_materials_emissive_strength), for bloom.
+// - red_panel.glb, green_panel.glb: unit cubes like grey_cube in Cornell box
+//   red (0.63, 0.065, 0.05) and green (0.14, 0.45, 0.091), scaled into the
+//   coloured walls of the GI review room.
 // Run from the repository root: cargo run -p melon_render --example gen_review_assets
 
 use std::f32::consts::PI;
@@ -234,13 +237,15 @@ fn tile_normal_map(size: u32) -> Vec<u8> {
     pixels
 }
 
-fn grey_cube(path: &str) {
+/// Unit cube (node `name`) in one rough dielectric `material` of base colour `rgb`.
+fn plain_cube(path: &str, name: &str, material: &str, rgb: [f32; 3]) {
     let mut glb = Glb::default();
     let a = glb.mesh(&cube());
+    let [r, g, b] = rgb;
     glb.write(
         path,
         &format!(
-            r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0,"name":"GreyCube"}}],"meshes":[{{"primitives":[{}]}}],"materials":[{{"name":"Grey","pbrMetallicRoughness":{{"baseColorFactor":[0.6,0.6,0.6,1.0],"metallicFactor":0.0,"roughnessFactor":0.8}}}}]"#,
+            r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0,"name":"{name}"}}],"meshes":[{{"primitives":[{}]}}],"materials":[{{"name":"{material}","pbrMetallicRoughness":{{"baseColorFactor":[{r},{g},{b},1.0],"metallicFactor":0.0,"roughnessFactor":0.8}}}}]"#,
             primitive(&a, 0)
         ),
     );
@@ -329,8 +334,26 @@ fn normal_panel(path: &str) {
 fn main() {
     let dir = "assets/models/review";
     fs::create_dir_all(dir).expect("failed to create assets/models/review");
-    grey_cube(&format!("{dir}/grey_cube.glb"));
+    plain_cube(
+        &format!("{dir}/grey_cube.glb"),
+        "GreyCube",
+        "Grey",
+        [0.6, 0.6, 0.6],
+    );
     material_spheres(&format!("{dir}/material_spheres.glb"));
     normal_panel(&format!("{dir}/normal_panel.glb"));
     emissive_cube(&format!("{dir}/emissive_cube.glb"));
+    // Cornell box walls (classic red and green), scaled into panels.
+    plain_cube(
+        &format!("{dir}/red_panel.glb"),
+        "RedPanel",
+        "Red",
+        [0.63, 0.065, 0.05],
+    );
+    plain_cube(
+        &format!("{dir}/green_panel.glb"),
+        "GreenPanel",
+        "Green",
+        [0.14, 0.45, 0.091],
+    );
 }
