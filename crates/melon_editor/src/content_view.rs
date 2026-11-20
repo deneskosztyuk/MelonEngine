@@ -577,6 +577,11 @@ impl ContentBrowser {
             {
                 actions.push(Action::Request(BrowserRequest::AskDelete(path.clone())));
             }
+            if is_model_path(&entry.name) && ui.button("Extract Materials").clicked() {
+                actions.push(Action::Request(BrowserRequest::ExtractMaterials(
+                    path.clone(),
+                )));
+            }
             ui.separator();
             if ui.button("Show in Explorer").clicked() {
                 actions.push(Action::Request(BrowserRequest::Reveal(path.clone())));

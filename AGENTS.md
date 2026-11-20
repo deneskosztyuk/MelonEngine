@@ -463,9 +463,18 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   every shadow pass. Double-sided and blend mesh pipelines are built lazily
   per (sample count, GI mode) (`ensure_variant`, shader override
   `ALPHA_BLEND`). Editor: Create > New Material (folder menu), `.mat`
-  Inspector card (`material_card.rs`, saves on every change). Not done in
-  the editor: material-on-sphere thumbnails, drag-and-drop assignment,
-  "Extract materials" for glTF models.
+  Inspector card (`material_card.rs`, saves on every change); `.mat` tiles
+  get a thumbnail (`Renderer::render_material_thumbnail`: the material on
+  `builtin:sphere`, same auxiliary view and own submission as model
+  thumbnails; `ThumbnailSubject`); dragging a `.mat` onto an entity in the
+  Scene view assigns it to the part under the cursor (`viewport::pick_part`
+  uses `AssetServer::part_bounds`, written by the renderer), onto a
+  Hierarchy row to every part, or into the `MeshMaterials` Inspector field
+  (`WidgetKind::Materials`), each one undo step (`assign_material_step`);
+  a glTF model's context menu "Extract Materials" writes `.mat` + png files
+  and `.meta`s next to it (`melon_render::extract_materials`,
+  `asset_ops::extract_materials`) and assigns them to the selected entity if
+  it draws that model.
 - **Local lights (`lights.rs`).** `PointLight` / `SpotLight` (core,
   registered; spot shines along local -Z; radiance `color * intensity /
   d^2` windowed to 0 at `range`, spot cone squared smooth). `extract` fills

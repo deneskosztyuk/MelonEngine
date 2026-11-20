@@ -3,6 +3,7 @@ use std::sync::Arc;
 mod cascades;
 mod extract;
 pub mod gi;
+mod gltf_materials;
 mod ibl;
 mod lights;
 mod local_shadows;
@@ -12,6 +13,7 @@ mod overlay;
 mod timings;
 
 pub use extract::{FrameData, blends, extract};
+pub use gltf_materials::extract_materials;
 pub use lights::LocalLight;
 pub use overlay::{OverlayDepth, OverlayDraw, OverlayShape, TORUS_TUBE};
 

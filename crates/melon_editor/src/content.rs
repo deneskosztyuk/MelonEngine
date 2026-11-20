@@ -116,6 +116,9 @@ pub enum BrowserRequest {
     NewFolder(PathBuf),
     /// Create "New Material.mat" inside this folder.
     NewMaterial(PathBuf),
+    /// Write the glTF model's materials as `.mat` files (and textures) next
+    /// to it and assign them on the selected entity that uses it.
+    ExtractMaterials(PathBuf),
     Rename(PathBuf, String),
     Duplicate(PathBuf),
     /// Ask before deleting (the editor lists what uses it).

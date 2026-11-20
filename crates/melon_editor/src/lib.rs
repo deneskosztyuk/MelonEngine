@@ -384,6 +384,27 @@ impl Editor {
         );
     }
 
+    /// Set every part's material of `entity` from `parts` (project-relative
+    /// `.mat` paths, one per part) as one undo step.
+    fn assign_materials_step(&mut self, world: &mut World, entity: Entity, parts: &[String]) {
+        let slots: Vec<_> = parts
+            .iter()
+            .map(|p| material_assign::slot_for(&self.project_root, p))
+            .collect();
+        let before = self.history.begin(world, &[entity]);
+        world
+            .entity_mut(entity)
+            .insert(melon_core::MeshMaterials { parts: slots });
+        self.history.commit(
+            world,
+            before,
+            &[],
+            "Extract Materials".to_string(),
+            self.selected,
+            self.selected,
+        );
+    }
+
     /// The project-relative `.mat` path of a Content Browser drag, if it is one.
     fn dragged_material(&self, drag: &content::AssetDrag) -> Option<String> {
         let rel = melon_core::assets::project_relative(&self.project_root, &drag.path)?;
@@ -1134,6 +1155,25 @@ impl Editor {
                 self.content.refresh();
                 self.content.start_rename(file.clone());
                 Some(file)
+            }
+            Request::ExtractMaterials(model) => {
+                let parts =
+                    asset_ops::extract_materials(&mut world.resource_mut::<AssetServer>(), &model)?;
+                let rel = melon_core::assets::project_relative(&self.project_root, &model);
+                // The selected entity gets them if it draws this model.
+                if let Some(entity) = self.selected
+                    && let Some(handle) = world.get::<Handle<Model>>(entity).copied()
+                    && rel.as_deref() == Some(world.resource::<AssetServer>().path(handle))
+                {
+                    self.assign_materials_step(world, entity, &parts);
+                }
+                self.content.refresh();
+                tracing::info!(
+                    "extracted {} materials from {}",
+                    parts.len(),
+                    model.display()
+                );
+                None
             }
             Request::Rename(path, name) => {
                 let new =
@@ -4531,6 +4571,45 @@ mod tests {
         editor_key(&mut editor, &mut world, egui::Key::Delete);
         assert!(world.get::<melon_core::PendingDelete>(entity).is_some());
         assert!(x.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extract_materials_request_assigns_them_to_the_selected_entity_using_the_model() {
+        use melon_core::MeshMaterials;
+        let (mut editor, mut world, root) = browser_project("extract_request");
+        let model_file = root.join("assets/models/thing.gltf");
+        std::fs::write(&model_file, crate::asset_ops::ONE_MATERIAL_GLTF).unwrap();
+        let model: Handle<Model> = world
+            .resource_mut::<AssetServer>()
+            .load("assets/models/thing.gltf");
+        let user = world.spawn((Transform::default(), model)).id();
+        let other = world.spawn((Transform::default(), model)).id();
+        let cube: Handle<Model> = world.resource_mut::<AssetServer>().load("builtin:cube");
+        let unrelated = world.spawn((Transform::default(), cube)).id();
+        editor.set_selected(Some(user));
+        editor
+            .content
+            .request(content::BrowserRequest::ExtractMaterials(model_file));
+        editor.apply_content_requests(&mut world);
+        assert!(root.join("assets/models/thing_Paint.mat").is_file());
+        let parts = world.get::<MeshMaterials>(user).unwrap().parts.clone();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].path, "assets/models/thing_Paint.mat");
+        assert!(!parts[0].guid.is_empty());
+        assert!(
+            world.get::<MeshMaterials>(other).is_none(),
+            "only the selected one"
+        );
+        // A selection that does not use the model is left alone.
+        editor.set_selected(Some(unrelated));
+        editor
+            .content
+            .request(content::BrowserRequest::ExtractMaterials(
+                root.join("assets/models/thing.gltf"),
+            ));
+        editor.apply_content_requests(&mut world);
+        assert!(world.get::<MeshMaterials>(unrelated).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
