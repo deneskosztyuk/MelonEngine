@@ -44,8 +44,14 @@ struct LightUniform {
     _pad1: f32,
     ground_color: vec3f,
     _pad2: f32,
-    // World -> shadow map clip space (orthographic, from the sun).
+    // World -> shadow map clip space (orthographic, from the sun): cascade 0.
     light_view_proj: mat4x4f,
+    // Every cascade's matrix, the far view depth of each, (count, shadow
+    // distance) and the camera axis the depths are measured along.
+    cascade_view_proj: array<mat4x4f, 4>,
+    cascade_far: vec4f,
+    cascade_info: vec4f,
+    cascade_forward: vec4f,
 };
 
 struct MaterialUniform {
@@ -77,7 +83,7 @@ struct VsOut {
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 @group(1) @binding(0) var<storage, read> instances: array<Instance>;
 @group(0) @binding(1) var<uniform> light: LightUniform;
-@group(0) @binding(2) var shadow_map: texture_depth_2d;
+@group(0) @binding(2) var shadow_map: texture_depth_2d_array;
 @group(0) @binding(3) var shadow_sampler: sampler_comparison;
 @group(0) @binding(4) var<uniform> env: EnvironmentUniform;
 // Image-based ambient (ibl.rs): irradiance / pi as SH9, the environment
@@ -160,12 +166,14 @@ fn vs_main(in: VsIn, @builtin(instance_index) instance: u32) -> VsOut {
     return out;
 }
 
-// 1.0 = fully lit, 0.0 = fully shadowed. 3x3 PCF over the sun's shadow map.
-// `normal` is the geometric world normal: the lookup moves along it by about
-// 1.5 shadow texels, more as the sun grazes the surface (normal-offset
-// sampling), so lit faces do not shadow themselves.
-fn shadow_factor(world_pos: vec3f, normal: vec3f) -> f32 {
-    let m = light.light_view_proj;
+// 3x3 PCF over cascade `i` of the sun's shadow map: x = lit factor (1.0 =
+// fully lit, 0.0 = fully shadowed; 1.0 outside the cascade's box), y = how
+// far out in the box the point is (1.0 at the edge). `normal` is the
+// geometric world normal: the lookup moves along it by about 1.5 shadow
+// texels, more as the sun grazes the surface (normal-offset sampling), so
+// lit faces do not shadow themselves.
+fn cascade_shadow(i: u32, world_pos: vec3f, normal: vec3f) -> vec2f {
+    let m = light.cascade_view_proj[i];
     // The ortho box maps 2 * radius world units onto the map's width.
     let texel_world = 2.0 / (length(vec3f(m[0].x, m[1].x, m[2].x))
         * f32(textureDimensions(shadow_map).x));
@@ -175,9 +183,10 @@ fn shadow_factor(world_pos: vec3f, normal: vec3f) -> f32 {
     let ndc = ls.xyz / ls.w;
     // Clip space y points up, texture v points down.
     let uv = ndc.xy * vec2f(0.5, -0.5) + 0.5;
+    let edge = max(abs(ndc.x), abs(ndc.y));
     // Outside the shadow box counts as lit.
-    if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || ndc.z > 1.0) {
-        return 1.0;
+    if (edge > 1.0 || ndc.z > 1.0 || ndc.z < 0.0) {
+        return vec2f(1.0, max(edge, 1.001));
     }
     let texel = 1.0 / vec2f(textureDimensions(shadow_map));
     var sum = 0.0;
@@ -185,10 +194,46 @@ fn shadow_factor(world_pos: vec3f, normal: vec3f) -> f32 {
         for (var x = -1; x <= 1; x++) {
             // The Level variant is allowed in non-uniform control flow.
             sum += textureSampleCompareLevel(
-                shadow_map, shadow_sampler, uv + vec2f(f32(x), f32(y)) * texel, ndc.z);
+                shadow_map, shadow_sampler, uv + vec2f(f32(x), f32(y)) * texel, i, ndc.z);
         }
     }
-    return sum / 9.0;
+    return vec2f(sum / 9.0, edge);
+}
+
+// Sun shadow at a point seen by the camera: the cascade is picked by view
+// depth and blended into the next one over its last 15%; the last cascade
+// fades to lit at the shadow distance.
+fn shadow_factor(world_pos: vec3f, normal: vec3f) -> f32 {
+    let count = u32(light.cascade_info.x);
+    let depth = dot(world_pos - camera.eye, light.cascade_forward.xyz);
+    for (var i = 0u; i < count; i++) {
+        let far = light.cascade_far[i];
+        if (depth <= far) {
+            let here = cascade_shadow(i, world_pos, normal).x;
+            let fade = smoothstep(0.85 * far, far, depth);
+            if (fade <= 0.0) {
+                return here;
+            }
+            if (i + 1u < count) {
+                return mix(here, cascade_shadow(i + 1u, world_pos, normal).x, fade);
+            }
+            return mix(here, 1.0, fade);
+        }
+    }
+    return 1.0;
+}
+
+// Sun shadow at a point without a camera (the GI voxel passes): the finest
+// cascade whose box holds it.
+fn shadow_factor_volume(world_pos: vec3f, normal: vec3f) -> f32 {
+    let count = u32(light.cascade_info.x);
+    for (var i = 0u; i < count; i++) {
+        let s = cascade_shadow(i, world_pos, normal);
+        if (s.y <= 1.0) {
+            return s.x;
+        }
+    }
+    return 1.0;
 }
 
 // Diffuse ambient (irradiance / pi) of the environment around `n`.
@@ -416,7 +461,7 @@ fn fs_voxel(in: VsOut) -> @location(0) vec4f {
     }
     let metallic = clamp(mr.b * material.metallic, 0.0, 1.0);
     let sun = (1.0 - light.ambient) * light.color * max(dot(n, light.direction), 0.0)
-        * shadow_factor(in.world_pos, n);
+        * shadow_factor_volume(in.world_pos, n);
     // The first update after GI (re)starts (hysteresis 0) has no last
     // frame: the atlases may hold another scene.
     let feedback = select(0.0, gi.intensity, gi.hysteresis > 0.0);

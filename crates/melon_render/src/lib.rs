@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+mod cascades;
 mod extract;
 pub mod gi;
 mod ibl;
@@ -314,6 +315,12 @@ struct LightUniform {
     ground_color: [f32; 3],
     _pad2: f32,
     light_view_proj: [[f32; 4]; 4],
+    /// Every shadow cascade's matrix (`cascades::CascadeSet`).
+    cascade_view_proj: [[[f32; 4]; 4]; cascades::MAX_CASCADES],
+    cascade_far: [f32; 4],
+    /// x cascade count, y shadow distance.
+    cascade_info: [f32; 4],
+    cascade_forward: [f32; 4],
 }
 
 #[repr(C)]
@@ -835,12 +842,16 @@ pub struct SceneRenderer {
     shadow_pipeline: wgpu::RenderPipeline,
     /// Shadow pass for alpha-masked casters (reads the material, group 2).
     shadow_mask_pipeline: wgpu::RenderPipeline,
-    /// Light view-proj for the shadow pass (group 0 of `shadow_pipeline`).
-    shadow_camera_buffer: wgpu::Buffer,
-    shadow_bind_group: wgpu::BindGroup,
-    /// The sun's shadow map (`set_shadow_map_size` recreates it).
+    /// Light view-proj per cascade for the shadow pass (group 0 of
+    /// `shadow_pipeline`): separate buffers, since writes apply at submit.
+    shadow_camera_buffers: Vec<wgpu::Buffer>,
+    shadow_bind_groups: Vec<wgpu::BindGroup>,
+    /// The sun's shadow map, one layer per cascade
+    /// (`set_shadow_map_size` / `set_cascades` recreate it), its array view
+    /// for sampling and a view per layer to render into.
     shadow_texture: wgpu::Texture,
     shadow_view: wgpu::TextureView,
+    shadow_layers: Vec<wgpu::TextureView>,
     shadow_sampler: wgpu::Sampler,
     /// `builtin:cube`'s material: the checkerboard as base colour.
     checker_material: wgpu::BindGroup,
@@ -1392,9 +1403,23 @@ impl Renderer {
             // and its uniform stay as the last main view left them.
             scene.gi.mode = melon_core::GiMode::Off;
         }
-        let light_view_proj =
-            directional_light_view_proj(frame.light.to_light(), SHADOW_CENTER, SHADOW_RADIUS);
-        scene.update_light(&frame.light, light_view_proj);
+        // Auxiliary views (thumbnails) keep the shadow map as it is and use
+        // one cascade.
+        let cascade_count = if main {
+            scene.set_cascades(quality.cascades);
+            scene.cascade_count() as usize
+        } else {
+            1
+        };
+        let cascade_set = cascades::fit(
+            frame.view_proj,
+            frame.eye,
+            frame.light.to_light(),
+            cascade_count,
+            quality.shadow_distance as f32,
+            scene.shadow_map_size(),
+        );
+        scene.update_light_cascades(&frame.light, &cascade_set);
         for (_, handle) in &frame.models {
             self.model_cache.prepare(&self.scene, server, *handle);
         }
@@ -1406,13 +1431,18 @@ impl Renderer {
         // off screen still shade the view), then batch by model: every part
         // of a model draws its instances in one call.
         let camera = Frustum::from_view_proj(frame.view_proj);
-        let shadow_box = Frustum::from_view_proj(light_view_proj);
+        let shadow_boxes: Vec<Frustum> = cascade_set
+            .view_proj
+            .iter()
+            .map(|m| Frustum::from_view_proj(*m))
+            .collect();
         let mut stats = RenderStats {
             lights: stats_lights.0,
             lights_dropped: stats_lights.1,
             ..Default::default()
         };
-        let (mut seen, mut casters, mut voxelized) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut seen, mut voxelized) = (Vec::new(), Vec::new());
+        let mut casters: Vec<Vec<_>> = vec![Vec::new(); shadow_boxes.len()];
         // Entities with the same material overrides share a set id (0 = none),
         // so they batch together.
         let mut set_ids: std::collections::HashMap<&[Option<MaterialHandle>], u32> =
@@ -1435,15 +1465,23 @@ impl Renderer {
             } else {
                 stats.culled += 1;
             }
-            if shadow_box.intersects_aabb(min, max) {
-                casters.push((key, *matrix));
-            } else {
+            let mut cast = false;
+            for (list, shadow_box) in casters.iter_mut().zip(&shadow_boxes) {
+                if shadow_box.intersects_aabb(min, max) {
+                    list.push((key, *matrix));
+                    cast = true;
+                }
+            }
+            if !cast {
                 stats.shadow_culled += 1;
             }
         }
-        let mut matrices = Vec::with_capacity(seen.len() + casters.len());
+        let mut matrices = Vec::with_capacity(seen.len() * 2);
         let seen = batch(seen, &mut matrices);
-        let casters = batch(casters, &mut matrices);
+        let casters: Vec<_> = casters
+            .into_iter()
+            .map(|list| batch(list, &mut matrices))
+            .collect();
         let voxelized = batch(voxelized, &mut matrices);
         self.scene.update_instances(&matrices);
 
@@ -1502,22 +1540,26 @@ impl Renderer {
             .cloned()
             .collect();
         let blend_calls: Vec<_> = calls.blend.iter().map(|(_, call)| call.clone()).collect();
-        let mut shadow_draw_calls: Vec<(&Mesh, std::ops::Range<u32>)> = Vec::new();
-        let mut shadow_masked_calls: Vec<(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)> =
-            Vec::new();
-        for (key, instances) in &casters {
-            let model = self.model_cache.model(server, key.0);
-            for (part, mesh) in model.meshes.iter().enumerate() {
-                let (group, surface) = part_material(*key, part);
-                if surface.blend {
-                    continue;
-                }
-                if surface.masked {
-                    shadow_masked_calls.push((mesh, group, instances.clone()));
-                } else {
-                    shadow_draw_calls.push((mesh, instances.clone()));
+        // Per cascade: the plain casters and the alpha-masked ones.
+        type PlainCasters<'a> = Vec<(&'a Mesh, std::ops::Range<u32>)>;
+        let mut shadow_calls: Vec<(PlainCasters, Vec<DrawCall>)> = Vec::new();
+        for cascade in &casters {
+            let (mut plain, mut masked) = (Vec::new(), Vec::new());
+            for (key, instances) in cascade {
+                let model = self.model_cache.model(server, key.0);
+                for (part, mesh) in model.meshes.iter().enumerate() {
+                    let (group, surface) = part_material(*key, part);
+                    if surface.blend {
+                        continue;
+                    }
+                    if surface.masked {
+                        masked.push((mesh, group, instances.clone()));
+                    } else {
+                        plain.push((mesh, instances.clone()));
+                    }
                 }
             }
+            shadow_calls.push((plain, masked));
         }
         let all_draws = [draw_calls, &calls.two_sided, &blend_calls];
         stats.draw_calls = all_draws.iter().map(|c| c.len() as u32).sum();
@@ -1526,7 +1568,10 @@ impl Renderer {
             .flat_map(|c| c.iter())
             .map(|(_, _, r)| r.len() as u32)
             .sum();
-        stats.shadow_draw_calls = (shadow_draw_calls.len() + shadow_masked_calls.len()) as u32;
+        stats.shadow_draw_calls = shadow_calls
+            .iter()
+            .map(|(plain, masked)| (plain.len() + masked.len()) as u32)
+            .sum();
 
         // The draw lists borrow the model cache; the scene is a separate field.
         let scene = &mut self.scene;
@@ -1546,7 +1591,9 @@ impl Renderer {
         if !blend_calls.is_empty() {
             scene.ensure_variant(Variant::Blend);
         }
-        scene.render_shadow_pass_masked(encoder, &shadow_draw_calls, &shadow_masked_calls);
+        for (layer, (plain, masked)) in shadow_calls.iter().enumerate() {
+            scene.render_cascade(encoder, layer, plain, masked);
+        }
         mark(encoder, timer, timings::Mark::Shadows);
         // The depth/normal prepass feeds SSAO and SSGI. AO off (quality or
         // strength 0): skip the SSAO passes and bind white, so the image
@@ -1725,7 +1772,7 @@ impl SceneRenderer {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
                         multisampled: false,
                     },
                     count: None,
@@ -1927,7 +1974,8 @@ impl SceneRenderer {
             mapped_at_creation: false,
         });
 
-        let (shadow_texture, shadow_view) = create_shadow_map(&device, SHADOW_MAP_SIZE);
+        let (shadow_texture, shadow_view, shadow_layers) =
+            create_shadow_map(&device, SHADOW_MAP_SIZE, 1);
         // Linear filtering on a comparison sampler gives 2x2 hardware PCF per tap.
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shadow comparison sampler"),
@@ -1938,20 +1986,29 @@ impl SceneRenderer {
             compare: Some(wgpu::CompareFunction::LessEqual),
             ..Default::default()
         });
-        let shadow_camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("shadow camera uniform buffer"),
-            size: std::mem::size_of::<CameraUniform>() as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let shadow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("shadow camera bind group"),
-            layout: &shadow_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: shadow_camera_buffer.as_entire_binding(),
-            }],
-        });
+        let shadow_camera_buffers: Vec<wgpu::Buffer> = (0..cascades::MAX_CASCADES)
+            .map(|_| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("shadow camera uniform buffer"),
+                    size: std::mem::size_of::<CameraUniform>() as wgpu::BufferAddress,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+        let shadow_bind_groups: Vec<wgpu::BindGroup> = shadow_camera_buffers
+            .iter()
+            .map(|buffer| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("shadow camera bind group"),
+                    layout: &shadow_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    }],
+                })
+            })
+            .collect();
 
         let ibl_sky = ibl::SkyParams::default();
         let ibl = ibl::IblGpu::new(&device, &queue, &ibl::Source::Procedural(ibl_sky));
@@ -2077,10 +2134,11 @@ impl SceneRenderer {
             ibl_built: Some((ibl_sky, None)),
             shadow_pipeline,
             shadow_mask_pipeline,
-            shadow_camera_buffer,
-            shadow_bind_group,
+            shadow_camera_buffers,
+            shadow_bind_groups,
             shadow_texture,
             shadow_view,
+            shadow_layers,
             shadow_sampler,
             checker_material,
             prepass_pipeline,
@@ -2111,10 +2169,27 @@ impl SceneRenderer {
     /// texture.
     pub fn set_shadow_map_size(&mut self, size: u32) {
         let size = size.clamp(256, self.device.limits().max_texture_dimension_2d);
-        if self.shadow_texture.width() == size {
+        self.rebuild_shadow_map(size, self.shadow_layers.len() as u32);
+    }
+
+    /// Sets the number of sun shadow cascades (1 to 4), recreating the
+    /// shadow map when it changes.
+    pub fn set_cascades(&mut self, count: u32) {
+        let count = count.clamp(1, cascades::MAX_CASCADES as u32);
+        self.rebuild_shadow_map(self.shadow_texture.width(), count);
+    }
+
+    /// Number of cascade layers the shadow map has.
+    pub fn cascade_count(&self) -> u32 {
+        self.shadow_layers.len() as u32
+    }
+
+    fn rebuild_shadow_map(&mut self, size: u32, layers: u32) {
+        if self.shadow_texture.width() == size && self.shadow_layers.len() as u32 == layers {
             return;
         }
-        (self.shadow_texture, self.shadow_view) = create_shadow_map(&self.device, size);
+        (self.shadow_texture, self.shadow_view, self.shadow_layers) =
+            create_shadow_map(&self.device, size, layers);
         self.rebuild_frame_bind_group();
         self.gi.set_shadow_map(
             &self.device,
@@ -2128,7 +2203,7 @@ impl SceneRenderer {
                 lighting_layout: &self.lighting_layout,
             },
         );
-        tracing::debug!(size, "shadow map recreated");
+        tracing::debug!(size, layers, "shadow map recreated");
     }
 
     /// Group 0 over the current buffers, shadow map and IBL textures.
@@ -2283,14 +2358,19 @@ impl SceneRenderer {
     }
 }
 
-/// A `Depth32Float` sun shadow map of `size` x `size` texels and its view.
-fn create_shadow_map(device: &wgpu::Device, size: u32) -> (wgpu::Texture, wgpu::TextureView) {
+/// A `Depth32Float` sun shadow map of `layers` layers of `size` x `size`
+/// texels: the array view to sample and a view per layer to render into.
+fn create_shadow_map(
+    device: &wgpu::Device,
+    size: u32,
+    layers: u32,
+) -> (wgpu::Texture, wgpu::TextureView, Vec<wgpu::TextureView>) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("shadow map"),
         size: wgpu::Extent3d {
             width: size,
             height: size,
-            depth_or_array_layers: 1,
+            depth_or_array_layers: layers,
         },
         mip_level_count: 1,
         sample_count: 1,
@@ -2299,8 +2379,21 @@ fn create_shadow_map(device: &wgpu::Device, size: u32) -> (wgpu::Texture, wgpu::
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    (texture, view)
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    let layer_views = (0..layers)
+        .map(|layer| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: layer,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        })
+        .collect();
+    (texture, view, layer_views)
 }
 
 /// Group 0: camera, light, the shadow map + comparison sampler, environment
@@ -3493,6 +3586,11 @@ impl SceneRenderer {
 
     /// `light_view_proj` is the shadow box, see [`directional_light_view_proj`].
     pub fn update_light(&mut self, light: &melon_core::Light, light_view_proj: glam::Mat4) {
+        self.update_light_cascades(light, &cascades::CascadeSet::single(light_view_proj));
+    }
+
+    /// `update_light` with the sun's shadow cascades.
+    fn update_light_cascades(&mut self, light: &melon_core::Light, set: &cascades::CascadeSet) {
         self.ibl_sky.ambient = light.ambient;
         self.ibl_sky.sky_color = light.sky_color;
         self.ibl_sky.ground_color = light.ground_color;
@@ -3515,20 +3613,28 @@ impl SceneRenderer {
             _pad1: 0.0,
             ground_color: ground_color.to_array(),
             _pad2: 0.0,
-            light_view_proj: light_view_proj.to_cols_array_2d(),
+            light_view_proj: set.view_proj[0].to_cols_array_2d(),
+            cascade_view_proj: std::array::from_fn(|i| {
+                set.view_proj
+                    .get(i)
+                    .unwrap_or(&set.view_proj[0])
+                    .to_cols_array_2d()
+            }),
+            cascade_far: set.far,
+            cascade_info: [set.view_proj.len() as f32, set.distance, 0.0, 0.0],
+            cascade_forward: set.forward.extend(0.0).to_array(),
         };
         self.queue
             .write_buffer(&self.light_buffer, 0, bytemuck::cast_slice(&[uniform]));
         // The shadow shader reads only `view_proj`.
-        let shadow_camera = CameraUniform {
-            view_proj: light_view_proj.to_cols_array_2d(),
-            ..Zeroable::zeroed()
-        };
-        self.queue.write_buffer(
-            &self.shadow_camera_buffer,
-            0,
-            bytemuck::cast_slice(&[shadow_camera]),
-        );
+        for (buffer, m) in self.shadow_camera_buffers.iter().zip(&set.view_proj) {
+            let shadow_camera = CameraUniform {
+                view_proj: m.to_cols_array_2d(),
+                ..Zeroable::zeroed()
+            };
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(&[shadow_camera]));
+        }
     }
 
     /// SSAO kernel, radius and strength for the SSAO passes.
@@ -3654,11 +3760,23 @@ impl SceneRenderer {
         draw_calls: &[(&Mesh, std::ops::Range<u32>)],
         masked: &[(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)],
     ) {
+        self.render_cascade(encoder, 0, draw_calls, masked);
+    }
+
+    /// One shadow cascade: the casters into layer `layer` with the matrix
+    /// of `update_light_cascades`.
+    fn render_cascade(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        layer: usize,
+        draw_calls: &[(&Mesh, std::ops::Range<u32>)],
+        masked: &[(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)],
+    ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("melon_render shadow pass"),
             color_attachments: &[],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &self.shadow_view,
+                view: &self.shadow_layers[layer],
                 depth_ops: Some(wgpu::Operations {
                     load: wgpu::LoadOp::Clear(1.0),
                     store: wgpu::StoreOp::Store,
@@ -3670,7 +3788,7 @@ impl SceneRenderer {
             multiview_mask: None,
         });
         pass.set_pipeline(&self.shadow_pipeline);
-        pass.set_bind_group(0, &self.shadow_bind_group, &[]);
+        pass.set_bind_group(0, &self.shadow_bind_groups[layer], &[]);
         pass.set_bind_group(1, &self.instance_bind_group, &[]);
         for (mesh, instances) in draw_calls {
             pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
@@ -4719,8 +4837,8 @@ mod tests {
     }
 
     #[test]
-    fn light_uniform_size_is_128() {
-        assert_eq!(std::mem::size_of::<LightUniform>(), 128);
+    fn light_uniform_size_is_432() {
+        assert_eq!(std::mem::size_of::<LightUniform>(), 432);
     }
 
     #[test]
@@ -6175,6 +6293,45 @@ mod tests {
             return Err(format!(
                 "light cap: {} shaded, {} dropped (max_lights {})",
                 stats.lights, stats.lights_dropped, quality.max_lights
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_far_cascade_shadow(r: &mut Renderer) -> Result<(), String> {
+        use glam::Vec3;
+        // A 4 m cube 30 m from the camera casts onto the floor: that depth
+        // is in the third cascade (splits about 10, 27 and 100 m).
+        let mut server = repo_server();
+        let grey = server.load("assets/models/review/grey_cube.glb");
+        let models = vec![
+            slab(
+                grey,
+                Vec3::new(120.0, 0.2, 120.0),
+                Vec3::new(0.0, -0.1, -30.0),
+            ),
+            slab(grey, Vec3::splat(4.0), Vec3::new(0.0, 2.0, -30.0)),
+        ];
+        let camera = melon_core::Camera {
+            eye: Vec3::new(0.0, 6.0, 0.0),
+            center: Vec3::new(0.0, 0.0, -30.0),
+            aspect: 1.0,
+            ..Default::default()
+        };
+        let light = melon_core::Light {
+            direction: Vec3::new(-1.0, -1.0, 0.0).normalize(),
+            ambient: 0.1,
+            sky_color: Vec3::ONE,
+            ground_color: Vec3::ONE,
+            ..Default::default()
+        };
+        let pixels = render_frame(r, camera, light, plain_environment(), models, &mut server);
+        let view_proj = camera.view_proj();
+        let shadowed = value_at(&pixels, screen_px(view_proj, Vec3::new(-4.0, 0.0, -30.0)));
+        let lit = value_at(&pixels, screen_px(view_proj, Vec3::new(4.0, 0.0, -30.0)));
+        if shadowed + 30 > lit {
+            return Err(format!(
+                "far cascade: floor in the cube's shadow {shadowed}, lit floor {lit} (want a gap over 30)"
             ));
         }
         Ok(())
@@ -7955,6 +8112,7 @@ mod tests {
             Box::new(check_alpha_mask_and_blend),
             Box::new(check_local_lights),
             Box::new(check_ibl_uniform_sky),
+            Box::new(check_far_cascade_shadow),
         ];
 
         #[cfg(target_os = "windows")]
