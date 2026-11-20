@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 mod extract;
+pub mod gi;
 mod models;
 mod overlay;
 
@@ -481,6 +482,13 @@ fn image_from_gltf_data(data: &gltf::image::Data) -> image::DynamicImage {
     }
 }
 
+/// mesh.wgsl with the shared DDGI declarations prepended (mesh and voxel
+/// pipelines).
+const MESH_WGSL: &str = concat!(
+    include_str!("../../../assets/shaders/gi_common.wgsl"),
+    include_str!("../../../assets/shaders/mesh.wgsl")
+);
+
 /// Format of the scene colour target. The tonemap pass maps it to the display.
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
@@ -594,7 +602,9 @@ pub struct SceneRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface_format: wgpu::TextureFormat,
+    /// The mesh pipeline without and with DDGI (`GI_ENABLED` override).
     mesh_pipeline: wgpu::RenderPipeline,
+    mesh_gi_pipeline: wgpu::RenderPipeline,
     tonemap_pipeline: wgpu::RenderPipeline,
     tonemap_bind_group_layout: wgpu::BindGroupLayout,
     /// Bloom: one source texture + sampler per pass, the first (Karis)
@@ -641,6 +651,8 @@ pub struct SceneRenderer {
     lighting_layout: wgpu::BindGroupLayout,
     /// Group 3 with a 1x1 white AO texture: no occlusion (AO off).
     unoccluded_lighting: wgpu::BindGroup,
+    /// DDGI world data (voxels, probe atlases) and its passes.
+    gi: gi::Gi,
     /// Depth-tested lines inside the 3D pass (grid, axes, selection box).
     world_line_pipeline: wgpu::RenderPipeline,
     world_lines: LineBuffer,
@@ -798,6 +810,8 @@ impl Renderer {
         scene.update_camera(frame.view_proj, frame.eye);
         scene.update_environment(&frame.environment);
         scene.update_ssao(&frame.environment);
+        let gi_on = frame.environment.gi_intensity > 0.0;
+        scene.update_gi(frame.environment.gi_intensity);
         let light_view_proj =
             directional_light_view_proj(frame.light.to_light(), SHADOW_CENTER, SHADOW_RADIUS);
         scene.update_light(&frame.light, light_view_proj);
@@ -811,9 +825,13 @@ impl Renderer {
         let camera = Frustum::from_view_proj(frame.view_proj);
         let shadow_box = Frustum::from_view_proj(light_view_proj);
         let mut stats = RenderStats::default();
-        let (mut seen, mut casters) = (Vec::new(), Vec::new());
+        let (mut seen, mut casters, mut voxelized) = (Vec::new(), Vec::new(), Vec::new());
+        let (gi_min, gi_max) = (gi::GI_ORIGIN, gi::GI_ORIGIN + gi::volume_size());
         for (matrix, handle) in &frame.models {
             let (min, max) = world_aabb(*matrix, self.model_cache.model(server, *handle).bounds);
+            if gi_on && min.cmple(gi_max).all() && max.cmpge(gi_min).all() {
+                voxelized.push((*handle, *matrix));
+            }
             if camera.intersects_aabb(min, max) {
                 seen.push((*handle, *matrix));
             } else {
@@ -828,15 +846,23 @@ impl Renderer {
         let mut matrices = Vec::with_capacity(seen.len() + casters.len());
         let seen = batch(seen, &mut matrices);
         let casters = batch(casters, &mut matrices);
+        let voxelized = batch(voxelized, &mut matrices);
         self.scene.update_instances(&matrices);
 
-        let mut draw_calls: Vec<(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)> = Vec::new();
-        for (handle, instances) in &seen {
-            let model = self.model_cache.model(server, *handle);
-            for (mesh, material) in model.meshes.iter().zip(&model.material_bind_groups) {
-                draw_calls.push((mesh, material, instances.clone()));
-            }
-        }
+        let (cache, assets) = (&self.model_cache, &*server);
+        let textured =
+            move |batches: &[(melon_core::Handle<melon_core::Model>, std::ops::Range<u32>)]| {
+                let mut calls: Vec<(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)> = Vec::new();
+                for (handle, instances) in batches {
+                    let model = cache.model(assets, *handle);
+                    for (mesh, material) in model.meshes.iter().zip(&model.material_bind_groups) {
+                        calls.push((mesh, material, instances.clone()));
+                    }
+                }
+                calls
+            };
+        let draw_calls = textured(&seen);
+        let voxel_draw_calls = textured(&voxelized);
         let mut shadow_draw_calls: Vec<(&Mesh, std::ops::Range<u32>)> = Vec::new();
         for (handle, instances) in &casters {
             for mesh in &self.model_cache.model(server, *handle).meshes {
@@ -850,6 +876,11 @@ impl Renderer {
         // The draw lists borrow the model cache; the scene is a separate field.
         let scene = &mut self.scene;
         scene.render_shadow_pass(encoder, &shadow_draw_calls);
+        // GI off: no voxel or probe passes; the mesh shader keeps the
+        // hemisphere ambient, so the image matches the renderer without GI.
+        if gi_on {
+            scene.render_gi(encoder, &voxel_draw_calls);
+        }
         // AO off: skip the SSAO passes and bind white, so the image matches
         // the renderer without SSAO.
         let lighting = if frame.environment.ao_strength > 0.0 {
@@ -1024,20 +1055,21 @@ impl SceneRenderer {
             ],
         });
 
-        // Group 3: per-view lighting inputs (SSAO now; GI data later).
+        // Group 3: per-view lighting inputs: AO (R, 1 = unoccluded), then
+        // the DDGI atlases, sampler and settings (shared by every view).
+        let [gi_1, gi_2, gi_3, gi_4] = gi::lighting_layout_entries();
         let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("lighting bind group layout"),
-            entries: &[texture_entry(0)], // AO (R, 1 = unoccluded)
+            entries: &[texture_entry(0), gi_1, gi_2, gi_3, gi_4],
         });
-        let mesh_pipeline = Renderer::build_mesh_pipeline(
-            &device,
-            &[
-                &frame_layout,
-                &model_layout,
-                &material_layout,
-                &lighting_layout,
-            ],
-        );
+        let mesh_layouts = [
+            &frame_layout,
+            &model_layout,
+            &material_layout,
+            &lighting_layout,
+        ];
+        let mesh_pipeline = Renderer::build_mesh_pipeline(&device, &mesh_layouts, false);
+        let mesh_gi_pipeline = Renderer::build_mesh_pipeline(&device, &mesh_layouts, true);
 
         let unfilterable_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,
@@ -1273,13 +1305,32 @@ impl SceneRenderer {
             [Some(&checker), None, None, None],
         );
 
+        let gi = gi::Gi::new(
+            &device,
+            &gi::GiInputs {
+                light: &light_buffer,
+                environment: &environment_buffer,
+                shadow_view: &shadow_view,
+                shadow_sampler: &shadow_sampler,
+                model_layout: &model_layout,
+                material_layout: &material_layout,
+                lighting_layout: &lighting_layout,
+            },
+        );
+        let [gi_1, gi_2, gi_3, gi_4] = gi.lighting_entries();
         let unoccluded_lighting = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("unoccluded lighting bind group"),
             layout: &lighting_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&default_textures.white),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&default_textures.white),
+                },
+                gi_1,
+                gi_2,
+                gi_3,
+                gi_4,
+            ],
         });
 
         let world_line_pipeline = Renderer::build_world_line_pipeline(&device, &frame_layout);
@@ -1293,6 +1344,7 @@ impl SceneRenderer {
             queue,
             surface_format,
             mesh_pipeline,
+            mesh_gi_pipeline,
             tonemap_pipeline,
             tonemap_bind_group_layout: tonemap_layout,
             bloom_layout,
@@ -1324,6 +1376,7 @@ impl SceneRenderer {
             ssao_buffer,
             lighting_layout,
             unoccluded_lighting,
+            gi,
             world_line_pipeline,
             world_lines: LineBuffer::default(),
             instance_buffer,
@@ -1335,13 +1388,22 @@ impl SceneRenderer {
 }
 
 impl Renderer {
-    /// `layouts`: frame, model, material, lighting (groups 0 to 3).
+    /// `layouts`: frame, model, material, lighting (groups 0 to 3). `gi`:
+    /// diffuse ambient from the DDGI probes instead of the hemisphere.
     fn build_mesh_pipeline(
         device: &wgpu::Device,
         layouts: &[&wgpu::BindGroupLayout; 4],
+        gi: bool,
     ) -> wgpu::RenderPipeline {
-        let shader =
-            device.create_shader_module(wgpu::include_wgsl!("../../../assets/shaders/mesh.wgsl"));
+        let constants = [("GI_ENABLED", if gi { 1.0 } else { 0.0 })];
+        let compilation_options = wgpu::PipelineCompilationOptions {
+            constants: &constants,
+            ..Default::default()
+        };
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("mesh.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(MESH_WGSL.into()),
+        });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh pipeline layout"),
@@ -1355,7 +1417,7 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
+                compilation_options: compilation_options.clone(),
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
@@ -1385,7 +1447,7 @@ impl Renderer {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
+                compilation_options: compilation_options.clone(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: HDR_FORMAT,
                     blend: Some(wgpu::BlendState::REPLACE),
@@ -2093,10 +2155,11 @@ impl SceneRenderer {
             layout: &self.ssao_blur_layout,
             entries: &[entry(1, &normal_view), uniform, entry(3, &raw_view)],
         });
+        let [gi_1, gi_2, gi_3, gi_4] = self.gi.lighting_entries();
         let lighting_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lighting bind group"),
             layout: &self.lighting_layout,
-            entries: &[entry(0, &ao_view)],
+            entries: &[entry(0, &ao_view), gi_1, gi_2, gi_3, gi_4],
         });
         SsaoTargets {
             depth_view,
@@ -2962,14 +3025,20 @@ impl SceneRenderer {
 
     /// Draw 3D meshes with per-draw-call materials.
     /// Each draw call is `(mesh, material_bind_group, instance range)`;
-    /// `lighting` is the view's group 3 (per-view lighting inputs).
+    /// `lighting` is the view's group 3 (per-view lighting inputs). Diffuse
+    /// ambient comes from the GI probes when the last `render_scene` had
+    /// `gi_intensity` above 0.
     pub fn draw_meshes_textured(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
         draw_calls: &[(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)],
         lighting: &wgpu::BindGroup,
     ) {
-        pass.set_pipeline(&self.mesh_pipeline);
+        pass.set_pipeline(if self.gi.on {
+            &self.mesh_gi_pipeline
+        } else {
+            &self.mesh_pipeline
+        });
         pass.set_bind_group(0, &self.frame_bind_group, &[]);
         pass.set_bind_group(1, &self.instance_bind_group, &[]);
         pass.set_bind_group(3, lighting, &[]);
@@ -3560,6 +3629,7 @@ mod tests {
         // No fog, so the lit/shadow thresholds keep their meaning.
         r.update_environment(&melon_core::Environment {
             fog_density: 0.0,
+            gi_intensity: 0.0,
             ..Default::default()
         });
         r.update_light(
@@ -3705,14 +3775,78 @@ mod tests {
         }
     }
 
-    /// No fog, no AO: thresholds keep their meaning.
+    /// No fog, AO, bloom or GI: thresholds keep their meaning.
     fn plain_environment() -> melon_core::Environment {
         melon_core::Environment {
             fog_density: 0.0,
             ao_strength: 0.0,
             bloom_intensity: 0.0,
+            gi_intensity: 0.0,
             ..Default::default()
         }
+    }
+
+    /// Frames rendered before reading a GI result, so the probes converge
+    /// (a running mean, then hysteresis 0.97).
+    const GI_FRAMES: u32 = 60;
+
+    /// `render_frame` into one target, `GI_FRAMES` times when GI is on (once
+    /// when off); returns the last frame's pixels.
+    fn render_converged(
+        r: &mut Renderer,
+        camera: melon_core::Camera,
+        light: melon_core::Light,
+        environment: melon_core::Environment,
+        models: &[(glam::Mat4, melon_core::Handle<melon_core::Model>)],
+        server: &mut melon_core::AssetServer,
+    ) -> Vec<u8> {
+        // Handle ids restart with every AssetServer: drop models cached for
+        // another test's server.
+        r.model_cache = ModelCache::new(&r.scene);
+        let target = r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let frame = FrameData {
+            view_proj: camera.view_proj(),
+            eye: camera.eye,
+            light,
+            environment,
+            models: models.to_vec(),
+        };
+        let frames = if environment.gi_intensity > 0.0 {
+            GI_FRAMES
+        } else {
+            1
+        };
+        for i in 0..frames {
+            let mut encoder = r
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            r.render_scene(&mut encoder, &frame, server, &target, &[], &[]);
+            if i + 1 == frames {
+                return read_back(r.device(), r.queue(), encoder, &target.color_texture);
+            }
+            r.queue().submit([encoder.finish()]);
+        }
+        unreachable!("frames >= 1")
+    }
+
+    /// A box of `size` centred at `center` in model `model`.
+    fn slab(
+        model: melon_core::Handle<melon_core::Model>,
+        size: glam::Vec3,
+        center: glam::Vec3,
+    ) -> (glam::Mat4, melon_core::Handle<melon_core::Model>) {
+        (
+            glam::Mat4::from_scale_rotation_translation(size, glam::Quat::IDENTITY, center),
+            model,
+        )
+    }
+    fn repo_server() -> melon_core::AssetServer {
+        melon_core::AssetServer::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..").into())
+    }
+
+    /// Sum of the RGB channels of a pixel.
+    fn rgb_sum(p: [u8; 4]) -> u32 {
+        p[..3].iter().map(|&c| u32::from(c)).sum()
     }
 
     /// Pixel of a TEST_SIZE target that world point `p` projects to.
@@ -3757,6 +3891,7 @@ mod tests {
             fog_density: 0.0,
             ao_strength,
             bloom_intensity: 0.0,
+            gi_intensity: 0.0,
             ..Default::default()
         };
         let models = vec![(floor, cube), (Mat4::from_translation(Vec3::Y * 0.5), cube)];
@@ -3983,6 +4118,7 @@ mod tests {
             environment: melon_core::Environment {
                 ao_strength: 0.0,
                 bloom_intensity: 0.0,
+                gi_intensity: 0.0,
                 ..Default::default()
             },
             models: if cube {
@@ -4110,6 +4246,174 @@ mod tests {
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
+            Box::new(|renderer| {
+                // GI colour bleeding: a sunlit red wall (0.4 m, more than a
+                // voxel) on a grey floor, black sky (so the bounce is not
+                // diluted), low sun (the wall gets far more of it than the
+                // floor). With GI the floor beside the wall's lit face turns
+                // red; without it, it stays grey.
+                use glam::Vec3;
+                let mut server = repo_server();
+                let grey = server.load("assets/models/review/grey_cube.glb");
+                let red = server.load("assets/models/review/red_panel.glb");
+                let models = [
+                    slab(grey, Vec3::new(8.0, 0.2, 8.0), Vec3::new(0.0, -0.1, 0.0)),
+                    slab(red, Vec3::new(0.4, 2.0, 4.0), Vec3::new(-0.2, 1.0, 0.0)),
+                ];
+                let camera = top_down_camera();
+                let px = screen_px(camera.view_proj(), Vec3::new(0.3, 0.0, 0.0));
+                let mut ratio = |gi_intensity| {
+                    let env = melon_core::Environment {
+                        zenith_color: Vec3::ZERO,
+                        horizon_color: Vec3::ZERO,
+                        gi_intensity,
+                        ..plain_environment()
+                    };
+                    let light = melon_core::Light {
+                        direction: -Vec3::new(1.0, 0.25, 0.0).normalize(),
+                        ..test_light()
+                    };
+                    let pixels =
+                        render_converged(renderer, camera, light, env, &models, &mut server);
+                    let p = pixel_at(renderer, &pixels, px);
+                    f32::from(p[0]) / f32::from(p[1]).max(1.0)
+                };
+                let (on, off) = (ratio(1.0), ratio(0.0));
+                if on < off + 0.05 {
+                    return Err(format!(
+                        "GI should bleed red onto the floor: R/G {on:.3} with GI, {off:.3} without"
+                    ));
+                }
+                Ok(())
+            }),
+            Box::new(|renderer| {
+                // GI bounce into shade: the back wall of an open-front room
+                // (red and green sides, sun in through the opening, not
+                // reaching the back) with a dim hemisphere. GI brings the
+                // sunlit floor's bounce and the sky in.
+                use glam::Vec3;
+                let mut server = repo_server();
+                let grey = server.load("assets/models/review/grey_cube.glb");
+                let red = server.load("assets/models/review/red_panel.glb");
+                let green = server.load("assets/models/review/green_panel.glb");
+                let models = [
+                    slab(grey, Vec3::new(5.8, 0.1, 7.4), Vec3::new(0.0, -0.05, -0.8)),
+                    slab(red, Vec3::new(0.4, 4.4, 5.4), Vec3::new(2.7, 2.2, 0.2)),
+                    slab(green, Vec3::new(0.4, 4.4, 5.4), Vec3::new(-2.7, 2.2, 0.2)),
+                    slab(grey, Vec3::new(5.8, 4.4, 0.4), Vec3::new(0.0, 2.2, 2.7)),
+                    slab(grey, Vec3::new(5.8, 0.4, 5.4), Vec3::new(0.0, 4.2, 0.2)),
+                ];
+                let camera = melon_core::Camera {
+                    eye: Vec3::new(0.0, 2.0, -8.5),
+                    center: Vec3::new(0.0, 1.9, 1.0),
+                    aspect: 1.0,
+                    ..Default::default()
+                };
+                let light = melon_core::Light {
+                    sky_color: Vec3::splat(0.1),
+                    ground_color: Vec3::splat(0.1),
+                    ..Default::default()
+                };
+                let px = screen_px(camera.view_proj(), Vec3::new(0.0, 2.0, 2.5));
+                let mut back_wall = |gi_intensity| {
+                    let env = melon_core::Environment {
+                        gi_intensity,
+                        ..plain_environment()
+                    };
+                    let pixels =
+                        render_converged(renderer, camera, light, env, &models, &mut server);
+                    rgb_sum(pixel_at(renderer, &pixels, px))
+                };
+                let (on, off) = (back_wall(1.0), back_wall(0.0));
+                if on < off + 60 {
+                    return Err(format!(
+                        "GI should light the shaded back wall: RGB sum {on} with GI, {off} without"
+                    ));
+                }
+                Ok(())
+            }),
+            Box::new(|renderer| {
+                // No leak: a closed box (0.4 m walls, above the 0.35 m
+                // minimum, see AGENTS.md) on a sunlit floor, black sky, no hemisphere: inside,
+                // only light leaking through the walls could show. Control:
+                // the box's outer -z wall, which the sun misses, does get
+                // bounce from the sunlit floor in front of it.
+                use glam::Vec3;
+                let mut server = repo_server();
+                let grey = server.load("assets/models/review/grey_cube.glb");
+                let (wall, side, cap) = (
+                    Vec3::new(0.4, 2.2, 3.3),
+                    Vec3::new(2.5, 2.2, 0.4),
+                    Vec3::new(3.3, 0.4, 3.3),
+                );
+                // Interior [0, 2.5] x [0.4, 2.6] x [0, 2.5]; a probe sits at
+                // (1.25, 0.75, 1.25).
+                let models = [
+                    slab(grey, Vec3::new(8.0, 0.2, 8.0), Vec3::new(0.0, -0.1, 0.0)),
+                    slab(grey, cap, Vec3::new(1.25, 0.2, 1.25)),
+                    slab(grey, cap, Vec3::new(1.25, 2.8, 1.25)),
+                    slab(grey, wall, Vec3::new(-0.2, 1.5, 1.25)),
+                    slab(grey, wall, Vec3::new(2.7, 1.5, 1.25)),
+                    slab(grey, side, Vec3::new(1.25, 1.5, -0.2)),
+                    slab(grey, side, Vec3::new(1.25, 1.5, 2.7)),
+                ];
+                let light = melon_core::Light {
+                    ambient: 0.0,
+                    ..test_light()
+                };
+                let env = |gi_intensity| melon_core::Environment {
+                    zenith_color: Vec3::ZERO,
+                    horizon_color: Vec3::ZERO,
+                    gi_intensity,
+                    ..plain_environment()
+                };
+                let inside = melon_core::Camera {
+                    eye: Vec3::new(1.25, 1.5, 0.3),
+                    center: Vec3::new(1.25, 1.0, 2.5),
+                    aspect: 1.0,
+                    ..Default::default()
+                };
+                // RGB sum of the brightest pixel (channel order does not matter).
+                let brightest = |pixels: &[u8]| {
+                    pixels
+                        .chunks(4)
+                        .map(|p| rgb_sum([p[0], p[1], p[2], 0]))
+                        .max()
+                        .unwrap_or(0)
+                };
+                let leak_on =
+                    render_converged(renderer, inside, light, env(1.0), &models, &mut server);
+                let leak_on = brightest(&leak_on);
+                let leak_off =
+                    render_converged(renderer, inside, light, env(0.0), &models, &mut server);
+                let leak_off = brightest(&leak_off);
+                let camera = melon_core::Camera {
+                    eye: Vec3::new(1.25, 1.5, -4.0),
+                    center: Vec3::new(1.25, 1.5, 0.0),
+                    aspect: 1.0,
+                    ..Default::default()
+                };
+                let shade = screen_px(camera.view_proj(), Vec3::new(1.25, 1.5, -0.4));
+                let control = |r: &mut Renderer, server: &mut melon_core::AssetServer, gi| {
+                    let pixels = render_converged(r, camera, light, env(gi), &models, server);
+                    rgb_sum(pixel_at(r, &pixels, shade))
+                };
+                let control_on = control(renderer, &mut server, 1.0);
+                let control_off = control(renderer, &mut server, 0.0);
+                // Tolerance: 3 sRGB steps per channel (0.4 m walls measure 3
+                // over all three channels; walls of one voxel leak hundreds).
+                if leak_on > leak_off + 9 {
+                    return Err(format!(
+                        "light leaks into the closed box: brightest RGB sum {leak_on} with GI, {leak_off} without"
+                    ));
+                }
+                if control_on < control_off + 30 {
+                    return Err(format!(
+                        "control: the shaded outer wall should get bounce: {control_on} with GI, {control_off} without"
+                    ));
+                }
+                Ok(())
+            }),
             Box::new(|renderer| {
                 // The review emissive cube 8 m away on black: about 8 pixels
                 // wide and HDR bright (12, 1.2, 0.14). Bloom lights up the black
@@ -4599,6 +4903,7 @@ mod tests {
                         environment: melon_core::Environment {
                             ao_strength: 0.0,
                             bloom_intensity: 0.0,
+                            gi_intensity: 0.0,
                             ..Default::default()
                         },
                         models,
@@ -4633,6 +4938,7 @@ mod tests {
                     fog_density: 0.0,
                     ao_strength: 0.0,
                     bloom_intensity: 0.0,
+                    gi_intensity: 0.0,
                     ..Default::default()
                 };
                 let light = melon_core::Light {
@@ -4672,6 +4978,7 @@ mod tests {
                     fog_density: 0.0,
                     ao_strength: 0.0,
                     bloom_intensity: 0.0,
+                    gi_intensity: 0.0,
                     ..Default::default()
                 };
                 let light = melon_core::Light {
@@ -4702,6 +5009,7 @@ mod tests {
                     fog_density: 0.0,
                     ao_strength: 0.0,
                     bloom_intensity: 0.0,
+                    gi_intensity: 0.0,
                     ..Default::default()
                 };
                 let light = melon_core::Light::default();
@@ -4743,6 +5051,7 @@ mod tests {
                         fog_density,
                         ao_strength: 0.0,
                         bloom_intensity: 0.0,
+                        gi_intensity: 0.0,
                         ..Default::default()
                     };
                     let light = melon_core::Light::default();

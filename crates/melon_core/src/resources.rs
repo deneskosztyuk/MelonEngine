@@ -198,6 +198,10 @@ pub struct Environment {
     /// Bloom: how much of the blurred HDR image is mixed into the scene
     /// colour before tonemapping; 0 = off (the bloom passes are skipped).
     pub bloom_intensity: f32,
+    /// Dynamic diffuse GI (DDGI probes over a voxel scene): scales the
+    /// probe irradiance that replaces the hemisphere ambient inside the GI
+    /// volume; 0 = off (the voxel and probe passes are skipped).
+    pub gi_intensity: f32,
 }
 
 impl Default for Environment {
@@ -210,6 +214,7 @@ impl Default for Environment {
             ao_strength: 1.0,
             ao_radius: 0.5,
             bloom_intensity: 0.08,
+            gi_intensity: 1.0,
         }
     }
 }
@@ -235,6 +240,11 @@ mod tests {
     fn environment_ao_defaults() {
         let env = Environment::default();
         assert_eq!((env.ao_strength, env.ao_radius), (1.0, 0.5));
+    }
+
+    #[test]
+    fn environment_gi_default_is_on() {
+        assert_eq!(Environment::default().gi_intensity, 1.0);
     }
 
     #[test]

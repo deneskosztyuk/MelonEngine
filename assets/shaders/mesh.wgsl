@@ -2,9 +2,11 @@
 // uv + tangent. Group 0: camera, light (sun + sky/ground hemisphere + shadow
 // matrix), shadow map, environment. Group 2: the material (base colour,
 // metallic-roughness, normal and emissive textures, one sampler, factors).
-// Group 3: per-view lighting inputs (the SSAO texture).
+// Group 3: per-view lighting inputs (the SSAO texture) and the DDGI probe
+// atlases (shared world data). gi_common.wgsl is prepended.
 // Sun: Cook-Torrance (GGX, height-correlated Smith, Schlick Fresnel), shadowed.
-// Ambient: hemisphere diffuse plus a sky-gradient specular, both occluded by
+// Ambient: diffuse from the DDGI probes inside the GI volume (hemisphere
+// outside it, or with GI off) plus a sky-gradient specular, both occluded by
 // SSAO (never the sun). Emissive is added,
 // then exponential distance fog fades toward the horizon colour. Output is
 // linear HDR; the tonemap pass maps it to the display.
@@ -84,8 +86,21 @@ struct VsOut {
 @group(2) @binding(5) var<uniform> material: MaterialUniform;
 // Ambient occlusion per screen pixel (R, 1 = open); 1x1 white when off.
 @group(3) @binding(0) var ao_tex: texture_2d<f32>;
+// DDGI probe atlases: irradiance (rgb, cosine-weighted mean radiance) and
+// distance moments (r = mean, g = mean square), octahedral tiles with a
+// 1-texel border; linear clamp sampler; volume and probe grid settings.
+@group(3) @binding(1) var irradiance_atlas: texture_2d<f32>;
+@group(3) @binding(2) var depth_atlas: texture_2d<f32>;
+@group(3) @binding(3) var gi_sampler: sampler;
+@group(3) @binding(4) var<uniform> gi: GiUniform;
+// Voxel passes only (their own group 0): the voxel radiance volume (see
+// VOXEL_SCALE) and the projection axis (x: 0 = X, 1 = Y, 2 = Z).
+@group(0) @binding(5) var<storage, read_write> voxels: array<atomic<u32>>;
+@group(0) @binding(6) var<uniform> voxel_axis: vec4u;
 
 const PI: f32 = 3.14159265;
+// False in the GI-off mesh pipeline (see the ambient term in fs_main).
+override GI_ENABLED: bool = true;
 
 @vertex
 fn vs_main(in: VsIn, @builtin(instance_index) instance: u32) -> VsOut {
@@ -180,6 +195,65 @@ fn specular_occlusion(ndv: f32, ao: f32, roughness: f32) -> f32 {
     return clamp(pow(ndv + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao, 0.0, 1.0);
 }
 
+// Atlas uv of direction `dir` in probe `cell`'s tile (`n` interior texels).
+fn probe_uv(cell: vec3i, dir: vec3f, n: u32, atlas: texture_2d<f32>) -> vec2f {
+    let px = vec2f(probe_tile(cell, n + 2u)) + 1.0 + (oct_encode(dir) * 0.5 + 0.5) * f32(n);
+    return px / vec2f(textureDimensions(atlas));
+}
+
+// Diffuse irradiance (cosine-weighted mean radiance) at `p` with normal `n`
+// from the 8 surrounding probes. Weights: trilinear, backface (probes
+// behind the surface count less), Chebyshev visibility from the distance
+// moments (probes that cannot see the point drop out). `v` points to the
+// viewer: the lookup point moves toward it and along the normal (DDGI's
+// self-shadow bias) so a surface does not shadow itself.
+fn gi_irradiance(p: vec3f, n: vec3f, v: vec3f) -> vec3f {
+    let biased = p + (0.2 * n + 0.8 * v) * (0.3 * 0.75 * gi.spacing);
+    let grid = (biased - gi.origin) / gi.spacing - 0.5;
+    let base = clamp(vec3i(floor(grid)), vec3i(0), vec3i(gi.probe_counts) - 2);
+    let alpha = clamp(grid - vec3f(base), vec3f(0.0), vec3f(1.0));
+    var sum = vec3f(0.0);
+    var weight_sum = 0.0;
+    for (var i = 0u; i < 8u; i++) {
+        let offset = vec3u(i, i >> 1u, i >> 2u) & vec3u(1u);
+        let cell = base + vec3i(offset);
+        let probe = probe_position(cell);
+        let to_probe = normalize(probe - p);
+        let wrap = (dot(to_probe, n) + 1.0) * 0.5;
+        var w = wrap * wrap + 0.2;
+        let from_probe = biased - probe;
+        let r = length(from_probe);
+        let moments = textureSampleLevel(depth_atlas, gi_sampler,
+            probe_uv(cell, from_probe / max(r, 1e-4), DEPTH_TEXELS, depth_atlas), 0.0).rg;
+        if (r > moments.x) {
+            let variance = abs(moments.y - moments.x * moments.x);
+            let d = r - moments.x;
+            let chebyshev = variance / (variance + d * d);
+            w *= chebyshev * chebyshev * chebyshev;
+        }
+        w = max(w, 1e-6);
+        // Crush tiny weights further, so probes that see the point win
+        // over leaky ones.
+        if (w < 0.2) {
+            w *= w * w / (0.2 * 0.2);
+        }
+        let t = select(1.0 - alpha, alpha, offset == vec3u(1u));
+        w *= t.x * t.y * t.z;
+        let irradiance = textureSampleLevel(irradiance_atlas, gi_sampler,
+            probe_uv(cell, n, IRRADIANCE_TEXELS, irradiance_atlas), 0.0).rgb;
+        sum += w * irradiance;
+        weight_sum += w;
+    }
+    return sum / max(weight_sum, 1e-12);
+}
+
+// 1 inside the GI volume, fading to 0 one probe spacing outside it.
+fn gi_volume_weight(p: vec3f) -> f32 {
+    let hi = gi.origin + vec3f(gi.probe_counts) * gi.spacing;
+    let outside = max(max(gi.origin - p, p - hi), vec3f(0.0));
+    return clamp(1.0 - max(outside.x, max(outside.y, outside.z)) / gi.spacing, 0.0, 1.0);
+}
+
 // World normal: the vertex normal bent by the tangent-space normal map.
 fn surface_normal(in: VsOut) -> vec3f {
     let n = normalize(in.world_normal);
@@ -225,12 +299,80 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let hemi = light.ambient * mix(light.ground_color, light.sky_color, n.y * 0.5 + 0.5);
     let f_amb = fresnel_schlick_roughness(ndv, f0, roughness);
     let reflected = mix(sky_radiance(reflect(-v, n)), hemi, roughness);
-    let ambient = (1.0 - f_amb) * (1.0 - metallic) * base * hemi * ao
+    var ambient = (1.0 - f_amb) * (1.0 - metallic) * base * hemi * ao
         + f_amb * reflected * specular_occlusion(ndv, ao, roughness);
+    // GI on: the probes replace the hemisphere in the diffuse term, blending
+    // back to it at the volume border. GI off is a pipeline built with
+    // GI_ENABLED false: the branch compiles away and the image matches the
+    // renderer without GI exactly (a runtime branch alone shifts a few
+    // pixels by one step).
+    if (GI_ENABLED) {
+        let inside = gi_volume_weight(in.world_pos);
+        var diffuse_light = hemi;
+        if (inside > 0.0) {
+            diffuse_light = mix(hemi, gi.intensity * gi_irradiance(in.world_pos, n, v), inside);
+        }
+        let diffuse = (1.0 - f_amb) * (1.0 - metallic) * base * diffuse_light * ao;
+        if (gi.gi_only != 0u) {
+            return vec4f(diffuse, 1.0);
+        }
+        ambient = diffuse + f_amb * reflected * specular_occlusion(ndv, ao, roughness);
+    }
 
     let emissive = (textureSample(emissive_tex, material_sampler, in.uv).rgb * material.emissive);
     let color = sun + ambient + emissive;
 
     let fog = 1.0 - exp(-env.fog_density * distance(in.world_pos, camera.eye));
     return vec4f(mix(color, env.horizon_color, fog), 1.0);
+}
+
+// Voxel passes: every instance in the GI volume, projected orthographically
+// along one axis (voxel_axis.x) onto a viewport of one pixel per voxel, no
+// depth test. Each fragment writes the radiance of its surface into the
+// voxel it lies in; three passes (X, Y, Z) cover every orientation.
+@vertex
+fn vs_voxel(in: VsIn, @builtin(instance_index) instance: u32) -> VsOut {
+    let model = instances[instance];
+    var out: VsOut;
+    let world_pos = (model.model * vec4f(in.position, 1.0)).xyz;
+    let rel = (world_pos - gi.origin) / (vec3f(gi.voxel_counts) * gi.voxel_size);
+    var uv = rel.xy;
+    if (voxel_axis.x == 0u) {
+        uv = rel.zy;
+    } else if (voxel_axis.x == 1u) {
+        uv = rel.xz;
+    }
+    out.clip_pos = vec4f(uv * 2.0 - 1.0, 0.5, 1.0);
+    out.world_normal = (model.normal_matrix * vec4f(in.normal, 0.0)).xyz;
+    out.uv = in.uv;
+    out.world_pos = world_pos;
+    out.world_tangent = vec4f(0.0);
+    return out;
+}
+
+// Outgoing diffuse radiance: albedo x (shadowed sun + last frame's probe
+// irradiance, the infinite-bounce feedback) + emissive. Merged per channel
+// with atomicMax, so the lit face of a surface thinner than a voxel wins.
+@fragment
+fn fs_voxel(in: VsOut) -> @location(0) vec4f {
+    let n = normalize(in.world_normal);
+    let base = (textureSample(base_color_tex, material_sampler, in.uv) * material.base_color).rgb;
+    let mr = textureSample(metallic_roughness_tex, material_sampler, in.uv);
+    let emissive = textureSample(emissive_tex, material_sampler, in.uv).rgb * material.emissive;
+    let metallic = clamp(mr.b * material.metallic, 0.0, 1.0);
+    let sun = (1.0 - light.ambient) * light.color * max(dot(n, light.direction), 0.0)
+        * shadow_factor(in.world_pos, n);
+    let bounce = gi.intensity * gi_irradiance(in.world_pos, n, n);
+    let radiance = (1.0 - metallic) * base * (sun + bounce) + emissive;
+    // A hair inside the surface, so faces on a voxel boundary pick the solid side.
+    let cell = vec3i(floor((in.world_pos - 0.01 * n - gi.origin) / gi.voxel_size));
+    let counts = vec3i(gi.voxel_counts);
+    if (all(cell >= vec3i(0)) && all(cell < counts)) {
+        let i = 3u * u32(cell.x + counts.x * (cell.y + counts.y * cell.z));
+        let q = vec3u(clamp(radiance, vec3f(0.0), vec3f(VOXEL_MAX)) * VOXEL_SCALE) + 1u;
+        atomicMax(&voxels[i], q.x);
+        atomicMax(&voxels[i + 1u], q.y);
+        atomicMax(&voxels[i + 2u], q.z);
+    }
+    return vec4f(0.0);
 }
