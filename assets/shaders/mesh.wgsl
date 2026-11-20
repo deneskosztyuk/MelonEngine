@@ -127,6 +127,16 @@ struct ClusterUniform {
     forward: vec4f,
 };
 
+// Point / spot shadows (local_shadows.rs): the depth atlas and one record
+// per tile (view-projection, atlas rect, texel size per metre).
+struct ShadowView {
+    view_proj: mat4x4f,
+    rect: vec4f,
+    params: vec4f,
+};
+@group(0) @binding(11) var local_shadow_atlas: texture_depth_2d;
+@group(0) @binding(12) var<storage, read> shadow_views: array<ShadowView>;
+
 @group(3) @binding(9) var<storage, read> local_lights: array<LocalLight>;
 @group(3) @binding(10) var<storage, read> cluster_ranges: array<vec2u>;
 @group(3) @binding(11) var<storage, read> cluster_indices: array<u32>;
@@ -308,6 +318,68 @@ fn gi_only() -> bool {
     return gi.gi_only != 0u;
 }
 
+// Shadow of a light with a shadow view (spot.w = its first tile; point lights
+// have six, picked by the dominant axis of the vector from the light): 3x3
+// PCF in the atlas, 1.0 where the point is outside the view.
+fn local_shadow(light: LocalLight, world_pos: vec3f, normal: vec3f) -> f32 {
+    let d = world_pos - light.position_range.xyz;
+    var index = i32(light.spot.w);
+    if (light.spot.z < 0.5) {
+        let a = abs(d);
+        var face = 0;
+        if (a.x >= a.y && a.x >= a.z) {
+            face = select(1, 0, d.x > 0.0);
+        } else if (a.y >= a.z) {
+            face = select(3, 2, d.y > 0.0);
+        } else {
+            face = select(5, 4, d.z > 0.0);
+        }
+        index += face;
+    }
+    let view = shadow_views[index];
+    let dist = max(length(d), 1e-3);
+    // Normal offset: about 1.5 shadow texels at this distance, more at grazing angles.
+    let ndl = clamp(dot(normal, -d / dist), 0.0, 1.0);
+    let offset = normal * (1.5 * view.params.x * dist * sqrt(1.0 - ndl * ndl));
+    let clip = view.view_proj * vec4f(world_pos + offset, 1.0);
+    if (clip.w <= 0.0) {
+        return 1.0;
+    }
+    let ndc = clip.xyz / clip.w;
+    if (any(abs(ndc.xy) > vec2f(1.0)) || ndc.z > 1.0 || ndc.z < 0.0) {
+        return 1.0;
+    }
+    let texel = 1.0 / vec2f(textureDimensions(local_shadow_atlas));
+    let lo = view.rect.xy + texel;
+    let hi = view.rect.xy + view.rect.zw - texel;
+    let uv = view.rect.xy + (ndc.xy * vec2f(0.5, -0.5) + 0.5) * view.rect.zw;
+    var sum = 0.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let at = clamp(uv + vec2f(f32(x), f32(y)) * texel, lo, hi);
+            sum += textureSampleCompareLevel(local_shadow_atlas, shadow_sampler, at, ndc.z);
+        }
+    }
+    return sum / 9.0;
+}
+
+// Direction to the light (xyz) and its attenuation (w): inverse square
+// windowed to the range, times the squared smooth cone for spots.
+fn local_light_attenuation(light: LocalLight, world_pos: vec3f) -> vec4f {
+    let to_light = light.position_range.xyz - world_pos;
+    let d2 = max(dot(to_light, to_light), 1e-4);
+    let r = light.position_range.w;
+    let l = to_light * inverseSqrt(d2);
+    let q = d2 / (r * r);
+    let window = clamp(1.0 - q * q, 0.0, 1.0);
+    var atten = window * window / d2;
+    if (light.spot.z > 0.5) {
+        let cone = clamp(dot(-l, light.direction.xyz) * light.spot.x + light.spot.y, 0.0, 1.0);
+        atten *= cone * cone;
+    }
+    return vec4f(l, atten);
+}
+
 // Light from the point and spot lights in this fragment's cluster: the same
 // Cook-Torrance as the sun, with radiance color / d^2 windowed to reach 0 at
 // the light's range (Karis) and, for spots, a squared smooth cone.
@@ -323,26 +395,22 @@ fn local_light_radiance(
     var sum = vec3f(0.0);
     for (var i = 0u; i < range.y; i++) {
         let light = local_lights[cluster_indices[range.x + i]];
-        let to_light = light.position_range.xyz - world_pos;
-        let d2 = max(dot(to_light, to_light), 1e-4);
-        let r = light.position_range.w;
-        let l = to_light * inverseSqrt(d2);
-        let q = d2 / (r * r);
-        let window = clamp(1.0 - q * q, 0.0, 1.0);
-        var atten = window * window / d2;
-        if (light.spot.z > 0.5) {
-            let cone = clamp(dot(-l, light.direction.xyz) * light.spot.x + light.spot.y, 0.0, 1.0);
-            atten *= cone * cone;
-        }
+        let la = local_light_attenuation(light, world_pos);
+        let l = la.xyz;
+        let atten = la.w;
         let ndl = max(dot(n, l), 0.0);
         if (atten <= 0.0 || ndl <= 0.0) {
             continue;
+        }
+        var shadow = 1.0;
+        if (light.spot.w >= 0.0) {
+            shadow = local_shadow(light, world_pos, normalize(n));
         }
         let h = normalize(l + v);
         let f = fresnel_schlick(max(dot(h, v), 0.0), f0);
         let spec = distribution_ggx(max(dot(n, h), 0.0), alpha) * visibility_smith_ggx(ndv, ndl, alpha) * f;
         let diff = (1.0 - f) * (1.0 - metallic) * base / PI;
-        sum += (diff + spec) * light.color.rgb * atten * ndl;
+        sum += (diff + spec) * light.color.rgb * atten * ndl * shadow;
     }
     return sum;
 }
@@ -466,7 +534,19 @@ fn fs_voxel(in: VsOut) -> @location(0) vec4f {
     // frame: the atlases may hold another scene.
     let feedback = select(0.0, gi.intensity, gi.hysteresis > 0.0);
     let bounce = feedback * gi_irradiance(in.world_pos, n, n, false);
-    let radiance = (1.0 - metallic) * base * (sun + bounce) + emissive;
+    // Shadowed point / spot lights (the first cluster.dims.w of the light
+    // list) inject their diffuse light; unshadowed ones do not, so light
+    // never leaks through walls.
+    var local = vec3f(0.0);
+    for (var i = 0u; i < cluster.dims.w; i++) {
+        let light = local_lights[i];
+        let la = local_light_attenuation(light, in.world_pos);
+        let ndl = max(dot(n, la.xyz), 0.0);
+        if (la.w > 0.0 && ndl > 0.0) {
+            local += light.color.rgb * la.w * ndl * local_shadow(light, in.world_pos, n) / PI;
+        }
+    }
+    let radiance = (1.0 - metallic) * base * (sun + bounce + local) + emissive;
     // A hair inside the surface, so faces on a voxel boundary pick the solid side.
     let cell = vec3i(floor((in.world_pos - 0.01 * n - gi.origin) / gi.voxel_size));
     let counts = vec3i(gi.voxel_counts);

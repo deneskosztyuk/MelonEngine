@@ -187,13 +187,21 @@ pub struct ClusterData {
     pub dropped: usize,
     /// Shaded lights, in `lights` order, as given to `build` (callers match
     /// shadow slots to them).
-    #[allow(dead_code)] // read by the shadow slot assignment (goal 5)
     pub source: Vec<usize>,
+    /// The first `shadowed` of `lights` cast shadows (the nearest
+    /// shadow-casting ones, up to the cap).
+    pub shadowed: usize,
 }
 
 /// Pick the `max_lights` most important visible lights (brightest per
-/// squared distance) and list them per cluster.
-pub fn build(grid: &ClusterGrid, lights: &[LocalLight], max_lights: usize) -> ClusterData {
+/// squared distance), put the nearest `shadow_cap` of the shadow-casting
+/// ones first, and list them per cluster.
+pub fn build(
+    grid: &ClusterGrid,
+    lights: &[LocalLight],
+    max_lights: usize,
+    shadow_cap: usize,
+) -> ClusterData {
     let max_lights = max_lights.min(LIGHT_CAPACITY);
     let mut visible: Vec<(usize, [u32; 6], f32)> = lights
         .iter()
@@ -208,6 +216,17 @@ pub fn build(grid: &ClusterGrid, lights: &[LocalLight], max_lights: usize) -> Cl
     let dropped = visible.len().saturating_sub(max_lights);
     visible.sort_by(|a, b| b.2.total_cmp(&a.2));
     visible.truncate(max_lights);
+    let distance = |i: usize| lights[i].position.distance_squared(grid.eye);
+    let mut casters: Vec<usize> = visible
+        .iter()
+        .map(|v| v.0)
+        .filter(|&i| lights[i].cast_shadows)
+        .collect();
+    casters.sort_by(|&a, &b| distance(a).total_cmp(&distance(b)));
+    casters.truncate(shadow_cap);
+    // Shadowed lights first (nearest first), the rest in importance order.
+    visible.sort_by_key(|v| casters.iter().position(|&c| c == v.0).unwrap_or(usize::MAX));
+    let shadowed = casters.len();
 
     let mut counts = vec![0u32; CLUSTER_COUNT];
     let each_cluster = |range: &[u32; 6], mut f: Box<dyn FnMut(usize) + '_>| {
@@ -268,6 +287,7 @@ pub fn build(grid: &ClusterGrid, lights: &[LocalLight], max_lights: usize) -> Cl
         indices,
         dropped,
         source: visible.iter().map(|(i, _, _)| *i).collect(),
+        shadowed,
     }
 }
 
@@ -429,7 +449,7 @@ mod tests {
         let g = grid();
         assert!(g.range_of(Vec3::new(0.0, 0.0, 10.0), 1.0).is_none());
         assert!(g.range_of(Vec3::new(100.0, 0.0, -10.0), 1.0).is_none());
-        let data = build(&g, &[point(Vec3::new(0.0, 0.0, 10.0), 1.0)], 16);
+        let data = build(&g, &[point(Vec3::new(0.0, 0.0, 10.0), 1.0)], 16, 0);
         assert!(data.lights.is_empty() && data.indices.is_empty());
     }
 
@@ -440,7 +460,7 @@ mod tests {
             point(Vec3::new(0.0, 0.0, -10.0), 1.0),
             point(Vec3::new(6.0, 2.0, -20.0), 3.0),
         ];
-        let data = build(&g, &lights, 16);
+        let data = build(&g, &lights, 16, 0);
         assert_eq!(data.lights.len(), 2);
         for (slot, &source) in data.source.iter().enumerate() {
             let l = lights[source];
@@ -469,11 +489,33 @@ mod tests {
             point(Vec3::new(0.0, 0.0, -5.0), 2.0),
             point(Vec3::new(0.0, 0.0, -12.0), 2.0),
         ];
-        let data = build(&g, &lights, 2);
+        let data = build(&g, &lights, 2, 0);
         assert_eq!(data.dropped, 1);
         let mut kept = data.source.clone();
         kept.sort();
         assert_eq!(kept, [1, 2]);
+    }
+
+    #[test]
+    fn the_shadow_cap_keeps_the_nearest_casters_first() {
+        let g = grid();
+        let caster = |z: f32| LocalLight {
+            cast_shadows: true,
+            ..point(Vec3::new(0.0, 0.0, z), 2.0)
+        };
+        let lights = [
+            caster(-30.0),
+            point(Vec3::new(0.0, 0.0, -3.0), 2.0),
+            caster(-8.0),
+            caster(-15.0),
+            caster(-4.0),
+        ];
+        let data = build(&g, &lights, 16, 2);
+        assert_eq!(data.shadowed, 2);
+        // The two nearest casters, nearest first, ahead of everything else.
+        assert_eq!(&data.source[..2], [4, 2]);
+        assert_eq!(build(&g, &lights, 16, 0).shadowed, 0);
+        assert_eq!(build(&g, &lights, 16, 9).shadowed, 4);
     }
 
     #[test]
@@ -483,7 +525,7 @@ mod tests {
             spot: Some((0.3, 0.6)),
             ..point(Vec3::new(0.0, 0.0, -10.0), 5.0)
         };
-        let l = build(&g, &[spot], 4).lights[0];
+        let l = build(&g, &[spot], 4, 0).lights[0];
         let at = |angle: f32| (angle.cos() * l.spot[0] + l.spot[1]).clamp(0.0, 1.0);
         assert!((at(0.3) - 1.0).abs() < 1e-4 && at(0.6).abs() < 1e-4 && at(0.45) > 0.3);
         assert_eq!(l.spot[2], 1.0);

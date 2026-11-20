@@ -5,6 +5,7 @@ mod extract;
 pub mod gi;
 mod ibl;
 mod lights;
+mod local_shadows;
 mod materials;
 mod models;
 mod overlay;
@@ -301,6 +302,10 @@ pub struct RenderStats {
     /// `RenderQuality::max_lights`.
     pub lights: u32,
     pub lights_dropped: u32,
+    /// Lights with shadows this frame, and the shadow views (atlas tiles)
+    /// they drew.
+    pub shadowed_lights: u32,
+    pub shadow_views: u32,
 }
 
 #[repr(C)]
@@ -664,6 +669,9 @@ struct Calls<'a> {
     blend: Vec<(glam::Vec3, DrawCall<'a>)>,
 }
 
+/// One shadow view's draws: plain casters and alpha-masked ones.
+type ShadowDraws<'a> = (Vec<(&'a Mesh, std::ops::Range<u32>)>, Vec<DrawCall<'a>>);
+
 type DrawCall<'a> = (&'a Mesh, &'a wgpu::BindGroup, std::ops::Range<u32>);
 
 /// A mesh pipeline for surfaces the opaque, back-face-culled one does not fit.
@@ -846,6 +854,14 @@ pub struct SceneRenderer {
     /// `shadow_pipeline`): separate buffers, since writes apply at submit.
     shadow_camera_buffers: Vec<wgpu::Buffer>,
     shadow_bind_groups: Vec<wgpu::BindGroup>,
+    /// Point / spot shadows: the depth atlas (4 x 4 while no light casts
+    /// shadows), the tile records the shaders read, and a camera uniform
+    /// per drawn tile (`ensure_local_cameras`).
+    local_atlas: wgpu::Texture,
+    local_atlas_view: wgpu::TextureView,
+    local_views_buffer: wgpu::Buffer,
+    shadow_camera_layout: wgpu::BindGroupLayout,
+    local_shadow_cameras: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     /// The sun's shadow map, one layer per cascade
     /// (`set_shadow_map_size` / `set_cascades` recreate it), its array view
     /// for sampling and a view per layer to render into.
@@ -1370,24 +1386,72 @@ impl Renderer {
         scene.update_ssao(&frame.environment);
         // The lights and their cluster lists of this view; other views draw
         // without local lights.
-        let (cluster, cluster_data) = if main {
+        // The shadow atlas exists at full size only while a light casts shadows.
+        let wants_atlas =
+            main && quality.shadowed_lights > 0 && frame.lights.iter().any(|l| l.cast_shadows);
+        scene.set_local_shadow_atlas(if wants_atlas {
+            quality.local_shadow_size
+        } else {
+            4
+        });
+        let (mut cluster, mut cluster_data) = if main {
             let size = target.size();
             let grid = lights::ClusterGrid::new(
                 frame.view_proj,
                 frame.eye,
                 [size.width as f32, size.height as f32],
             );
-            let data = lights::build(&grid, &frame.lights, quality.max_lights as usize);
+            let data = lights::build(
+                &grid,
+                &frame.lights,
+                quality.max_lights as usize,
+                quality.shadowed_lights as usize,
+            );
             (grid.uniform(), data)
         } else {
             (lights::ClusterUniform::empty(), Default::default())
         };
+        // Point / spot shadows: a tile per spot light, six per point light.
+        let mut local_views: Vec<glam::Mat4> = Vec::new();
+        let mut local_layout = (4, 1);
+        if cluster_data.shadowed > 0 {
+            let mut tans = Vec::new();
+            for slot in 0..cluster_data.shadowed {
+                let light = &frame.lights[cluster_data.source[slot]];
+                let (views, tan_half) = local_shadows::views_for(light);
+                cluster_data.lights[slot].spot[3] = local_views.len() as f32;
+                tans.extend(std::iter::repeat_n(tan_half, views.len()));
+                local_views.extend(views);
+            }
+            let atlas = scene.local_atlas.width();
+            local_layout = local_shadows::tile_layout(atlas, local_views.len());
+            let (tile, grid) = local_layout;
+            let records: Vec<local_shadows::ShadowViewGpu> = local_views
+                .iter()
+                .zip(&tans)
+                .enumerate()
+                .map(|(i, (m, tan_half))| {
+                    let (x, y) = local_shadows::tile_origin(i, tile, grid);
+                    let a = atlas as f32;
+                    local_shadows::ShadowViewGpu {
+                        view_proj: m.to_cols_array_2d(),
+                        rect: [x as f32 / a, y as f32 / a, tile as f32 / a, tile as f32 / a],
+                        params: [2.0 * tan_half / tile as f32, 0.0, 0.0, 0.0],
+                    }
+                })
+                .collect();
+            scene
+                .queue
+                .write_buffer(&scene.local_views_buffer, 0, bytemuck::cast_slice(&records));
+        }
+        cluster.dims[3] = cluster_data.shadowed as u32;
         scene
             .frame_lights
             .write(&scene.queue, &cluster, &cluster_data);
         let stats_lights = (
             cluster_data.lights.len() as u32,
             cluster_data.dropped as u32,
+            cluster_data.shadowed as u32,
         );
         if main {
             scene.gi.update(
@@ -1439,10 +1503,17 @@ impl Renderer {
         let mut stats = RenderStats {
             lights: stats_lights.0,
             lights_dropped: stats_lights.1,
+            shadowed_lights: stats_lights.2,
+            shadow_views: local_views.len() as u32,
             ..Default::default()
         };
         let (mut seen, mut voxelized) = (Vec::new(), Vec::new());
         let mut casters: Vec<Vec<_>> = vec![Vec::new(); shadow_boxes.len()];
+        let local_boxes: Vec<Frustum> = local_views
+            .iter()
+            .map(|m| Frustum::from_view_proj(*m))
+            .collect();
+        let mut local_casters: Vec<Vec<_>> = vec![Vec::new(); local_boxes.len()];
         // Entities with the same material overrides share a set id (0 = none),
         // so they batch together.
         let mut set_ids: std::collections::HashMap<&[Option<MaterialHandle>], u32> =
@@ -1475,10 +1546,19 @@ impl Renderer {
             if !cast {
                 stats.shadow_culled += 1;
             }
+            for (list, view_box) in local_casters.iter_mut().zip(&local_boxes) {
+                if view_box.intersects_aabb(min, max) {
+                    list.push((key, *matrix));
+                }
+            }
         }
         let mut matrices = Vec::with_capacity(seen.len() * 2);
         let seen = batch(seen, &mut matrices);
         let casters: Vec<_> = casters
+            .into_iter()
+            .map(|list| batch(list, &mut matrices))
+            .collect();
+        let local_casters: Vec<_> = local_casters
             .into_iter()
             .map(|list| batch(list, &mut matrices))
             .collect();
@@ -1540,12 +1620,11 @@ impl Renderer {
             .cloned()
             .collect();
         let blend_calls: Vec<_> = calls.blend.iter().map(|(_, call)| call.clone()).collect();
-        // Per cascade: the plain casters and the alpha-masked ones.
-        type PlainCasters<'a> = Vec<(&'a Mesh, std::ops::Range<u32>)>;
-        let mut shadow_calls: Vec<(PlainCasters, Vec<DrawCall>)> = Vec::new();
-        for cascade in &casters {
+        // Per shadow view (cascade or point / spot tile): the plain casters
+        // and the alpha-masked ones.
+        let casters_of = |view: &Vec<(DrawKey, std::ops::Range<u32>)>| {
             let (mut plain, mut masked) = (Vec::new(), Vec::new());
-            for (key, instances) in cascade {
+            for (key, instances) in view {
                 let model = self.model_cache.model(server, key.0);
                 for (part, mesh) in model.meshes.iter().enumerate() {
                     let (group, surface) = part_material(*key, part);
@@ -1559,8 +1638,10 @@ impl Renderer {
                     }
                 }
             }
-            shadow_calls.push((plain, masked));
-        }
+            (plain, masked)
+        };
+        let shadow_calls: Vec<ShadowDraws> = casters.iter().map(casters_of).collect();
+        let local_calls: Vec<ShadowDraws> = local_casters.iter().map(casters_of).collect();
         let all_draws = [draw_calls, &calls.two_sided, &blend_calls];
         stats.draw_calls = all_draws.iter().map(|c| c.len() as u32).sum();
         stats.instances_drawn = all_draws
@@ -1570,6 +1651,7 @@ impl Renderer {
             .sum();
         stats.shadow_draw_calls = shadow_calls
             .iter()
+            .chain(&local_calls)
             .map(|(plain, masked)| (plain.len() + masked.len()) as u32)
             .sum();
 
@@ -1593,6 +1675,9 @@ impl Renderer {
         }
         for (layer, (plain, masked)) in shadow_calls.iter().enumerate() {
             scene.render_cascade(encoder, layer, plain, masked);
+        }
+        if !local_views.is_empty() {
+            scene.render_local_shadows(encoder, &local_views, local_layout, &local_calls);
         }
         mark(encoder, timer, timings::Mark::Shadows);
         // The depth/normal prepass feeds SSAO and SSGI. AO off (quality or
@@ -1795,6 +1880,27 @@ impl SceneRenderer {
                     count: None,
                 },
                 ibl_texture_entry(10),
+                // Point / spot shadows: the depth atlas and the tile records.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let model_layout = instance_buffer_layout(&device);
@@ -2010,6 +2116,13 @@ impl SceneRenderer {
             })
             .collect();
 
+        let (local_atlas, local_atlas_view) = create_local_atlas(&device, 4);
+        let local_views_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("local shadow views"),
+            size: (local_shadows::MAX_VIEWS * size_of::<local_shadows::ShadowViewGpu>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let ibl_sky = ibl::SkyParams::default();
         let ibl = ibl::IblGpu::new(&device, &queue, &ibl::Source::Procedural(ibl_sky));
         let frame_bind_group = frame_bind_group(
@@ -2019,6 +2132,7 @@ impl SceneRenderer {
             &shadow_view,
             &shadow_sampler,
             &ibl,
+            (&local_atlas_view, &local_views_buffer),
         );
 
         let texture_1x1 = |label, rgba: [u8; 4]| {
@@ -2076,6 +2190,8 @@ impl SceneRenderer {
                 light: &light_buffer,
                 shadow_view: &shadow_view,
                 shadow_sampler: &shadow_sampler,
+                local_atlas: &local_atlas_view,
+                local_views: &local_views_buffer,
                 model_layout: &model_layout,
                 material_layout: &material_layout,
                 lighting_layout: &lighting_layout,
@@ -2087,18 +2203,20 @@ impl SceneRenderer {
         };
         let empty_lights = lights::LightBuffers::new(&device);
         let frame_lights = lights::LightBuffers::new(&device);
-        let lighting = |label, voxels| {
+        let lighting = |label, voxels, lights: &lights::LightBuffers| {
             let mut entries = vec![white_ao.clone()];
             entries.extend(gi.entries(None, voxels));
-            entries.extend(empty_lights.entries());
+            entries.extend(lights.entries());
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
                 layout: &lighting_layout,
                 entries: &entries,
             })
         };
-        let unoccluded_lighting = lighting("unoccluded lighting bind group", true);
-        let voxel_pass_lighting = lighting("gi voxel pass lighting bind group", false);
+        let unoccluded_lighting = lighting("unoccluded lighting bind group", true, &empty_lights);
+        // The voxel passes see the frame's lights (the shadowed ones inject).
+        let voxel_pass_lighting =
+            lighting("gi voxel pass lighting bind group", false, &frame_lights);
 
         let (instance_buffer, instance_bind_group) =
             create_instance_buffer(&device, &model_layout, INITIAL_INSTANCE_CAPACITY);
@@ -2136,6 +2254,11 @@ impl SceneRenderer {
             shadow_mask_pipeline,
             shadow_camera_buffers,
             shadow_bind_groups,
+            local_atlas,
+            local_atlas_view,
+            local_views_buffer,
+            shadow_camera_layout: shadow_layout,
+            local_shadow_cameras: Vec::new(),
             shadow_texture,
             shadow_view,
             shadow_layers,
@@ -2190,6 +2313,25 @@ impl SceneRenderer {
         }
         (self.shadow_texture, self.shadow_view, self.shadow_layers) =
             create_shadow_map(&self.device, size, layers);
+        self.shadow_bindings_changed();
+        tracing::debug!(size, layers, "shadow map recreated");
+    }
+
+    /// Edge of the point / spot shadow atlas, recreated when it changes
+    /// (a 4 x 4 stand-in while nothing casts shadows).
+    pub fn set_local_shadow_atlas(&mut self, size: u32) {
+        let size = size.clamp(4, self.device.limits().max_texture_dimension_2d);
+        if self.local_atlas.width() == size {
+            return;
+        }
+        (self.local_atlas, self.local_atlas_view) = create_local_atlas(&self.device, size);
+        self.shadow_bindings_changed();
+        tracing::debug!(size, "local shadow atlas recreated");
+    }
+
+    /// Rebind everything that reads the shadow textures (group 0, the GI
+    /// voxel passes).
+    fn shadow_bindings_changed(&mut self) {
         self.rebuild_frame_bind_group();
         self.gi.set_shadow_map(
             &self.device,
@@ -2198,12 +2340,93 @@ impl SceneRenderer {
                 light: &self.light_buffer,
                 shadow_view: &self.shadow_view,
                 shadow_sampler: &self.shadow_sampler,
+                local_atlas: &self.local_atlas_view,
+                local_views: &self.local_views_buffer,
                 model_layout: &self.model_bind_group_layout,
                 material_layout: &self.material_bind_group_layout,
                 lighting_layout: &self.lighting_layout,
             },
         );
-        tracing::debug!(size, layers, "shadow map recreated");
+    }
+
+    /// Camera uniforms and bind groups for at least `count` local shadow tiles.
+    fn ensure_local_cameras(&mut self, count: usize) {
+        while self.local_shadow_cameras.len() < count {
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("local shadow camera uniform"),
+                size: std::mem::size_of::<CameraUniform>() as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("local shadow camera bind group"),
+                layout: &self.shadow_camera_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+            });
+            self.local_shadow_cameras.push((buffer, group));
+        }
+    }
+
+    /// Draw every point / spot shadow tile into the atlas in one pass: tile
+    /// `i` renders `tiles[i]` with its view-projection into its square of
+    /// the atlas (`tile` texels, `grid` tiles per row).
+    fn render_local_shadows(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        views: &[glam::Mat4],
+        layout: (u32, u32),
+        draws: &[ShadowDraws],
+    ) {
+        self.ensure_local_cameras(views.len());
+        for ((buffer, _), m) in self.local_shadow_cameras.iter().zip(views) {
+            let camera = CameraUniform {
+                view_proj: m.to_cols_array_2d(),
+                ..Zeroable::zeroed()
+            };
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(&[camera]));
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("melon_render local shadow pass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.local_atlas_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        let (tile, grid) = layout;
+        for (i, (plain, masked)) in draws.iter().enumerate() {
+            let (x, y) = local_shadows::tile_origin(i, tile, grid);
+            pass.set_viewport(x as f32, y as f32, tile as f32, tile as f32, 0.0, 1.0);
+            pass.set_scissor_rect(x, y, tile, tile);
+            pass.set_bind_group(0, &self.local_shadow_cameras[i].1, &[]);
+            pass.set_bind_group(1, &self.instance_bind_group, &[]);
+            pass.set_pipeline(&self.shadow_pipeline);
+            for (mesh, instances) in plain {
+                pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.draw_indexed(0..mesh.index_count, 0, instances.clone());
+            }
+            if !masked.is_empty() {
+                pass.set_pipeline(&self.shadow_mask_pipeline);
+                for (mesh, material, instances) in masked {
+                    pass.set_bind_group(2, *material, &[]);
+                    pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
+                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    pass.draw_indexed(0..mesh.index_count, 0, instances.clone());
+                }
+            }
+        }
     }
 
     /// Group 0 over the current buffers, shadow map and IBL textures.
@@ -2219,6 +2442,7 @@ impl SceneRenderer {
             &self.shadow_view,
             &self.shadow_sampler,
             &self.ibl,
+            (&self.local_atlas_view, &self.local_views_buffer),
         );
     }
 
@@ -2405,6 +2629,7 @@ fn frame_bind_group(
     shadow_view: &wgpu::TextureView,
     shadow_sampler: &wgpu::Sampler,
     ibl: &ibl::IblGpu,
+    (local_atlas, local_views): (&wgpu::TextureView, &wgpu::Buffer),
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("frame bind group"),
@@ -2446,8 +2671,36 @@ fn frame_bind_group(
                 binding: 10,
                 resource: wgpu::BindingResource::TextureView(&ibl.brdf),
             },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::TextureView(local_atlas),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: local_views.as_entire_binding(),
+            },
         ],
     })
+}
+
+/// A `Depth32Float` atlas of `size` x `size` texels for point / spot shadows.
+fn create_local_atlas(device: &wgpu::Device, size: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("local shadow atlas"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
 }
 
 impl Renderer {
@@ -6337,6 +6590,147 @@ mod tests {
         Ok(())
     }
 
+    /// `render_lit`'s white floor plus, when `occluder`, a 2 m slab one metre
+    /// up; returns the pixels and stats. Light `lights`, no sun.
+    fn render_with_occluder(
+        r: &mut Renderer,
+        lights: Vec<lights::LocalLight>,
+        quality: melon_core::RenderQuality,
+        occluder: bool,
+        gi_intensity: f32,
+    ) -> (Vec<u8>, RenderStats) {
+        let root = material_project("lit_occluder");
+        write_mat(
+            &root,
+            "white",
+            "(base_color: (0.8, 0.8, 0.8, 1.0), metallic: 0.0, roughness: 0.8)",
+        );
+        let mut server = fresh_ids_server(root.clone(), 7400);
+        r.materials = Default::default();
+        r.model_cache = ModelCache::new(&r.scene);
+        let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+        let material = server.load("assets/materials/white.mat");
+        let mut frame = FrameData {
+            view_proj: top_down_camera().view_proj(),
+            eye: top_down_camera().eye,
+            light: melon_core::Light {
+                color: glam::Vec3::ZERO,
+                ambient: 0.0,
+                ..test_light()
+            },
+            environment: melon_core::Environment {
+                gi_intensity,
+                ..plain_environment()
+            },
+            quality,
+            lights,
+            ..Default::default()
+        };
+        let slab = |size: glam::Vec3, at: glam::Vec3| {
+            glam::Mat4::from_scale_rotation_translation(size, glam::Quat::IDENTITY, at)
+        };
+        frame.models.push((
+            slab(
+                glam::Vec3::new(12.0, 0.2, 12.0),
+                glam::Vec3::new(0.0, -0.1, 0.0),
+            ),
+            cube,
+        ));
+        frame.overrides.insert(0, vec![Some(material)]);
+        if occluder {
+            frame.models.push((
+                slab(
+                    glam::Vec3::new(2.0, 0.2, 2.0),
+                    glam::Vec3::new(0.0, 1.0, 0.0),
+                ),
+                cube,
+            ));
+            frame.overrides.insert(1, vec![Some(material)]);
+        }
+        let mut target =
+            r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let mut encoder = r
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let stats = r.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
+        let pixels = read_back(r.device(), r.queue(), encoder, &target.color_texture);
+        let _ = std::fs::remove_dir_all(&root);
+        (pixels, stats)
+    }
+
+    fn check_local_light_shadows(r: &mut Renderer) -> Result<(), String> {
+        let quality = melon_core::RenderQuality::default();
+        let at = glam::Vec3::new(0.0, 3.0, 0.0);
+        // On the floor, 1.25 m from the centre: in the slab's shadow (its
+        // edge casts out to 1.5 m) yet visible from above (the slab hides
+        // 1 m).
+        let probe = screen_px(
+            top_down_camera().view_proj(),
+            glam::Vec3::new(1.25, 0.0, 0.0),
+        );
+        let point = lights::LocalLight {
+            cast_shadows: true,
+            ..point_light(at, 30.0, 8.0)
+        };
+        let spot = lights::LocalLight {
+            spot: Some((0.5, 0.9)),
+            ..point
+        };
+        for (name, light) in [("point", point), ("spot", spot)] {
+            let (open, stats) = render_with_occluder(r, vec![light], quality, false, 0.0);
+            let (shaded, _) = render_with_occluder(r, vec![light], quality, true, 0.0);
+            let (lit, dark) = (value_at(&open, probe), value_at(&shaded, probe));
+            let expected_views = if name == "point" { 6 } else { 1 };
+            if stats.shadowed_lights != 1 || stats.shadow_views != expected_views {
+                return Err(format!(
+                    "{name}: {} shadowed lights, {} views (want 1 and {expected_views})",
+                    stats.shadowed_lights, stats.shadow_views
+                ));
+            }
+            if dark + 25 > lit {
+                return Err(format!(
+                    "{name} light shadow: floor in the shadow {dark}, unshadowed {lit} (want a gap over 25)"
+                ));
+            }
+            // Without the flag the same slab casts nothing.
+            let plain = lights::LocalLight {
+                cast_shadows: false,
+                ..light
+            };
+            let (unshadowed, _) = render_with_occluder(r, vec![plain], quality, true, 0.0);
+            if value_at(&unshadowed, probe) + 5 < lit {
+                return Err(format!("{name}: an unshadowed light cast a shadow"));
+            }
+        }
+        // The cap: five shadow-casting lights, two allowed.
+        let capped = melon_core::RenderQuality {
+            shadowed_lights: 2,
+            ..quality
+        };
+        let many: Vec<_> = (0..5)
+            .map(|i| lights::LocalLight {
+                position: glam::Vec3::new(i as f32 - 2.0, 3.0, 2.0),
+                ..point
+            })
+            .collect();
+        let (_, stats) = render_with_occluder(r, many.clone(), capped, true, 0.0);
+        if stats.shadowed_lights != 2 || stats.shadow_views != 12 {
+            return Err(format!(
+                "cap: {} shadowed lights, {} views (want 2 and 12)",
+                stats.shadowed_lights, stats.shadow_views
+            ));
+        }
+        // With DDGI on, a shadowed light injects into the voxels: the frame renders.
+        let (_, stats) = render_with_occluder(r, many, quality, true, 1.0);
+        if stats.shadowed_lights != 5 {
+            return Err(format!(
+                "ddgi frame: {} shadowed lights",
+                stats.shadowed_lights
+            ));
+        }
+        Ok(())
+    }
+
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
@@ -8113,6 +8507,7 @@ mod tests {
             Box::new(check_local_lights),
             Box::new(check_ibl_uniform_sky),
             Box::new(check_far_cascade_shadow),
+            Box::new(check_local_light_shadows),
         ];
 
         #[cfg(target_os = "windows")]

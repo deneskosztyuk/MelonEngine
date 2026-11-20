@@ -25,6 +25,10 @@ pub(crate) struct GiInputs<'a> {
     pub light: &'a wgpu::Buffer,
     pub shadow_view: &'a wgpu::TextureView,
     pub shadow_sampler: &'a wgpu::Sampler,
+    /// The point / spot shadow atlas and its view records (group 0
+    /// bindings 11 and 12 of the voxel passes).
+    pub local_atlas: &'a wgpu::TextureView,
+    pub local_views: &'a wgpu::Buffer,
     pub model_layout: &'a wgpu::BindGroupLayout,
     pub material_layout: &'a wgpu::BindGroupLayout,
     pub lighting_layout: &'a wgpu::BindGroupLayout,

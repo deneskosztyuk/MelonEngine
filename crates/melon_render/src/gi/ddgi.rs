@@ -339,6 +339,20 @@ impl Ddgi {
                     buffer(wgpu::BufferBindingType::Storage { read_only: false }),
                 ),
                 entry(6, wgpu::ShaderStages::VERTEX, uniform_ty),
+                entry(
+                    11,
+                    fragment,
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                ),
+                entry(
+                    12,
+                    fragment,
+                    buffer(wgpu::BufferBindingType::Storage { read_only: true }),
+                ),
             ],
         });
         let voxel_axes = [0u32, 1, 2].map(|axis| {
@@ -549,6 +563,14 @@ fn voxel_groups(
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: axes[axis].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(inputs.local_atlas),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: inputs.local_views.as_entire_binding(),
                 },
             ],
         })
