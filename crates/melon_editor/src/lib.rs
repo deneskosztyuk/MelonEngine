@@ -22,6 +22,7 @@ use winit::window::Window;
 pub mod asset_db;
 pub mod asset_ops;
 pub mod asset_watch;
+pub mod audio_settings;
 pub mod console;
 pub mod content;
 mod content_view;
@@ -597,6 +598,48 @@ impl Editor {
         self.project_settings.set_quality_broken(broken);
     }
 
+    /// The host loaded a broken `config/audio.ron`: the first Apply backs it up.
+    pub fn set_audio_broken(&mut self, broken: bool) {
+        self.project_settings.set_audio_broken(broken);
+    }
+
+    /// Custom field editors of a component type (see `inspect::FieldWidget`).
+    fn field_widgets(&self, world: &World, type_path: &str) -> inspect::FieldWidgets {
+        use inspect::{FieldWidget, WidgetKind};
+        let mut widgets = inspect::FieldWidgets::new();
+        if type_path == melon_core::AudioSource::type_path() {
+            let buses = world
+                .get_resource::<melon_core::AudioSettings>()
+                .map(|s| s.buses.iter().map(|b| b.name.clone()).collect())
+                .unwrap_or_default();
+            widgets.insert(
+                "bus",
+                FieldWidget {
+                    label: None,
+                    kind: WidgetKind::Choice(buses),
+                },
+            );
+            widgets.insert(
+                "clip",
+                FieldWidget {
+                    label: None,
+                    kind: WidgetKind::Asset {
+                        root: self.project_root.clone(),
+                        extensions: &melon_core::audio::AUDIO_EXTENSIONS,
+                    },
+                },
+            );
+            widgets.insert(
+                "volume",
+                FieldWidget {
+                    label: Some("Volume (linear)"),
+                    kind: WidgetKind::Slider { min: 0.0, max: 1.0 },
+                },
+            );
+        }
+        widgets
+    }
+
     pub fn selected_entity(&self) -> Option<Entity> {
         self.selected
     }
@@ -841,6 +884,21 @@ impl Editor {
             }
             Request::Reveal(path) => {
                 asset_ops::reveal(&path);
+                None
+            }
+            Request::PreviewAudio(path) => {
+                if let Some(clip) = melon_core::assets::project_relative(&self.project_root, &path)
+                {
+                    world
+                        .resource_mut::<melon_core::AudioRequests>()
+                        .preview_play(&clip);
+                }
+                None
+            }
+            Request::StopAudioPreview => {
+                world
+                    .resource_mut::<melon_core::AudioRequests>()
+                    .preview_stop();
                 None
             }
             Request::Open(path) => {
@@ -1681,9 +1739,10 @@ impl Editor {
                     .map(|v| v.into_partial_reflect())
                     .unwrap_or_else(|_| value.to_dynamic());
                 let id = egui::Id::new(("inspector_component", info.type_path));
+                let widgets = self.field_widgets(world, info.type_path);
                 let (changed, remove) =
                     component_card(ui, &mut card_fills, &info.display_name, id, |ui| {
-                        inspect::reflect_ui(ui, id, copy.as_mut(), &registry)
+                        inspect::reflect_ui_with(ui, id, copy.as_mut(), &registry, &widgets)
                     });
                 if remove {
                     reflect.remove(&mut world.entity_mut(entity));
@@ -2693,6 +2752,11 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                 self.editor.content_tab_shown = true;
                 self.editor.content.blocked =
                     self.editor.delete_confirm.is_some() || self.editor.confirm_open.is_some();
+                let playing = self
+                    .world
+                    .get_resource::<melon_core::AudioPreview>()
+                    .and_then(|p| p.0.clone());
+                self.editor.content.set_audio_preview(playing);
                 self.editor.content.ui(ui);
                 self.editor.apply_content_requests(self.world);
             }

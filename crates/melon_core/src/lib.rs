@@ -11,6 +11,7 @@ use tracing::instrument;
 
 pub mod actions;
 pub mod assets;
+pub mod audio;
 pub mod components;
 pub mod hierarchy;
 pub mod input;
@@ -25,6 +26,10 @@ pub use actions::{
     Action, ActionKind, Actions, AxisBinding, InputMap, LoadOutcome, update_actions_system,
 };
 pub use assets::{AssetGuid, AssetMeta, AssetServer, Handle, META_VERSION, Model, meta_path};
+pub use audio::{
+    AudioBus, AudioClip, AudioListener, AudioPreview, AudioRequest, AudioRequests, AudioSettings,
+    AudioSource,
+};
 pub use bevy_ecs;
 pub use bevy_ecs::query::With;
 pub use bevy_reflect;
@@ -135,6 +140,9 @@ impl Core {
         world.init_resource::<InputMap>();
         world.init_resource::<Actions>();
         world.init_resource::<RenderQuality>();
+        world.init_resource::<AudioSettings>();
+        world.init_resource::<AudioRequests>();
+        world.init_resource::<AudioPreview>();
         world.init_resource::<AppTypeRegistry>();
         world.init_resource::<RegistryGeneration>();
 
@@ -157,7 +165,9 @@ impl Core {
             .register_component::<Aabb>()
             .register_component::<BodyInfo>()
             .register_component::<Spin>()
-            .register_component::<Bob>();
+            .register_component::<Bob>()
+            .register_component::<AudioSource>()
+            .register_component::<AudioListener>();
         core
     }
 
