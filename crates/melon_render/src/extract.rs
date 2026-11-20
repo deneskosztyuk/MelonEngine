@@ -3,7 +3,7 @@
 use glam::Mat4;
 use melon_core::bevy_ecs::world::World;
 use melon_core::hierarchy::render_matrices;
-use melon_core::{Camera, Handle, Light, Model, SimulationState, Time};
+use melon_core::{Camera, Environment, Handle, Light, Model, SimulationState, Time};
 
 /// Everything one view needs to draw a frame.
 pub struct FrameData {
@@ -11,6 +11,8 @@ pub struct FrameData {
     /// Camera position (overlay shading).
     pub eye: glam::Vec3,
     pub light: Light,
+    /// Sky and fog.
+    pub environment: Environment,
     /// World matrix and model of every entity with a `Handle<Model>`.
     pub models: Vec<(Mat4, Handle<Model>)>,
 }
@@ -21,7 +23,7 @@ pub fn blends(state: SimulationState) -> bool {
     state != SimulationState::Editing
 }
 
-/// Read the camera, the light and every model entity's world matrix
+/// Read the camera, the light, the environment and every model entity's world matrix
 /// (interpolated along its parent chain) from `world`.
 pub fn extract(world: &mut World) -> FrameData {
     let view_proj = world
@@ -32,6 +34,10 @@ pub fn extract(world: &mut World) -> FrameData {
         .get_resource::<Camera>()
         .map_or(glam::Vec3::ZERO, |c| c.eye);
     let light = world.get_resource::<Light>().copied().unwrap_or_default();
+    let environment = world
+        .get_resource::<Environment>()
+        .copied()
+        .unwrap_or_default();
     let alpha = world.get_resource::<Time>().map_or(1.0, Time::alpha);
     let state = world
         .get_resource::<SimulationState>()
@@ -47,6 +53,7 @@ pub fn extract(world: &mut World) -> FrameData {
         view_proj,
         eye,
         light,
+        environment,
         models,
     }
 }
@@ -57,7 +64,7 @@ mod tests {
     use glam::Vec3;
     use melon_core::bevy_ecs::world::World;
     use melon_core::{
-        AssetServer, Camera, ChildOf, Handle, Light, Model, SimulationState, Transform,
+        AssetServer, Camera, ChildOf, Environment, Handle, Light, Model, SimulationState, Transform,
     };
 
     fn cube(world: &mut World) -> Handle<Model> {
@@ -115,6 +122,18 @@ mod tests {
         let frame = extract(&mut world);
         assert_eq!(frame.view_proj, glam::Mat4::default());
         assert_eq!(frame.light.ambient, Light::default().ambient);
+        assert_eq!(frame.environment, Environment::default());
+    }
+
+    #[test]
+    fn environment_comes_from_resource() {
+        let mut world = World::new();
+        let env = Environment {
+            fog_density: 0.5,
+            ..Default::default()
+        };
+        world.insert_resource(env);
+        assert_eq!(extract(&mut world).environment, env);
     }
 
     #[test]

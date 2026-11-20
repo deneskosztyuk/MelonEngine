@@ -1,11 +1,21 @@
 // M4 mesh shader. Vertex has position + normal + uv. Camera uniform carries
 // view_proj. Light uniform carries direction + ambient (sky/ground hemisphere)
 // + the sun's shadow matrix. Texture + sampler in group 2. Per-vertex color is dropped — replaced
-// by textured PBR-ish shading. Output is linear HDR; the tonemap pass maps it
-// to the display.
+// by textured PBR-ish shading. Exponential distance fog fades toward the
+// horizon colour. Output is linear HDR; the tonemap pass maps it to the
+// display.
 
 struct CameraUniform {
     view_proj: mat4x4f,
+    inv_view_proj: mat4x4f,
+    eye: vec3f,
+};
+
+struct EnvironmentUniform {
+    zenith_color: vec3f,
+    // Exponential fog per metre; the fog colour is the horizon colour.
+    fog_density: f32,
+    horizon_color: vec3f,
 };
 
 struct ModelUniform {
@@ -48,6 +58,7 @@ struct VsOut {
 @group(0) @binding(1) var<uniform> light: LightUniform;
 @group(0) @binding(2) var shadow_map: texture_depth_2d;
 @group(0) @binding(3) var shadow_sampler: sampler_comparison;
+@group(0) @binding(4) var<uniform> env: EnvironmentUniform;
 @group(2) @binding(0) var albedo_tex: texture_2d<f32>;
 @group(2) @binding(1) var albedo_sampler: sampler;
 
@@ -97,5 +108,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let diffuse = (1.0 - light.ambient) * ndl * albedo * light.color
         * shadow_factor(in.world_pos);
 
-    return vec4f(ambient + diffuse, 1.0);
+    let fog = 1.0 - exp(-env.fog_density * distance(in.world_pos, camera.eye));
+    return vec4f(mix(ambient + diffuse, env.horizon_color, fog), 1.0);
 }

@@ -71,7 +71,9 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
 - [x] Hemisphere ambient: sky and ground colours on `Light`.
 - [x] HDR target + ACES tonemap pass.
 - [x] MSAA 4x.
-- [ ] Skybox.
+- [x] Skybox: procedural sky (horizon/zenith gradient, sun disc) from the
+      `Environment` resource, plus exponential distance fog in the horizon
+      colour.
 - [ ] Instancing or storage buffers (removes the 1024 cap, bug 4), frustum culling.
 - [ ] `Camera` as a component; multiple cameras.
 - [ ] glTF: node tree, multiple meshes, materials, skinning, animation. Fixes bug 6.

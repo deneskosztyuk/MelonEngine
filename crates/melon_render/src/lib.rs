@@ -74,6 +74,21 @@ use winit::window::Window;
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
+    /// Clip -> world, to rebuild view rays (sky).
+    inv_view_proj: [[f32; 4]; 4],
+    /// Camera position (fog distance).
+    eye: [f32; 3],
+    _pad: f32,
+}
+
+/// `melon_core::Environment` as the shaders see it (group 0, binding 4).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct EnvironmentUniform {
+    zenith_color: [f32; 3],
+    fog_density: f32,
+    horizon_color: [f32; 3],
+    _pad: f32,
 }
 
 #[repr(C)]
@@ -308,8 +323,9 @@ pub struct SceneRenderer {
     texture_bind_group_layout: wgpu::BindGroupLayout,
     camera_buffer: wgpu::Buffer,
     light_buffer: wgpu::Buffer,
+    environment_buffer: wgpu::Buffer,
     /// Group 0: per-frame data shared by every pipeline (camera, light,
-    /// shadow map).
+    /// shadow map, environment).
     frame_bind_group: wgpu::BindGroup,
     shadow_pipeline: wgpu::RenderPipeline,
     /// Light view-proj for the shadow pass (group 0 of `shadow_pipeline`).
@@ -322,6 +338,8 @@ pub struct SceneRenderer {
     #[allow(dead_code)]
     albedo_texture: wgpu::Texture,
     albedo_bind_group: wgpu::BindGroup,
+    /// Fullscreen sky behind the meshes (3D pass).
+    sky_pipeline: wgpu::RenderPipeline,
     /// Depth-tested lines inside the 3D pass (grid, axes, selection box).
     world_line_pipeline: wgpu::RenderPipeline,
     world_lines: LineBuffer,
@@ -442,7 +460,7 @@ impl Renderer {
     }
 
     /// Record one view of `frame` into `target`: shadow pass, 3D pass (HDR,
-    /// MSAA) with the meshes and depth-tested `world_lines`, the tonemap pass
+    /// MSAA) with the meshes, the sky and depth-tested `world_lines`, the tonemap pass
     /// onto the target's display image, then the `overlay` shapes.
     /// Models load (or hot-reload) here on first use.
     pub fn render_scene(
@@ -455,7 +473,8 @@ impl Renderer {
         overlay: &[OverlayDraw],
     ) {
         let scene = &mut self.scene;
-        scene.update_camera(frame.view_proj);
+        scene.update_camera(frame.view_proj, frame.eye);
+        scene.update_environment(&frame.environment);
         scene.update_light(
             &frame.light,
             directional_light_view_proj(frame.light.to_light(), SHADOW_CENTER, SHADOW_RADIUS),
@@ -507,6 +526,7 @@ impl Renderer {
                 multiview_mask: None,
             });
             scene.draw_meshes_textured(&mut pass, &draw_calls);
+            scene.draw_sky(&mut pass);
             scene.draw_world_lines(&mut pass, world_lines, frame.view_proj);
         }
         let color_view = target.color_view();
@@ -592,6 +612,7 @@ impl SceneRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
+                uniform_entry(4, wgpu::ShaderStages::FRAGMENT),
             ],
         });
         let model_layout = dynamic_uniform_buffer_layout(&device, "model bind group layout");
@@ -651,6 +672,13 @@ impl SceneRenderer {
         let light_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("light uniform buffer"),
             size: std::mem::size_of::<LightUniform>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let environment_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("environment uniform buffer"),
+            size: std::mem::size_of::<EnvironmentUniform>() as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -715,6 +743,10 @@ impl SceneRenderer {
                     binding: 3,
                     resource: wgpu::BindingResource::Sampler(&shadow_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: environment_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -722,6 +754,7 @@ impl SceneRenderer {
             Renderer::create_checkerboard_texture(&device, &queue, &texture_layout);
 
         let world_line_pipeline = Renderer::build_world_line_pipeline(&device, &frame_layout);
+        let sky_pipeline = Renderer::build_sky_pipeline(&device, &frame_layout);
 
         // Reusable model uniform buffer with dynamic offsets.
         // Stride = max(ModelUniform size, min_uniform_buffer_offset_alignment).
@@ -760,6 +793,7 @@ impl SceneRenderer {
             texture_bind_group_layout: texture_layout,
             camera_buffer,
             light_buffer,
+            environment_buffer,
             frame_bind_group,
             shadow_pipeline,
             shadow_camera_buffer,
@@ -768,6 +802,7 @@ impl SceneRenderer {
             shadow_view,
             albedo_texture,
             albedo_bind_group,
+            sky_pipeline,
             world_line_pipeline,
             world_lines: LineBuffer::default(),
             model_uniform_buffer,
@@ -969,6 +1004,56 @@ impl Renderer {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: Some(false),
                 depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: MSAA_SAMPLES,
+                ..Default::default()
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FORMAT,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
+    }
+
+    /// Sky pipeline for the 3D pass: a fullscreen triangle at the far plane,
+    /// depth-tested `LessEqual` without depth writes, so it shows only where
+    /// no geometry was drawn.
+    fn build_sky_pipeline(
+        device: &wgpu::Device,
+        frame_layout: &wgpu::BindGroupLayout,
+    ) -> wgpu::RenderPipeline {
+        let shader =
+            device.create_shader_module(wgpu::include_wgsl!("../../../assets/shaders/sky.wgsl"));
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sky pipeline layout"),
+            bind_group_layouts: &[Some(frame_layout)],
+            immediate_size: 0,
+        });
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("melon_render sky pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -1418,12 +1503,31 @@ impl Renderer {
 }
 
 impl SceneRenderer {
-    pub fn update_camera(&self, view_proj: glam::Mat4) {
+    /// `view_proj` must be invertible (sky rays); `eye` is the camera position.
+    pub fn update_camera(&self, view_proj: glam::Mat4, eye: glam::Vec3) {
         let uniform = CameraUniform {
             view_proj: view_proj.to_cols_array_2d(),
+            inv_view_proj: view_proj.inverse().to_cols_array_2d(),
+            eye: eye.to_array(),
+            _pad: 0.0,
         };
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[uniform]));
+    }
+
+    /// Sky colours and fog density for the mesh and sky shaders.
+    pub fn update_environment(&self, environment: &melon_core::Environment) {
+        let uniform = EnvironmentUniform {
+            zenith_color: environment.zenith_color.to_array(),
+            fog_density: environment.fog_density,
+            horizon_color: environment.horizon_color.to_array(),
+            _pad: 0.0,
+        };
+        self.queue.write_buffer(
+            &self.environment_buffer,
+            0,
+            bytemuck::cast_slice(&[uniform]),
+        );
     }
 
     /// `light_view_proj` is the shadow box, see [`directional_light_view_proj`].
@@ -1441,8 +1545,10 @@ impl SceneRenderer {
         };
         self.queue
             .write_buffer(&self.light_buffer, 0, bytemuck::cast_slice(&[uniform]));
+        // The shadow shader reads only `view_proj`.
         let shadow_camera = CameraUniform {
             view_proj: light_view_proj.to_cols_array_2d(),
+            ..Zeroable::zeroed()
         };
         self.queue.write_buffer(
             &self.shadow_camera_buffer,
@@ -1883,6 +1989,14 @@ impl SceneRenderer {
         }
     }
 
+    /// Sky into the 3D pass, after the meshes and before the world lines
+    /// (lines write no depth, so the sky would cover them).
+    pub fn draw_sky(&self, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_pipeline(&self.sky_pipeline);
+        pass.set_bind_group(0, &self.frame_bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
     /// Depth-tested lines in the 3D (HDR, multisampled) pass: grid, axes,
     /// selection box. Hidden behind geometry.
     pub fn draw_world_lines(
@@ -1905,12 +2019,14 @@ impl SceneRenderer {
     /// Writes the shared frame camera buffer. Every write lands before the
     /// frame is submitted, so all passes see the last value: callers must pass
     /// this frame's camera `view_proj` (they all do), never a special one.
+    /// Only `view_proj` is written, so the eye and inverse from
+    /// `update_camera` stay.
     fn write_line_camera(&self, view_proj: glam::Mat4) {
-        let uniform = CameraUniform {
-            view_proj: view_proj.to_cols_array_2d(),
-        };
-        self.queue
-            .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[uniform]));
+        self.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::cast_slice(&view_proj.to_cols_array()),
+        );
     }
 }
 
@@ -2081,8 +2197,31 @@ mod tests {
     }
 
     #[test]
-    fn camera_uniform_size_is_64() {
-        assert_eq!(std::mem::size_of::<CameraUniform>(), 64);
+    fn camera_uniform_size_is_144() {
+        assert_eq!(std::mem::size_of::<CameraUniform>(), 144);
+    }
+
+    #[test]
+    fn environment_uniform_size_is_32() {
+        assert_eq!(std::mem::size_of::<EnvironmentUniform>(), 32);
+    }
+
+    #[test]
+    fn default_camera_view_proj_is_invertible() {
+        // The sky rebuilds view rays from the inverse. Checked for the core
+        // default and the editor's default pose (eye (0, 4, 8) on the origin).
+        let editor = melon_core::Camera {
+            eye: glam::Vec3::new(0.0, 4.0, 8.0),
+            center: glam::Vec3::ZERO,
+            ..Default::default()
+        };
+        for vp in [
+            melon_core::Camera::default().view_proj(),
+            editor.view_proj(),
+        ] {
+            assert!(vp.determinant().abs() > 1e-6, "{vp}");
+            assert!((vp * vp.inverse()).abs_diff_eq(glam::Mat4::IDENTITY, 1e-4));
+        }
     }
 
     #[test]
@@ -2166,14 +2305,17 @@ mod tests {
         let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
         let (_depth, depth_view) = Renderer::create_depth_target(&device, size);
 
+        let eye = Vec3::new(0.0, if from_below { -10.0 } else { 10.0 }, 0.0);
         r.update_camera(
             directx::orthographic(-4.0, 4.0, -4.0, 4.0, 0.1, 20.0)
-                * view::look_at_mat4(
-                    Vec3::new(0.0, if from_below { -10.0 } else { 10.0 }, 0.0),
-                    Vec3::ZERO,
-                    Vec3::NEG_Z,
-                ),
+                * view::look_at_mat4(eye, Vec3::ZERO, Vec3::NEG_Z),
+            eye,
         );
+        // No fog, so the lit/shadow thresholds keep their meaning.
+        r.update_environment(&melon_core::Environment {
+            fog_density: 0.0,
+            ..Default::default()
+        });
         r.update_light(
             light,
             directional_light_view_proj(light.to_light(), shadow_center, shadow_radius),
@@ -2229,6 +2371,31 @@ mod tests {
         }
         r.tonemap_pass(&mut encoder, &hdr, &color_view);
         read_back(&device, r.queue(), encoder, &color)
+    }
+
+    /// Renders `models` through `render_scene` from `camera` and returns the
+    /// TEST_SIZE x TEST_SIZE display pixels.
+    fn render_frame(
+        r: &mut Renderer,
+        camera: melon_core::Camera,
+        light: melon_core::Light,
+        environment: melon_core::Environment,
+        models: Vec<(glam::Mat4, melon_core::Handle<melon_core::Model>)>,
+        server: &mut melon_core::AssetServer,
+    ) -> Vec<u8> {
+        let target = r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let frame = FrameData {
+            view_proj: camera.view_proj(),
+            eye: camera.eye,
+            light,
+            environment,
+            models,
+        };
+        let mut encoder = r
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        r.render_scene(&mut encoder, &frame, server, &target, &[], &[]);
+        read_back(r.device(), r.queue(), encoder, &target.color_texture)
     }
 
     /// Clears an HDR target to `value` (all channels), tonemaps it to sRGB8
@@ -2438,6 +2605,7 @@ mod tests {
             view_proj: camera.view_proj(),
             eye: camera.eye,
             light: melon_core::Light::default(),
+            environment: melon_core::Environment::default(),
             models: if cube {
                 vec![(glam::Mat4::IDENTITY, h)]
             } else {
@@ -2758,6 +2926,7 @@ mod tests {
                         view_proj: melon_core::Camera::default().view_proj(),
                         eye: melon_core::Camera::default().eye,
                         light: melon_core::Light::default(),
+                        environment: melon_core::Environment::default(),
                         models,
                     };
                     let mut encoder = renderer
@@ -2779,6 +2948,109 @@ mod tests {
                 } else {
                     Err(format!(
                         "render_scene_draws_a_cube: centre {empty} with and without the cube"
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
+                // Red horizon, blue zenith, sun behind both views.
+                let env = melon_core::Environment {
+                    zenith_color: glam::Vec3::Z,
+                    horizon_color: glam::Vec3::X,
+                    fog_density: 0.0,
+                };
+                let light = melon_core::Light {
+                    direction: glam::Vec3::new(0.0, -1.0, -1.0).normalize(),
+                    ..Default::default()
+                };
+                let mut server = melon_core::AssetServer::new(".".into());
+                let up_camera = melon_core::Camera {
+                    eye: glam::Vec3::ZERO,
+                    center: glam::Vec3::new(0.0, 10.0, -1.0),
+                    aspect: 1.0,
+                    ..Default::default()
+                };
+                let level_camera = melon_core::Camera {
+                    aspect: 1.0,
+                    ..Default::default()
+                };
+                let centre = (TEST_SIZE / 2, TEST_SIZE / 2);
+                let up = render_frame(renderer, up_camera, light, env, vec![], &mut server);
+                let up = pixel_at(renderer, &up, centre);
+                let level = render_frame(renderer, level_camera, light, env, vec![], &mut server);
+                let level = pixel_at(renderer, &level, centre);
+                if up[2] > up[0] && level[0] > level[2] {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "sky_zenith_vs_horizon: up {up:?} (want blue > red), level {level:?} (want red > blue)"
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
+                // Dark sky; looking straight at the sun gives a white HDR disc.
+                let env = melon_core::Environment {
+                    zenith_color: glam::Vec3::splat(0.02),
+                    horizon_color: glam::Vec3::splat(0.02),
+                    fog_density: 0.0,
+                };
+                let light = melon_core::Light::default();
+                let camera = melon_core::Camera {
+                    eye: glam::Vec3::ZERO,
+                    center: light.to_light(),
+                    aspect: 1.0,
+                    ..Default::default()
+                };
+                let mut server = melon_core::AssetServer::new(".".into());
+                let px = render_frame(renderer, camera, light, env, vec![], &mut server);
+                let sun = pixel_at(renderer, &px, (TEST_SIZE / 2, TEST_SIZE / 2));
+                let corner = pixel_at(renderer, &px, (0, 0));
+                if sun[..3].iter().all(|&c| c > 250) && corner[0] < 60 {
+                    Ok(())
+                } else {
+                    Err(format!("sky_sun_disc: centre {sun:?}, corner {corner:?}"))
+                }
+            }),
+            Box::new(|renderer| {
+                // A floor pixel ~10 m away, blue fog: fog pulls it toward blue.
+                use melon_core::{AssetServer, Handle, Model};
+                let mut server = AssetServer::new(".".into());
+                let cube: Handle<Model> = server.load("builtin:cube");
+                let floor = glam::Mat4::from_scale_rotation_translation(
+                    glam::Vec3::new(100.0, 0.1, 100.0),
+                    glam::Quat::IDENTITY,
+                    glam::Vec3::new(0.0, -0.05, 0.0),
+                );
+                let camera = melon_core::Camera {
+                    eye: glam::Vec3::Y,
+                    center: glam::Vec3::new(0.0, 0.0, -10.0),
+                    aspect: 1.0,
+                    ..Default::default()
+                };
+                let mut floor_px = |fog_density| {
+                    let env = melon_core::Environment {
+                        horizon_color: glam::Vec3::Z,
+                        fog_density,
+                        ..Default::default()
+                    };
+                    let light = melon_core::Light::default();
+                    let px = render_frame(
+                        renderer,
+                        camera,
+                        light,
+                        env,
+                        vec![(floor, cube)],
+                        &mut server,
+                    );
+                    pixel_at(renderer, &px, (TEST_SIZE / 2, TEST_SIZE / 2))
+                };
+                let clear = floor_px(0.0);
+                let foggy = floor_px(0.2);
+                let blueness = |p: [u8; 4]| i32::from(p[2]) - i32::from(p[0]);
+                if blueness(foggy) > blueness(clear) + 40 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "fog_pulls_far_floor_to_horizon: clear {clear:?}, foggy {foggy:?}"
                     ))
                 }
             }),

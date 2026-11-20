@@ -114,6 +114,11 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   (from the light into the scene). Shaders want the opposite; pass
   `Light::to_light()`.
 - **Ambient.** A sky/ground hemisphere on `Light` (`sky_color`, `ground_color`, scaled by `ambient`), blended by the world normal's y.
+- **Environment.** Optional `melon_core::Environment` resource (default when
+  absent, not registered in `Core::new`): procedural sky (`zenith_color`,
+  `horizon_color`) and exponential distance fog (`fog_density`). The fog
+  colour is `horizon_color`. Mesh fog only; world lines and overlay shapes
+  are not fogged.
 - **Camera conventions.** Right-handed, DirectX depth (near = 0, far = 1).
   Screen helpers take logical points.
 - **Checking rendering.** Agents verify rendering with the snapshot example

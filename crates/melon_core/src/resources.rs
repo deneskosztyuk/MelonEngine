@@ -179,6 +179,30 @@ impl Default for Light {
     }
 }
 
+/// Procedural sky and distance fog. Optional: the renderer uses the default
+/// when no `Environment` resource exists.
+#[derive(Resource, Debug, Clone, Copy, PartialEq)]
+pub struct Environment {
+    /// Sky straight up (linear HDR radiance).
+    pub zenith_color: Vec3,
+    /// Sky at the horizon (linear HDR radiance), also the fog colour, so
+    /// distant geometry melts into the sky.
+    pub horizon_color: Vec3,
+    /// Exponential fog density per metre; 0 turns fog off.
+    pub fog_density: f32,
+}
+
+impl Default for Environment {
+    fn default() -> Self {
+        Self {
+            // Clear day in the same hues as `Light::default`'s sky ambient.
+            zenith_color: Vec3::new(0.15, 0.3, 0.75),
+            horizon_color: Vec3::new(0.7, 0.8, 0.95),
+            fog_density: 0.01,
+        }
+    }
+}
+
 #[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SimulationState {
     /// Editor edit mode: nothing simulates, play time is 0.
@@ -354,6 +378,19 @@ mod tests {
         assert!(lum(l.sky_color) > lum(l.ground_color));
         // A side-facing surface gets the midpoint; at least the old flat white.
         assert!(lum((l.sky_color + l.ground_color) * 0.5) >= 1.0);
+    }
+
+    #[test]
+    fn environment_default_is_a_clear_day() {
+        let e = Environment::default();
+        for c in [e.zenith_color, e.horizon_color] {
+            assert!(c.is_finite() && c.min_element() >= 0.0, "{c:?}");
+        }
+        assert!(e.fog_density.is_finite() && e.fog_density >= 0.0);
+        // Zenith: darker and bluer than the horizon.
+        assert!(e.zenith_color.length() < e.horizon_color.length());
+        let blue = |c: Vec3| c.z / c.x;
+        assert!(blue(e.zenith_color) > blue(e.horizon_color));
     }
 
     #[test]

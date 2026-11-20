@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use glam::{Mat4, Quat, Vec3};
-use melon_core::{AssetServer, Camera, Handle, Light, Model};
+use melon_core::{AssetServer, Camera, Environment, Handle, Light, Model};
 use melon_render::{FrameData, Renderer};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -101,6 +101,7 @@ fn render(window: Arc<Window>, out: &str, view: &str) -> Result<()> {
         view_proj: camera.view_proj(),
         eye: camera.eye,
         light: Light::default(),
+        environment: Environment::default(),
         models: review_scene(&mut server),
     };
 
