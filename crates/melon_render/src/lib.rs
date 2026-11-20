@@ -651,6 +651,9 @@ pub struct SceneRenderer {
     lighting_layout: wgpu::BindGroupLayout,
     /// Group 3 with a 1x1 white AO texture: no occlusion (AO off).
     unoccluded_lighting: wgpu::BindGroup,
+    /// Group 3 of the GI voxel passes: `unoccluded_lighting` without the
+    /// voxel volume they write.
+    voxel_pass_lighting: wgpu::BindGroup,
     /// DDGI world data (voxels, probe atlases) and its passes.
     gi: gi::Gi,
     /// Depth-tested lines inside the 3D pass (grid, axes, selection box).
@@ -1057,10 +1060,10 @@ impl SceneRenderer {
 
         // Group 3: per-view lighting inputs: AO (R, 1 = unoccluded), then
         // the DDGI atlases, sampler and settings (shared by every view).
-        let [gi_1, gi_2, gi_3, gi_4] = gi::lighting_layout_entries();
+        let [gi_1, gi_2, gi_3, gi_4, gi_5] = gi::lighting_layout_entries();
         let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("lighting bind group layout"),
-            entries: &[texture_entry(0), gi_1, gi_2, gi_3, gi_4],
+            entries: &[texture_entry(0), gi_1, gi_2, gi_3, gi_4, gi_5],
         });
         let mesh_layouts = [
             &frame_layout,
@@ -1309,7 +1312,6 @@ impl SceneRenderer {
             &device,
             &gi::GiInputs {
                 light: &light_buffer,
-                environment: &environment_buffer,
                 shadow_view: &shadow_view,
                 shadow_sampler: &shadow_sampler,
                 model_layout: &model_layout,
@@ -1317,21 +1319,20 @@ impl SceneRenderer {
                 lighting_layout: &lighting_layout,
             },
         );
-        let [gi_1, gi_2, gi_3, gi_4] = gi.lighting_entries();
-        let unoccluded_lighting = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("unoccluded lighting bind group"),
-            layout: &lighting_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&default_textures.white),
-                },
-                gi_1,
-                gi_2,
-                gi_3,
-                gi_4,
-            ],
-        });
+        let white_ao = wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&default_textures.white),
+        };
+        let lighting = |label, voxels| {
+            let [gi_1, gi_2, gi_3, gi_4, gi_5] = gi.lighting_entries(voxels);
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &lighting_layout,
+                entries: &[white_ao.clone(), gi_1, gi_2, gi_3, gi_4, gi_5],
+            })
+        };
+        let unoccluded_lighting = lighting("unoccluded lighting bind group", true);
+        let voxel_pass_lighting = lighting("gi voxel pass lighting bind group", false);
 
         let world_line_pipeline = Renderer::build_world_line_pipeline(&device, &frame_layout);
         let sky_pipeline = Renderer::build_sky_pipeline(&device, &frame_layout);
@@ -1376,6 +1377,7 @@ impl SceneRenderer {
             ssao_buffer,
             lighting_layout,
             unoccluded_lighting,
+            voxel_pass_lighting,
             gi,
             world_line_pipeline,
             world_lines: LineBuffer::default(),
@@ -2155,11 +2157,11 @@ impl SceneRenderer {
             layout: &self.ssao_blur_layout,
             entries: &[entry(1, &normal_view), uniform, entry(3, &raw_view)],
         });
-        let [gi_1, gi_2, gi_3, gi_4] = self.gi.lighting_entries();
+        let [gi_1, gi_2, gi_3, gi_4, gi_5] = self.gi.lighting_entries(true);
         let lighting_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lighting bind group"),
             layout: &self.lighting_layout,
-            entries: &[entry(0, &ao_view), gi_1, gi_2, gi_3, gi_4],
+            entries: &[entry(0, &ao_view), gi_1, gi_2, gi_3, gi_4, gi_5],
         });
         SsaoTargets {
             depth_view,
@@ -3840,6 +3842,54 @@ mod tests {
             model,
         )
     }
+
+    /// The GI test room: interior 5 x 4 x 5 m around the origin (x and z in
+    /// -2.5..2.5), 0.4 m walls, red at +x, green at -x, grey back wall
+    /// (+z), ceiling and floor, open toward -z where the default sun comes in.
+    fn test_room(
+        server: &mut melon_core::AssetServer,
+    ) -> Vec<(glam::Mat4, melon_core::Handle<melon_core::Model>)> {
+        use glam::Vec3;
+        let grey = server.load("assets/models/review/grey_cube.glb");
+        let red = server.load("assets/models/review/red_panel.glb");
+        let green = server.load("assets/models/review/green_panel.glb");
+        let o = TEST_ROOM_OFFSET;
+        vec![
+            slab(
+                grey,
+                Vec3::new(5.8, 0.1, 7.4),
+                Vec3::new(0.0, -0.05, -0.8) + o,
+            ),
+            // Walls end under the ceiling and at the back wall: overlapping
+            // slabs share face planes, which z-fight (striped edges).
+            slab(red, Vec3::new(0.4, 4.0, 5.0), Vec3::new(2.7, 2.0, 0.0) + o),
+            slab(
+                green,
+                Vec3::new(0.4, 4.0, 5.0),
+                Vec3::new(-2.7, 2.0, 0.0) + o,
+            ),
+            slab(grey, Vec3::new(5.8, 4.0, 0.4), Vec3::new(0.0, 2.0, 2.7) + o),
+            slab(grey, Vec3::new(5.8, 0.4, 5.4), Vec3::new(0.0, 4.2, 0.2) + o),
+        ]
+    }
+
+    /// Shift of the test room: it then sits on the probe and voxel grids
+    /// exactly like the snapshot `cornell` room (inner faces 0.4 voxel into
+    /// a voxel, probes 0.35 m outside the side walls), where bright corner
+    /// rims showed. On voxel boundaries the faces would hide them.
+    const TEST_ROOM_OFFSET: glam::Vec3 = glam::Vec3::new(-0.5, 0.0, -0.5);
+
+    /// The test room's light: the default sun with a dim hemisphere, so
+    /// bounce dominates the shade.
+    fn test_room_light() -> melon_core::Light {
+        melon_core::Light {
+            sky_color: glam::Vec3::splat(0.1),
+            ground_color: glam::Vec3::splat(0.1),
+            ..Default::default()
+        }
+    }
+
+    /// Asset server at the repository root (review models).
     fn repo_server() -> melon_core::AssetServer {
         melon_core::AssetServer::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..").into())
     }
@@ -4247,9 +4297,178 @@ mod tests {
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
             Box::new(|renderer| {
+                // GI sky calibration: an open floor in a pillar's shadow, far
+                // from walls, sees only the sky. With GI it must match the
+                // hemisphere ambient it replaces (within 10%), not the
+                // brighter background sky.
+                use glam::Vec3;
+                let mut server = repo_server();
+                let grey = server.load("assets/models/review/grey_cube.glb");
+                let models = [
+                    slab(grey, Vec3::new(8.0, 0.2, 8.0), Vec3::new(0.0, -0.1, 0.0)),
+                    slab(grey, Vec3::new(0.4, 4.0, 0.4), Vec3::new(2.0, 2.0, 0.0)),
+                ];
+                let light = melon_core::Light {
+                    direction: test_light().direction,
+                    ..Default::default()
+                };
+                let camera = top_down_camera();
+                let px = screen_px(camera.view_proj(), Vec3::new(-1.0, 0.0, 0.0));
+                let mut shade = |gi_intensity| {
+                    let env = melon_core::Environment {
+                        gi_intensity,
+                        ..plain_environment()
+                    };
+                    let pixels =
+                        render_converged(renderer, camera, light, env, &models, &mut server);
+                    pixel_at(renderer, &pixels, px)
+                };
+                let (on, off) = (shade(1.0), shade(0.0));
+                let ratio = rgb_sum(on) as f32 / rgb_sum(off).max(1) as f32;
+                if (ratio - 1.0).abs() > 0.1 {
+                    return Err(format!(
+                        "GI should keep a shaded open floor at the hemisphere level: {on:?} with GI, {off:?} without (ratio {ratio:.3})"
+                    ));
+                }
+                Ok(())
+            }),
+            Box::new(|renderer| {
+                // No bright rims at inside corners: the shaded back wall in its
+                // top and bottom corners by the green wall (8 cm from each
+                // face) and the floor by the back wall are not brighter than
+                // the same surface 0.5 m away (0.7 m diagonally in a corner). Seen from the
+                // room's front like the snapshot (the view bias points out
+                // of the room, not away from the side wall) through an 8
+                // degree lens (about 2.5 cm per pixel).
+                use glam::Vec3;
+                let mut server = repo_server();
+                let models = test_room(&mut server);
+                let env = melon_core::Environment {
+                    gi_intensity: 1.0,
+                    ..plain_environment()
+                };
+                let o = TEST_ROOM_OFFSET;
+                let checks = [
+                    (
+                        "top corner (back wall, green wall, ceiling)",
+                        Vec3::new(-2.5, 4.0, 2.5),
+                        Vec3::new(-2.42, 3.9, 2.5),
+                        Vec3::new(-1.92, 3.4, 2.5),
+                    ),
+                    (
+                        "bottom corner (back wall, green wall, floor)",
+                        Vec3::new(-2.5, 0.0, 2.5),
+                        Vec3::new(-2.42, 0.1, 2.5),
+                        Vec3::new(-1.92, 0.6, 2.5),
+                    ),
+                    (
+                        "floor by the back wall",
+                        Vec3::new(-1.0, 0.0, 2.5),
+                        Vec3::new(-1.0, 0.0, 2.42),
+                        Vec3::new(-1.0, 0.0, 1.92),
+                    ),
+                ];
+                let mut sums = Vec::new();
+                for (name, center, corner, away) in checks {
+                    let camera = melon_core::Camera {
+                        eye: Vec3::new(0.0, 2.0, -8.5) + o,
+                        center: center + o,
+                        aspect: 1.0,
+                        fov_y_radians: 8f32.to_radians(),
+                        ..Default::default()
+                    };
+                    let pixels = render_converged(
+                        renderer,
+                        camera,
+                        test_room_light(),
+                        env,
+                        &models,
+                        &mut server,
+                    );
+                    let at = |p: Vec3| {
+                        rgb_sum(pixel_at(
+                            renderer,
+                            &pixels,
+                            screen_px(camera.view_proj(), p + o),
+                        ))
+                    };
+                    sums.push((name, at(corner), at(away)));
+                }
+                // End on a GI-off frame (the mesh pipeline follows it).
+                let camera = melon_core::Camera::default();
+                render_converged(
+                    renderer,
+                    camera,
+                    test_room_light(),
+                    plain_environment(),
+                    &models,
+                    &mut server,
+                );
+                for (name, c, a) in sums {
+                    // Tolerance: 2 sRGB steps per channel.
+                    if c > a + 6 {
+                        return Err(format!(
+                            "bright rim at the {name}: RGB sum {c} at the corner, {a} 0.5 m away"
+                        ));
+                    }
+                }
+                Ok(())
+            }),
+            Box::new(|renderer| {
+                // Guard: the front faces of the test room's red wall and
+                // ceiling (sunlit, coplanar at z = -2.5) show no stripes
+                // (z-fighting of overlapping slabs, or shadow acne). Seen
+                // obliquely from the room camera, 7 m away (the snapshot's
+                // angle and depth precision), through a 6 degree lens (about
+                // 1 cm per pixel): neighbouring pixels of each face differ by
+                // at most 2 sRGB steps per channel.
+                use glam::Vec3;
+                let mut server = repo_server();
+                let models = test_room(&mut server);
+                let camera = melon_core::Camera {
+                    eye: Vec3::new(0.0, 2.0, -8.5) + TEST_ROOM_OFFSET,
+                    center: Vec3::new(2.7, 4.0, -2.5) + TEST_ROOM_OFFSET,
+                    aspect: 1.0,
+                    fov_y_radians: 6f32.to_radians(),
+                    ..Default::default()
+                };
+                let pixels = render_converged(
+                    renderer,
+                    camera,
+                    melon_core::Light::default(),
+                    plain_environment(),
+                    &models,
+                    &mut server,
+                );
+                let face = |y: f32| Vec3::new(2.7, y, -2.5) + TEST_ROOM_OFFSET;
+                let x = screen_px(camera.view_proj(), face(4.0)).0;
+                let row = |y: f32| screen_px(camera.view_proj(), face(y)).1;
+                let steepest = |y0: f32, y1: f32| {
+                    (row(y1)..row(y0))
+                        .map(|y| {
+                            let a = rgb_sum(pixel_at(renderer, &pixels, (x, y)));
+                            let b = rgb_sum(pixel_at(renderer, &pixels, (x, y + 1)));
+                            a.abs_diff(b)
+                        })
+                        .max()
+                        .unwrap_or(0)
+                };
+                for (name, step) in [
+                    ("red wall", steepest(3.72, 3.95)),
+                    ("ceiling", steepest(4.05, 4.28)),
+                ] {
+                    if step > 6 {
+                        return Err(format!(
+                            "{name} front face is striped: neighbouring pixels differ by {step}"
+                        ));
+                    }
+                }
+                Ok(())
+            }),
+            Box::new(|renderer| {
                 // GI colour bleeding: a sunlit red wall (0.4 m, more than a
-                // voxel) on a grey floor, black sky (so the bounce is not
-                // diluted), low sun (the wall gets far more of it than the
+                // voxel) on a grey floor, black sky and hemisphere (so the
+                // bounce is not diluted), low sun (the wall gets far more of it than the
                 // floor). With GI the floor beside the wall's lit face turns
                 // red; without it, it stays grey.
                 use glam::Vec3;
@@ -4271,6 +4490,8 @@ mod tests {
                     };
                     let light = melon_core::Light {
                         direction: -Vec3::new(1.0, 0.25, 0.0).normalize(),
+                        sky_color: Vec3::ZERO,
+                        ground_color: Vec3::ZERO,
                         ..test_light()
                     };
                     let pixels =
@@ -4293,28 +4514,18 @@ mod tests {
                 // sunlit floor's bounce and the sky in.
                 use glam::Vec3;
                 let mut server = repo_server();
-                let grey = server.load("assets/models/review/grey_cube.glb");
-                let red = server.load("assets/models/review/red_panel.glb");
-                let green = server.load("assets/models/review/green_panel.glb");
-                let models = [
-                    slab(grey, Vec3::new(5.8, 0.1, 7.4), Vec3::new(0.0, -0.05, -0.8)),
-                    slab(red, Vec3::new(0.4, 4.4, 5.4), Vec3::new(2.7, 2.2, 0.2)),
-                    slab(green, Vec3::new(0.4, 4.4, 5.4), Vec3::new(-2.7, 2.2, 0.2)),
-                    slab(grey, Vec3::new(5.8, 4.4, 0.4), Vec3::new(0.0, 2.2, 2.7)),
-                    slab(grey, Vec3::new(5.8, 0.4, 5.4), Vec3::new(0.0, 4.2, 0.2)),
-                ];
+                let models = test_room(&mut server);
                 let camera = melon_core::Camera {
                     eye: Vec3::new(0.0, 2.0, -8.5),
                     center: Vec3::new(0.0, 1.9, 1.0),
                     aspect: 1.0,
                     ..Default::default()
                 };
-                let light = melon_core::Light {
-                    sky_color: Vec3::splat(0.1),
-                    ground_color: Vec3::splat(0.1),
-                    ..Default::default()
-                };
-                let px = screen_px(camera.view_proj(), Vec3::new(0.0, 2.0, 2.5));
+                let light = test_room_light();
+                let px = screen_px(
+                    camera.view_proj(),
+                    Vec3::new(0.0, 2.0, 2.5) + TEST_ROOM_OFFSET,
+                );
                 let mut back_wall = |gi_intensity| {
                     let env = melon_core::Environment {
                         gi_intensity,

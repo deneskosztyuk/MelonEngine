@@ -1,7 +1,7 @@
 // DDGI probe update (compute), after the voxel passes. gi_common.wgsl is
 // prepended. One workgroup per probe: each invocation traces one of the
 // GI_RAYS rays through the voxel radiance volume (3D DDA, early exit on the
-// first occupied voxel; a miss reads the sky) into workgroup memory, then
+// first occupied voxel; a miss reads the sky light) into workgroup memory, then
 // the workgroup blends them into every texel of the probe's irradiance and
 // depth tiles with hysteresis. Border texels compute the interior texel
 // they mirror, so the octahedral border needs no extra pass.
@@ -18,15 +18,8 @@ struct LightUniform {
     light_view_proj: mat4x4f,
 };
 
-struct EnvironmentUniform {
-    zenith_color: vec3f,
-    fog_density: f32,
-    horizon_color: vec3f,
-};
-
 @group(0) @binding(0) var<uniform> gi: GiUniform;
 @group(0) @binding(1) var<uniform> light: LightUniform;
-@group(0) @binding(2) var<uniform> env: EnvironmentUniform;
 // 3 u32 per voxel (see VOXEL_SCALE), x fastest, then y, then z.
 @group(0) @binding(3) var<storage, read> voxels: array<u32>;
 // Last frame's atlases (read) and this frame's (written, then copied over them).
@@ -55,18 +48,19 @@ fn ray_direction(i: u32) -> vec3f {
     return normalize((gi.ray_rotation * vec4f(d, 0.0)).xyz);
 }
 
-// The sky as sky.wgsl draws it, without the sun disc.
+// Sky light along a ray that leaves the volume: the hemisphere ambient's
+// colours, `light.ambient * sky_color` above the horizon, `ground_color`
+// below. Cosine-weighted over a normal's hemisphere this is exactly the
+// GI-off ambient `ambient * mix(ground, sky, n.y * 0.5 + 0.5)` (an open
+// plane tilted by t sees (1 + cos t) / 2 of the sky), so an unoccluded
+// surface keeps the GI-off brightness. The drawn sky (sky.wgsl) is the
+// background, several times brighter, and would wash the scene out.
 fn sky(dir: vec3f) -> vec3f {
-    let above = mix(env.horizon_color, env.zenith_color, sqrt(max(dir.y, 0.0)));
-    let g = light.ground_color;
-    let tint = mix(vec3f(1.0), g / max(max(g.r, g.g), max(g.b, 1e-4)), 0.3);
-    let haze = 0.8 * env.horizon_color * tint;
-    let below = mix(env.horizon_color, haze, smoothstep(0.0, 0.5, -dir.y));
-    return select(below, above, dir.y >= 0.0);
+    return light.ambient * select(light.ground_color, light.sky_color, dir.y >= 0.0);
 }
 
 // 3D DDA from `o` along unit `d` through the voxel grid: the first occupied
-// voxel's radiance and the distance to it, or the sky and MISS_DISTANCE.
+// voxel's radiance and the distance to it, or the sky light and MISS_DISTANCE.
 fn trace(o: vec3f, d: vec3f) -> vec4f {
     let counts = vec3i(gi.voxel_counts);
     let g = (o - gi.origin) / gi.voxel_size;

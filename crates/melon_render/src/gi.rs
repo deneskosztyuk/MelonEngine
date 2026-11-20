@@ -162,9 +162,9 @@ fn ray_rotation(frame: u32) -> Mat4 {
     )
 }
 
-/// Group 3 layout entries 1 to 4 (irradiance atlas, depth atlas, sampler,
-/// `GiUniform`); entry 0 is the AO texture.
-pub(crate) fn lighting_layout_entries() -> [wgpu::BindGroupLayoutEntry; 4] {
+/// Group 3 layout entries 1 to 5 (irradiance atlas, depth atlas, sampler,
+/// `GiUniform`, voxel buffer); entry 0 is the AO texture.
+pub(crate) fn lighting_layout_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
     let atlas = |binding| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -195,13 +195,22 @@ pub(crate) fn lighting_layout_entries() -> [wgpu::BindGroupLayoutEntry; 4] {
             },
             count: None,
         },
+        wgpu::BindGroupLayoutEntry {
+            binding: 5,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        },
     ]
 }
 
 /// Frame resources the GI passes read (from `SceneRenderer::new`).
 pub(crate) struct GiInputs<'a> {
     pub light: &'a wgpu::Buffer,
-    pub environment: &'a wgpu::Buffer,
     pub shadow_view: &'a wgpu::TextureView,
     pub shadow_sampler: &'a wgpu::Sampler,
     pub model_layout: &'a wgpu::BindGroupLayout,
@@ -254,6 +263,8 @@ pub(crate) struct Gi {
     sampler: wgpu::Sampler,
     /// 3 u32 per voxel: fixed-point radiance + 1 (0 = empty), atomicMax.
     voxels: wgpu::Buffer,
+    /// Stands in for `voxels` in the voxel passes' group 3.
+    no_voxels: wgpu::Buffer,
     voxel_pipeline: wgpu::RenderPipeline,
     /// Voxel pass group 0 per axis (X, Y, Z).
     voxel_groups: [wgpu::BindGroup; 3],
@@ -293,6 +304,12 @@ impl Gi {
             mapped_at_creation: false,
         });
 
+        let no_voxels = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gi dummy voxel buffer"),
+            size: 16,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         let entry = |binding, visibility, ty| wgpu::BindGroupLayoutEntry {
             binding,
             visibility,
@@ -410,7 +427,6 @@ impl Gi {
             entries: &[
                 entry(0, compute, uniform_ty),
                 entry(1, compute, uniform_ty),
-                entry(2, compute, uniform_ty),
                 entry(
                     3,
                     compute,
@@ -435,10 +451,6 @@ impl Gi {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: inputs.light.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: inputs.environment.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -492,6 +504,7 @@ impl Gi {
             depth,
             sampler,
             voxels,
+            no_voxels,
             voxel_pipeline,
             voxel_groups,
             voxel_target,
@@ -502,8 +515,10 @@ impl Gi {
         }
     }
 
-    /// Group 3 entries 1 to 4 for a lighting bind group.
-    pub(crate) fn lighting_entries(&self) -> [wgpu::BindGroupEntry<'_>; 4] {
+    /// Group 3 entries 1 to 5 for a lighting bind group. `voxels`: bind the
+    /// voxel volume for probe visibility; false (the voxel passes, which
+    /// write it) binds a dummy the shader never reads there.
+    pub(crate) fn lighting_entries(&self, voxels: bool) -> [wgpu::BindGroupEntry<'_>; 5] {
         [
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -520,6 +535,14 @@ impl Gi {
             wgpu::BindGroupEntry {
                 binding: 4,
                 resource: self.uniform.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: if voxels {
+                    self.voxels.as_entire_binding()
+                } else {
+                    self.no_voxels.as_entire_binding()
+                },
             },
         ]
     }
@@ -645,7 +668,7 @@ impl SceneRenderer {
             pass.set_pipeline(&gi.voxel_pipeline);
             pass.set_bind_group(0, group, &[]);
             pass.set_bind_group(1, &self.instance_bind_group, &[]);
-            pass.set_bind_group(3, &self.unoccluded_lighting, &[]);
+            pass.set_bind_group(3, &self.voxel_pass_lighting, &[]);
             for (mesh, material, instances) in draw_calls {
                 pass.set_bind_group(2, *material, &[]);
                 pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
