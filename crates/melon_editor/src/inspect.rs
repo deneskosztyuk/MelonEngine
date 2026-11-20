@@ -46,6 +46,77 @@ pub enum WidgetKind {
     /// A `Vec<MaterialSlot>`: one picker per mesh part (`.mat` files under
     /// `<root>/assets`), each a drop target for Content Browser drags.
     Materials { root: PathBuf },
+    /// An `f32` angle stored in radians, shown and edited in degrees.
+    Degrees { min: f32, max: f32 },
+    /// A linear `Vec3` colour edited with a colour picker.
+    Color,
+}
+
+/// An angle stored in radians as a drag value in degrees. The stored value
+/// is only touched when the user edits it, so drawing never drifts it.
+pub(crate) fn degrees_field(ui: &mut egui::Ui, radians: &mut f32, min: f32, max: f32) -> bool {
+    let mut degrees = radians.to_degrees();
+    let changed = ui
+        .add(
+            egui::DragValue::new(&mut degrees)
+                .speed(0.5)
+                .range(min..=max)
+                .suffix("\u{b0}")
+                .max_decimals(1),
+        )
+        .changed();
+    if changed {
+        *radians = degrees.to_radians();
+    }
+    changed
+}
+
+/// A picker of the files under `<root>/assets` with one of `extensions`,
+/// and a drop target for Content Browser drags. An empty path shows `None`,
+/// a path that is not a file is flagged missing.
+pub(crate) fn asset_field(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    v: &mut String,
+    root: &Path,
+    extensions: &[&str],
+) -> bool {
+    let mut changed = false;
+    let missing = !v.is_empty() && !root.join(&*v).is_file();
+    let text = if missing {
+        format!("{v} (missing)")
+    } else {
+        choice_label(v, std::slice::from_ref(v))
+    };
+    let combo = egui::ComboBox::from_id_salt(id)
+        .selected_text(text)
+        .width(ui.available_width())
+        .show_ui(ui, |ui| {
+            // Listed only while the dropdown is open.
+            if ui.selectable_label(v.is_empty(), "None").clicked() {
+                v.clear();
+                changed = true;
+            }
+            for path in content::asset_list(root, extensions) {
+                if ui
+                    .selectable_label(*v == path, &path)
+                    .on_hover_text(&path)
+                    .clicked()
+                {
+                    *v = path;
+                    changed = true;
+                }
+            }
+        });
+    // A file dragged from the Content Browser replaces it.
+    let drop = ui.interact(combo.response.rect, id.with("drop"), egui::Sense::hover());
+    if let Some(drag) = drop.dnd_release_payload::<AssetDrag>()
+        && let Some(path) = dropped_asset(root, &drag.path, extensions)
+    {
+        *v = path;
+        changed = true;
+    }
+    changed
 }
 
 pub type FieldWidgets = HashMap<&'static str, FieldWidget>;
@@ -210,40 +281,18 @@ fn widget_ui(
         }
         WidgetKind::Asset { root, extensions } => {
             let v = value.try_downcast_mut::<String>()?;
-            let mut changed = false;
-            let missing = !v.is_empty() && !root.join(&*v).is_file();
-            let text = if missing {
-                format!("{v} (missing)")
-            } else {
-                choice_label(v, std::slice::from_ref(v))
-            };
-            let combo = egui::ComboBox::from_id_salt(id)
-                .selected_text(text)
-                .width(ui.available_width())
-                .show_ui(ui, |ui| {
-                    // Listed only while the dropdown is open.
-                    if ui.selectable_label(v.is_empty(), "None").clicked() {
-                        v.clear();
-                        changed = true;
-                    }
-                    for path in content::asset_list(root, extensions) {
-                        if ui
-                            .selectable_label(*v == path, &path)
-                            .on_hover_text(&path)
-                            .clicked()
-                        {
-                            *v = path;
-                            changed = true;
-                        }
-                    }
-                });
-            // A file dragged from the Content Browser replaces it.
-            let drop = ui.interact(combo.response.rect, id.with("drop"), egui::Sense::hover());
-            if let Some(drag) = drop.dnd_release_payload::<AssetDrag>()
-                && let Some(path) = dropped_asset(root, &drag.path, extensions)
-            {
-                *v = path;
-                changed = true;
+            Some(asset_field(ui, id, v, root, extensions))
+        }
+        WidgetKind::Degrees { min, max } => {
+            let v = value.try_downcast_mut::<f32>()?;
+            Some(degrees_field(ui, v, *min, *max))
+        }
+        WidgetKind::Color => {
+            let v = value.try_downcast_mut::<Vec3>()?;
+            let mut rgb = v.to_array();
+            let changed = ui.color_edit_button_rgb(&mut rgb).changed();
+            if changed {
+                *v = Vec3::from_array(rgb);
             }
             Some(changed)
         }
@@ -849,6 +898,72 @@ mod tests {
             texts.push_str(&format!("{:?}", clipped.shape));
         }
         assert!(texts.contains("Speed (linear)"), "label override drawn");
+    }
+
+    #[test]
+    fn degrees_widget_edits_radians_and_never_drifts_them() {
+        let mut h = Harness::new();
+        h.widgets.insert(
+            "speed",
+            FieldWidget {
+                label: None,
+                kind: WidgetKind::Degrees {
+                    min: 0.0,
+                    max: 90.0,
+                },
+            },
+        );
+        let mut value = sample();
+        value.speed = std::f32::consts::FRAC_PI_2;
+        // Drawing alone leaves the stored radians bit for bit.
+        for _ in 0..3 {
+            assert!(!h.frame(&mut value, vec![]));
+        }
+        assert_eq!(value.speed.to_bits(), std::f32::consts::FRAC_PI_2.to_bits());
+        // Dragging the value 10 points to the left lowers it by 5 degrees.
+        let pos = h.center(root().with("speed"));
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let left = pos - egui::vec2(10.0, 0.0);
+        let mut changed = false;
+        for events in [
+            vec![egui::Event::PointerMoved(pos)],
+            vec![button(true)],
+            vec![egui::Event::PointerMoved(left)],
+            vec![egui::Event::PointerButton {
+                pos: left,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![],
+        ] {
+            changed |= h.frame(&mut value, events);
+        }
+        assert!(changed);
+        let degrees = value.speed.to_degrees();
+        assert!((degrees - 85.0).abs() < 1.5, "{degrees}");
+    }
+
+    #[test]
+    fn colour_widget_leaves_an_unedited_colour_alone() {
+        let mut h = Harness::new();
+        h.widgets.insert(
+            "pos",
+            FieldWidget {
+                label: None,
+                kind: WidgetKind::Color,
+            },
+        );
+        let mut value = sample();
+        let before = value.pos;
+        assert!(!h.frame(&mut value, vec![]));
+        assert_eq!(value.pos, before);
+        assert!(h.ctx.read_response(root().with("pos")).is_some());
     }
 
     const FIELDS: [&str; 11] = [

@@ -943,6 +943,35 @@ impl Editor {
                 },
             );
         }
+        if type_path == melon_core::PointLight::type_path()
+            || type_path == melon_core::SpotLight::type_path()
+        {
+            widgets.insert(
+                "color",
+                FieldWidget {
+                    label: None,
+                    kind: WidgetKind::Color,
+                },
+            );
+        }
+        if type_path == melon_core::SpotLight::type_path() {
+            // Stored in radians, edited in degrees.
+            for (field, label) in [
+                ("inner_angle", "Inner angle"),
+                ("outer_angle", "Outer angle"),
+            ] {
+                widgets.insert(
+                    field,
+                    FieldWidget {
+                        label: Some(label),
+                        kind: WidgetKind::Degrees {
+                            min: 0.0,
+                            max: 85.0,
+                        },
+                    },
+                );
+            }
+        }
         if type_path == melon_core::MeshMaterials::type_path() {
             widgets.insert(
                 "parts",
