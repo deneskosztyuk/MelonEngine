@@ -14,6 +14,7 @@ pub mod assets;
 pub mod audio;
 pub mod components;
 pub mod cursor;
+pub mod environment_asset;
 pub mod hierarchy;
 pub mod input;
 pub mod local_lights;
@@ -51,6 +52,10 @@ pub use components::{
     store_previous_transforms_system,
 };
 pub use cursor::{AppExit, Cursor, CursorMode};
+pub use environment_asset::{
+    AmbientSection, AoSection, AssetRef, BloomSection, ENVIRONMENT_EXTENSION, EnvironmentAsset,
+    FogSection, GiSection, SkySection, SunSection,
+};
 pub use glam;
 pub use hierarchy::{ChildOf, Children, GlobalTransform};
 pub use input::{GameInputGate, Input, InputButton, InputFocus, KeyCode, MouseButton, RawPresses};
@@ -219,6 +224,19 @@ impl Core {
             .register_component::<SpotLight>()
             .register_component::<Lod>()
             .register_component::<SceneLighting>();
+        {
+            let registry = core.world.resource::<AppTypeRegistry>().clone();
+            let mut registry = registry.write();
+            registry.register::<AssetRef>();
+            registry.register::<SunSection>();
+            registry.register::<AmbientSection>();
+            registry.register::<SkySection>();
+            registry.register::<FogSection>();
+            registry.register::<AoSection>();
+            registry.register::<GiSection>();
+            registry.register::<BloomSection>();
+            registry.register::<EnvironmentAsset>();
+        }
         core
     }
 
