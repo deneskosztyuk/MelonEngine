@@ -220,6 +220,21 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   a thumbnail recorded into the frame's encoder would give the Scene view
   the thumbnail's camera. One per frame, driven by
   `Editor::thumbnail_request` / `thumbnail_done`.
+  A thumbnail is an auxiliary view (`record_view(.., View::Auxiliary)`):
+  GI shaded as Off without `Gi::update` (no DDGI voxelising or probe
+  update, `updates` and SSGI history untouched), the current shadow map
+  size and sample count (its `FrameData::quality` sizes are ignored, so no
+  rebuild), no GPU timestamps. Its target follows the current sample count
+  (`match_msaa`, that target only). GPU checks
+  `thumbnail_does_not_disturb_the_next_scene_frame` (DDGI on) and
+  `thumbnail_keeps_shadow_map_and_msaa`.
+- **One main `render_scene` per submit (hard rule).** The camera, light,
+  environment, SSAO and GI uniforms and the instance buffer are shared and
+  written with `queue.write_buffer`, which applies at the next submit: two
+  views recorded into one submission both draw with the last view's data.
+  Auxiliary views (thumbnails) go in their own submission after the
+  frame's. A second main view (a Game view next to the Scene view) needs
+  per-view uniform and instance buffers first.
 - **Scene format.** RON, `SCENE_VERSION = 4` in `melon_editor/src/scene.rs`:
   `parent` is an index into `entities`, `transform` is local (versions 1 and 2
   still load, all roots). `model` is the path (`#mesh<N>` included) and

@@ -631,6 +631,17 @@ pub fn directional_light_view_proj(
         * view::look_at_mat4(eye, center, up)
 }
 
+/// What `Renderer::record_view` records: the scene view of the frame (world
+/// lines, overlay, quality, GI, timings) or an auxiliary view such as a
+/// thumbnail.
+enum View<'a> {
+    Main {
+        world_lines: &'a [LineVertex],
+        overlay: &'a [OverlayDraw],
+    },
+    Auxiliary,
+}
+
 /// Offscreen HDR colour target that the 3D pass renders into. With MSAA the
 /// pass draws into the multisampled texture and resolves into the
 /// single-sample one, which the tonemap pass reads; with 1 sample it draws
@@ -1115,7 +1126,7 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("thumbnail"),
             });
-        self.render_scene(&mut encoder, &frame, server, target, &[], &[]);
+        self.record_view(&mut encoder, &frame, server, target, View::Auxiliary);
         let source = target.color_texture();
         let format = source.format();
         let texture = self.device().create_texture(&wgpu::TextureDescriptor {
@@ -1161,12 +1172,50 @@ impl Renderer {
         world_lines: &[LineVertex],
         overlay: &[OverlayDraw],
     ) -> RenderStats {
+        self.record_view(
+            encoder,
+            frame,
+            server,
+            target,
+            View::Main {
+                world_lines,
+                overlay,
+            },
+        )
+    }
+
+    /// `render_scene` for a `View::Main`; a `View::Auxiliary` (thumbnail)
+    /// leaves the world state alone: GI shaded as Off without updating it,
+    /// the current shadow map size and sample count (its quality's are
+    /// ignored), no GPU timestamps.
+    fn record_view(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &FrameData,
+        server: &mut melon_core::AssetServer,
+        target: &mut ViewportTarget,
+        view: View<'_>,
+    ) -> RenderStats {
+        let main = matches!(view, View::Main { .. });
+        let (world_lines, overlay) = match view {
+            View::Main {
+                world_lines,
+                overlay,
+            } => (world_lines, overlay),
+            View::Auxiliary => (&[][..], &[][..]),
+        };
         let quality = &frame.quality;
         let scene = &mut self.scene;
-        scene.set_shadow_map_size(quality.shadow_map_size);
-        scene.set_msaa(quality.msaa);
+        if main {
+            scene.set_shadow_map_size(quality.shadow_map_size);
+            scene.set_msaa(quality.msaa);
+        }
         scene.match_msaa(target);
-        let gi_mode = gi::frame_mode(&frame.environment, quality.gi_mode);
+        let gi_mode = if main {
+            gi::frame_mode(&frame.environment, quality.gi_mode)
+        } else {
+            melon_core::GiMode::Off
+        };
         scene.match_gi_view(
             target,
             (gi_mode == melon_core::GiMode::Ssgi).then_some(quality.ssgi_resolution),
@@ -1175,14 +1224,20 @@ impl Renderer {
         scene.update_camera(frame.view_proj, frame.eye);
         scene.update_environment(&frame.environment);
         scene.update_ssao(&frame.environment);
-        scene.gi.update(
-            &scene.queue,
-            &frame.environment,
-            gi_mode,
-            &target.lighting.gi,
-            frame.view_proj,
-            frame.eye,
-        );
+        if main {
+            scene.gi.update(
+                &scene.queue,
+                &frame.environment,
+                gi_mode,
+                &target.lighting.gi,
+                frame.view_proj,
+                frame.eye,
+            );
+        } else {
+            // Draw with the GI-off pipeline; DDGI's probes and update count
+            // and its uniform stay as the last main view left them.
+            scene.gi.mode = melon_core::GiMode::Off;
+        }
         let light_view_proj =
             directional_light_view_proj(frame.light.to_light(), SHADOW_CENTER, SHADOW_RADIUS);
         scene.update_light(&frame.light, light_view_proj);
@@ -1245,7 +1300,8 @@ impl Renderer {
 
         // The draw lists borrow the model cache; the scene is a separate field.
         let scene = &mut self.scene;
-        let timer = &mut self.timer;
+        let mut untimed = None;
+        let timer = if main { &mut self.timer } else { &mut untimed };
         let mark = |encoder: &mut wgpu::CommandEncoder, timer: &Option<timings::GpuTimer>, m| {
             if let Some(timer) = timer {
                 timer.mark(encoder, m);
@@ -1346,7 +1402,7 @@ impl Renderer {
             frame.eye,
             overlay,
         );
-        if let Some(timer) = self.timer.as_mut() {
+        if let Some(timer) = timer.as_mut() {
             timer.finish(
                 encoder,
                 timings::Ran {
@@ -5106,6 +5162,119 @@ mod tests {
         assert!(centre.x.abs() < 1e-3 && centre.y.abs() < 1e-3, "{centre}");
     }
 
+    /// Renders a GI reset frame, then two main frames of the GI room at
+    /// `quality`, with and without two thumbnails between them: the second
+    /// frame must be byte-identical, and the thumbnails must keep the shadow
+    /// map, the sample count and the scene target's MSAA textures.
+    fn thumbnails_between_frames(
+        renderer: &mut Renderer,
+        quality: melon_core::RenderQuality,
+        name: &str,
+    ) -> Result<(), String> {
+        use melon_core::{GiMode, Handle, Model};
+        // The GI test room: its colours bleed only through DDGI. Handle ids
+        // past the other checks' (the model cache is shared, keyed by id).
+        let mut server = fresh_ids_server(repo_server().root().to_path_buf(), 5000);
+        let models = test_room(&mut server);
+        let camera = melon_core::Camera {
+            eye: glam::Vec3::new(0.0, 2.0, -8.5),
+            center: glam::Vec3::new(0.0, 1.9, 1.0),
+            aspect: 1.0,
+            ..Default::default()
+        };
+        let mut scene_target =
+            renderer.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let frame = |quality| FrameData {
+            view_proj: camera.view_proj(),
+            eye: camera.eye,
+            light: test_room_light(),
+            environment: melon_core::Environment::default(),
+            quality,
+            models: models.clone(),
+        };
+        let reset = frame(melon_core::RenderQuality {
+            gi_mode: GiMode::Off,
+            ..quality
+        });
+        let main = frame(quality);
+        let root = temp_project(name);
+        std::fs::write(root.join("assets/models/m.gltf"), TWO_NODE_GLTF).unwrap();
+        let mut thumb_server = fresh_ids_server(root.clone(), 6000);
+        let h: Handle<Model> = thumb_server.load("assets/models/m.gltf");
+        let mut thumb_target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(
+            THUMBNAIL_SIZE,
+            THUMBNAIL_SIZE,
+        ));
+        let identity = |renderer: &Renderer, target: &ViewportTarget| {
+            (
+                renderer.scene.shadow_texture.clone(),
+                renderer.scene.msaa(),
+                target.hdr_target.msaa.as_ref().map(|(t, _)| t.clone()),
+                target._depth_texture.clone(),
+            )
+        };
+        let mut run = |renderer: &mut Renderer, thumbnails: bool| -> Result<Vec<u8>, String> {
+            for (i, frame) in [&reset, &main, &main].into_iter().enumerate() {
+                if i == 2 && thumbnails {
+                    let before = identity(renderer, &scene_target);
+                    for _ in 0..2 {
+                        renderer
+                            .render_thumbnail(&mut thumb_server, h, &mut thumb_target)
+                            .ok_or(format!("{name}: no thumbnail"))?;
+                    }
+                    if identity(renderer, &scene_target) != before {
+                        return Err(format!("{name}: shadow map or MSAA targets rebuilt"));
+                    }
+                }
+                let mut encoder = renderer
+                    .device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                renderer.render_scene(
+                    &mut encoder,
+                    frame,
+                    &mut server,
+                    &mut scene_target,
+                    &[],
+                    &[],
+                );
+                if i < 2 {
+                    renderer.queue().submit([encoder.finish()]);
+                } else {
+                    return Ok(read_back(
+                        renderer.device(),
+                        renderer.queue(),
+                        encoder,
+                        &scene_target.color_texture,
+                    ));
+                }
+            }
+            unreachable!()
+        };
+        // The first run settles the targets (MSAA, quality switch).
+        run(renderer, false)?;
+        let plain = run(renderer, false);
+        let with_thumbnails = run(renderer, true);
+        // End on a GI-off frame, like the other GI checks.
+        let mut encoder = renderer
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        renderer.render_scene(
+            &mut encoder,
+            &reset,
+            &mut server,
+            &mut scene_target,
+            &[],
+            &[],
+        );
+        renderer.queue().submit([encoder.finish()]);
+        let _ = std::fs::remove_dir_all(&root);
+        if plain? == with_thumbnails? {
+            Ok(())
+        } else {
+            Err(format!("{name}: the next frame's pixels changed"))
+        }
+    }
+
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
@@ -6210,55 +6379,32 @@ mod tests {
                 }
             }),
             Box::new(|renderer| {
-                use melon_core::{AssetServer, Handle, Model};
-                let mut server = AssetServer::new(".".into());
-                let cube: Handle<Model> = server.load("builtin:cube");
-                let mut scene_target = renderer
-                    .create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
-                let frame = FrameData {
-                    view_proj: melon_core::Camera::default().view_proj(),
-                    eye: melon_core::Camera::default().eye,
-                    light: melon_core::Light::default(),
-                    environment: melon_core::Environment::default(),
-                    quality: melon_core::RenderQuality::default(),
-                    models: vec![(glam::Mat4::from_rotation_y(0.4), cube)],
+                // DDGI on (default quality): thumbnails leave the world GI
+                // state alone.
+                thumbnails_between_frames(
+                    renderer,
+                    melon_core::RenderQuality::default(),
+                    "thumbnail_does_not_disturb_the_next_scene_frame",
+                )
+            }),
+            Box::new(|renderer| {
+                // Shadow map and MSAA not at the thumbnail's (default)
+                // quality: the thumbnail must not rebuild them.
+                let quality = melon_core::RenderQuality {
+                    shadow_map_size: 1024,
+                    msaa: 1,
+                    ..Default::default()
                 };
-                let mut scene = |renderer: &mut Renderer, server: &mut AssetServer| {
-                    let mut encoder = renderer
-                        .device()
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-                    renderer.render_scene(
-                        &mut encoder,
-                        &frame,
-                        server,
-                        &mut scene_target,
-                        &[],
-                        &[],
-                    );
-                    read_back(
-                        renderer.device(),
-                        renderer.queue(),
-                        encoder,
-                        &scene_target.color_texture,
-                    )
-                };
-                let before = scene(renderer, &mut server);
-                let root = temp_project("thumb_disturb");
-                std::fs::write(root.join("assets/models/m.gltf"), TWO_NODE_GLTF).unwrap();
-                let mut thumb_server = fresh_ids_server(root.clone(), 3000);
-                let h: Handle<Model> = thumb_server.load("assets/models/m.gltf");
-                let mut thumb_target = renderer.create_viewport_target(
-                    winit::dpi::PhysicalSize::new(THUMBNAIL_SIZE, THUMBNAIL_SIZE),
+                let result = thumbnails_between_frames(
+                    renderer,
+                    quality,
+                    "thumbnail_keeps_shadow_map_and_msaa",
                 );
-                let made = renderer.render_thumbnail(&mut thumb_server, h, &mut thumb_target);
-                let _ = std::fs::remove_dir_all(&root);
-                made.ok_or("thumbnail_does_not_disturb_the_next_scene_frame: no thumbnail")?;
-                let after = scene(renderer, &mut server);
-                if before == after {
-                    Ok(())
-                } else {
-                    Err("thumbnail_does_not_disturb_the_next_scene_frame: pixels changed".into())
-                }
+                let default = melon_core::RenderQuality::default();
+                let scene = renderer.scene_mut();
+                scene.set_shadow_map_size(default.shadow_map_size);
+                scene.set_msaa(default.msaa);
+                result
             }),
             Box::new(|renderer| {
                 let model = renderer
