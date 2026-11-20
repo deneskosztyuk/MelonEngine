@@ -405,7 +405,177 @@ impl App {
     }
 }
 
+impl App {
+    /// One editor + render frame. Called from `about_to_wait`, not from
+    /// `RedrawRequested`: on Windows winit raises `RedrawRequested` from
+    /// `WM_PAINT`, which Windows only generates when no input is waiting,
+    /// so a fast mouse (or raw input while playing) held frames back for
+    /// 100+ ms. `about_to_wait` runs once the queued events are handled.
+    fn draw_frame(&mut self, event_loop: &ActiveEventLoop) {
+        let frame_n = self
+            .core
+            .world
+            .get_resource::<FrameCounter>()
+            .map(|c| c.frame)
+            .unwrap_or(0);
+        let _frame_span = tracing::info_span!("frame", n = frame_n).entered();
+
+        // Frame cap: sleep to the deadline here. Waiting in the event
+        // loop (WaitUntil) missed deadlines by ~100 ms while input
+        // events streamed in.
+        if let Some(pacer) = self.pacer.as_ref() {
+            let next = pacer.next();
+            let slept = self.stats.clock();
+            std::thread::sleep(pacing::sleep_until_deadline(
+                next,
+                Instant::now(),
+                pacer.period(),
+            ));
+            self.stats.sleep_done(slept);
+        }
+        self.stats.frame_start();
+        let now = Instant::now();
+        let dt = self
+            .last_frame
+            .map(|t| now.duration_since(t).as_secs_f32())
+            .unwrap_or(1.0 / 60.0);
+        if let Some(pacer) = self.pacer.as_mut() {
+            pacer.advance(now);
+        }
+        if let Some(mut time) = self.core.world.get_resource_mut::<Time>() {
+            time.update(dt);
+        }
+        self.last_frame = Some(now);
+        #[cfg(feature = "hot-reload")]
+        self.game.poll(dt, &mut self.core);
+
+        self.core.update();
+        self.stats.lap(pacing::Stage::Update);
+
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let (Some(editor), Some(editor_ui)) = (self.editor.as_mut(), self.editor_ui.as_mut())
+        else {
+            return;
+        };
+        let present = self.core.world.resource::<RenderQuality>().present;
+        if renderer.set_present(present) {
+            self.pacer = pacing::frame_cap(renderer.present_mode(), self.frame_period);
+        }
+        let Some(mut frame) = renderer.begin_frame() else {
+            // No editor pass this frame (e.g. minimised): drop the presses anyway.
+            clear_raw_presses(&mut self.core.world);
+            return;
+        };
+        self.stats.lap(pacing::Stage::Acquire);
+
+        // Editor UI first: it may move the camera, edit entities or
+        // queue a File operation, and this frame should show all of it.
+        editor.update(
+            window,
+            renderer.device(),
+            renderer.queue(),
+            &mut frame.encoder,
+            &mut self.core.world,
+            editor_ui,
+        );
+        self.stats.lap(pacing::Stage::Editor);
+        clear_raw_presses(&mut self.core.world);
+        // The editor wrote the gate during its UI pass; it applies from the next events on.
+        let gate = self
+            .core
+            .world
+            .get_resource::<GameInputGate>()
+            .is_some_and(|g| g.0);
+        if let Some(mut input) = self.core.world.get_resource_mut::<Input>()
+            && apply_gate(&mut input, &mut self.game_input, gate)
+        {
+            grab_cursor(window, gate);
+            event_loop.listen_device_events(pacing::device_events(gate));
+        }
+        if editor_ui.run_pending_operation(&mut self.core.world) {
+            event_loop.exit();
+        }
+        let overlay = editor_ui.take_overlay_draws();
+        let world_line_vertices = editor_ui.take_world_line_vertices();
+
+        // Follow the viewport panel's size: recreate the target, hand it
+        // to the editor UI, and match the camera aspect before drawing.
+        let requested_size = editor_ui.requested_viewport_size();
+        if self
+            .viewport_target
+            .as_ref()
+            .is_none_or(|t| t.size() != requested_size)
+        {
+            let viewport_target = renderer.create_viewport_target(requested_size);
+            editor.set_viewport_target(renderer.device(), &viewport_target);
+            self.viewport_target = Some(viewport_target);
+            let aspect = requested_size.width as f32 / requested_size.height as f32;
+            if let Some(mut camera) = self.core.world.get_resource_mut::<Camera>() {
+                camera.set_aspect(aspect);
+            }
+        }
+
+        let frame_data = melon_render::extract(&mut self.core.world);
+        if let Some(target) = self.viewport_target.as_mut() {
+            let mut server = self.core.world.resource_mut::<melon_core::AssetServer>();
+            renderer.render_scene(
+                &mut frame.encoder,
+                &frame_data,
+                &mut server,
+                target,
+                &world_line_vertices,
+                &overlay,
+            );
+        }
+        {
+            let mut pass = renderer.ui_pass(&mut frame);
+            editor.render(&mut pass);
+        }
+        self.stats.lap(pacing::Stage::Render);
+        renderer.end_frame(frame);
+        self.stats.lap(pacing::Stage::Submit);
+        let timings = renderer.timings();
+        self.stats.gpu_total(timings.total);
+        self.core.world.insert_resource(RenderTimings {
+            budget_ms: Some(self.frame_period.as_secs_f32() * 1000.0),
+            ..timings
+        });
+
+        // One Content Browser thumbnail per frame, in its own
+        // submission after this frame's (shared uniforms are written
+        // with `queue.write_buffer`, applied at the next submit).
+        if let Some(target) = self.thumbnail_target.as_mut()
+            && let Some(request) = editor_ui.thumbnail_request(&mut self.core.world)
+        {
+            let view = {
+                let mut server = self.core.world.resource_mut::<melon_core::AssetServer>();
+                renderer.render_thumbnail(&mut server, request.handle, target)
+            };
+            let id = view
+                .map(|view| editor.register_thumbnail(renderer.device(), &view, request.existing));
+            editor_ui.thumbnail_done(&request, id);
+        }
+    }
+}
+
 impl ApplicationHandler for App {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Minimized: no frames (and no game updates), as when frames waited
+        // for `WM_PAINT`, which a minimized window never gets.
+        if self
+            .window
+            .as_ref()
+            .is_some_and(|w| w.is_minimized() != Some(true))
+        {
+            self.draw_frame(event_loop);
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -565,160 +735,9 @@ impl ApplicationHandler for App {
                     input.wheel += notches;
                 }
             }
-            WindowEvent::RedrawRequested => {
-                let frame_n = self
-                    .core
-                    .world
-                    .get_resource::<FrameCounter>()
-                    .map(|c| c.frame)
-                    .unwrap_or(0);
-                let _frame_span = tracing::info_span!("frame", n = frame_n).entered();
-
-                // Frame cap: sleep to the deadline here. Waiting in the event
-                // loop (WaitUntil) missed deadlines by ~100 ms while input
-                // events streamed in.
-                if let Some(pacer) = self.pacer.as_ref() {
-                    let next = pacer.next();
-                    let slept = self.stats.clock();
-                    std::thread::sleep(pacing::sleep_until_deadline(
-                        next,
-                        Instant::now(),
-                        pacer.period(),
-                    ));
-                    self.stats.sleep_done(slept);
-                }
-                self.stats.frame_start();
-                let now = Instant::now();
-                let dt = self
-                    .last_frame
-                    .map(|t| now.duration_since(t).as_secs_f32())
-                    .unwrap_or(1.0 / 60.0);
-                if let Some(pacer) = self.pacer.as_mut() {
-                    pacer.advance(now);
-                }
-                if let Some(mut time) = self.core.world.get_resource_mut::<Time>() {
-                    time.update(dt);
-                }
-                self.last_frame = Some(now);
-                #[cfg(feature = "hot-reload")]
-                self.game.poll(dt, &mut self.core);
-
-                self.core.update();
-                self.stats.lap(pacing::Stage::Update);
-
-                let Some(renderer) = self.renderer.as_mut() else {
-                    return;
-                };
-                let Some(window) = self.window.as_ref() else {
-                    return;
-                };
-                let (Some(editor), Some(editor_ui)) =
-                    (self.editor.as_mut(), self.editor_ui.as_mut())
-                else {
-                    return;
-                };
-                let present = self.core.world.resource::<RenderQuality>().present;
-                if renderer.set_present(present) {
-                    self.pacer = pacing::frame_cap(renderer.present_mode(), self.frame_period);
-                }
-                let Some(mut frame) = renderer.begin_frame() else {
-                    // No editor pass this frame (e.g. minimised): drop the presses anyway.
-                    clear_raw_presses(&mut self.core.world);
-                    return;
-                };
-                self.stats.lap(pacing::Stage::Acquire);
-
-                // Editor UI first: it may move the camera, edit entities or
-                // queue a File operation, and this frame should show all of it.
-                editor.update(
-                    window,
-                    renderer.device(),
-                    renderer.queue(),
-                    &mut frame.encoder,
-                    &mut self.core.world,
-                    editor_ui,
-                );
-                self.stats.lap(pacing::Stage::Editor);
-                clear_raw_presses(&mut self.core.world);
-                // The editor wrote the gate during its UI pass; it applies from the next events on.
-                let gate = self
-                    .core
-                    .world
-                    .get_resource::<GameInputGate>()
-                    .is_some_and(|g| g.0);
-                if let Some(mut input) = self.core.world.get_resource_mut::<Input>()
-                    && apply_gate(&mut input, &mut self.game_input, gate)
-                {
-                    grab_cursor(window, gate);
-                    event_loop.listen_device_events(pacing::device_events(gate));
-                }
-                if editor_ui.run_pending_operation(&mut self.core.world) {
-                    event_loop.exit();
-                }
-                let overlay = editor_ui.take_overlay_draws();
-                let world_line_vertices = editor_ui.take_world_line_vertices();
-
-                // Follow the viewport panel's size: recreate the target, hand it
-                // to the editor UI, and match the camera aspect before drawing.
-                let requested_size = editor_ui.requested_viewport_size();
-                if self
-                    .viewport_target
-                    .as_ref()
-                    .is_none_or(|t| t.size() != requested_size)
-                {
-                    let viewport_target = renderer.create_viewport_target(requested_size);
-                    editor.set_viewport_target(renderer.device(), &viewport_target);
-                    self.viewport_target = Some(viewport_target);
-                    let aspect = requested_size.width as f32 / requested_size.height as f32;
-                    if let Some(mut camera) = self.core.world.get_resource_mut::<Camera>() {
-                        camera.set_aspect(aspect);
-                    }
-                }
-
-                let frame_data = melon_render::extract(&mut self.core.world);
-                if let Some(target) = self.viewport_target.as_mut() {
-                    let mut server = self.core.world.resource_mut::<melon_core::AssetServer>();
-                    renderer.render_scene(
-                        &mut frame.encoder,
-                        &frame_data,
-                        &mut server,
-                        target,
-                        &world_line_vertices,
-                        &overlay,
-                    );
-                }
-                {
-                    let mut pass = renderer.ui_pass(&mut frame);
-                    editor.render(&mut pass);
-                }
-                self.stats.lap(pacing::Stage::Render);
-                renderer.end_frame(frame);
-                self.stats.lap(pacing::Stage::Submit);
-                let timings = renderer.timings();
-                self.stats.gpu_total(timings.total);
-                self.core.world.insert_resource(RenderTimings {
-                    budget_ms: Some(self.frame_period.as_secs_f32() * 1000.0),
-                    ..timings
-                });
-
-                // One Content Browser thumbnail per frame, in its own
-                // submission after this frame's (shared uniforms are written
-                // with `queue.write_buffer`, applied at the next submit).
-                if let Some(target) = self.thumbnail_target.as_mut()
-                    && let Some(request) = editor_ui.thumbnail_request(&mut self.core.world)
-                {
-                    let view = {
-                        let mut server = self.core.world.resource_mut::<melon_core::AssetServer>();
-                        renderer.render_thumbnail(&mut server, request.handle, target)
-                    };
-                    let id = view.map(|view| {
-                        editor.register_thumbnail(renderer.device(), &view, request.existing)
-                    });
-                    editor_ui.thumbnail_done(&request, id);
-                }
-
-                window.request_redraw();
-            }
+            // Only paints Windows asks for itself (resize, expose): frames are
+            // drawn from `about_to_wait`, see `draw_frame`.
+            WindowEvent::RedrawRequested => self.draw_frame(event_loop),
             _ => {}
         }
         self.stats.event_done(event_start);
