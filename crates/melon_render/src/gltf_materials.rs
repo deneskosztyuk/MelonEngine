@@ -38,6 +38,9 @@ fn part_materials(node: &gltf::Node, out: &mut Vec<Option<usize>>) {
 /// without a material get a default one). Textures are referenced by path;
 /// the caller adds `.meta`s and fills the GUIDs.
 pub fn extract_materials(model: &Path, rel_dir: &str) -> Result<Vec<String>> {
+    if crate::fbx::is_fbx(&model.to_string_lossy()) {
+        return extract_fbx(model, rel_dir);
+    }
     let (document, _, images) = gltf::import(model)
         .with_context(|| format!("failed to import glTF file: {}", model.display()))?;
     let dir = model.parent().unwrap_or_else(|| Path::new("."));
@@ -125,6 +128,74 @@ pub fn extract_materials(model: &Path, rel_dir: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// `extract_materials` for an FBX: textures are copied next to the model by
+/// their own file name (kept as is when the same file is already there).
+fn extract_fbx(model: &Path, rel_dir: &str) -> Result<Vec<String>> {
+    let name = model.to_string_lossy();
+    let bytes = std::fs::read(model).with_context(|| format!("could not read {name}"))?;
+    let fbx = crate::fbx::import(&name, &bytes, Some(&|p| std::fs::read(p)))?;
+    let dir = model.parent().unwrap_or_else(|| Path::new("."));
+    let stem = file_safe(&model.file_stem().unwrap_or_default().to_string_lossy());
+
+    let mut written: HashMap<usize, String> = HashMap::new();
+    let mut files: HashMap<Option<usize>, String> = HashMap::new();
+    let mut used_names = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for material_index in fbx.part_materials() {
+        if let Some(path) = files.get(&material_index) {
+            out.push(path.clone());
+            continue;
+        }
+        let material = material_index.map(|i| &fbx.materials[i]);
+        let mut asset = material.map_or_else(MaterialAsset::new_default, |m| m.asset.clone());
+        if let Some(material) = material {
+            let slots = [
+                &mut asset.base_color_texture,
+                &mut asset.metallic_roughness_texture,
+                &mut asset.normal_texture,
+                &mut asset.emissive_texture,
+            ];
+            for (slot, texture) in slots.into_iter().zip(material.textures) {
+                let Some(t) = texture else { continue };
+                let texture = &fbx.textures[t];
+                let rel = match written.get(&t) {
+                    Some(rel) => rel.clone(),
+                    None => {
+                        let mut file = texture.file_name.clone();
+                        if std::fs::read(dir.join(&file)).is_ok_and(|b| b != texture.bytes) {
+                            file = format!("{stem}_{file}");
+                        }
+                        std::fs::write(dir.join(&file), &texture.bytes)
+                            .with_context(|| format!("could not write {file}"))?;
+                        let rel = format!("{rel_dir}/{file}");
+                        written.insert(t, rel.clone());
+                        rel
+                    }
+                };
+                *slot = Some(TextureRef {
+                    guid: None,
+                    path: rel,
+                });
+            }
+        }
+        let mut name = file_safe(
+            material
+                .map(|m| m.name.as_str())
+                .filter(|n| !n.is_empty())
+                .unwrap_or("default"),
+        );
+        if !used_names.insert(name.clone()) {
+            name = format!("{name}_{}", used_names.len());
+        }
+        let file = format!("{stem}_{name}.mat");
+        asset.save(&dir.join(&file))?;
+        let rel = format!("{rel_dir}/{file}");
+        files.insert(material_index, rel.clone());
+        out.push(rel);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +243,66 @@ mod tests {
         assert_eq!(glass.alpha_mode, AlphaMode::Blend);
         assert!(parts[0].starts_with("assets/models/") && parts[0].ends_with(".mat"));
         assert!(parts[0].contains("Red Paint") || parts[0].contains("Red_Paint"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn extract_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("melon_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn png_bytes(colour: [u8; 4]) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(2, 2, image::Rgba(colour))
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn fbx_materials_and_embedded_textures_are_written_next_to_the_model() {
+        use crate::fbx::fixture::Cube;
+        let dir = extract_dir("extract_fbx");
+        let png = png_bytes([0, 255, 0, 255]);
+        let cube = Cube {
+            two_materials: true,
+            texture: Some("t.png"),
+            embedded: Some(png.clone()),
+            ..Cube::default()
+        };
+        let model = dir.join("box.fbx");
+        std::fs::write(&model, cube.ascii()).unwrap();
+        let parts = extract_materials(&model, "assets/models").unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_ne!(parts[0], parts[1]);
+        let red = MaterialAsset::read(&dir.join(parts[0].rsplit('/').next().unwrap())).unwrap();
+        let blue = MaterialAsset::read(&dir.join(parts[1].rsplit('/').next().unwrap())).unwrap();
+        let texture = red.base_color_texture.unwrap();
+        assert_eq!(texture.path, "assets/models/t.png");
+        assert!(blue.base_color_texture.is_none());
+        assert_eq!(blue.base_color, [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(std::fs::read(dir.join("t.png")).unwrap(), png);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fbx_texture_already_next_to_the_model_is_kept_not_overwritten() {
+        use crate::fbx::fixture::Cube;
+        let dir = extract_dir("extract_fbx_beside");
+        let png = png_bytes([1, 2, 3, 255]);
+        std::fs::write(dir.join("t.png"), &png).unwrap();
+        let cube = Cube {
+            texture: Some("t.png"),
+            ..Cube::default()
+        };
+        std::fs::write(dir.join("box.fbx"), cube.ascii()).unwrap();
+        let parts = extract_materials(&dir.join("box.fbx"), "assets/models").unwrap();
+        let mat = MaterialAsset::read(&dir.join(parts[0].rsplit('/').next().unwrap())).unwrap();
+        assert_eq!(mat.base_color_texture.unwrap().path, "assets/models/t.png");
+        assert_eq!(std::fs::read(dir.join("t.png")).unwrap(), png);
+        assert!(!dir.join("box_t.png").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

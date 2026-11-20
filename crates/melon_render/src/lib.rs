@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 mod cascades;
 mod extract;
+mod fbx;
 pub mod gi;
 mod gltf_materials;
 mod ibl;
@@ -32,9 +33,13 @@ pub struct GltfNode {
     pub mesh: Option<usize>,
 }
 
-/// The node tree of a glTF / GLB file's default scene (or first scene),
-/// depth-first, parents before children. Reads no buffers or images.
+/// The node tree of a glTF / GLB file's default scene (or first scene), or
+/// of an FBX file, depth-first, parents before children. A glTF read touches
+/// no buffers or images; an FBX is parsed whole.
 pub fn gltf_nodes(path: &std::path::Path) -> Result<Vec<GltfNode>> {
+    if let Some(fbx) = read_fbx(path) {
+        return Ok(fbx?.nodes);
+    }
     let gltf = gltf::Gltf::open(path)
         .with_context(|| format!("failed to read glTF file: {}", path.display()))?;
     nodes_of(&gltf.document)
@@ -47,9 +52,12 @@ pub fn gltf_nodes_from_slice(bytes: &[u8]) -> Result<Vec<GltfNode>> {
 }
 
 /// Bounds of a glTF / GLB file's default scene from the POSITION accessors'
-/// min / max and the node transforms (no vertex data is read). `None` if
-/// the scene has no meshes.
+/// min / max and the node transforms (no vertex data is read), or of an FBX
+/// file (parsed whole, in metres, Y up). `None` if the scene has no meshes.
 pub fn gltf_bounds(path: &std::path::Path) -> Result<Option<(glam::Vec3, glam::Vec3)>> {
+    if let Some(fbx) = read_fbx(path) {
+        return Ok(fbx?.bounds());
+    }
     let gltf = gltf::Gltf::open(path)
         .with_context(|| format!("failed to read glTF file: {}", path.display()))?;
     bounds_of(&gltf.document)
@@ -59,6 +67,16 @@ pub fn gltf_bounds(path: &std::path::Path) -> Result<Option<(glam::Vec3, glam::V
 pub fn gltf_bounds_from_slice(bytes: &[u8]) -> Result<Option<(glam::Vec3, glam::Vec3)>> {
     let gltf = gltf::Gltf::from_slice(bytes).context("failed to read glTF data")?;
     bounds_of(&gltf.document)
+}
+
+/// `path` parsed (no textures) when it is an FBX file.
+fn read_fbx(path: &std::path::Path) -> Option<Result<fbx::FbxModel>> {
+    let name = path.to_string_lossy();
+    fbx::is_fbx(&name).then(|| {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("failed to read FBX file: {}", path.display()))?;
+        fbx::import(&name, &bytes, None)
+    })
 }
 
 /// Side of a Content Browser thumbnail, in pixels.
@@ -413,6 +431,24 @@ pub struct MaterialUniform {
 }
 
 impl MaterialUniform {
+    /// The factors of a `.mat` asset.
+    pub fn from_asset(asset: &melon_core::MaterialAsset) -> Self {
+        use melon_core::material::AlphaMode;
+        Self {
+            base_color: asset.base_color,
+            emissive: asset.emissive.map(|c| c * asset.emissive_strength),
+            metallic: asset.metallic,
+            roughness: asset.roughness,
+            normal_scale: asset.normal_scale,
+            alpha_cutoff: match asset.alpha_mode {
+                // 0 means "no mask", so a cutoff of 0 is the smallest one.
+                AlphaMode::Mask { cutoff } => cutoff.max(1e-4),
+                _ => 0.0,
+            },
+            _pad: 0.0,
+        }
+    }
+
     /// The factors of a glTF material (glTF defaults where unset).
     pub fn from_gltf(material: &gltf::Material) -> Self {
         let pbr = material.pbr_metallic_roughness();
@@ -452,6 +488,15 @@ pub struct Surface {
 }
 
 impl Surface {
+    pub fn from_asset(asset: &melon_core::MaterialAsset) -> Self {
+        use melon_core::material::AlphaMode;
+        Self {
+            blend: asset.alpha_mode == AlphaMode::Blend,
+            double_sided: asset.double_sided,
+            masked: matches!(asset.alpha_mode, AlphaMode::Mask { .. }),
+        }
+    }
+
     pub fn from_gltf(material: &gltf::Material) -> Self {
         Self {
             blend: material.alpha_mode() == gltf::material::AlphaMode::Blend,
@@ -4733,6 +4778,97 @@ impl SceneRenderer {
         }
     }
 
+    /// Load an FBX (see `fbx`): the parts of every node's mesh with the node
+    /// transforms baked in, like `load_gltf`. `name` is the model's path,
+    /// `read` fetches its external textures.
+    pub(crate) fn load_fbx(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        read: fbx::Reader,
+    ) -> Result<LoadedModel> {
+        let fbx = fbx::import(name, bytes, Some(read))?;
+        let model = self.fbx_model(&fbx, fbx.baked_parts());
+        if model.meshes.is_empty() {
+            anyhow::bail!("FBX scene contains no meshes");
+        }
+        tracing::info!("loaded FBX {}: {} part(s)", name, model.meshes.len());
+        Ok(model)
+    }
+
+    /// Every FBX mesh of a file from one import, like `load_gltf_meshes`:
+    /// entry `i` is `<file>#mesh<i>` in mesh space.
+    pub(crate) fn load_fbx_meshes(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        read: fbx::Reader,
+    ) -> Result<Vec<Result<LoadedModel>>> {
+        let fbx = fbx::import(name, bytes, Some(read))?;
+        Ok(fbx
+            .meshes
+            .iter()
+            .enumerate()
+            .map(|(i, parts)| {
+                let parts = parts
+                    .iter()
+                    .map(|p| (p.vertices.clone(), p.indices.clone(), p.material))
+                    .collect();
+                let model = self.fbx_model(&fbx, parts);
+                if model.meshes.is_empty() {
+                    anyhow::bail!("{name} mesh {i} has no triangles");
+                }
+                Ok(model)
+            })
+            .collect())
+    }
+
+    /// Upload FBX `parts` (vertices, indices, material index), one material
+    /// bind group per FBX material. Undecodable textures bind the default.
+    fn fbx_model(
+        &self,
+        fbx: &fbx::FbxModel,
+        parts: Vec<(Vec<Vertex>, Vec<u32>, Option<usize>)>,
+    ) -> LoadedModel {
+        const SRGB: [bool; 4] = [true, false, false, true];
+        let mut model = LoadedModel {
+            meshes: Vec::new(),
+            material_bind_groups: Vec::new(),
+            surfaces: Vec::new(),
+            part_bounds: Vec::new(),
+            bounds: (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)),
+        };
+        let mut built: std::collections::HashMap<Option<usize>, (wgpu::BindGroup, Surface)> =
+            std::collections::HashMap::new();
+        for (vertices, indices, material) in parts {
+            self.push_mesh(&mut model, &vertices, &indices);
+            let (group, surface) = built.entry(material).or_insert_with(|| {
+                let asset = material.map_or_else(melon_core::MaterialAsset::new_default, |m| {
+                    fbx.materials[m].asset.clone()
+                });
+                let slots = material.map_or([None; 4], |m| fbx.materials[m].textures);
+                let textures = [0, 1, 2, 3].map(|i| {
+                    let texture = &fbx.textures[slots[i]?];
+                    match image::load_from_memory(&texture.bytes) {
+                        Ok(img) => Some(self.create_texture_from_image_as(&img, SRGB[i])),
+                        Err(error) => {
+                            tracing::warn!("texture {}: {error}", texture.file_name);
+                            None
+                        }
+                    }
+                });
+                let group = self.create_material_bind_group(
+                    &MaterialUniform::from_asset(&asset),
+                    [0, 1, 2, 3].map(|i| textures[i].as_ref()),
+                );
+                (group, Surface::from_asset(&asset))
+            });
+            model.material_bind_groups.push(group.clone());
+            model.surfaces.push(*surface);
+        }
+        model
+    }
+
     /// Load a glTF from the pack: `name` is its pack path, `files` its external
     /// buffers and images (`packed_gltf::external_files`).
     pub fn load_gltf_packed(
@@ -4800,6 +4936,38 @@ impl SceneRenderer {
             self.add_node(&child, world, buffers, images, model)?;
         }
         Ok(())
+    }
+
+    /// Upload `vertices` / `indices` as the next part of `model` and grow its
+    /// bounds (the vertices are already in model space).
+    fn push_mesh(&self, model: &mut LoadedModel, vertices: &[Vertex], indices: &[u32]) {
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gltf vertex buffer"),
+                contents: bytemuck::cast_slice(vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gltf index buffer"),
+                contents: bytemuck::cast_slice(indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        let (mut lo, mut hi) = (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN));
+        for v in vertices {
+            lo = lo.min(glam::Vec3::from_array(v.position));
+            hi = hi.max(glam::Vec3::from_array(v.position));
+        }
+        model.part_bounds.push((lo, hi));
+        model.meshes.push(Mesh {
+            vertex_buffer,
+            index_buffer,
+            index_count: indices.len() as u32,
+            index_format: wgpu::IndexFormat::Uint32,
+        });
+        model.bounds = (model.bounds.0.min(lo), model.bounds.1.max(hi));
     }
 
     fn add_primitive(
@@ -4892,32 +5060,7 @@ impl SceneRenderer {
             }
         }
 
-        let vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gltf vertex buffer"),
-                contents: bytemuck::cast_slice(&vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        let index_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gltf index buffer"),
-                contents: bytemuck::cast_slice(&indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-        let (mut lo, mut hi) = (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN));
-        for v in &vertices {
-            lo = lo.min(glam::Vec3::from_array(v.position));
-            hi = hi.max(glam::Vec3::from_array(v.position));
-        }
-        model.part_bounds.push((lo, hi));
-        model.meshes.push(Mesh {
-            vertex_buffer,
-            index_buffer,
-            index_count: indices.len() as u32,
-            index_format: wgpu::IndexFormat::Uint32,
-        });
+        self.push_mesh(model, &vertices, &indices);
 
         // ponytail: every texture reference uploads its image again, no mips;
         // cache per image and generate mips when models share textures.
@@ -6347,6 +6490,23 @@ mod tests {
     }"#;
 
     #[test]
+    fn model_nodes_and_bounds_read_an_fbx_file() {
+        let dir = temp_project("fbx_nodes");
+        let file = dir.join("assets/models/box.fbx");
+        std::fs::write(&file, fbx::fixture::Cube::default().ascii()).unwrap();
+        let nodes = gltf_nodes(&file).unwrap();
+        let (min, max) = gltf_bounds(&file).unwrap().unwrap();
+        std::fs::write(&file, "garbage").unwrap();
+        let broken = gltf_nodes(&file);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].mesh, Some(0));
+        assert!(min.abs_diff_eq(glam::Vec3::new(0.5, 1.0, 1.5), 1e-4));
+        assert!(max.abs_diff_eq(glam::Vec3::new(1.5, 3.0, 4.5), 1e-4));
+        assert!(broken.is_err());
+    }
+
+    #[test]
     fn gltf_nodes_reads_two_node_tree() {
         let nodes = gltf_nodes_from_slice(TWO_NODE_GLTF.as_bytes()).unwrap();
         assert_eq!(nodes.len(), 2);
@@ -7389,6 +7549,232 @@ mod tests {
             return Err(format!("the corner should be background: {corner:?}"));
         }
         Ok(())
+    }
+
+    /// An FBX box with a diffuse texture `tex/t.png` (solid green) next to it.
+    fn fbx_project(name: &str, with_texture: bool) -> std::path::PathBuf {
+        use crate::fbx::fixture::Cube;
+        let root = temp_project(name);
+        let cube = Cube {
+            texture: Some("tex/t.png"),
+            ..Cube::default()
+        };
+        std::fs::write(root.join("assets/models/box.fbx"), cube.ascii()).unwrap();
+        if with_texture {
+            std::fs::create_dir_all(root.join("assets/models/tex")).unwrap();
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 255, 0, 255]))
+                .save(root.join("assets/models/tex/t.png"))
+                .unwrap();
+        }
+        root
+    }
+
+    fn thumbnail_pixels(
+        r: &mut Renderer,
+        server: &mut melon_core::AssetServer,
+        path: &str,
+    ) -> Result<Vec<u8>, String> {
+        let h: melon_core::Handle<melon_core::Model> = server.load(path);
+        let mut target = r.create_viewport_target(winit::dpi::PhysicalSize::new(
+            THUMBNAIL_SIZE,
+            THUMBNAIL_SIZE,
+        ));
+        let texture = r
+            .render_thumbnail_texture(server, h, &mut target)
+            .ok_or("no thumbnail")?;
+        let encoder = r
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        Ok(read_back(r.device(), r.queue(), encoder, &texture))
+    }
+
+    fn check_fbx_disk_and_pack(r: &mut Renderer) -> Result<(), String> {
+        use melon_core::{Handle, Model};
+        use std::sync::Arc;
+        let root = fbx_project("fbx_disk", true);
+        let mut server = fresh_ids_server(root.clone(), 9300);
+        let h: Handle<Model> = server.load("assets/models/box.fbx");
+        let mut cache = ModelCache::new(r.scene());
+        let bounds = cache.get(r.scene(), &mut server, h).bounds;
+        let part: Handle<Model> = server.load("assets/models/box.fbx#mesh0");
+        let part_bounds = cache.get(r.scene(), &mut server, part).bounds;
+        let on_disk = thumbnail_pixels(r, &mut server, "assets/models/box.fbx");
+
+        // The pack alone serves the model and its texture.
+        let pak = root.join("game.pak");
+        melon_core::pack::build_pack(&root, &[], &pak).unwrap();
+        std::fs::remove_dir_all(root.join("assets")).unwrap();
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let mut packed = fresh_ids_server(root.clone(), 9400);
+        packed.set_pack(Arc::new(melon_core::pack::Pack::open(&pak).unwrap()));
+        let from_pack = thumbnail_pixels(r, &mut packed, "assets/models/box.fbx");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let (lo, hi) = (
+            glam::Vec3::new(0.5, 1.0, 1.5),
+            glam::Vec3::new(1.5, 3.0, 4.5),
+        );
+        if !(bounds.0.abs_diff_eq(lo, 1e-4) && bounds.1.abs_diff_eq(hi, 1e-4)) {
+            return Err(format!(
+                "fbx on disk: placeholder or wrong bounds {bounds:?}"
+            ));
+        }
+        if !(part_bounds
+            .0
+            .abs_diff_eq(lo - glam::Vec3::new(1.0, 2.0, 3.0), 1e-4))
+        {
+            return Err(format!("fbx #mesh0 is not in mesh space: {part_bounds:?}"));
+        }
+        if on_disk? != from_pack? {
+            return Err("fbx from the pack looks different from the one on disk".into());
+        }
+        Ok(())
+    }
+
+    fn check_fbx_missing_texture_differs(r: &mut Renderer) -> Result<(), String> {
+        let textured = fbx_project("fbx_tex", true);
+        let bare = fbx_project("fbx_notex", false);
+        let a = thumbnail_pixels(
+            r,
+            &mut fresh_ids_server(textured.clone(), 9500),
+            "assets/models/box.fbx",
+        );
+        let b = thumbnail_pixels(
+            r,
+            &mut fresh_ids_server(bare.clone(), 9600),
+            "assets/models/box.fbx",
+        );
+        let _ = std::fs::remove_dir_all(&textured);
+        let _ = std::fs::remove_dir_all(&bare);
+        if a? == b? {
+            return Err("a missing texture should bind the default, not the texture".into());
+        }
+        Ok(())
+    }
+
+    fn check_fbx_hot_reload_and_corrupt(r: &mut Renderer) -> Result<(), String> {
+        use crate::fbx::fixture::Cube;
+        use melon_core::{AssetServer, Handle, Model};
+        let root = fbx_project("fbx_reload", true);
+        let file = root.join("assets/models/box.fbx");
+        let mut server = AssetServer::new(root.clone());
+        let h: Handle<Model> = server.load("assets/models/box.fbx");
+        server.poll_changes();
+        let mut cache = ModelCache::new(r.scene());
+        let first = cache.get(r.scene(), &mut server, h).bounds.0.x;
+        let touch = |secs| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(secs))
+                .unwrap();
+        };
+        let moved = Cube {
+            translation: [5.0, 2.0, 3.0],
+            texture: Some("tex/t.png"),
+            ..Cube::default()
+        };
+        std::fs::write(&file, moved.ascii()).unwrap();
+        touch(2);
+        server.poll_changes();
+        let second = cache.get(r.scene(), &mut server, h).bounds.0.x;
+        std::fs::write(&file, "garbage").unwrap();
+        touch(4);
+        server.poll_changes();
+        let third = cache.get(r.scene(), &mut server, h).bounds.0.x;
+        let _ = std::fs::remove_dir_all(&root);
+        if (first, second, third) == (0.5, 4.5, 4.5) {
+            Ok(())
+        } else {
+            Err(format!(
+                "fbx reload: min x {first}, {second}, {third} (want 0.5, 4.5, 4.5: reload, then keep the last good model)"
+            ))
+        }
+    }
+
+    /// The same box as glTF (positions, normals and uvs of the FBX import,
+    /// the FBX material's factors) draws the same pixels.
+    fn check_fbx_renders_like_gltf(r: &mut Renderer) -> Result<(), String> {
+        use crate::fbx::fixture::{Cube, base64};
+        let root = temp_project("fbx_vs_gltf");
+        let cube = Cube::default();
+        std::fs::write(root.join("assets/models/box.fbx"), cube.ascii()).unwrap();
+        let fbx = crate::fbx::import("box.fbx", cube.ascii().as_bytes(), None).unwrap();
+        let (vertices, indices, _) = fbx.baked_parts().remove(0);
+        let mut data: Vec<u8> = Vec::new();
+        for v in &vertices {
+            data.extend(bytemuck::cast_slice(&v.position));
+        }
+        for v in &vertices {
+            data.extend(bytemuck::cast_slice(&v.normal));
+        }
+        for v in &vertices {
+            data.extend(bytemuck::cast_slice(&v.uv));
+        }
+        data.extend(bytemuck::cast_slice(&indices));
+        let n = vertices.len();
+        let (lo, hi) = fbx.bounds().unwrap();
+        let material = &fbx.materials[0].asset;
+        let gltf = format!(
+            r#"{{"asset": {{"version": "2.0"}}, "scene": 0, "scenes": [{{"nodes": [0]}}],
+            "nodes": [{{"mesh": 0}}],
+            "meshes": [{{"primitives": [{{"attributes": {{"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2}}, "indices": 3, "material": 0}}]}}],
+            "materials": [{{"pbrMetallicRoughness": {{"baseColorFactor": {:?}, "metallicFactor": 0.0, "roughnessFactor": 0.5}}, "emissiveFactor": {:?}}}],
+            "buffers": [{{"byteLength": {}, "uri": "data:application/octet-stream;base64,{}"}}],
+            "bufferViews": [
+                {{"buffer": 0, "byteOffset": 0, "byteLength": {}}},
+                {{"buffer": 0, "byteOffset": {}, "byteLength": {}}},
+                {{"buffer": 0, "byteOffset": {}, "byteLength": {}}},
+                {{"buffer": 0, "byteOffset": {}, "byteLength": {}}}],
+            "accessors": [
+                {{"bufferView": 0, "componentType": 5126, "count": {n}, "type": "VEC3", "min": {:?}, "max": {:?}}},
+                {{"bufferView": 1, "componentType": 5126, "count": {n}, "type": "VEC3"}},
+                {{"bufferView": 2, "componentType": 5126, "count": {n}, "type": "VEC2"}},
+                {{"bufferView": 3, "componentType": 5125, "count": {}, "type": "SCALAR"}}]}}"#,
+            material.base_color,
+            material.emissive,
+            data.len(),
+            base64(&data),
+            n * 12,
+            n * 12,
+            n * 12,
+            n * 24,
+            n * 8,
+            n * 32,
+            indices.len() * 4,
+            lo.to_array(),
+            hi.to_array(),
+            indices.len(),
+        );
+        std::fs::write(root.join("assets/models/box.gltf"), gltf).unwrap();
+        let a = thumbnail_pixels(
+            r,
+            &mut fresh_ids_server(root.clone(), 9700),
+            "assets/models/box.fbx",
+        );
+        let b = thumbnail_pixels(
+            r,
+            &mut fresh_ids_server(root.clone(), 9800),
+            "assets/models/box.gltf",
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let (a, b) = (a?, b?);
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| x.abs_diff(*y))
+            .max()
+            .unwrap_or(0);
+        let background = &a[0..3];
+        let drawn = a.chunks(4).filter(|p| &p[0..3] != background).count();
+        if drawn > 100 && worst <= 2 {
+            Ok(())
+        } else {
+            Err(format!(
+                "fbx vs gltf box: {drawn} drawn pixels, worst channel difference {worst}"
+            ))
+        }
     }
 
     fn check_packed_materials_textures_and_sky(r: &mut Renderer) -> Result<(), String> {
@@ -9855,6 +10241,10 @@ mod tests {
             Box::new(check_material_cache_evicts),
             Box::new(check_mask_edge_alpha_to_coverage),
             Box::new(check_gi_sun_injection_ignores_the_camera),
+            Box::new(check_fbx_disk_and_pack),
+            Box::new(check_fbx_missing_texture_differs),
+            Box::new(check_fbx_hot_reload_and_corrupt),
+            Box::new(check_fbx_renders_like_gltf),
         ];
 
         #[cfg(target_os = "windows")]

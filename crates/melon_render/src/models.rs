@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use melon_core::assets::{BUILTIN_PREFIX, split_mesh_fragment};
 use melon_core::{AssetServer, Handle, Model};
 
+use crate::fbx::is_fbx;
 use crate::{LoadedModel, SceneRenderer};
 
 struct CachedModel {
@@ -32,7 +33,12 @@ impl Source {
             let bytes = server
                 .read(&name)
                 .map_err(|e| anyhow::anyhow!("{name} is not in the pack: {e}"))?;
-            let files = crate::packed_gltf::external_files(&name, &bytes, &|p| server.read(p))?;
+            // An FBX reads its textures through the server while it loads.
+            let files = if is_fbx(&name) {
+                HashMap::new()
+            } else {
+                crate::packed_gltf::external_files(&name, &bytes, &|p| server.read(p))?
+            };
             return Ok(Self::Packed { name, bytes, files });
         }
         server.full_path(handle).map(Self::File).ok_or_else(|| {
@@ -40,18 +46,41 @@ impl Source {
         })
     }
 
-    fn model(&self, scene: &SceneRenderer, path: &str) -> anyhow::Result<LoadedModel> {
+    fn model(
+        &self,
+        scene: &SceneRenderer,
+        server: &AssetServer,
+        path: &str,
+    ) -> anyhow::Result<LoadedModel> {
         match self {
+            Self::File(file) if is_fbx(&file.to_string_lossy()) => {
+                let bytes = std::fs::read(file)?;
+                scene.load_fbx(&file.to_string_lossy(), &bytes, &|p| std::fs::read(p))
+            }
             Self::File(file) => scene.load_gltf(&file.to_string_lossy()),
+            Self::Packed { name, bytes, .. } if is_fbx(name) => scene
+                .load_fbx(name, bytes, &|p| server.read(p))
+                .map_err(|e| e.context(format!("packed model {path}"))),
             Self::Packed { name, bytes, files } => scene
                 .load_gltf_packed(name, bytes, files)
                 .map_err(|e| e.context(format!("packed model {path}"))),
         }
     }
 
-    fn meshes(&self, scene: &SceneRenderer) -> anyhow::Result<Vec<anyhow::Result<LoadedModel>>> {
+    fn meshes(
+        &self,
+        scene: &SceneRenderer,
+        server: &AssetServer,
+    ) -> anyhow::Result<Vec<anyhow::Result<LoadedModel>>> {
         match self {
+            Self::File(file) if is_fbx(&file.to_string_lossy()) => {
+                let bytes = std::fs::read(file)?;
+                scene.load_fbx_meshes(&file.to_string_lossy(), &bytes, &|p| std::fs::read(p))
+            }
             Self::File(file) => scene.load_gltf_meshes(&file.to_string_lossy()),
+            Self::Packed { name, bytes, .. } if is_fbx(name) => {
+                scene.load_fbx_meshes(name, bytes, &|p| server.read(p))
+            }
             Self::Packed { name, bytes, files } => scene.load_gltf_meshes_bytes(name, bytes, files),
         }
     }
@@ -80,7 +109,7 @@ impl ModelCache {
         mesh: usize,
     ) -> anyhow::Result<LoadedModel> {
         let mut ours = None;
-        for (i, model) in source.meshes(scene)?.into_iter().enumerate() {
+        for (i, model) in source.meshes(scene, server)?.into_iter().enumerate() {
             if i == mesh {
                 ours = Some(model);
                 continue;
@@ -179,7 +208,7 @@ impl ModelCache {
                     (file_path, Some(mesh)) => {
                         self.load_fragments(scene, server, handle, file_path, &source, mesh)
                     }
-                    (_, None) => source.model(scene, &path),
+                    (_, None) => source.model(scene, server, &path),
                 },
                 Err(error) => Err(error),
             };

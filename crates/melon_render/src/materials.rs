@@ -8,7 +8,6 @@
 use std::collections::{HashMap, HashSet};
 
 use glam::Vec3;
-use melon_core::material::AlphaMode;
 use melon_core::{AssetServer, Handle, Material, MaterialAsset, Texture};
 
 use crate::{MaterialUniform, SceneRenderer, Surface};
@@ -166,25 +165,9 @@ impl MaterialCache {
             .enumerate()
             .map(|(i, h)| h.and_then(|h| self.texture(h, SRGB[i])))
             .collect();
-        let factors = MaterialUniform {
-            base_color: asset.base_color,
-            emissive: asset.emissive.map(|c| c * asset.emissive_strength),
-            metallic: asset.metallic,
-            roughness: asset.roughness,
-            normal_scale: asset.normal_scale,
-            alpha_cutoff: match asset.alpha_mode {
-                // 0 means "no mask", so a cutoff of 0 is the smallest one.
-                AlphaMode::Mask { cutoff } => cutoff.max(1e-4),
-                _ => 0.0,
-            },
-            _pad: 0.0,
-        };
+        let factors = MaterialUniform::from_asset(&asset);
         let group = scene.create_material_bind_group(&factors, [0, 1, 2, 3].map(|i| textures[i]));
-        let surface = Surface {
-            blend: asset.alpha_mode == AlphaMode::Blend,
-            double_sided: asset.double_sided,
-            masked: matches!(asset.alpha_mode, AlphaMode::Mask { .. }),
-        };
+        let surface = Surface::from_asset(&asset);
         self.builds += 1;
         self.materials.insert(
             id,
