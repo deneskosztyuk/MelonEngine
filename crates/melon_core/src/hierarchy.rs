@@ -162,10 +162,15 @@ pub fn render_matrices(world: &mut World, alpha: f32, blend: bool) -> HashMap<En
     .collect()
 }
 
-/// Scene entities (`Name` + `Transform`, not being deleted) depth-first:
-/// parents before children, siblings in `Children` order. `usize` is depth.
-pub fn depth_first(world: &mut World) -> Vec<(Entity, usize)> {
-    let roots: Vec<Entity> = world
+/// Order of the scene's root entities (the Hierarchy's top level and the
+/// scene file's root order). Healed by `root_order`: dead or non-root
+/// entities drop out, unlisted roots are appended.
+#[derive(bevy_ecs::resource::Resource, Default)]
+pub struct RootOrder(pub Vec<Entity>);
+
+/// Scene roots (`Name` + `Transform`, no parent, not being deleted) in order.
+pub fn root_order(world: &mut World) -> Vec<Entity> {
+    let found: Vec<Entity> = world
         .query_filtered::<Entity, (
             With<Name>,
             With<Transform>,
@@ -174,6 +179,32 @@ pub fn depth_first(world: &mut World) -> Vec<(Entity, usize)> {
         )>()
         .iter(world)
         .collect();
+    let live: std::collections::HashSet<Entity> = found.iter().copied().collect();
+    let mut order = world.remove_resource::<RootOrder>().unwrap_or_default().0;
+    order.retain(|e| live.contains(e));
+    let known: std::collections::HashSet<Entity> = order.iter().copied().collect();
+    order.extend(found.into_iter().filter(|e| !known.contains(e)));
+    world.insert_resource(RootOrder(order.clone()));
+    order
+}
+
+/// Position of a root among the roots (`None` if it is not one).
+pub fn root_index(world: &mut World, entity: Entity) -> Option<usize> {
+    root_order(world).iter().position(|&e| e == entity)
+}
+
+/// Put root `entity` at `index` among the roots (clamped).
+pub fn move_root(world: &mut World, entity: Entity, index: usize) {
+    let mut order = root_order(world);
+    order.retain(|&e| e != entity);
+    order.insert(index.min(order.len()), entity);
+    world.insert_resource(RootOrder(order));
+}
+
+/// Scene entities (`Name` + `Transform`, not being deleted) depth-first:
+/// parents before children, siblings in `Children` order. `usize` is depth.
+pub fn depth_first(world: &mut World) -> Vec<(Entity, usize)> {
+    let roots = root_order(world);
     let world: &World = world;
     let listed = |e: Entity| {
         world.get::<Name>(e).is_some()

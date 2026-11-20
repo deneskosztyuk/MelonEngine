@@ -41,6 +41,7 @@ fn kind_color(kind: AssetKind) -> Color32 {
         AssetKind::Texture => colors::SUCCESS,
         AssetKind::Shader => colors::ERROR,
         AssetKind::Scene => colors::INFO,
+        AssetKind::Audio => colors::ACCENT,
         AssetKind::Other => colors::TEXT_MUTED,
     }
 }
@@ -348,6 +349,17 @@ impl ContentBrowser {
                 .changed()
             {
                 actions.push(Action::Search(search));
+            }
+            if let Some((playing, request)) = self.audio_toggle() {
+                let (glyph, tip) = if playing {
+                    ("⏹ Stop", "Stop the preview")
+                } else {
+                    ("▶ Preview", "Play the selected clip (Ui bus)")
+                };
+                if ui.button(glyph).on_hover_text(tip).clicked() {
+                    actions.push(Action::Request(request));
+                }
+                ui.separator();
             }
             for kind in AssetKind::FILE_KINDS {
                 let text = RichText::new(kind.label()).color(kind_color(kind));

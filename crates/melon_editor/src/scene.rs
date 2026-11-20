@@ -59,19 +59,22 @@ pub struct SceneData {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SceneEntity {
-    name: String,
+    pub(crate) name: String,
     /// Index of the parent in `entities` (version 3+).
     #[serde(default)]
     parent: Option<u32>,
     /// Model asset path (project-relative, or `builtin:cube`).
     #[serde(default)]
-    model: Option<String>,
+    pub(crate) model: Option<String>,
     /// GUID of the model file (version 4+); `model` is the fallback.
     #[serde(default)]
     model_guid: Option<AssetGuid>,
     /// Version 5: component RON by type path (`Transform` is local to the parent).
     #[serde(default)]
-    components: BTreeMap<String, Box<RawValue>>,
+    pub(crate) components: BTreeMap<String, Box<RawValue>>,
+    /// Stable editor id (`EditorId`), so undo steps and Play find the entity again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) uid: Option<uuid::Uuid>,
     // Versions 1-4, read only: converted into `components` on load.
     #[serde(default, skip_serializing, deserialize_with = "present")]
     transform: Option<Transform>,
@@ -299,6 +302,7 @@ fn registry_of(world: &World) -> Result<AppTypeRegistry> {
 /// (deleted this frame but not yet despawned). Depth-first, so parents come
 /// before their children and sibling order is kept.
 pub fn scene_to_data(world: &mut World) -> Result<SceneData> {
+    crate::history::ensure_ids(world);
     let rows: Vec<Entity> = depth_first(world).into_iter().map(|(e, _)| e).collect();
     let world: &World = world;
     let index: std::collections::HashMap<Entity, u32> = rows
@@ -306,57 +310,15 @@ pub fn scene_to_data(world: &mut World) -> Result<SceneData> {
         .enumerate()
         .map(|(i, e)| (*e, i as u32))
         .collect();
-    let server = world.get_resource::<AssetServer>();
     let registry = registry_of(world)?;
     let registry = registry.read();
 
     let mut entities = Vec::with_capacity(rows.len());
     for &e in &rows {
-        let name = world
-            .get::<Name>(e)
-            .map(|n| n.0.clone())
-            .unwrap_or_default();
-        let mut components = BTreeMap::new();
-        for registration in registry.iter() {
-            let Some(component) = registration.data::<ReflectComponent>() else {
-                continue;
-            };
-            let Some(value) = component.reflect(world.entity(e)) else {
-                continue;
-            };
-            let path = registration.type_info().type_path();
-            let raw = component_ron(value.as_partial_reflect(), &registry)
-                .with_context(|| format!("entity '{name}': cannot save `{path}`"))?;
-            components.insert(path.to_string(), raw);
-        }
-        if let Some(kept) = world.get::<KeptComponents>(e) {
-            for (path, raw) in &kept.0 {
-                components
-                    .entry(path.clone())
-                    .or_insert_with(|| raw.clone());
-            }
-        }
-        entities.push(SceneEntity {
-            name,
-            parent: world
-                .get::<ChildOf>(e)
-                .and_then(|c| index.get(&c.parent()).copied()),
-            model: world
-                .get::<Handle<Model>>(e)
-                .zip(server)
-                .map(|(h, s)| s.path(*h).to_string()),
-            model_guid: world
-                .get::<Handle<Model>>(e)
-                .zip(server)
-                .and_then(|(h, s)| s.guid_of(s.path(*h))),
-            components,
-            transform: None,
-            mesh_ref: None,
-            aabb: None,
-            body_info: None,
-            spin: None,
-            bob: None,
-        });
+        let parent = world
+            .get::<ChildOf>(e)
+            .and_then(|c| index.get(&c.parent()).copied());
+        entities.push(capture_entity(world, &registry, e, parent)?);
     }
 
     let name_counter = world
@@ -368,6 +330,60 @@ pub fn scene_to_data(world: &mut World) -> Result<SceneData> {
         version: SCENE_VERSION,
         entities,
         name_counter,
+    })
+}
+
+/// One entity as the scene file holds it (`parent` is the caller's index).
+pub(crate) fn capture_entity(
+    world: &World,
+    registry: &TypeRegistry,
+    e: Entity,
+    parent: Option<u32>,
+) -> Result<SceneEntity> {
+    let server = world.get_resource::<AssetServer>();
+    let name = world
+        .get::<Name>(e)
+        .map(|n| n.0.clone())
+        .unwrap_or_default();
+    let mut components = BTreeMap::new();
+    for registration in registry.iter() {
+        let Some(component) = registration.data::<ReflectComponent>() else {
+            continue;
+        };
+        let Some(value) = component.reflect(world.entity(e)) else {
+            continue;
+        };
+        let path = registration.type_info().type_path();
+        let raw = component_ron(value.as_partial_reflect(), registry)
+            .with_context(|| format!("entity '{name}': cannot save `{path}`"))?;
+        components.insert(path.to_string(), raw);
+    }
+    if let Some(kept) = world.get::<KeptComponents>(e) {
+        for (path, raw) in &kept.0 {
+            components
+                .entry(path.clone())
+                .or_insert_with(|| raw.clone());
+        }
+    }
+    Ok(SceneEntity {
+        name,
+        parent,
+        model: world
+            .get::<Handle<Model>>(e)
+            .zip(server)
+            .map(|(h, s)| s.path(*h).to_string()),
+        model_guid: world
+            .get::<Handle<Model>>(e)
+            .zip(server)
+            .and_then(|(h, s)| s.guid_of(s.path(*h))),
+        components,
+        uid: world.get::<crate::history::EditorId>(e).map(|i| i.0),
+        transform: None,
+        mesh_ref: None,
+        aabb: None,
+        body_info: None,
+        spin: None,
+        bob: None,
     })
 }
 
@@ -426,7 +442,29 @@ pub fn apply_scene(world: &mut World, physics: &mut PhysicsWorld, data: &SceneDa
             world.entity_mut(id).insert(ChildOf(ids[p as usize]));
         }
     }
-    // Bodies and colliders from the components, at the world poses.
+    // A hand-copied block can repeat a uid; steps would find the wrong entity.
+    let mut seen = HashSet::new();
+    let mut regenerated = 0;
+    for &id in &ids {
+        if let Some(uid) = world.get::<crate::history::EditorId>(id).map(|i| i.0)
+            && !seen.insert(uid)
+        {
+            let fresh = uuid::Uuid::new_v4();
+            world.entity_mut(id).insert(crate::history::EditorId(fresh));
+            regenerated += 1;
+        }
+    }
+    if regenerated > 0 {
+        tracing::warn!("{regenerated} entities shared an id with another; gave them new ones");
+    }
+    let roots: Vec<Entity> = data
+        .entities
+        .iter()
+        .zip(&ids)
+        .filter(|(e, _)| e.parent.is_none())
+        .map(|(_, &id)| id)
+        .collect();
+    world.insert_resource(melon_core::hierarchy::RootOrder(roots));
     melon_physics::sync_components(world, physics);
     Ok(())
 }
@@ -559,9 +597,25 @@ fn spawn_scene_entity(
     entity: &SceneEntity,
     decoded: Decoded,
 ) -> Entity {
-    let id = world
-        .spawn((Name(entity.name.clone()), Transform::default()))
-        .id();
+    let id = world.spawn_empty().id();
+    fill_scene_entity(world, registry, id, entity, decoded);
+    id
+}
+
+/// Give `id` the name, model, editor id and components of `entity`.
+fn fill_scene_entity(
+    world: &mut World,
+    registry: &TypeRegistry,
+    id: Entity,
+    entity: &SceneEntity,
+    decoded: Decoded,
+) {
+    world
+        .entity_mut(id)
+        .insert((Name(entity.name.clone()), Transform::default()));
+    if let Some(uid) = entity.uid {
+        world.entity_mut(id).insert(crate::history::EditorId(uid));
+    }
 
     let model = entity
         .model
@@ -589,7 +643,35 @@ fn spawn_scene_entity(
     if !decoded.kept.is_empty() {
         world.entity_mut(id).insert(KeptComponents(decoded.kept));
     }
-    id
+}
+
+/// Write `entity` into the world (undo / redo): over `existing` when given
+/// (its components, model and kept data are replaced; its parent, children
+/// and body are left to the caller), else as a new entity. No body is made.
+pub(crate) fn restore_entity(
+    world: &mut World,
+    existing: Option<Entity>,
+    entity: &SceneEntity,
+) -> Result<Entity> {
+    let registry = registry_of(world)?;
+    let registry = registry.read();
+    let decoded = decode_entity(entity, &registry, &mut HashSet::new())?;
+    let id = match existing {
+        Some(id) => {
+            for registration in registry.iter() {
+                if let Some(component) = registration.data::<ReflectComponent>() {
+                    component.remove(&mut world.entity_mut(id));
+                }
+            }
+            world
+                .entity_mut(id)
+                .remove::<(KeptComponents, Handle<Model>)>();
+            id
+        }
+        None => world.spawn_empty().id(),
+    };
+    fill_scene_entity(world, &registry, id, entity, decoded);
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -670,6 +752,7 @@ mod tests {
             components: BTreeMap::new(),
             model: None,
             model_guid: None,
+            uid: None,
             aabb: None,
             body_info: None,
             spin: None,
@@ -1427,6 +1510,33 @@ mod tests {
     }
 
     #[test]
+    fn audio_source_and_listener_round_trip() {
+        use melon_core::{AudioListener, AudioSource};
+        let mut world = reg_world();
+        let source = AudioSource {
+            clip: "assets/audio/door.ogg".into(),
+            volume: 0.5,
+            pitch: 1.5,
+            looping: true,
+            play_on_start: true,
+            spatial: true,
+            min_distance: 2.0,
+            max_distance: 40.0,
+            bus: "Music".into(),
+        };
+        world.spawn((
+            Name("Speaker".to_string()),
+            Transform::default(),
+            source.clone(),
+            AudioListener,
+        ));
+        round_trip(&mut world, &mut PhysicsWorld::new());
+        let e = named(&mut world, "Speaker");
+        assert_eq!(world.get::<AudioSource>(e), Some(&source));
+        assert!(world.get::<AudioListener>(e).is_some());
+    }
+
+    #[test]
     fn v6_file_has_no_runtime_components() {
         let mut world = reg_world();
         let root = world
@@ -1705,5 +1815,22 @@ mod tests {
         let data = scene_to_data(&mut melon_core::Core::new().world).unwrap();
         let mut bare = World::new();
         assert!(apply_scene(&mut bare, &mut PhysicsWorld::new(), &data).is_err());
+    }
+
+    #[test]
+    fn duplicate_uids_in_a_file_are_regenerated() {
+        let mut world = reg_world();
+        world.spawn((Name("A".into()), Transform::default()));
+        world.spawn((Name("B".into()), Transform::default()));
+        let mut data = scene_to_data(&mut world).unwrap();
+        data.entities[1].uid = data.entities[0].uid;
+        let mut physics = PhysicsWorld::new();
+        apply_scene(&mut world, &mut physics, &data).unwrap();
+        let ids: HashSet<_> = world
+            .query::<&crate::history::EditorId>()
+            .iter(&world)
+            .map(|i| i.0)
+            .collect();
+        assert_eq!(ids.len(), 2);
     }
 }

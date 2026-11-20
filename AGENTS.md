@@ -10,13 +10,14 @@ Current state and planned work: `docs/ROADMAP.md`.
 | `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera. No GPU or window code. |
 | `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache`) records sun shadow pass, depth/normal prepass, SSAO passes, the GI mode's passes (`gi/`: DDGI voxel and probe passes or SSGI), 3D pass into HDR target, bloom passes, tonemap pass; `ui_pass` for the editor. |
 | `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource): component sync (`sync.rs`), scene queries (`queries.rs`), character controller, mesh collider triangles. See "Physics" below. |
-| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), Content Drawer (`drawer.rs`), asset `.meta` files (`asset_db.rs`), file operations (`asset_ops.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), Project Settings window (`project_settings.rs`). |
+| `crates/melon_audio` | kira playback: `Director` (decisions, tested with a mock `Backend`), `KiraBackend` (device, bus tracks), `spatial` (attenuation, pan), `AudioEngine` (host calls `update` once per frame). The game-facing types are in `melon_core::audio`. |
+| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), Content Drawer (`drawer.rs`), asset `.meta` files (`asset_db.rs`), file operations (`asset_ops.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), undo history (`history.rs`), Project Settings window (`project_settings.rs`, with `quality_settings.rs` and `audio_settings.rs`). |
 | `crates/melon_game` | Game logic as an `rlib` + `dylib`, hot-reloaded in dev builds. |
 | `crates/melon_host` | Binary: winit event loop, input mapping, frame order (core update, editor, extract, render_scene, ui pass). No render pass code. |
 | `assets/models` | glTF models. `cube.glb` loads at startup. `review/` holds the snapshot scene's material test models (`grey_cube`, `material_spheres`, `normal_panel`, `emissive_cube`, `red_panel`, `green_panel`), written by `cargo run -p melon_render --example gen_review_assets` from the repo root; commit them when regenerated. |
 | `assets/shaders` | WGSL shaders, compiled in with `wgpu::include_wgsl!` (no runtime reload). Shared pieces are prepended with `concat!(include_str!(..))` (WGSL has no include): `mesh.wgsl` = `gi_common` + `ddgi_common` + `gi_ddgi` + `gi_ssgi` + `mesh`; `ddgi_update.wgsl` = `gi_common` + `ddgi_common` + it; `ssgi.wgsl` = `gi_common` + it. |
 
-Dependency direction: `core` <- `render`, `physics` <- `editor` <- `host`.
+Dependency direction: `core` <- `render`, `physics`, `audio`; `render`, `physics` <- `editor`; `editor`, `audio` <- `host`.
 `melon_game` depends only on `melon_core`. Keep it that way.
 
 ## Commands
@@ -78,6 +79,39 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   features; the running host refuses that reload (fingerprint error). Run
   `just game` again. Plugin `FixedUpdate` systems run after the
   physics chain. Release builds call `core.add_plugin(&GamePlugin)`.
+- **Audio.** Types the game uses live in `melon_core::audio`: `AudioSource`
+  (clip path, linear volume 0..1, pitch, looping, `play_on_start`, spatial,
+  min/max distance, bus) and `AudioListener` (both registered components;
+  without a listener the `Camera` listens), `AudioSettings` (buses, `Master`
+  first; `config/audio.ron`, edited in Edit ▸ Project Settings ▸ Audio,
+  pending until Apply; `gain(bus)` = bus x master, mute = 0) and
+  `AudioRequests` (game systems push `play_one_shot[_at]`, `play`, `pause`,
+  `stop`, `set_volume`; drained once per frame; game requests are dropped
+  unless `Playing`). `melon_audio::Director` reads them: nothing plays in
+  `Editing`; `play_on_start` sources start once per Play session; Pause
+  pauses and Stop stops every game sound; the editor preview
+  (`preview_play`, Content Browser button, `Ui` bus, `AudioPreview` says what
+  plays) works in every state and is left alone by Pause / Stop. Clips are
+  `AssetServer::load::<AudioClip>` (`.wav .ogg .mp3 .flac`, hot reload
+  restarts a playing source). Under 5 s decodes to memory (cached per file
+  version), longer streams from disk (`spatial::STREAM_THRESHOLD`).
+  Attenuation is `min/d` shifted to reach 0 at `max`; pan is the listener's
+  right vector dotted with the direction to the source. No output device:
+  one warning, silent run. Tests use a mock `Backend` or
+  `KiraBackend::silent()`; never open a device in a test. Adding a bus field
+  needs `#[serde(default)]`-style compatibility, as for quality files.
+  Live edits: a source whose clip, `looping` or `bus` changes restarts;
+  removing or renaming a bus drops its track (`Backend::retain_buses`) and
+  restarts its voices on Master (an unknown bus plays on Master). Inspector:
+  `AudioSource` fields use `inspect::FieldWidget` (bus dropdown, clip picker
+  with Content Browser drop, volume slider); other components can add theirs
+  in `Editor::field_widgets`.
+  Manual check (no device in tests): add an Audio Source (looping, spatial,
+  clip from `assets/`) to a cube and press Play: it sounds, and walking the
+  camera past pans it left/right and fades it with distance. Select a clip
+  in the Content Browser and press Preview (works while Editing). Mute Sfx
+  in Project Settings ▸ Audio and Apply: it goes silent. Pause pauses it,
+  Stop silences it, and nothing sounds in edit mode.
 - **Stages.** Register systems with `core.add_systems(Stage, ...)`:
   `FixedUpdate` (1/60 s, 0..N times per frame, not while paused), `Update`
   (once per frame, read `Time::delta_seconds`), `PostUpdate`. `PreUpdate`
@@ -216,6 +250,8 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   the subtree `PendingDelete`); `cleanup_deleted_system` removes the rapier
   bodies and despawns. Do not despawn physics entities directly (a stray
   despawn is swept by `sync_components`, but joints and events lag a step).
+  Editor code calls `History::delete` instead (it marks the subtree and
+  records the undo step); `mark_for_delete` stays for game and engine code.
 - **Physics (`melon_physics`).** Game data is in `melon_core::physics`
   (usable from `melon_game`): `RigidBody` (kind, mass, damping, gravity
   scale, per-axis rotation lock, ccd), `Collider` (shape `Box` /
@@ -265,6 +301,8 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   (`world_matrix`, `set_world_transform`, `set_parent_keep_world`,
   `render_matrices`) or `GlobalTransform` (written in `PostUpdate` and before
   physics sync). Fixed bodies follow their parent; dynamic bodies don't.
+  Root order is `melon_core::hierarchy::RootOrder` (the Hierarchy lists
+  roots through `root_order`; `move_root` reorders).
 - **Assets.** Reference files through `AssetServer::load::<Model>(path)` →
   `Handle<Model>`; paths are project-relative with forward slashes
   (`assets/models/x.glb`), plus `builtin:cube`; `x.glb#mesh2` draws one glTF
@@ -300,10 +338,33 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   Auxiliary views (thumbnails) go in their own submission after the
   frame's. A second main view (a Game view next to the Scene view) needs
   per-view uniform and instance buffers first.
+- **Undo / redo (`history.rs`).** A step stores the scene-file form
+  (`scene::capture_entity`) of the entities it touched, before and after;
+  undo writes "before" back, redo "after" (`restore_entity` overwrites an
+  entity in place or spawns it; then parents, sibling order, bodies via
+  `rebuild_body`). Steps name entities by `EditorId` (uuid component, added
+  lazily, saved as `SceneEntity::uid` so ids survive Play / Stop and saves),
+  never by `Entity`. Edits to the selected entity (Inspector, Add / Remove
+  Component, mesh, gizmo) are found by `History::track` once per frame
+  (`Editor::track_history`): it diffs a snapshot taken at rest and records
+  one step when the gesture ends (no dragged widget, no focused text field,
+  no gizmo drag). Create, delete, reparent, rename, duplicate are explicit
+  (`record_created`, `delete`, `reparent`, `rename`, `duplicate`): never
+  `mark_for_delete` or `hierarchy_drop` straight from editor UI. Nothing is
+  recorded or undone unless `SimulationState::Editing`; cap `MAX_STEPS` =
+  200; opening a scene clears it. Shortcuts: Ctrl+Z, Ctrl+Y / Ctrl+Shift+Z,
+  Ctrl+D, F2 (not while typing or with the Content Browser focused, which
+  owns F2 / Ctrl+D). A new editable thing that is not a registered
+  component, `Name`, `Handle<Model>` or the hierarchy is invisible to
+  history. Root order is the `melon_core::hierarchy::RootOrder` resource (healed
+  by `root_order`, set from file order by `apply_scene`, so the scene
+  version is unaffected); steps store a root's index like a child's.
 - **Scene format.** RON, `SCENE_VERSION = 6` in `melon_editor/src/scene.rs`:
   each entity has `name`, `parent` (index into `entities`), `model` (path,
   `#mesh<N>` included), `model_guid` (wins when it resolves, so a scene
-  written by hand may give only `model`) and `components`, a map from type
+  written by hand may give only `model`), optional `uid`
+  (the entity's `EditorId`: assigned when missing, regenerated on load if two
+  entities share one; `uid` is kept in v6) and `components`, a map from type
   path to the component's RON written through the registry (`Transform` is
   local to the parent). Adding a saved component = `#[derive(Component,
   Reflect)]` + `register_component`; no `SceneEntity` edit. Unknown or

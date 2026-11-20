@@ -153,6 +153,8 @@ mod tests {
             names,
             [
                 "Aabb",
+                "Audio Listener",
+                "Audio Source",
                 "Bob",
                 "Character Controller",
                 "Collider",

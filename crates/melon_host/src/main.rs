@@ -266,6 +266,10 @@ struct App {
     input_map_broken: bool,
     /// `config/quality.ron` failed to load: the editor backs it up before its first Apply.
     quality_broken: bool,
+    /// `config/audio.ron` failed to load: the editor backs it up before its first Apply.
+    audio_broken: bool,
+    /// The audio device; updated once per frame, after the core update.
+    audio: melon_audio::AudioEngine,
     last_frame: Option<Instant>,
     /// Frame cap, set when the present mode does not wait for vblank.
     pacer: Option<pacing::FrameDeadline>,
@@ -346,6 +350,10 @@ impl App {
         let (quality, outcome) = melon_core::RenderQuality::load(&quality_path);
         let quality_broken = outcome.log(&quality_path, "quality settings");
         core.world.insert_resource(quality);
+        let audio_path = melon_editor::audio_settings::audio_path(PROJECT_ROOT.as_ref());
+        let (audio_settings, outcome) = melon_core::AudioSettings::load(&audio_path);
+        let audio_broken = outcome.log(&audio_path, "audio settings");
+        core.world.insert_resource(audio_settings);
         spawn_default_scene(&mut core.world);
         #[cfg(not(feature = "hot-reload"))]
         core.add_plugin(&melon_game::GamePlugin);
@@ -371,6 +379,8 @@ impl App {
             game_input: false,
             input_map_broken,
             quality_broken,
+            audio_broken,
+            audio: melon_audio::AudioEngine::new(),
             last_frame: None,
             pacer: None,
             frame_period: pacing::frame_period(None),
@@ -438,6 +448,8 @@ impl App {
         self.game.poll(dt, &mut self.core);
 
         self.core.update();
+        // Editor requests (clip preview) from the last frame play now.
+        self.audio.update(&mut self.core.world);
         self.stats.lap(pacing::Stage::Update);
 
         let Some(renderer) = self.renderer.as_mut() else {
@@ -647,6 +659,7 @@ impl ApplicationHandler for App {
         editor_ui.set_project_root(std::path::Path::new(PROJECT_ROOT));
         editor_ui.set_input_map_broken(self.input_map_broken);
         editor_ui.set_quality_broken(self.quality_broken);
+        editor_ui.set_audio_broken(self.audio_broken);
 
         let size = renderer.size();
         let aspect = size.width as f32 / size.height.max(1) as f32;

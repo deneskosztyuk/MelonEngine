@@ -11,7 +11,8 @@ an item lands.
 | `melon_core` | `Core` wraps a bevy_ecs `World` + stage schedules (`PreUpdate`, `FixedUpdate` at 1/60 s, `Update`, `PostUpdate`) with interpolated rendering. Transform hierarchy (`ChildOf` / `Children`, `GlobalTransform`). Assets: `Handle<Model>`, `AssetServer` (GUIDs from `.meta` sidecars, file hot reload). Input: all keys, mouse buttons and wheel, `just_pressed` / `just_released`, action mapping (`Actions` / `InputMap`), editor/game input focus. Plugin API (`App`, `Plugin`) with an ABI fingerprint. One `Camera` resource, one directional `Light`, `Environment` (sky, fog, GI/AO/bloom look), `RenderQuality` (presets, profiles in `config/quality.ron`), `Time`, `SimulationState`. |
 | `melon_render` | wgpu forward renderer. Frame: sun shadow pass (directional shadow map, 3x3 PCF), GI (DDGI voxel probes or SSGI, modular), SSAO (depth/normal prepass), sky, 3D pass into an HDR target (MSAA 1/2/4 from `RenderQuality`), bloom, ACES tonemap, overlay pass (gizmos). glTF metallic-roughness PBR (normal maps, emissive), instanced draws from a storage buffer with CPU frustum culling, GPU pass timings. glTF loading (node tree, multiple meshes, materials), bounds from accessors, model thumbnails (auxiliary views). `extract` → `FrameData`, offscreen `ViewportTarget`. |
 | `melon_physics` | rapier3d under data components (`RigidBody`, `Collider` box / sphere / capsule / mesh with layers and triggers, `CharacterController`, `Joint`) kept in sync by `sync_components`; ray, sphere-cast and overlap queries (`PhysicsQueries`) and collision / trigger events for game code; green collider outlines in the Scene view. |
-| `melon_editor` | egui + egui_dock editor: dockable panels (Hierarchy, Scene, Inspector, Content Browser, Console) with a saved layout, menu bar, toolbar, status bar, theme. Move / Rotate / Scale gizmos with plane handles and snapping. Play / Pause / Step / Stop with a scene snapshot. RON scenes (version 6, GUID + path references). Project Settings (input mapping). Content Browser: folder tree, tiles/list, search, type filter, favorites, file operations carrying `.meta`, references check, live updates, Asset card in the Inspector, thumbnails, Ctrl+Space Content Drawer. |
+| `melon_audio` | kira playback: `AudioSource` / `AudioListener`, distance attenuation and pan, buses with volume and mute, one-shots, editor clip preview; silent without a device. |
+| `melon_editor` | egui + egui_dock editor: dockable panels (Hierarchy, Scene, Inspector, Content Browser, Console) with a saved layout, menu bar, toolbar, status bar, theme. Move / Rotate / Scale gizmos with plane handles and snapping. Play / Pause / Step / Stop with a scene snapshot. RON scenes (version 6, GUID + path references). Project Settings (input mapping, quality, audio buses). Audio clip preview in the Content Browser. Content Browser: folder tree, tiles/list, search, type filter, favorites, file operations carrying `.meta`, references check, live updates, Asset card in the Inspector, thumbnails, Ctrl+Space Content Drawer. |
 | `melon_game` | Game plugin with two demo systems, live-reloaded in dev builds. |
 | `melon_host` | winit event loop, frame order, game plugin loader (dev) / static plugin (ship). |
 
@@ -59,14 +60,14 @@ Core features all three share, and where MelonEngine stands (✅ done,
 | Physics | Rigid bodies, shapes | ✅ |
 | Physics | Ray casts, triggers, collision events | ✅ |
 | Physics | Character controller, joints | ✅ |
-| Audio | Playback, 3D sound, mixing | ❌ |
+| Audio | Playback, 3D sound, mixing | ✅ (no effects, no reverb zones) |
 | UI | In-game UI and text | ❌ |
 | Gameplay | Navigation mesh | ❌ |
 | Gameplay | Networking | ❌ (not core for a first game) |
 | Editor | Viewport, gizmos, snapping | ✅ (no local/world toggle) |
 | Editor | Hierarchy, inspector | ✅ |
 | Editor | Content browser | ✅ |
-| Editor | Undo / redo | ❌ |
+| Editor | Undo / redo | ✅ |
 | Editor | Play in editor | ✅ |
 | Editor | Game view | ❌ |
 | Editor | Console / log | ✅ |
@@ -82,7 +83,7 @@ one; 10 comes after.
       Inspector (cards, Add / Remove Component) and scene files (format v5,
       no hand-listed `SceneEntity`); an agent can build levels as RON data.
       Next step: prefabs, built on the same registry.
-2. - [ ] **Undo / Redo** (command history), plus entity rename and duplicate.
+2. - [x] **Undo / Redo** (snapshot history, `history.rs`), plus entity rename and duplicate.
 3. - [ ] **Rendering:** `Handle<Texture>` / `Handle<Material>` assets; point
       and spot lights; image-based ambient; cascaded sun shadows, then
       point/spot shadows; LOD. (PBR, sky, GI, instancing and culling are
@@ -91,7 +92,8 @@ one; 10 comes after.
       API, triggers and collision events, character controller, joints.
       (Done; see AGENTS.md "Physics".)
 5. - [ ] **Animation:** glTF skinning, clips, blending.
-6. - [ ] **Audio:** playback, 3D sound, buses.
+6. - [x] **Audio:** `AudioSource` / `AudioListener` components, 3D
+      attenuation and pan, buses (`config/audio.ron`), clip preview, kira.
 7. - [ ] **In-game UI and text**, plus a debug-draw API.
 8. - [ ] **Cameras as components**, several cameras, and a Game view next to
       the Scene view.
