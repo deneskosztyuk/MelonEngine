@@ -2987,6 +2987,34 @@ mod tests {
                 }
             }),
             Box::new(|renderer| {
+                // A ray ~3 degrees below the horizon is still the fog colour
+                // (grey 0.5 here), so the fogged floor edge meets it smoothly.
+                let env = melon_core::Environment {
+                    zenith_color: glam::Vec3::Z,
+                    horizon_color: glam::Vec3::splat(0.5),
+                    fog_density: 0.0,
+                };
+                let light = melon_core::Light {
+                    direction: glam::Vec3::new(0.0, -1.0, -1.0).normalize(),
+                    ..Default::default()
+                };
+                let camera = melon_core::Camera {
+                    aspect: 1.0,
+                    ..Default::default()
+                };
+                let mut server = melon_core::AssetServer::new(".".into());
+                let px = render_frame(renderer, camera, light, env, vec![], &mut server);
+                let below = pixel_at(renderer, &px, (TEST_SIZE / 2, TEST_SIZE / 2 + 4));
+                let want = tonemap_value(renderer, 0.5);
+                if below[..3].iter().all(|&c| c.abs_diff(want) <= 4) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "sky_just_below_horizon_is_fog_colour: {below:?}, want ~{want}"
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
                 // Dark sky; looking straight at the sun gives a white HDR disc.
                 let env = melon_core::Environment {
                     zenith_color: glam::Vec3::splat(0.02),

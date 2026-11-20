@@ -1,6 +1,6 @@
 // Renders the fixed review scene offscreen and saves it as a PNG.
 // Run: cargo run -p melon_render --example snapshot -- <out.png> [view]
-// Views: overview (default), low.
+// Views: overview (default), low, sun.
 
 use std::sync::Arc;
 
@@ -74,7 +74,19 @@ fn camera(view: &str) -> Result<Camera> {
         "overview" => (Vec3::new(-11.0, 9.0, 12.0), Vec3::new(0.5, 0.5, -1.0)),
         // Near the floor, looking toward the horizon.
         "low" => (Vec3::new(-9.0, 0.6, 9.0), Vec3::new(9.0, 1.2, -9.0)),
-        _ => bail!("unknown view {view:?}; expected overview or low"),
+        // From the +x +z side, up toward the default sun (disc near the top
+        // edge), the pillar and walls in view.
+        "sun" => {
+            let eye = Vec3::new(6.0, 0.3, 6.0);
+            let pitch = 34f32.to_radians();
+            let dir = Vec3::new(
+                -pitch.cos() * 0.5f32.sqrt(),
+                pitch.sin(),
+                -pitch.cos() * 0.5f32.sqrt(),
+            );
+            (eye, eye + dir)
+        }
+        _ => bail!("unknown view {view:?}; expected overview, low or sun"),
     };
     Ok(Camera {
         eye,
@@ -187,7 +199,7 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let out = args
         .next()
-        .context("usage: snapshot <out.png> [overview|low]")?;
+        .context("usage: snapshot <out.png> [overview|low|sun]")?;
     let view = args.next().unwrap_or_else(|| "overview".into());
 
     #[cfg(target_os = "windows")]
@@ -222,6 +234,6 @@ mod tests {
     #[test]
     fn unknown_view_is_an_error() {
         assert!(camera("sideways").is_err());
-        assert!(camera("overview").is_ok() && camera("low").is_ok());
+        assert!(camera("overview").is_ok() && camera("low").is_ok() && camera("sun").is_ok());
     }
 }

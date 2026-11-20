@@ -1,7 +1,7 @@
 // Procedural sky: one fullscreen triangle at the far plane, drawn after the
 // meshes with a LessEqual depth test, so it fills only pixels no geometry
-// covered. Horizon-to-zenith gradient above the horizon, a darker ground tone
-// below it, and a small soft sun disc. Output is linear HDR.
+// covered. Horizon-to-zenith gradient above the horizon, a slightly darker,
+// ground-tinted haze below it, and a small soft sun disc. Output is linear HDR.
 
 struct CameraUniform {
     view_proj: mat4x4f,
@@ -62,8 +62,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let dir = normalize(mid.xyz / mid.w - near.xyz / near.w);
 
     let above = mix(env.horizon_color, env.zenith_color, sqrt(max(dir.y, 0.0)));
-    let ground = 0.5 * env.horizon_color * light.ground_color;
-    let below = mix(env.horizon_color, ground, smoothstep(0.0, 0.2, -dir.y));
+    // Below: a slightly darker haze with a faint ground tint, so distance
+    // beyond the (fogged) floor continues the sky instead of a hard band.
+    let g = light.ground_color;
+    let tint = mix(vec3f(1.0), g / max(max(g.r, g.g), max(g.b, 1e-4)), 0.3);
+    let haze = 0.8 * env.horizon_color * tint;
+    let below = mix(env.horizon_color, haze, smoothstep(0.0, 0.5, -dir.y));
     var color = select(below, above, dir.y >= 0.0);
 
     let sun = smoothstep(SUN_COS_OUTER, SUN_COS_INNER, dot(dir, light.direction));

@@ -122,6 +122,6 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 - **Camera conventions.** Right-handed, DirectX depth (near = 0, far = 1).
   Screen helpers take logical points.
 - **Checking rendering.** Agents verify rendering with the snapshot example
-  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low]`),
+  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun]`),
   never by opening the editor or game window.
 - **GPU tests** open a window, so they need a display and adapter.
