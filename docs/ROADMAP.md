@@ -143,7 +143,8 @@ Goal: an editor that looks and works like Unity / Unreal / Godot.
       hierarchy search, Step.
 - [x] Editor frame pacing: raw device events only while the game has
       input, Mailbox present with a refresh-rate frame cap (FIFO fallback,
-      `MELON_PRESENT=fifo`), `MELON_FRAME_STATS=1` timing line.
+      `MELON_PRESENT=fifo`), `MELON_FRAME_STATS=1` timing line; DX12
+      first on Windows for Mailbox (`MELON_BACKEND=vulkan|dx12|auto`).
 - [x] Quality settings (part a): `RenderQuality` presets, profiles,
       `config/quality.ron`, Project Settings ▸ Quality panel.
 - [ ] Quality settings part b: renderer reads `RenderQuality` (GI/AO/bloom

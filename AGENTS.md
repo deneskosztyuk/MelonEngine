@@ -80,6 +80,13 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   (60 Hz if unknown): `about_to_wait` sets `ControlFlow::WaitUntil` the next
   deadline (previous deadline + period, no drift; a hitch restarts the grid)
   and requests the redraw when it is due. FIFO keeps `Poll` + redraw.
+  On Windows `Renderer::new` tries DX12 first, then the default backends
+  (`backend_order`): AMD's Windows Vulkan driver offers no Mailbox, so
+  Vulkan meant FIFO stalls. DX12 offers Mailbox (flip model, no tearing).
+  `MELON_BACKEND=vulkan|dx12|auto` overrides it (dev switch; unknown = auto).
+  The "renderer ready" line names the backend and present mode. Every
+  shader also goes through naga to HLSL: run the tests under both backends
+  when you touch WGSL.
 - **Diagnosing stutter.** `$env:MELON_FRAME_STATS=1` makes the host print one
   stderr line every 2 s: FPS, average and worst frame interval, the worst
   frame's stages (update, acquire, editor, render, submit, other = events and
