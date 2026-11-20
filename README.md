@@ -86,6 +86,12 @@ Editor:
 - **W / E / R** — Move / Rotate / Scale tool
 - **Delete** — delete the selected entity
 - **Ctrl+S** — save the scene (File ▸ Save As… the first time)
+- **Content Browser:** folder tree (right-click a folder to add it to
+  Favorites), clickable path, Back / Forward (also mouse buttons 4 / 5),
+  search (this folder and below), type filter chips, and a size slider whose
+  far left switches tiles to a list. Click selects, double-click opens a
+  folder. Favorites, size, folder and tree width are saved to
+  `.melon/content_browser.ron`.
 - **Models:** drag a `.glb` / `.gltf` from the Content Browser into the Scene
   (lands on the ground under the cursor) or the Hierarchy (at the origin, or
   under the row you drop it on). It unpacks into an entity per glTF node. Or

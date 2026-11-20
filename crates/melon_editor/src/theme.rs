@@ -61,6 +61,10 @@ pub mod sizes {
     pub const TILE_DEFAULT: f32 = 72.0;
     pub const TILE_MAX: f32 = 128.0;
     pub const TILE_LIST_BELOW: f32 = 48.0;
+    pub const CONTENT_TREE_MIN: f32 = 120.0;
+    pub const CONTENT_SEARCH: f32 = 160.0;
+    /// Height of the name line under a tile.
+    pub const TILE_LABEL: f32 = 18.0;
 }
 
 /// Apply the editor theme (dark) to every egui style.

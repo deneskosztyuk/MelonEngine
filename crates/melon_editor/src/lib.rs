@@ -20,6 +20,7 @@ use winit::window::Window;
 pub mod asset_db;
 pub mod console;
 pub mod content;
+mod content_view;
 pub mod gizmo;
 pub mod layout;
 pub mod play;

@@ -185,6 +185,8 @@ pub struct ContentBrowser {
     tile_size: f32,
     /// Folder tree width, written back by the view.
     pub(crate) tree_width: f32,
+    /// Sub-folders per folder for the tree view, cleared by `refresh`.
+    pub(crate) tree_children: std::collections::HashMap<PathBuf, Vec<PathBuf>>,
     /// File kinds shown; folders are always shown outside search.
     filter: HashSet<AssetKind>,
     /// What the asset view shows, rebuilt only when the folder, search or
@@ -204,6 +206,7 @@ impl ContentBrowser {
             favorites: Vec::new(),
             tile_size: theme::sizes::TILE_DEFAULT,
             tree_width: theme::sizes::CONTENT_TREE,
+            tree_children: std::collections::HashMap::new(),
             filter: AssetKind::FILE_KINDS.into_iter().collect(),
             visible: Vec::new(),
         };
@@ -344,6 +347,10 @@ impl ContentBrowser {
         self.tile_size < theme::sizes::TILE_LIST_BELOW
     }
 
+    pub fn tile_size(&self) -> f32 {
+        self.tile_size
+    }
+
     pub fn tile_size_mut(&mut self) -> &mut f32 {
         &mut self.tile_size
     }
@@ -465,6 +472,7 @@ impl ContentBrowser {
                 None => break,
             }
         }
+        self.tree_children.clear();
         let shown = |e: &ContentEntry| e.is_dir || self.filter.contains(&e.kind);
         self.visible = if self.search.is_empty() {
             list_dir(&self.current).into_iter().filter(shown).collect()
@@ -479,81 +487,6 @@ impl ContentBrowser {
             files
         };
     }
-
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(self.current != self.root, egui::Button::new("Up"))
-                .clicked()
-            {
-                self.up();
-            }
-            if ui.button("Refresh").clicked() {
-                self.refresh();
-            }
-            ui.separator();
-            let root_name = self
-                .root
-                .file_name()
-                .map_or("assets".into(), |n| n.to_string_lossy().into_owned());
-            let mut crumb = root_name;
-            if let Ok(rel) = self.current.strip_prefix(&self.root) {
-                for part in rel.components() {
-                    crumb.push_str(" / ");
-                    crumb.push_str(&part.as_os_str().to_string_lossy());
-                }
-            }
-            ui.label(egui::RichText::new(crumb).color(theme::colors::TEXT_MUTED));
-        });
-        ui.separator();
-        if self.visible.is_empty() {
-            ui.weak("Empty folder (or the assets folder was not found)");
-            return;
-        }
-        let mut open = None;
-        egui::ScrollArea::vertical()
-            .auto_shrink(false)
-            .show(ui, |ui| {
-                for entry in &self.visible {
-                    let (icon, detail) = if entry.is_dir {
-                        ("🗀", String::new())
-                    } else {
-                        ("🗋", format_size(entry.size))
-                    };
-                    // Model files drag into the Scene or Hierarchy as their
-                    // project-relative asset path.
-                    let model_path = (!entry.is_dir && is_model_path(&entry.name))
-                        .then(|| {
-                            self.root
-                                .parent()
-                                .and_then(|p| project_relative(p, &entry.path))
-                        })
-                        .flatten();
-                    let label = format!("{icon} {}", entry.name);
-                    let row = ui.horizontal(|ui| {
-                        let response = match model_path {
-                            Some(path) => {
-                                ui.dnd_drag_source(egui::Id::new(&entry.path), path, |ui| {
-                                    ui.selectable_label(false, &label)
-                                })
-                                .inner
-                            }
-                            None => ui.selectable_label(false, &label),
-                        };
-                        if !detail.is_empty() {
-                            ui.weak(detail);
-                        }
-                        response
-                    });
-                    if entry.is_dir && row.inner.double_clicked() {
-                        open = Some(entry.path.clone());
-                    }
-                }
-            });
-        if let Some(dir) = open {
-            self.open(dir);
-        }
-    }
 }
 
 /// Every file under `dir`, recursively (folders are not included).
@@ -567,7 +500,7 @@ fn walk_files(dir: &Path, out: &mut Vec<ContentEntry>) {
     }
 }
 
-fn format_size(bytes: u64) -> String {
+pub(crate) fn format_size(bytes: u64) -> String {
     match bytes {
         b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / f64::from(1 << 20)),
         b if b >= 1 << 10 => format!("{:.1} KB", b as f64 / f64::from(1 << 10)),
