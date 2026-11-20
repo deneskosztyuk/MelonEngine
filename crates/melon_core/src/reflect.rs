@@ -148,7 +148,19 @@ mod tests {
         let names: Vec<String> = registered_components(&core.world)
             .into_iter()
             .map(|c| c.display_name)
-            .collect();
+        assert_eq!(
+            names,
+            [
+                "Aabb",
+                "Bob",
+                "Character Controller",
+                "Collider",
+                "Joint",
+                "Rigid Body",
+                "Spin",
+                "Transform"
+            ]
+        );
         assert_eq!(names, ["Aabb", "Bob", "Body Info", "Spin", "Transform"]);
     }
 

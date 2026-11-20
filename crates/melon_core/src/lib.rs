@@ -14,6 +14,7 @@ pub mod assets;
 pub mod components;
 pub mod hierarchy;
 pub mod input;
+pub mod physics;
 pub mod plugin;
 pub mod quality;
 pub mod reflect;
@@ -35,6 +36,10 @@ pub use components::{
 pub use glam;
 pub use hierarchy::{ChildOf, Children, GlobalTransform};
 pub use input::{GameInputGate, Input, InputButton, InputFocus, KeyCode, MouseButton, RawPresses};
+pub use physics::{
+    CharacterController, Collider, ColliderShape, CollisionEvent, CollisionEventKind, Joint,
+    JointKind, PhysicsQueries, QueryBackend, QueryFilter, RayHit, RigidBody, RigidBodyKind,
+};
 pub use plugin::{App, Plugin, abi_fingerprint};
 pub use quality::{
     GiMode, PresentPreference, QualityPreset, QualitySetting, RenderQuality, RenderTimings,
@@ -137,6 +142,8 @@ impl Core {
         world.init_resource::<RenderQuality>();
         world.init_resource::<AppTypeRegistry>();
         world.init_resource::<RegistryGeneration>();
+        world.init_resource::<bevy_ecs::message::Messages<CollisionEvent>>();
+        world.init_resource::<PhysicsQueries>();
 
         let mut core = Self {
             world,
@@ -155,7 +162,10 @@ impl Core {
         core.add_systems(Update, assets::hot_reload_system);
         core.register_component::<Transform>()
             .register_component::<Aabb>()
-            .register_component::<BodyInfo>()
+            .register_component::<RigidBody>()
+            .register_component::<Collider>()
+            .register_component::<CharacterController>()
+            .register_component::<Joint>()
             .register_component::<Spin>()
             .register_component::<Bob>();
         core
