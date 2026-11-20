@@ -138,12 +138,18 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   = `Mailbox` when offered, else `Fifo` (`MELON_PRESENT=fifo` forces FIFO,
   a debug A/B switch). Mailbox does not wait for vblank, so the host caps
   frames at the monitor refresh rate (60 Hz if unknown;
-  `pacing::frame_cap`, on only with Mailbox): the loop stays `Poll` with a
-  redraw requested every frame, and `RedrawRequested` first sleeps
-  (`std::thread::sleep`, a high-resolution waitable timer on Windows) until
-  the deadline (previous deadline + period, no drift; a hitch restarts the
-  grid; at most one period). Do not go back to `ControlFlow::WaitUntil`:
-  it missed deadlines by ~100 ms while input events streamed in (drag).
+  `pacing::frame_cap`, on only with Mailbox): the loop stays `Poll` and
+  `draw_frame` first sleeps (`std::thread::sleep`, a high-resolution
+  waitable timer on Windows) until the deadline (previous deadline +
+  period, no drift; a hitch restarts the grid; at most one period). Do not
+  go back to `ControlFlow::WaitUntil`: it missed deadlines by ~100 ms while
+  input events streamed in (drag). Frames are drawn from `about_to_wait`
+  and, once a period late (`pacing::frame_overdue`), from inside any
+  window or device event callback: winit calls `about_to_wait` only when
+  the message queue is empty, and a moving 1000 Hz mouse (each real
+  `WM_MOUSEMOVE` takes ~1 ms in Windows on the dev machine) kept it busy,
+  holding frames back 100-400 ms. Drawing only from `RedrawRequested`
+  (`WM_PAINT`, sent only to an idle queue) starved the same way.
   On Windows `Renderer::new` tries DX12 first, then the default backends
   (`backend_order`): AMD's Windows Vulkan driver offers no Mailbox, so
   Vulkan meant FIFO stalls. DX12 offers Mailbox (flip model, no tearing).
