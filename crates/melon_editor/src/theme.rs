@@ -34,6 +34,14 @@ pub mod colors {
     pub const AXIS_X: Color32 = ERROR;
     pub const AXIS_Y: Color32 = SUCCESS;
     pub const AXIS_Z: Color32 = ACCENT_HOVER;
+    /// Quality settings rows, alternating.
+    pub const QUALITY_ROWS: [Color32; 2] = [SURFACE, SURFACE_RAISED];
+    /// Per-pass colours: the row dot and its cost bar segment.
+    pub const PASS_GI: Color32 = Color32::from_rgb(0x7f, 0x77, 0xdd);
+    pub const PASS_AO: Color32 = Color32::from_rgb(0x1d, 0x9e, 0x75);
+    pub const PASS_SHADOWS: Color32 = Color32::from_rgb(0x88, 0x87, 0x80);
+    pub const PASS_AA: Color32 = Color32::from_rgb(0x37, 0x8a, 0xdd);
+    pub const PASS_BLOOM: Color32 = Color32::from_rgb(0xef, 0x9f, 0x27);
 }
 
 /// Size tokens, in points.
@@ -54,6 +62,12 @@ pub mod sizes {
     pub const SETTINGS_WINDOW: egui::Vec2 = egui::vec2(720.0, 420.0);
     pub const SETTINGS_SECTIONS: f32 = 140.0;
     pub const SETTINGS_NAME: f32 = 140.0;
+    /// Quality rows: cost and tag columns, dropdown width, colour dot.
+    pub const QUALITY_COST: f32 = 54.0;
+    pub const QUALITY_TAG: f32 = 56.0;
+    pub const QUALITY_DROPDOWN: f32 = 112.0;
+    pub const QUALITY_DOT: f32 = 8.0;
+    pub const QUALITY_BAR_HEIGHT: f32 = 10.0;
 }
 
 /// Apply the editor theme (dark) to every egui style.

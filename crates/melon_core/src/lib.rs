@@ -110,6 +110,7 @@ impl Core {
         world.init_resource::<RawPresses>();
         world.init_resource::<InputMap>();
         world.init_resource::<Actions>();
+        world.init_resource::<RenderQuality>();
 
         let mut core = Self {
             world,
