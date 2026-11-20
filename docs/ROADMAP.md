@@ -84,10 +84,13 @@ one; 10 comes after.
       no hand-listed `SceneEntity`); an agent can build levels as RON data.
       Next step: prefabs, built on the same registry.
 2. - [x] **Undo / Redo** (snapshot history, `history.rs`), plus entity rename and duplicate.
-3. - [ ] **Rendering:** `Handle<Texture>` / `Handle<Material>` assets; point
-      and spot lights; image-based ambient; cascaded sun shadows, then
-      point/spot shadows; LOD. (PBR, sky, GI, instancing and culling are
-      done, see Graphics tier.)
+3. - [x] **Rendering:** `Handle<Texture>` / `Handle<Material>` assets (`.mat`
+      files, `MeshMaterials` per part, alpha mask / blend); point and spot
+      lights (clustered forward); image-based ambient (procedural or HDR
+      sky); cascaded sun shadows; point/spot shadows (atlas, DDGI
+      injection); `Lod` component. (Done; see AGENTS.md "Rendering" notes.
+      Not done: a `Content Browser` material-on-sphere thumbnail, drag-drop
+      assignment and glTF "Extract materials" in the editor.)
 4. - [x] **Physics:** sphere / capsule / trimesh shapes, ray cast and query
       API, triggers and collision events, character controller, joints.
       (Done; see AGENTS.md "Physics".)
