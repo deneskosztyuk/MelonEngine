@@ -100,6 +100,11 @@ pub struct RenderQuality {
 
 pub const SHADOW_MAP_SIZES: [u32; 3] = [1024, 2048, 4096];
 pub const MSAA_SAMPLES: [u32; 3] = [1, 2, 4];
+pub const MAX_LIGHTS_OPTIONS: [u32; 4] = [64, 128, 256, 512];
+pub const CASCADE_OPTIONS: [u32; 4] = [1, 2, 3, 4];
+pub const SHADOW_DISTANCE_OPTIONS: [u32; 4] = [40, 60, 100, 200];
+pub const SHADOWED_LIGHTS_OPTIONS: [u32; 5] = [0, 2, 4, 8, 16];
+pub const LOCAL_SHADOW_SIZES: [u32; 3] = [1024, 2048, 4096];
 
 impl Default for RenderQuality {
     fn default() -> Self {
@@ -117,10 +122,15 @@ pub enum QualitySetting {
     Msaa,
     Bloom,
     Present,
+    MaxLights,
+    Cascades,
+    ShadowDistance,
+    ShadowedLights,
+    LocalShadowSize,
 }
 
 impl QualitySetting {
-    pub const ALL: [QualitySetting; 7] = [
+    pub const ALL: [QualitySetting; 12] = [
         Self::Gi,
         Self::SsgiResolution,
         Self::Ao,
@@ -128,12 +138,20 @@ impl QualitySetting {
         Self::Msaa,
         Self::Bloom,
         Self::Present,
+        Self::MaxLights,
+        Self::Cascades,
+        Self::ShadowDistance,
+        Self::ShadowedLights,
+        Self::LocalShadowSize,
     ];
 
     /// True when a change recreates GPU targets and pipelines (shadow map,
     /// MSAA); false when it switches on the next frame.
     pub fn needs_rebuild(self) -> bool {
-        matches!(self, Self::ShadowMap | Self::Msaa)
+        matches!(
+            self,
+            Self::ShadowMap | Self::Msaa | Self::Cascades | Self::LocalShadowSize
+        )
     }
 }
 
@@ -350,6 +368,28 @@ mod tests {
             p(QualityPreset::Max),
             q(GiMode::Ddgi, Half, true, 4096, 4, true, MailboxCapped)
         );
+    }
+
+    #[test]
+    fn every_preset_value_is_one_of_the_panel_options() {
+        for p in QualityPreset::ALL {
+            let q = RenderQuality::preset(p);
+            assert!(MAX_LIGHTS_OPTIONS.contains(&q.max_lights), "{p:?}");
+            assert!(CASCADE_OPTIONS.contains(&q.cascades), "{p:?}");
+            assert!(
+                SHADOW_DISTANCE_OPTIONS.contains(&q.shadow_distance),
+                "{p:?}"
+            );
+            assert!(
+                SHADOWED_LIGHTS_OPTIONS.contains(&q.shadowed_lights),
+                "{p:?}"
+            );
+            assert!(LOCAL_SHADOW_SIZES.contains(&q.local_shadow_size), "{p:?}");
+        }
+        assert!(QualitySetting::Cascades.needs_rebuild());
+        assert!(QualitySetting::LocalShadowSize.needs_rebuild());
+        assert!(!QualitySetting::MaxLights.needs_rebuild());
+        assert_eq!(QualitySetting::ALL.len(), 12);
     }
 
     #[test]
