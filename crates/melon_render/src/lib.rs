@@ -118,6 +118,81 @@ pub struct Vertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub uv: [f32; 2],
+    /// Tangent along +U (xyz) and bitangent sign (w = +1 or -1):
+    /// bitangent = cross(normal, tangent) * w.
+    pub tangent: [f32; 4],
+}
+
+/// Per-vertex tangents from positions and UVs, written into `vertices`:
+/// per-triangle U and V directions accumulated per vertex, made
+/// perpendicular to the normal (Gram-Schmidt), handedness from the
+/// accumulated V direction. glTF's V runs down the image while normal maps
+/// store green = up, so the bitangent is -dP/dV. Vertices with no usable
+/// UVs get any tangent perpendicular to the normal.
+fn generate_tangents(vertices: &mut [Vertex], indices: &[u32]) {
+    use glam::{Vec2, Vec3};
+    let mut tan = vec![Vec3::ZERO; vertices.len()];
+    let mut bitan = vec![Vec3::ZERO; vertices.len()];
+    for tri in indices.chunks_exact(3) {
+        let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| i as usize);
+        if [a, b, c].iter().any(|&i| i >= vertices.len()) {
+            continue;
+        }
+        let p = |i: usize| Vec3::from_array(vertices[i].position);
+        let uv = |i: usize| Vec2::from_array(vertices[i].uv);
+        let (e1, e2) = (p(b) - p(a), p(c) - p(a));
+        let (d1, d2) = (uv(b) - uv(a), uv(c) - uv(a));
+        let det = d1.x * d2.y - d2.x * d1.y;
+        if det.abs() < 1e-12 {
+            continue;
+        }
+        let t = (e1 * d2.y - e2 * d1.y) / det;
+        let bt = (e2 * d1.x - e1 * d2.x) / det;
+        for i in [a, b, c] {
+            tan[i] += t;
+            bitan[i] += bt;
+        }
+    }
+    for (v, (t, bt)) in vertices.iter_mut().zip(tan.into_iter().zip(bitan)) {
+        let n = Vec3::from_array(v.normal);
+        let t = (t - n * n.dot(t))
+            .try_normalize()
+            .unwrap_or_else(|| n.any_orthonormal_vector());
+        let w = if n.cross(t).dot(bt) > 0.0 { -1.0 } else { 1.0 };
+        v.tangent = t.extend(w).to_array();
+    }
+}
+
+/// glTF metallic-roughness factors of one material (group 2, binding 5).
+/// Each factor multiplies its texture; missing textures bind 1x1 defaults
+/// (white, flat normal, black emissive).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct MaterialUniform {
+    /// Linear RGBA.
+    pub base_color: [f32; 4],
+    /// Linear HDR radiance added on top of the lit colour.
+    pub emissive: [f32; 3],
+    pub metallic: f32,
+    pub roughness: f32,
+    /// Scales the tangent-space normal map's X and Y.
+    pub normal_scale: f32,
+    pub _pad: [f32; 2],
+}
+
+impl MaterialUniform {
+    /// The factors of a glTF material (glTF defaults where unset).
+    pub fn from_gltf(material: &gltf::Material) -> Self {
+        let pbr = material.pbr_metallic_roughness();
+        Self {
+            base_color: pbr.base_color_factor(),
+            emissive: material.emissive_factor(),
+            metallic: pbr.metallic_factor(),
+            roughness: pbr.roughness_factor(),
+            normal_scale: material.normal_texture().map_or(1.0, |n| n.scale()),
+            _pad: [0.0; 2],
+        }
+    }
 }
 
 #[repr(C)]
@@ -127,6 +202,68 @@ pub struct LineVertex {
     pub color: [f32; 3],
 }
 
+/// 1x1 textures bound where a material has none.
+struct DefaultTextures {
+    /// Base colour and metallic-roughness: the factors alone.
+    white: wgpu::TextureView,
+    /// Normal map (0.5, 0.5, 1): the vertex normal unchanged.
+    flat_normal: wgpu::TextureView,
+    /// Emissive: none.
+    black: wgpu::TextureView,
+}
+
+/// `builtin:cube`: rough white dielectric under the checkerboard.
+const CHECKER_MATERIAL: MaterialUniform = MaterialUniform {
+    base_color: [1.0; 4],
+    emissive: [0.0; 3],
+    metallic: 0.0,
+    roughness: 0.8,
+    normal_scale: 1.0,
+    _pad: [0.0; 2],
+};
+
+/// A group 2 bind group: `textures` are base colour, metallic-roughness,
+/// normal and emissive; `None` binds the matching default.
+fn material_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    defaults: &DefaultTextures,
+    factors: &MaterialUniform,
+    textures: [Option<&wgpu::TextureView>; 4],
+) -> wgpu::BindGroup {
+    let [base, metallic_roughness, normal, emissive] = textures;
+    let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("material uniform buffer"),
+        contents: bytemuck::bytes_of(factors),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    fn view(binding: u32, view: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
+        wgpu::BindGroupEntry {
+            binding,
+            resource: wgpu::BindingResource::TextureView(view),
+        }
+    }
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("material bind group"),
+        layout,
+        entries: &[
+            view(0, base.unwrap_or(&defaults.white)),
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            view(2, metallic_roughness.unwrap_or(&defaults.white)),
+            view(3, normal.unwrap_or(&defaults.flat_normal)),
+            view(4, emissive.unwrap_or(&defaults.black)),
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: uniform.as_entire_binding(),
+            },
+        ],
+    })
+}
+
 pub struct Mesh {
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
@@ -134,15 +271,13 @@ pub struct Mesh {
     pub index_format: wgpu::IndexFormat,
 }
 
-/// A model loaded from a glTF file. Each primitive becomes one `Mesh` with an
-/// optional albedo texture bind group. Draw by zipping `meshes` with
-/// `albedo_bind_groups` (falling back to the renderer's checkerboard when an
-/// entry is `None`).
+/// A model loaded from a glTF file. Each primitive becomes one `Mesh` with
+/// its material bind group (group 2). Draw by zipping `meshes` with
+/// `material_bind_groups`.
 pub struct LoadedModel {
     pub meshes: Vec<Mesh>,
-    /// Per-primitive albedo bind group. `None` if the primitive had no
-    /// base color texture; the caller should bind the renderer's default.
-    pub albedo_bind_groups: Vec<Option<wgpu::BindGroup>>,
+    /// Per-primitive material (see [`SceneRenderer::create_material_bind_group`]).
+    pub material_bind_groups: Vec<wgpu::BindGroup>,
     /// Local-space bounds (min, max) of every part, node transforms included.
     pub bounds: (glam::Vec3, glam::Vec3),
 }
@@ -320,7 +455,10 @@ pub struct SceneRenderer {
     tonemap_bind_group_layout: wgpu::BindGroupLayout,
     #[allow(dead_code)]
     model_bind_group_layout: wgpu::BindGroupLayout,
-    texture_bind_group_layout: wgpu::BindGroupLayout,
+    material_bind_group_layout: wgpu::BindGroupLayout,
+    /// The one sampler every material binds (repeat, linear).
+    material_sampler: wgpu::Sampler,
+    default_textures: DefaultTextures,
     camera_buffer: wgpu::Buffer,
     light_buffer: wgpu::Buffer,
     environment_buffer: wgpu::Buffer,
@@ -334,10 +472,8 @@ pub struct SceneRenderer {
     // Kept alive for `shadow_view`.
     _shadow_texture: wgpu::Texture,
     shadow_view: wgpu::TextureView,
-    // Kept to keep the texture alive for the lifetime of the renderer.
-    #[allow(dead_code)]
-    albedo_texture: wgpu::Texture,
-    albedo_bind_group: wgpu::BindGroup,
+    /// `builtin:cube`'s material: the checkerboard as base colour.
+    checker_material: wgpu::BindGroup,
     /// Fullscreen sky behind the meshes (3D pass).
     sky_pipeline: wgpu::RenderPipeline,
     /// Depth-tested lines inside the 3D pass (grid, axes, selection box).
@@ -486,12 +622,12 @@ impl Renderer {
         for (_, handle) in &frame.models {
             self.model_cache.prepare(&self.scene, server, *handle);
         }
-        let mut draw_calls: Vec<(usize, &Mesh, Option<&wgpu::BindGroup>)> =
+        let mut draw_calls: Vec<(usize, &Mesh, &wgpu::BindGroup)> =
             Vec::with_capacity(frame.models.len());
         for (i, (_, handle)) in frame.models.iter().enumerate() {
             let model = self.model_cache.model(server, *handle);
-            for (mesh, albedo) in model.meshes.iter().zip(&model.albedo_bind_groups) {
-                draw_calls.push((i, mesh, albedo.as_ref()));
+            for (mesh, material) in model.meshes.iter().zip(&model.material_bind_groups) {
+                draw_calls.push((i, mesh, material));
             }
         }
         // The draw list borrows the model cache; the scene is a separate field.
@@ -622,30 +758,37 @@ impl SceneRenderer {
         });
         let shadow_pipeline =
             Renderer::build_shadow_pipeline(&device, &shadow_layout, &model_layout);
-        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("texture bind group layout"),
+        let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        // Group 2: one material. Every material binds all four textures
+        // (1x1 defaults where the glTF has none), so the layout is fixed.
+        let material_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("material bind group layout"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
+                texture_entry(0), // base colour (sRGB)
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                texture_entry(2), // metallic-roughness (linear: G roughness, B metallic)
+                texture_entry(3), // tangent-space normal (linear)
+                texture_entry(4), // emissive (sRGB)
+                uniform_entry(5, wgpu::ShaderStages::FRAGMENT), // MaterialUniform
             ],
         });
 
         let mesh_pipeline =
-            Renderer::build_mesh_pipeline(&device, &frame_layout, &model_layout, &texture_layout);
+            Renderer::build_mesh_pipeline(&device, &frame_layout, &model_layout, &material_layout);
 
         let tonemap_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tonemap bind group layout"),
@@ -750,8 +893,53 @@ impl SceneRenderer {
             ],
         });
 
-        let (albedo_texture, albedo_bind_group) =
-            Renderer::create_checkerboard_texture(&device, &queue, &texture_layout);
+        let texture_1x1 = |label, rgba: [u8; 4]| {
+            let texture = device.create_texture_with_data(
+                &queue,
+                &wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+                wgpu::util::TextureDataOrder::LayerMajor,
+                &rgba,
+            );
+            texture.create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let default_textures = DefaultTextures {
+            white: texture_1x1("default white texture", [255; 4]),
+            flat_normal: texture_1x1("default flat normal texture", [128, 128, 255, 255]),
+            black: texture_1x1("default black texture", [0, 0, 0, 255]),
+        };
+        let material_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("material sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let checker = Renderer::create_checkerboard_texture(&device, &queue)
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let checker_material = material_bind_group(
+            &device,
+            &material_layout,
+            &material_sampler,
+            &default_textures,
+            &CHECKER_MATERIAL,
+            [Some(&checker), None, None, None],
+        );
 
         let world_line_pipeline = Renderer::build_world_line_pipeline(&device, &frame_layout);
         let sky_pipeline = Renderer::build_sky_pipeline(&device, &frame_layout);
@@ -790,7 +978,9 @@ impl SceneRenderer {
             tonemap_pipeline,
             tonemap_bind_group_layout: tonemap_layout,
             model_bind_group_layout: model_layout,
-            texture_bind_group_layout: texture_layout,
+            material_bind_group_layout: material_layout,
+            material_sampler,
+            default_textures,
             camera_buffer,
             light_buffer,
             environment_buffer,
@@ -800,8 +990,7 @@ impl SceneRenderer {
             shadow_bind_group,
             _shadow_texture: shadow_texture,
             shadow_view,
-            albedo_texture,
-            albedo_bind_group,
+            checker_material,
             sky_pipeline,
             world_line_pipeline,
             world_lines: LineBuffer::default(),
@@ -843,6 +1032,7 @@ impl Renderer {
                         0 => Float32x3,  // position
                         1 => Float32x3,  // normal
                         2 => Float32x2,  // uv
+                        3 => Float32x4,  // tangent + handedness
                     ],
                 }],
             },
@@ -1098,11 +1288,7 @@ impl Renderer {
         (texture, view)
     }
 
-    fn create_checkerboard_texture(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        texture_layout: &wgpu::BindGroupLayout,
-    ) -> (wgpu::Texture, wgpu::BindGroup) {
+    fn create_checkerboard_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::Texture {
         const SIZE: u32 = 64;
         const TILE: u32 = 8;
         let mut pixels = Vec::with_capacity((SIZE * SIZE * 4) as usize);
@@ -1152,34 +1338,7 @@ impl Renderer {
             },
         );
 
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("albedo sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("albedo bind group"),
-            layout: texture_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
-
-        (texture, bind_group)
+        texture
     }
 }
 
@@ -1188,138 +1347,163 @@ impl SceneRenderer {
     pub fn cube_mesh(&self) -> Mesh {
         // 24 vertices (6 faces x 4), 36 indices. Each face has a normal + UVs.
         // UVs map so the checkerboard repeats once per face.
-        let vertices: [Vertex; 24] = [
+        let mut vertices: [Vertex; 24] = [
             // +X (normal +X)
             Vertex {
                 position: [0.5, -0.5, -0.5],
                 normal: [1.0, 0.0, 0.0],
                 uv: [0.0, 0.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [0.5, 0.5, -0.5],
                 normal: [1.0, 0.0, 0.0],
                 uv: [0.0, 1.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [0.5, 0.5, 0.5],
                 normal: [1.0, 0.0, 0.0],
                 uv: [1.0, 1.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [0.5, -0.5, 0.5],
                 normal: [1.0, 0.0, 0.0],
                 uv: [1.0, 0.0],
+                tangent: [0.0; 4],
             },
             // -X (normal -X)
             Vertex {
                 position: [-0.5, -0.5, 0.5],
                 normal: [-1.0, 0.0, 0.0],
                 uv: [0.0, 0.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [-0.5, 0.5, 0.5],
                 normal: [-1.0, 0.0, 0.0],
                 uv: [0.0, 1.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [-0.5, 0.5, -0.5],
                 normal: [-1.0, 0.0, 0.0],
                 uv: [1.0, 1.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [-0.5, -0.5, -0.5],
                 normal: [-1.0, 0.0, 0.0],
                 uv: [1.0, 0.0],
+                tangent: [0.0; 4],
             },
             // +Y (normal +Y)
             Vertex {
                 position: [0.5, 0.5, -0.5],
                 normal: [0.0, 1.0, 0.0],
                 uv: [0.0, 0.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [-0.5, 0.5, -0.5],
                 normal: [0.0, 1.0, 0.0],
                 uv: [0.0, 1.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [-0.5, 0.5, 0.5],
                 normal: [0.0, 1.0, 0.0],
                 uv: [1.0, 1.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [0.5, 0.5, 0.5],
                 normal: [0.0, 1.0, 0.0],
                 uv: [1.0, 0.0],
+                tangent: [0.0; 4],
             },
             // -Y (normal -Y)
             Vertex {
                 position: [0.5, -0.5, 0.5],
                 normal: [0.0, -1.0, 0.0],
                 uv: [0.0, 0.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [-0.5, -0.5, 0.5],
                 normal: [0.0, -1.0, 0.0],
                 uv: [0.0, 1.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [-0.5, -0.5, -0.5],
                 normal: [0.0, -1.0, 0.0],
                 uv: [1.0, 1.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [0.5, -0.5, -0.5],
                 normal: [0.0, -1.0, 0.0],
                 uv: [1.0, 0.0],
+                tangent: [0.0; 4],
             },
             // +Z (normal +Z)
             Vertex {
                 position: [0.5, -0.5, 0.5],
                 normal: [0.0, 0.0, 1.0],
                 uv: [0.0, 0.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [0.5, 0.5, 0.5],
                 normal: [0.0, 0.0, 1.0],
                 uv: [0.0, 1.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [-0.5, 0.5, 0.5],
                 normal: [0.0, 0.0, 1.0],
                 uv: [1.0, 1.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [-0.5, -0.5, 0.5],
                 normal: [0.0, 0.0, 1.0],
                 uv: [1.0, 0.0],
+                tangent: [0.0; 4],
             },
             // -Z (normal -Z)
             Vertex {
                 position: [-0.5, -0.5, -0.5],
                 normal: [0.0, 0.0, -1.0],
                 uv: [0.0, 0.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [-0.5, 0.5, -0.5],
                 normal: [0.0, 0.0, -1.0],
                 uv: [0.0, 1.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [0.5, 0.5, -0.5],
                 normal: [0.0, 0.0, -1.0],
                 uv: [1.0, 1.0],
+                tangent: [0.0; 4],
             },
             Vertex {
                 position: [0.5, -0.5, -0.5],
                 normal: [0.0, 0.0, -1.0],
                 uv: [1.0, 0.0],
+                tangent: [0.0; 4],
             },
         ];
         let indices: [u16; 36] = [
             0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7, 8, 9, 10, 8, 10, 11, 12, 13, 14, 12, 14, 15, 16,
             17, 18, 16, 18, 19, 20, 21, 22, 20, 22, 23,
         ];
+        generate_tangents(&mut vertices, &indices.map(u32::from));
 
         let vertex_buffer = self
             .device
@@ -1637,8 +1821,7 @@ impl SceneRenderer {
     }
 
     /// Convert an `image::DynamicImage` to RGBA8 and upload it as a texture.
-    /// Returns the texture; caller creates the view + bind group via
-    /// `create_texture_bind_group`.
+    /// Returns the texture; pass it to `create_material_bind_group`.
     #[instrument(skip(self), level = "debug")]
     pub fn create_texture_from_image(&self, img: &image::DynamicImage) -> wgpu::Texture {
         let rgba = img.to_rgba8();
@@ -1646,41 +1829,24 @@ impl SceneRenderer {
         self.create_texture_from_bytes(&rgba, width, height, wgpu::TextureFormat::Rgba8UnormSrgb)
     }
 
-    /// Create a texture view + sampler + bind group for the given texture,
-    /// using the renderer's existing texture bind group layout.
-    #[instrument(skip(self), level = "debug")]
-    pub fn create_texture_bind_group(&self, texture: &wgpu::Texture) -> wgpu::BindGroup {
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("loaded texture sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("loaded texture bind group"),
-            layout: &self.texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        })
-    }
-
-    /// Access the texture bind group layout (needed by callers that want to
-    /// create their own bind groups against the same layout).
-    pub fn texture_bind_group_layout(&self) -> &wgpu::BindGroupLayout {
-        &self.texture_bind_group_layout
+    /// A material bind group (group 2) from `factors` and optional
+    /// textures: base colour (sRGB), metallic-roughness (linear, G =
+    /// roughness, B = metallic), tangent-space normal (linear) and emissive
+    /// (sRGB). Missing textures bind white, flat normal and black.
+    pub fn create_material_bind_group(
+        &self,
+        factors: &MaterialUniform,
+        textures: [Option<&wgpu::Texture>; 4],
+    ) -> wgpu::BindGroup {
+        let views = textures.map(|t| t.map(|t| t.create_view(&Default::default())));
+        material_bind_group(
+            &self.device,
+            &self.material_bind_group_layout,
+            &self.material_sampler,
+            &self.default_textures,
+            factors,
+            [0, 1, 2, 3].map(|i| views[i].as_ref()),
+        )
     }
 
     /// Load a glTF / GLB file. Every primitive reachable from the default
@@ -1707,7 +1873,7 @@ impl SceneRenderer {
             .map(|gltf_mesh| {
                 let mut model = LoadedModel {
                     meshes: Vec::new(),
-                    albedo_bind_groups: Vec::new(),
+                    material_bind_groups: Vec::new(),
                     bounds: (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)),
                 };
                 for primitive in gltf_mesh.primitives() {
@@ -1746,7 +1912,7 @@ impl SceneRenderer {
     pub fn builtin_cube_model(&self) -> LoadedModel {
         LoadedModel {
             meshes: vec![self.cube_mesh()],
-            albedo_bind_groups: vec![None],
+            material_bind_groups: vec![self.checker_material.clone()],
             bounds: (glam::Vec3::splat(-0.5), glam::Vec3::splat(0.5)),
         }
     }
@@ -1759,7 +1925,7 @@ impl SceneRenderer {
     ) -> Result<LoadedModel> {
         let mut model = LoadedModel {
             meshes: Vec::new(),
-            albedo_bind_groups: Vec::new(),
+            material_bind_groups: Vec::new(),
             bounds: (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)),
         };
         let scene = document
@@ -1830,23 +1996,40 @@ impl SceneRenderer {
             );
         }
 
-        // Bake the node transform; normals use the inverse transpose.
+        let tangents: Option<Vec<[f32; 4]>> = reader
+            .read_tangents()
+            .map(|it| it.collect())
+            .filter(|t: &Vec<[f32; 4]>| t.len() == positions.len());
+
+        // Bake the node transform; normals use the inverse transpose,
+        // tangents the transform itself. A mirroring transform flips the
+        // bitangent, so the handedness flips with it.
         let normal_matrix = world.inverse().transpose();
-        let vertices: Vec<Vertex> = positions
+        let mirrored = world.determinant() < 0.0;
+        let mut vertices: Vec<Vertex> = positions
             .iter()
             .zip(&normals)
             .zip(&uvs)
-            .map(|((&pos, &norm), &uv)| {
+            .enumerate()
+            .map(|(i, ((&pos, &norm), &uv))| {
                 let p = world.transform_point3(glam::Vec3::from_array(pos));
                 model.bounds.0 = model.bounds.0.min(p);
                 model.bounds.1 = model.bounds.1.max(p);
                 let n = normal_matrix
                     .transform_vector3(glam::Vec3::from_array(norm))
                     .normalize_or_zero();
+                let tangent = tangents.as_ref().map_or([0.0; 4], |t| {
+                    let [x, y, z, w] = t[i];
+                    let t = world
+                        .transform_vector3(glam::Vec3::new(x, y, z))
+                        .normalize_or_zero();
+                    t.extend(if mirrored { -w } else { w }).to_array()
+                });
                 Vertex {
                     position: p.to_array(),
                     normal: n.to_array(),
                     uv,
+                    tangent,
                 }
             })
             .collect();
@@ -1855,9 +2038,14 @@ impl SceneRenderer {
             Some(indices) => indices.into_u32().collect(),
             None => (0..positions.len() as u32).collect(),
         };
+        // Generated from the baked vertices, before any winding flip: the
+        // handedness comes from the UV layout, not the winding.
+        if tangents.is_none() {
+            generate_tangents(&mut vertices, &indices);
+        }
         // A mirroring transform flips triangle winding; flip it back so back-face
         // culling keeps the outside.
-        if world.determinant() < 0.0 {
+        if mirrored {
             for tri in indices.chunks_exact_mut(3) {
                 tri.swap(1, 2);
             }
@@ -1884,17 +2072,32 @@ impl SceneRenderer {
             index_format: wgpu::IndexFormat::Uint32,
         });
 
-        let albedo = primitive
-            .material()
-            .pbr_metallic_roughness()
-            .base_color_texture()
-            .and_then(|info| info.texture().source())
-            .and_then(|image| images.get(image.index()))
-            .map(|img_data| {
-                let texture = self.create_texture_from_image(&image_from_gltf_data(img_data));
-                self.create_texture_bind_group(&texture)
-            });
-        model.albedo_bind_groups.push(albedo);
+        // ponytail: every texture reference uploads its image again, no mips;
+        // cache per image and generate mips when models share textures.
+        let material = primitive.material();
+        let pbr = material.pbr_metallic_roughness();
+        let upload = |texture: Option<gltf::Texture>, srgb: bool| {
+            let data = images.get(texture?.source()?.index())?;
+            let rgba = image_from_gltf_data(data).to_rgba8();
+            let format = if srgb {
+                wgpu::TextureFormat::Rgba8UnormSrgb
+            } else {
+                wgpu::TextureFormat::Rgba8Unorm
+            };
+            Some(self.create_texture_from_bytes(&rgba, rgba.width(), rgba.height(), format))
+        };
+        let textures = [
+            upload(pbr.base_color_texture().map(|t| t.texture()), true),
+            upload(pbr.metallic_roughness_texture().map(|t| t.texture()), false),
+            upload(material.normal_texture().map(|t| t.texture()), false),
+            upload(material.emissive_texture().map(|t| t.texture()), true),
+        ];
+        model
+            .material_bind_groups
+            .push(self.create_material_bind_group(
+                &MaterialUniform::from_gltf(&material),
+                [0, 1, 2, 3].map(|i| textures[i].as_ref()),
+            ));
         Ok(())
     }
 }
@@ -1953,11 +2156,12 @@ impl Renderer {
 impl SceneRenderer {
     /// Draw 3D meshes into an existing render pass.
     /// Each draw call is `(entity_index, mesh)` where `entity_index` is the index
-    /// into the model uniform buffer (see `update_model_uniforms`).
+    /// into the model uniform buffer (see `update_model_uniforms`). Every
+    /// mesh gets the checkerboard material.
     pub fn draw_meshes(&self, pass: &mut wgpu::RenderPass<'_>, draw_calls: &[(usize, &Mesh)]) {
         pass.set_pipeline(&self.mesh_pipeline);
         pass.set_bind_group(0, &self.frame_bind_group, &[]);
-        pass.set_bind_group(2, &self.albedo_bind_group, &[]);
+        pass.set_bind_group(2, &self.checker_material, &[]);
         for (entity_index, mesh) in draw_calls {
             let offset = self.model_uniform_offset(*entity_index);
             pass.set_bind_group(1, &self.model_bind_group, &[offset]);
@@ -1967,22 +2171,19 @@ impl SceneRenderer {
         }
     }
 
-    /// Draw 3D meshes with per-draw-call albedo textures.
-    /// Each draw call is `(entity_index, mesh, albedo_bind_group)`.
+    /// Draw 3D meshes with per-draw-call materials.
+    /// Each draw call is `(entity_index, mesh, material_bind_group)`.
     pub fn draw_meshes_textured(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
-        draw_calls: &[(usize, &Mesh, Option<&wgpu::BindGroup>)],
+        draw_calls: &[(usize, &Mesh, &wgpu::BindGroup)],
     ) {
         pass.set_pipeline(&self.mesh_pipeline);
         pass.set_bind_group(0, &self.frame_bind_group, &[]);
-        for (entity_index, mesh, albedo) in draw_calls {
+        for (entity_index, mesh, material) in draw_calls {
             let offset = self.model_uniform_offset(*entity_index);
             pass.set_bind_group(1, &self.model_bind_group, &[offset]);
-            match albedo {
-                Some(bg) => pass.set_bind_group(2, *bg, &[]),
-                None => pass.set_bind_group(2, &self.albedo_bind_group, &[]),
-            }
+            pass.set_bind_group(2, *material, &[]);
             pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -2158,8 +2359,72 @@ mod tests {
     use winit::window::{Window, WindowId};
 
     #[test]
-    fn vertex_size_is_32_bytes() {
-        assert_eq!(std::mem::size_of::<Vertex>(), 32);
+    fn vertex_size_is_48_bytes() {
+        assert_eq!(std::mem::size_of::<Vertex>(), 48);
+    }
+
+    /// Unit quad in the XY plane facing +Z, UVs given per corner
+    /// (corners: (0,0), (1,0), (1,1), (0,1) in XY).
+    fn quad(uvs: [[f32; 2]; 4]) -> Vec<Vertex> {
+        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+            .iter()
+            .zip(uvs)
+            .map(|(&[x, y], uv)| Vertex {
+                position: [x, y, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                uv,
+                tangent: [0.0; 4],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tangents_follow_u_with_positive_handedness() {
+        let mut v = quad([[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]);
+        generate_tangents(&mut v, &[0, 1, 2, 0, 2, 3]);
+        for t in v.iter().map(|v| v.tangent) {
+            assert!(
+                (glam::Vec4::from_array(t) - glam::Vec4::new(1.0, 0.0, 0.0, 1.0)).length() < 1e-5,
+                "{t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tangents_of_mirrored_uvs_have_negative_handedness() {
+        // U still runs along +X, V is flipped: the bitangent points the other way.
+        let mut v = quad([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+        generate_tangents(&mut v, &[0, 1, 2, 0, 2, 3]);
+        for t in v.iter().map(|v| v.tangent) {
+            assert!(
+                (glam::Vec4::from_array(t) - glam::Vec4::new(1.0, 0.0, 0.0, -1.0)).length() < 1e-5,
+                "{t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn material_uniform_is_48_bytes_16_aligned() {
+        assert_eq!(std::mem::size_of::<MaterialUniform>(), 48);
+        assert_eq!(std::mem::size_of::<MaterialUniform>() % 16, 0);
+    }
+
+    #[test]
+    fn gltf_default_material_values() {
+        // TWO_NODE_GLTF has no material: glTF's default material applies.
+        let gltf = gltf::Gltf::from_slice(TWO_NODE_GLTF.as_bytes()).unwrap();
+        let primitive = gltf
+            .document
+            .meshes()
+            .next()
+            .unwrap()
+            .primitives()
+            .next()
+            .unwrap();
+        let m = MaterialUniform::from_gltf(&primitive.material());
+        assert_eq!(m.base_color, [1.0; 4]);
+        assert_eq!((m.metallic, m.roughness, m.normal_scale), (1.0, 1.0, 1.0));
+        assert_eq!(m.emissive, [0.0; 3]);
     }
 
     #[test]
@@ -2186,14 +2451,17 @@ mod tests {
             position: [1.0, 2.0, 3.0],
             normal: [4.0, 5.0, 6.0],
             uv: [7.0, 8.0],
+            tangent: [9.0, 10.0, 11.0, 12.0],
         };
         let base = &v as *const _ as usize;
         let pos = &v.position as *const _ as usize - base;
         let norm = &v.normal as *const _ as usize - base;
         let uv = &v.uv as *const _ as usize - base;
+        let tangent = &v.tangent as *const _ as usize - base;
         assert_eq!(pos, 0, "position should be at offset 0");
         assert_eq!(norm, 12, "normal should be at offset 12");
         assert_eq!(uv, 24, "uv should be at offset 24");
+        assert_eq!(tangent, 32, "tangent should be at offset 32");
     }
 
     #[test]
@@ -2296,6 +2564,18 @@ mod tests {
         shadow_center: glam::Vec3,
         shadow_radius: f32,
     ) -> Vec<u8> {
+        render_test_scene_with(r, light, from_below, shadow_center, shadow_radius, None)
+    }
+
+    /// `render_test_scene` with the floor drawn in `floor` (default: white).
+    fn render_test_scene_with(
+        r: &mut Renderer,
+        light: &melon_core::Light,
+        from_below: bool,
+        shadow_center: glam::Vec3,
+        shadow_radius: f32,
+        floor: Option<&wgpu::BindGroup>,
+    ) -> Vec<u8> {
         use glam::camera::rh::{proj::directx, view};
         use glam::{Mat4, Quat, Vec3};
 
@@ -2332,9 +2612,8 @@ mod tests {
                 Vec3::new(0.0, 2.0, 0.0),
             ),
         ]);
-        let white =
-            r.create_texture_from_bytes(&[255; 4], 1, 1, wgpu::TextureFormat::Rgba8UnormSrgb);
-        let white_bg = r.create_texture_bind_group(&white);
+        // White rough dielectric: the checker factors on the default textures.
+        let white_bg = r.create_material_bind_group(&CHECKER_MATERIAL, [None; 4]);
         let cube = r.cube_mesh();
 
         let hdr = r.create_hdr_target(size);
@@ -2366,11 +2645,46 @@ mod tests {
             });
             r.draw_meshes_textured(
                 &mut pass,
-                &[(0, &cube, Some(&white_bg)), (1, &cube, Some(&white_bg))],
+                &[
+                    (0, &cube, floor.unwrap_or(&white_bg)),
+                    (1, &cube, &white_bg),
+                ],
             );
         }
         r.tonemap_pass(&mut encoder, &hdr, &color_view);
         read_back(&device, r.queue(), encoder, &color)
+    }
+
+    /// The test floor (seen from above) in a material with these factors and
+    /// an optional normal map; returns the pixels.
+    fn render_floor(
+        r: &mut Renderer,
+        light: &melon_core::Light,
+        factors: MaterialUniform,
+        normal_map: Option<&wgpu::Texture>,
+    ) -> Vec<u8> {
+        let material = r.create_material_bind_group(&factors, [None, None, normal_map, None]);
+        render_test_scene_with(r, light, false, glam::Vec3::ZERO, 20.0, Some(&material))
+    }
+
+    /// The test light with the sun placed so the floor at LIT_PX mirrors it
+    /// into the test camera (eye (0, 10, 0)): the half-vector there is the
+    /// floor normal, the peak of every highlight.
+    fn mirror_sun() -> melon_core::Light {
+        melon_core::Light {
+            direction: -glam::Vec3::new(2.0, 10.0, 0.0).normalize(),
+            ..test_light()
+        }
+    }
+
+    /// The brightest pixel (RGBA) around LIT_PX: with `mirror_sun`, the
+    /// highlight's peak.
+    fn highlight_peak(renderer: &Renderer, pixels: &[u8]) -> [u8; 4] {
+        (LIT_PX.0 - 3..=LIT_PX.0 + 3)
+            .flat_map(|x| (LIT_PX.1 - 3..=LIT_PX.1 + 3).map(move |y| (x, y)))
+            .map(|px| pixel_at(renderer, pixels, px))
+            .max_by_key(|p| p[..3].iter().map(|&c| u32::from(c)).sum::<u32>())
+            .unwrap_or_default()
     }
 
     /// Renders `models` through `render_scene` from `camera` and returns the
@@ -2731,6 +3045,83 @@ mod tests {
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
+            Box::new(|renderer| {
+                // Grey dielectric floor mirroring the sun into the camera.
+                let floor = |roughness| MaterialUniform {
+                    base_color: [0.5, 0.5, 0.5, 1.0],
+                    roughness,
+                    ..CHECKER_MATERIAL
+                };
+                let smooth = render_floor(renderer, &mirror_sun(), floor(0.05), None);
+                let rough = render_floor(renderer, &mirror_sun(), floor(1.0), None);
+                let smooth = highlight_peak(renderer, &smooth)[0];
+                let rough = highlight_peak(renderer, &rough)[0];
+                if smooth > rough.saturating_add(40) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "smooth_highlight_brighter_than_rough: smooth {smooth}, rough {rough} (want smooth > rough + 40)"
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
+                // Red base under the overhead highlight: a metal reflects red,
+                // a dielectric's highlight stays white over its red diffuse.
+                let red = |metallic| MaterialUniform {
+                    base_color: [1.0, 0.0, 0.0, 1.0],
+                    metallic,
+                    roughness: 0.2,
+                    ..CHECKER_MATERIAL
+                };
+                let metal = render_floor(renderer, &mirror_sun(), red(1.0), None);
+                let metal = highlight_peak(renderer, &metal);
+                let plastic = render_floor(renderer, &mirror_sun(), red(0.0), None);
+                let plastic = highlight_peak(renderer, &plastic);
+                if metal[0] > 200
+                    && metal[1] < 40
+                    && metal[2] < 40
+                    && plastic[1] > 200
+                    && plastic[2] > 200
+                {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "metal_specular_is_tinted: metal {metal:?} (want red), dielectric {plastic:?} (want near-white)"
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
+                // A 4x4 grid of normals tilted 35 degrees, alternating
+                // between +-tangent and +-bitangent from texel to texel, so
+                // the floor catches more or less sun everywhere.
+                let texels: Vec<u8> = (0..16)
+                    .flat_map(|i| {
+                        let tilt = |odd| if odd { 200 } else { 56 };
+                        [tilt(i % 2 == 1), tilt((i / 4) % 2 == 1), 220, 255]
+                    })
+                    .collect();
+                let bumps = renderer.create_texture_from_bytes(
+                    &texels,
+                    4,
+                    4,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                );
+                let flat = render_floor(renderer, &test_light(), CHECKER_MATERIAL, None);
+                let bumpy = render_floor(renderer, &test_light(), CHECKER_MATERIAL, Some(&bumps));
+                // The open floor right of the occluder's shadow.
+                let delta: u32 = (40..60)
+                    .flat_map(|x| (8..56).map(move |y| (x, y)))
+                    .map(|px| u32::from(value_at(&flat, px).abs_diff(value_at(&bumpy, px))))
+                    .sum();
+                let mean = delta as f32 / (20.0 * 48.0);
+                if mean > 8.0 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "normal_map_changes_shading: mean delta {mean:.2} (want > 8)"
+                    ))
+                }
+            }),
             Box::new(|renderer| {
                 let model = renderer
                     .load_gltf_bytes(TWO_NODE_GLTF.as_bytes())
@@ -3221,7 +3612,7 @@ mod tests {
             }),
             Box::new(|renderer| {
                 // Create a 2x2 RGBA8 texture from raw bytes and verify it can
-                // be used to build a bind group (proves the texture + layout
+                // be used to build a material bind group (proves the texture + layout
                 // path works end-to-end without panicking).
                 let pixels: [u8; 16] = [255; 16];
                 let texture = renderer.create_texture_from_bytes(
@@ -3230,12 +3621,15 @@ mod tests {
                     2,
                     wgpu::TextureFormat::Rgba8UnormSrgb,
                 );
-                let _bg = renderer.create_texture_bind_group(&texture);
+                let _bg = renderer.create_material_bind_group(
+                    &CHECKER_MATERIAL,
+                    [Some(&texture), None, None, None],
+                );
                 Ok(())
             }),
             Box::new(|renderer| {
                 // Load the sample GLB and verify it has 1 mesh with 36 indices
-                // and an albedo bind group.
+                // and a material.
                 let glb_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/models/cube.glb");
                 let model = renderer
                     .load_gltf(glb_path)
@@ -3249,14 +3643,11 @@ mod tests {
                         model.meshes[0].index_count
                     ));
                 }
-                if model.albedo_bind_groups.len() != 1 {
+                if model.material_bind_groups.len() != 1 {
                     return Err(format!(
-                        "expected 1 albedo bind group slot, got {}",
-                        model.albedo_bind_groups.len()
+                        "expected 1 material bind group, got {}",
+                        model.material_bind_groups.len()
                     ));
-                }
-                if model.albedo_bind_groups[0].is_none() {
-                    return Err("expected albedo bind group to be Some, got None".to_string());
                 }
                 Ok(())
             }),
