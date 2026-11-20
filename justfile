@@ -68,5 +68,6 @@ ship-run:
 # Package the game: build the player (release, no editor, static C runtime) and
 # write <out>/<GameName>/ with the executable and game.pak. The folder runs on a
 # PC without Rust or the Windows SDK. Same as the editor's File > Build.
-package out:
-    cargo run -p melon_host --no-default-features --bin melon_package -- {{out}}
+# Extra flags pass through: `just package "D:/My Games" --no-build`.
+package out *flags:
+    cargo run -p melon_host --no-default-features --bin melon_package -- "{{out}}" {{flags}}

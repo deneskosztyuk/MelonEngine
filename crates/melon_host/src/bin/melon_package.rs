@@ -17,6 +17,10 @@ fn main() -> ExitCode {
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--no-build" => build = false,
+            flag if flag.starts_with("--") => {
+                eprintln!("unknown flag {flag}");
+                return ExitCode::from(2);
+            }
             _ => out = Some(PathBuf::from(arg)),
         }
     }
