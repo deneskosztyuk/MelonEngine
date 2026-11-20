@@ -9,7 +9,9 @@ Place game assets here.
     - `material_spheres.glb` — two rows of five UV spheres, roughness 0.05 to 1; top row red dielectric, bottom row gold metal; one node and material each.
     - `normal_panel.glb` — 2x2 m panel with a tiled-bump normal map and no `TANGENT` attribute (the loader generates tangents).
 - `shaders/` — WGSL shader source files, included via `wgpu::include_wgsl!`.
-  - `mesh.wgsl` — glTF metallic-roughness PBR: Cook-Torrance sun (GGX, height-correlated Smith, Schlick Fresnel) with 3x3 PCF shadows, hemisphere diffuse ambient plus sky-gradient specular ambient, tangent-space normal maps, emissive, exponential distance fog. Group 2 is the material (see `AGENTS.md`). Writes linear HDR colour (`Rgba16Float`).
+  - `mesh.wgsl` — glTF metallic-roughness PBR: Cook-Torrance sun (GGX, height-correlated Smith, Schlick Fresnel) with 3x3 PCF shadows, hemisphere diffuse ambient plus sky-gradient specular ambient, tangent-space normal maps, emissive, exponential distance fog. SSAO (group 3) occludes the ambient terms only. Group 2 is the material (see `AGENTS.md`). Writes linear HDR colour (`Rgba16Float`).
+  - `prepass.wgsl` — SSAO depth/normal prepass: every mesh single-sample, writes the world normal and eye distance (`Rgba16Float`) plus depth.
+  - `ssao.wgsl` — fullscreen SSAO (`fs_ssao`: 16 hemisphere samples, range check, 4x4 rotation pattern) and its 4x4 depth-aware blur (`fs_blur`), into `R8Unorm` AO textures read by `mesh.wgsl` group 3.
   - `shadow.wgsl` — depth-only pass that renders every mesh from the sun into the 2048x2048 shadow map.
   - `sky.wgsl` — procedural sky: fullscreen triangle at the far plane behind the meshes, horizon-to-zenith gradient, darker ground below the horizon, HDR sun disc.
   - `tonemap.wgsl` — fullscreen pass that maps the HDR scene colour to the sRGB display target.

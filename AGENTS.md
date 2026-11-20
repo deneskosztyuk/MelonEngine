@@ -8,7 +8,7 @@ Current state and planned work: `docs/ROADMAP.md`.
 | Path | Role |
 |---|---|
 | `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera. No GPU or window code. |
-| `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache`) records sun shadow pass, 3D pass into HDR target, tonemap pass; `ui_pass` for the editor. |
+| `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache`) records sun shadow pass, SSAO passes, 3D pass into HDR target, tonemap pass; `ui_pass` for the editor. |
 | `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource) and ECS sync systems. |
 | `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), Project Settings window (`project_settings.rs`). |
 | `crates/melon_game` | Game logic as an `rlib` + `dylib`, hot-reloaded in dev builds. |
@@ -134,6 +134,21 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   cross(normal, tangent) * w). glTF `TANGENT` is read when present, else
   `generate_tangents` builds them from positions and UVs. Node transforms
   are baked into tangents too (w flips under mirroring).
+- **Per-view lighting (group 3).** Group 3 of the mesh pipeline holds
+  per-view lighting inputs, created per `ViewportTarget` (rebuilt with it on
+  resize): binding 0 = SSAO texture (`R8Unorm`, 1 = open, read with
+  `textureLoad` at the fragment position). The DDGI probe data joins this
+  group later. `draw_meshes_textured` takes the group; AO off binds a 1x1
+  white one (`unoccluded_lighting`).
+- **SSAO.** Before the 3D pass `render_scene` draws every mesh once,
+  single-sample, into the view's prepass targets (`Depth32Float` depth,
+  `Rgba16Float` world normal + eye distance), then `ssao.wgsl` `fs_ssao`
+  (16 hemisphere samples, range check, 4x4 Bayer rotation) and `fs_blur`
+  (4x4 depth-aware box, applies the strength). AO multiplies ambient
+  diffuse and specular only, never the sun. `Environment::ao_strength`
+  (default 1; 0 skips the passes and matches the pre-SSAO image exactly) and
+  `ao_radius` (metres, default 0.5). GPU tests that are not about AO set
+  `ao_strength: 0.0`.
 - **Environment.** Optional `melon_core::Environment` resource (default when
   absent, not registered in `Core::new`): procedural sky (`zenith_color`,
   `horizon_color`) and exponential distance fog (`fog_density`). The fog
@@ -142,6 +157,7 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 - **Camera conventions.** Right-handed, DirectX depth (near = 0, far = 1).
   Screen helpers take logical points.
 - **Checking rendering.** Agents verify rendering with the snapshot example
-  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials]`),
+  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner] [--ao-only|--no-ao]`;
+  `--ao-only` saves the SSAO term as a grey image),
   never by opening the editor or game window.
 - **GPU tests** open a window, so they need a display and adapter.
