@@ -5078,4 +5078,48 @@ mod tests {
         assert_eq!(physics.bodies.len(), 0);
         assert_eq!(physics.colliders.len(), 0);
     }
+
+    /// A moving, selected entity must not make egui run extra passes (each
+    /// one redraws the whole editor; "new Grid" every frame halved the FPS).
+    #[test]
+    fn moving_selected_entity_needs_one_pass_per_frame() {
+        let (mut editor, mut world, root) = browser_project("one_pass");
+        let entity = world
+            .spawn((
+                Name("Cube".to_string()),
+                Transform::default(),
+                melon_core::Spin,
+                melon_core::Aabb {
+                    half_extents: glam::Vec3::splat(0.5),
+                },
+            ))
+            .id();
+        editor.set_selected(Some(entity));
+        let ctx = egui::Context::default();
+        let mut reasons = Vec::new();
+        for frame in 0..8 {
+            world.get_mut::<Transform>(entity).unwrap().rotation =
+                glam::Quat::from_rotation_y(frame as f32 * 0.7);
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1600.0, 900.0),
+                )),
+                time: Some(frame as f64 / 60.0),
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| editor.build_ui(&mut world, ui));
+            if frame >= 3 {
+                reasons.extend(
+                    output
+                        .platform_output
+                        .request_discard_reasons
+                        .iter()
+                        .map(|r| format!("{r:?}")),
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(reasons.is_empty(), "extra passes: {reasons:#?}");
+    }
 }

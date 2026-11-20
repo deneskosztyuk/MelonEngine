@@ -2171,6 +2171,7 @@ dependencies = [
  "egui_dock",
  "glam 0.33.2",
  "image",
+ "log",
  "melon_core",
  "melon_physics",
  "melon_render",
