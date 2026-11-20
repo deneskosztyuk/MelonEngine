@@ -1,11 +1,12 @@
 use std::any::TypeId;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::mem::{align_of, size_of};
 
 use bevy_ecs::{
     resource::Resource,
     schedule::{IntoScheduleConfigs, ScheduleLabel, Schedules},
     system::ScheduleSystem,
-    world::World,
+    world::{FromWorld, World},
 };
 
 use crate::{Actions, Input, SimulationState, Time, Transform};
@@ -34,8 +35,17 @@ impl App<'_> {
         self
     }
 
+    /// Replaces the value on every hot reload (build runs again). For state
+    /// that must survive a reload, use `init_resource`.
     pub fn insert_resource<R: Resource>(&mut self, r: R) -> &mut Self {
         self.world.insert_resource(r);
+        self
+    }
+
+    /// Insert `R::from_world` only if `R` is missing, so the value survives
+    /// hot reloads.
+    pub fn init_resource<R: Resource + FromWorld>(&mut self) -> &mut Self {
+        self.world.init_resource::<R>();
         self
     }
 
@@ -44,21 +54,32 @@ impl App<'_> {
     }
 }
 
-/// Hash of the types that cross the host / game dylib boundary. Host and
-/// game must report the same value, or their layouts may differ.
+/// Hash of the types that cross the host / game dylib boundary (identity,
+/// size, align) and of melon_core's sources. Host and game must report the
+/// same value, or their layouts may differ.
 pub fn abi_fingerprint() -> u64 {
+    fn part<T: 'static>() -> (TypeId, usize, usize) {
+        (TypeId::of::<T>(), size_of::<T>(), align_of::<T>())
+    }
+    fingerprint_of(
+        &[
+            part::<App<'static>>(),
+            part::<World>(),
+            part::<Schedules>(),
+            part::<Transform>(),
+            part::<Time>(),
+            part::<Input>(),
+            part::<Actions>(),
+            part::<SimulationState>(),
+        ],
+        env!("MELON_CORE_SOURCE_HASH"),
+    )
+}
+
+fn fingerprint_of(parts: &[(TypeId, usize, usize)], source_hash: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
-    [
-        TypeId::of::<App<'static>>(),
-        TypeId::of::<World>(),
-        TypeId::of::<Schedules>(),
-        TypeId::of::<Transform>(),
-        TypeId::of::<Time>(),
-        TypeId::of::<Input>(),
-        TypeId::of::<Actions>(),
-        TypeId::of::<SimulationState>(),
-    ]
-    .hash(&mut hasher);
+    parts.hash(&mut hasher);
+    source_hash.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -143,6 +164,34 @@ mod tests {
         assert!(core.world.get::<crate::Transform>(entity).is_some());
         assert_eq!(core.world.resource::<Counter>().0, 2);
         assert!(core.world.contains_resource::<crate::FrameCounter>());
+    }
+
+    #[derive(Resource)]
+    struct Score(u32);
+
+    #[test]
+    fn rebuild_init_resource_keeps_value_insert_resource_replaces_it() {
+        let mut core = Core::new();
+        let build = |app: &mut App| {
+            app.init_resource::<Counter>().insert_resource(Score(0));
+        };
+        core.rebuild_plugins(build);
+        core.world.resource_mut::<Counter>().0 = 5;
+        core.world.resource_mut::<Score>().0 = 9;
+        core.rebuild_plugins(build);
+        assert_eq!(core.world.resource::<Counter>().0, 5);
+        assert_eq!(core.world.resource::<Score>().0, 0);
+    }
+
+    #[test]
+    fn fingerprint_covers_type_id_size_align_and_source() {
+        let base = [(TypeId::of::<u32>(), 4, 4)];
+        let f = fingerprint_of(&base, "src");
+        assert_ne!(f, fingerprint_of(&[(TypeId::of::<i32>(), 4, 4)], "src"));
+        assert_ne!(f, fingerprint_of(&[(TypeId::of::<u32>(), 8, 4)], "src"));
+        assert_ne!(f, fingerprint_of(&[(TypeId::of::<u32>(), 4, 8)], "src"));
+        assert_ne!(f, fingerprint_of(&base, "src2"));
+        assert!(!env!("MELON_CORE_SOURCE_HASH").is_empty());
     }
 
     #[test]
