@@ -20,7 +20,7 @@ Sound for games and the editor, with the shared core of Unity (AudioSource, Audi
 ## Decisions
 
 - **Library: `kira`** (game audio: mixer tracks for buses, spatial tracks with listener, tweens, streaming) with its default decoders (symphonia) for the formats above. Add it to `[workspace.dependencies]`.
-- **New crate `melon_audio`** (depends on `melon_core`); the editor and host use it; the dependency direction becomes `core <- render, physics, audio <- editor <- host`. Update AGENTS.md's layout table and dependency line.
+- **New crate `melon_audio`** (depends on `melon_core`); the host uses it (the editor only pushes requests through the core queue, so it does not depend on it); the dependency direction becomes `core <- render, physics, audio; render, physics <- editor; editor, audio <- host`. Update AGENTS.md's layout table and dependency line.
 - **Game-facing types live in `melon_core`** (components, the play-request API, bus names), because `melon_game` may depend only on `melon_core`. `melon_audio` reads them and drives kira. A message/command queue resource in core that the audio system drains each frame is the expected shape.
 - Long clips (music) stream from disk; short clips (under a few seconds) decode to memory. Pick the threshold and document it.
 

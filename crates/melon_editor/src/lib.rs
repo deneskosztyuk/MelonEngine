@@ -603,6 +603,43 @@ impl Editor {
         self.project_settings.set_audio_broken(broken);
     }
 
+    /// Custom field editors of a component type (see `inspect::FieldWidget`).
+    fn field_widgets(&self, world: &World, type_path: &str) -> inspect::FieldWidgets {
+        use inspect::{FieldWidget, WidgetKind};
+        let mut widgets = inspect::FieldWidgets::new();
+        if type_path == melon_core::AudioSource::type_path() {
+            let buses = world
+                .get_resource::<melon_core::AudioSettings>()
+                .map(|s| s.buses.iter().map(|b| b.name.clone()).collect())
+                .unwrap_or_default();
+            widgets.insert(
+                "bus",
+                FieldWidget {
+                    label: None,
+                    kind: WidgetKind::Choice(buses),
+                },
+            );
+            widgets.insert(
+                "clip",
+                FieldWidget {
+                    label: None,
+                    kind: WidgetKind::Asset {
+                        root: self.project_root.clone(),
+                        extensions: &melon_core::audio::AUDIO_EXTENSIONS,
+                    },
+                },
+            );
+            widgets.insert(
+                "volume",
+                FieldWidget {
+                    label: Some("Volume (linear)"),
+                    kind: WidgetKind::Slider { min: 0.0, max: 1.0 },
+                },
+            );
+        }
+        widgets
+    }
+
     pub fn selected_entity(&self) -> Option<Entity> {
         self.selected
     }
@@ -1702,9 +1739,10 @@ impl Editor {
                     .map(|v| v.into_partial_reflect())
                     .unwrap_or_else(|_| value.to_dynamic());
                 let id = egui::Id::new(("inspector_component", info.type_path));
+                let widgets = self.field_widgets(world, info.type_path);
                 let (changed, remove) =
                     component_card(ui, &mut card_fills, &info.display_name, id, |ui| {
-                        inspect::reflect_ui(ui, id, copy.as_mut(), &registry)
+                        inspect::reflect_ui_with(ui, id, copy.as_mut(), &registry, &widgets)
                     });
                 if remove {
                     reflect.remove(&mut world.entity_mut(entity));

@@ -11,7 +11,7 @@ Current state and planned work: `docs/ROADMAP.md`.
 | `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache`) records sun shadow pass, depth/normal prepass, SSAO passes, the GI mode's passes (`gi/`: DDGI voxel and probe passes or SSGI), 3D pass into HDR target, bloom passes, tonemap pass; `ui_pass` for the editor. |
 | `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource) and ECS sync systems. |
 | `crates/melon_audio` | kira playback: `Director` (decisions, tested with a mock `Backend`), `KiraBackend` (device, bus tracks), `spatial` (attenuation, pan), `AudioEngine` (host calls `update` once per frame). The game-facing types are in `melon_core::audio`. |
-| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), Content Drawer (`drawer.rs`), asset `.meta` files (`asset_db.rs`), file operations (`asset_ops.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), Project Settings window (`project_settings.rs`). |
+| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), Content Drawer (`drawer.rs`), asset `.meta` files (`asset_db.rs`), file operations (`asset_ops.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), Project Settings window (`project_settings.rs`, with `quality_settings.rs` and `audio_settings.rs`). |
 | `crates/melon_game` | Game logic as an `rlib` + `dylib`, hot-reloaded in dev builds. |
 | `crates/melon_host` | Binary: winit event loop, input mapping, frame order (core update, editor, extract, render_scene, ui pass). No render pass code. |
 | `assets/models` | glTF models. `cube.glb` loads at startup. `review/` holds the snapshot scene's material test models (`grey_cube`, `material_spheres`, `normal_panel`, `emissive_cube`, `red_panel`, `green_panel`), written by `cargo run -p melon_render --example gen_review_assets` from the repo root; commit them when regenerated. |
@@ -100,6 +100,18 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   one warning, silent run. Tests use a mock `Backend` or
   `KiraBackend::silent()`; never open a device in a test. Adding a bus field
   needs `#[serde(default)]`-style compatibility, as for quality files.
+  Live edits: a source whose clip, `looping` or `bus` changes restarts;
+  removing or renaming a bus drops its track (`Backend::retain_buses`) and
+  restarts its voices on Master (an unknown bus plays on Master). Inspector:
+  `AudioSource` fields use `inspect::FieldWidget` (bus dropdown, clip picker
+  with Content Browser drop, volume slider); other components can add theirs
+  in `Editor::field_widgets`.
+  Manual check (no device in tests): add an Audio Source (looping, spatial,
+  clip from `assets/`) to a cube and press Play: it sounds, and walking the
+  camera past pans it left/right and fades it with distance. Select a clip
+  in the Content Browser and press Preview (works while Editing). Mute Sfx
+  in Project Settings ▸ Audio and Apply: it goes silent. Pause pauses it,
+  Stop silences it, and nothing sounds in edit mode.
 - **Stages.** Register systems with `core.add_systems(Stage, ...)`:
   `FixedUpdate` (1/60 s, 0..N times per frame, not while paused), `Update`
   (once per frame, read `Time::delta_seconds`), `PostUpdate`. `PreUpdate`

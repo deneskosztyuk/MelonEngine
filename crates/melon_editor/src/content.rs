@@ -218,9 +218,10 @@ pub fn is_model_path(path: &str) -> bool {
 /// project-relative, forward-slash path, sorted.
 pub fn model_list(project_root: &Path) -> Vec<String> {
     let mut models = Vec::new();
-    collect_models(
+    collect_assets(
         &project_root.join("assets/models"),
         project_root,
+        &|name| is_model_path(name),
         &mut models,
     );
     models.sort();
@@ -228,11 +229,37 @@ pub fn model_list(project_root: &Path) -> Vec<String> {
     models
 }
 
-fn collect_models(dir: &Path, project_root: &Path, out: &mut Vec<String>) {
+/// Every file under `<project>/assets` with one of `extensions` (lower
+/// case, no dot) as a project-relative path, sorted.
+pub fn asset_list(project_root: &Path, extensions: &[&str]) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_assets(
+        &project_root.join("assets"),
+        project_root,
+        &|name| has_extension(name, extensions),
+        &mut files,
+    );
+    files.sort();
+    files
+}
+
+/// True when `name` ends in one of `extensions` (case-insensitive).
+pub fn has_extension(name: &str, extensions: &[&str]) -> bool {
+    Path::new(name)
+        .extension()
+        .is_some_and(|e| extensions.contains(&e.to_string_lossy().to_lowercase().as_str()))
+}
+
+fn collect_assets(
+    dir: &Path,
+    project_root: &Path,
+    wanted: &dyn Fn(&str) -> bool,
+    out: &mut Vec<String>,
+) {
     for entry in list_dir(dir) {
         if entry.is_dir {
-            collect_models(&entry.path, project_root, out);
-        } else if is_model_path(&entry.name)
+            collect_assets(&entry.path, project_root, wanted, out);
+        } else if wanted(&entry.name)
             && let Some(path) = project_relative(project_root, &entry.path)
         {
             out.push(path);
@@ -876,6 +903,25 @@ mod tests {
                 "{audio}"
             );
         }
+    }
+
+    #[test]
+    fn asset_list_finds_files_by_extension() {
+        let dir = temp_dir("asset_list");
+        let sub = dir.join("assets/audio/deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        for f in [
+            "assets/audio/b.OGG",
+            "assets/audio/deep/a.wav",
+            "assets/x.glb",
+        ] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        assert_eq!(
+            asset_list(&dir, &["wav", "ogg"]),
+            ["assets/audio/b.OGG", "assets/audio/deep/a.wav"]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

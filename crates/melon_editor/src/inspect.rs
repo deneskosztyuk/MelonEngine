@@ -7,12 +7,126 @@ use melon_core::bevy_reflect::{
     std_traits::ReflectDefault,
     tuple::DynamicTuple,
 };
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
 use melon_core::glam::{EulerRot, Quat, Vec2, Vec3, Vec4};
 
+use crate::content::{self, AssetDrag};
 use crate::content_view::id_label;
 use crate::{inspector_value, theme};
 
 const FLOAT_SPEED: f64 = 0.01;
+
+/// How one top-level field of a component is drawn instead of its default
+/// editor (by field name). The caller builds these per component type.
+pub struct FieldWidget {
+    /// Row label; the field name when `None`.
+    pub label: Option<&'static str>,
+    pub kind: WidgetKind,
+}
+
+pub enum WidgetKind {
+    /// A `String` picked from a list. A value not in it shows as missing.
+    Choice(Vec<String>),
+    /// A `String` asset path: a picker of the files under `<root>/assets`
+    /// with one of the extensions, and a drop target for Content Browser drags.
+    Asset {
+        root: PathBuf,
+        extensions: &'static [&'static str],
+    },
+    /// An `f32` slider.
+    Slider { min: f32, max: f32 },
+}
+
+pub type FieldWidgets = HashMap<&'static str, FieldWidget>;
+
+/// Dropdown text: the value, flagged when it is not one of `choices`.
+fn choice_label(value: &str, choices: &[String]) -> String {
+    if value.is_empty() {
+        "None".to_string()
+    } else if choices.iter().any(|c| c == value) {
+        value.to_string()
+    } else {
+        format!("{value} (missing)")
+    }
+}
+
+/// The project-relative path of a dragged file when it has a wanted extension.
+fn dropped_asset(root: &Path, dragged: &Path, extensions: &[&str]) -> Option<String> {
+    let rel = melon_core::assets::project_relative(root, dragged)?;
+    content::has_extension(&rel, extensions).then_some(rel)
+}
+
+/// The editor for a field with a `FieldWidget`; `None` when the value is not
+/// of the type the widget edits (the default editor draws it then).
+fn widget_ui(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    value: &mut dyn PartialReflect,
+    widget: &WidgetKind,
+) -> Option<bool> {
+    match widget {
+        WidgetKind::Slider { min, max } => {
+            let v = value.try_downcast_mut::<f32>()?;
+            Some(ui.add(egui::Slider::new(v, *min..=*max)).changed())
+        }
+        WidgetKind::Choice(choices) => {
+            let v = value.try_downcast_mut::<String>()?;
+            let mut changed = false;
+            egui::ComboBox::from_id_salt(id)
+                .selected_text(choice_label(v, choices))
+                .show_ui(ui, |ui| {
+                    for choice in choices {
+                        if ui.selectable_label(v == choice, choice).clicked() && v != choice {
+                            v.clone_from(choice);
+                            changed = true;
+                        }
+                    }
+                });
+            Some(changed)
+        }
+        WidgetKind::Asset { root, extensions } => {
+            let v = value.try_downcast_mut::<String>()?;
+            let mut changed = false;
+            let missing = !v.is_empty() && !root.join(&*v).is_file();
+            let text = if missing {
+                format!("{v} (missing)")
+            } else {
+                choice_label(v, std::slice::from_ref(v))
+            };
+            let combo = egui::ComboBox::from_id_salt(id)
+                .selected_text(text)
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    // Listed only while the dropdown is open.
+                    if ui.selectable_label(v.is_empty(), "None").clicked() {
+                        v.clear();
+                        changed = true;
+                    }
+                    for path in content::asset_list(root, extensions) {
+                        if ui
+                            .selectable_label(*v == path, &path)
+                            .on_hover_text(&path)
+                            .clicked()
+                        {
+                            *v = path;
+                            changed = true;
+                        }
+                    }
+                });
+            // A file dragged from the Content Browser replaces it.
+            let drop = ui.interact(combo.response.rect, id.with("drop"), egui::Sense::hover());
+            if let Some(drag) = drop.dnd_release_payload::<AssetDrag>()
+                && let Some(path) = dropped_asset(root, &drag.path, extensions)
+            {
+                *v = path;
+                changed = true;
+            }
+            Some(changed)
+        }
+    }
+}
 
 /// Edit `value` in place. A struct or tuple struct draws one grid row per
 /// field; each row's editor gets the id `id.with(field_name)` (nested fields
@@ -25,8 +139,21 @@ pub fn reflect_ui(
     value: &mut dyn PartialReflect,
     registry: &TypeRegistry,
 ) -> bool {
+    reflect_ui_with(ui, id, value, registry, &FieldWidgets::new())
+}
+
+/// `reflect_ui`, with `widgets` replacing the editors of named top-level fields.
+pub fn reflect_ui_with(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    value: &mut dyn PartialReflect,
+    registry: &TypeRegistry,
+    widgets: &FieldWidgets,
+) -> bool {
     match value.reflect_ref() {
-        ReflectRef::Struct(_) | ReflectRef::TupleStruct(_) => fields_ui(ui, id, value, registry),
+        ReflectRef::Struct(_) | ReflectRef::TupleStruct(_) => {
+            fields_ui(ui, id, value, registry, widgets)
+        }
         _ => value_ui(ui, id, value, registry),
     }
 }
@@ -37,6 +164,7 @@ fn fields_ui(
     id: egui::Id,
     value: &mut dyn PartialReflect,
     registry: &TypeRegistry,
+    widgets: &FieldWidgets,
 ) -> bool {
     let names: Vec<String> = match value.reflect_ref() {
         ReflectRef::Struct(s) => (0..s.field_len())
@@ -58,9 +186,14 @@ fn fields_ui(
                     _ => None,
                 };
                 let Some(field) = field else { continue };
-                ui.label(&name);
+                let widget = widgets.get(name.as_str());
+                ui.label(widget.and_then(|w| w.label).unwrap_or(&name));
                 let row = id.with(name.as_str());
-                let editor = ui.scope(|ui| value_ui(ui, row, field, registry));
+                let editor = ui.scope(|ui| {
+                    widget
+                        .and_then(|w| widget_ui(ui, row, field, &w.kind))
+                        .unwrap_or_else(|| value_ui(ui, row, field, registry))
+                });
                 // Fixed id over the editor (widget ids are positional).
                 ui.interact(editor.response.rect, row, egui::Sense::hover());
                 changed |= editor.inner;
@@ -147,7 +280,9 @@ fn value_ui(
         return egui::CollapsingHeader::new(title)
             .id_salt(id.with("header"))
             .default_open(true)
-            .show(ui, |ui| fields_ui(ui, id, value, registry))
+            .show(ui, |ui| {
+                fields_ui(ui, id, value, registry, &FieldWidgets::new())
+            })
             .body_returned
             .unwrap_or(false);
     }
@@ -327,6 +462,51 @@ mod tests {
         inner: Inner,
         limit: Option<f32>,
         list: Vec<f32>,
+    }
+
+    #[test]
+    fn choice_label_flags_unknown_values() {
+        let choices = ["Master".to_string(), "Sfx".to_string()];
+        assert_eq!(choice_label("Sfx", &choices), "Sfx");
+        assert_eq!(choice_label("Gone", &choices), "Gone (missing)");
+        assert_eq!(choice_label("", &choices), "None");
+    }
+
+    #[test]
+    fn dropped_asset_needs_project_path_and_extension() {
+        let root = Path::new("/p");
+        let ext = ["ogg", "wav"];
+        assert_eq!(
+            dropped_asset(root, Path::new("/p/assets/a/B.OGG"), &ext).as_deref(),
+            Some("assets/a/B.OGG")
+        );
+        assert_eq!(
+            dropped_asset(root, Path::new("/p/assets/a.glb"), &ext),
+            None
+        );
+        assert_eq!(dropped_asset(root, Path::new("/q/a.wav"), &ext), None);
+    }
+
+    #[test]
+    fn slider_widget_edits_a_float_field() {
+        let h = Harness::new();
+        let mut v = sample();
+        let widgets = FieldWidgets::from([(
+            "speed",
+            FieldWidget {
+                label: Some("Speed (linear)"),
+                kind: WidgetKind::Slider { min: 0.0, max: 1.0 },
+            },
+        )]);
+        let registry = &h.registry;
+        let mut texts = String::new();
+        let out = h.ctx.run_ui(egui::RawInput::default(), |ui| {
+            reflect_ui_with(ui, root(), &mut v, registry, &widgets);
+        });
+        for clipped in &out.shapes {
+            texts.push_str(&format!("{:?}", clipped.shape));
+        }
+        assert!(texts.contains("Speed (linear)"), "label override drawn");
     }
 
     const FIELDS: [&str; 9] = [
