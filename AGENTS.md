@@ -77,8 +77,9 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   every reload (a second hook registration panics). `cargo test` / `just test`
   while a dev-run is open rewrites `target/debug/melon_game.dll` with other
   features; the running host refuses that reload (fingerprint error). Run
-  `just game` again. Plugin `FixedUpdate` systems run after the
-  physics chain. Release builds call `core.add_plugin(&GamePlugin)`.
+  `just game` again. Plugin systems of a stage run after the engine's of
+  that stage (see Physics for the fixed-step stages). Release builds call
+  `core.add_plugin(&GamePlugin)`.
 - **Audio.** Types the game uses live in `melon_core::audio`: `AudioSource`
   (clip path, linear volume 0..1, pitch, looping, `play_on_start`, spatial,
   min/max distance, bus) and `AudioListener` (both registered components;
@@ -113,7 +114,8 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   in Project Settings ▸ Audio and Apply: it goes silent. Pause pauses it,
   Stop silences it, and nothing sounds in edit mode.
 - **Stages.** Register systems with `core.add_systems(Stage, ...)`:
-  `FixedUpdate` (1/60 s, 0..N times per frame, not while paused), `Update`
+  `FixedUpdate` (1/60 s, 0..N times per frame, not while paused, followed in
+  each fixed step by `PhysicsStep` and `FixedPostUpdate`), `Update`
   (once per frame, read `Time::delta_seconds`), `PostUpdate`. `PreUpdate`
   runs first each frame and fills `Actions`.
 - **Input.** Game code reads `Actions` (`pressed` / `just_pressed` /
@@ -264,48 +266,91 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   (usable from `melon_game`): `RigidBody` (kind, mass, damping, gravity
   scale, per-axis rotation lock, ccd), `Collider` (`shape`: `Box {
   half_extents }` / `Sphere { radius }` / `Capsule { half_height, radius }` /
-  `Mesh`; friction,
-  restitution, `sensor`, `membership` / `filter` bit masks),
-  `CharacterController`, `Joint` (`kind`: `Fixed` / `Hinge { axis, limited,
-  min, max }` / `Ball { limited, cone_limit }` / `Slider { axis, limited, min,
-  max }`, plus `anchor`, `parent_anchor`); all registered, so scenes and the
-  Inspector need no special code. A collider without a body is static; a
-  collider on a child attaches to the nearest ancestor body (a body's mass
-  is shared by its solid colliders). Shapes follow the entity's world
-  scale. Rapier objects are internal: `melon_physics::sync_components`
-  (system `sync_components_system`, run in `FixedUpdate` and in `PostUpdate`
-  so edit mode and Inspector edits are covered; scene load and the
-  Inspector call it directly) compares each component with what it last
-  built (`RigidBodyComponent` / `ColliderComponent` / `JointComponent` hold
-  the handles and the built copy) and creates, updates in place (body
-  parameters keep velocity), rebuilds (collider shape, owner, scale) or
-  removes; objects of despawned entities are swept. Never insert those
-  handle components yourself. Fixed bodies and kinematic bodies follow
-  their `Transform` (kinematic via the next-position API, so they push);
-  dynamic bodies write theirs. Mesh colliders read positions and indices of
-  the entity's glTF (`x.glb#meshN` unbaked, a whole file with node
-  transforms; `builtin:cube` is a unit box); a missing or broken model warns
-  and builds no collider (no retry until the component changes).
-  Queries: `Res<PhysicsQueries>` (`raycast`, `raycast_all`, `sphere_cast`,
-  `overlap_sphere`, `overlap_box` with `QueryFilter { layers, exclude,
-  sensors }`) read a snapshot (broad phase + colliders clone) published at
-  the end of each physics step, so they see the world of the last step and
-  nothing before the first one. Events: `Messages<CollisionEvent>`
-  (`Started` / `Ended` for solids, `TriggerEntered` / `TriggerExited` for
-  sensors, read with `MessageReader` in `FixedUpdate`; events of removed
-  colliders are dropped). Character: set `CharacterController::move_by`
-  (world-space delta, include gravity) each fixed step before
-  `character_controller_system`; it moves the `Transform` with rapier's
-  `KinematicCharacterController` (offset, max slope in degrees, autostep
-  height, snap distance) and writes `grounded` / `applied`. It sees colliders
-  of the last step; a capsule's round bottom climbs a ledge only with a
+  `Mesh`; friction, restitution, `sensor`, `membership` / `filter` bit
+  masks), `CharacterController`, `Joint` (`kind`: `Fixed` / `Hinge { axis,
+  limited, min, max }` / `Ball { limited, cone_limit }` / `Slider { axis,
+  limited, min, max }`, plus `anchor`, `parent_anchor`, `auto_anchor`); all
+  registered, so scenes and the Inspector need no special code. A collider
+  without a body is static; a collider on a child attaches to the nearest
+  ancestor body (a body's mass is shared by its solid colliders). Shapes
+  and joint anchors follow the entity's world scale. Adding a `Collider`
+  in the Inspector fits its box to the model bounds (else 0.5).
+  Rapier objects are internal: `melon_physics::sync_components` (system
+  `sync_components_system`, first in `PhysicsStep` and in `PostUpdate`, so
+  edit mode and Inspector edits are covered; scene load and the Inspector
+  call it directly) looks only at what changed: entities with a changed
+  `Transform`, physics component, `ChildOf` or model, everything below them
+  (their world poses moved) and mesh colliders whose model file version
+  changed. Each is compared with what it last built
+  (`RigidBodyComponent` / `ColliderComponent` / `JointComponent` hold the
+  handles and the built copy) and created, updated in place (body parameters
+  keep velocity), rebuilt (collider shape, owner, scale, mesh version) or
+  removed. Removals come through component `on_remove` hooks that queue the
+  handles in `PhysicsWorld`, so despawned entities cost nothing to find. An
+  idle scene does no rebuild work (`PhysicsWorld::stats` counts builds and
+  examined entities; a test pins it). Pose comparisons use a tolerance
+  relative to the distance from the origin. Never insert the handle
+  components yourself. Fixed and kinematic bodies follow their `Transform`
+  (kinematic via the next-position API, so they push); dynamic bodies write
+  theirs. Mesh colliders read positions and indices of the entity's glTF
+  (`x.glb#meshN` unbaked, a whole file with node transforms; `builtin:cube`
+  is a unit box); a missing or broken model warns and builds no collider
+  until its file version or handle changes. A mesh collider on a dynamic or
+  kinematic body warns once per build and takes mass and inertia from its
+  bounding box (rapier gives a triangle mesh none unless it is closed).
+  Stages: each fixed step runs `FixedUpdate` (game systems, previous
+  transforms), then `PhysicsStep` (sync, velocity writes, requests,
+  characters, rapier step, write back), then `FixedPostUpdate` (read events,
+  poses, `grounded`). A `melon_game` system in `FixedUpdate` therefore runs
+  before the step of the same fixed step: that is where to call
+  `CharacterController::move_by`, write `Velocity` or queue
+  `PhysicsRequests`. Plugin systems cannot be ordered against engine
+  systems of the same stage (separate schedules), hence the stages.
+  Game control of dynamic bodies: `Velocity { linear, angular }` is added to
+  every dynamic body, written after each step, and a value the game changes
+  goes into the body before the next one. `ResMut<PhysicsRequests>`:
+  `apply_impulse`, `apply_torque_impulse`, `apply_force` / `apply_torque`
+  (one step only) and `teleport(entity, position, rotation)`: the way to move
+  a dynamic body, whose `Transform` belongs to physics (a plain write is
+  overwritten by the next step). Requests for an entity without a body are
+  dropped. Queries: `Res<PhysicsQueries>` (`raycast`, `raycast_all`,
+  `sphere_cast`, `overlap_sphere`, `overlap_box` with `QueryFilter { layers,
+  exclude, sensors, hit_inside }`) read the live colliders and broad phase
+  (shared behind a lock, no copy; a new collider shows once a step has run).
+  A ray that starts inside a collider skips it unless `hit_inside`. Events:
+  `Messages<CollisionEvent>` (`Started` / `Ended` for solids,
+  `TriggerEntered` / `TriggerExited` for sensors; both entities; read with
+  `MessageReader` in `FixedPostUpdate`). Pairs with a fixed or kinematic
+  collider are detected for sensors, kinematic bodies and characters (every
+  pair, static with static too, only for a `CharacterController` collider),
+  so a kinematic or body-less character entering a static trigger fires; a
+  static sensor over a static floor does not. Removing a touching collider
+  (component removal, despawn, `PendingDelete`) emits `Ended` /
+  `TriggerExited` for its active pairs. Play and Stop clear the event queue.
+  Character: `CharacterController::move_by` (world-space delta, include
+  gravity) before the step; the character moves the `Transform` with
+  rapier's `KinematicCharacterController` (offset, max slope in degrees,
+  autostep height, snap distance) and writes `grounded` / `applied`. It sees
+  the live colliders; a capsule's round bottom climbs a ledge only with a
   large enough move per step (about 0.1 m). Joints connect the entity's body
   to its nearest ancestor body, or a fixed world body (then `parent_anchor`
-  is a world position); the bodies are assumed aligned at creation (hinge /
-  slider axes are the same vector on both bodies; `Fixed` keeps the
-  relative rotation). Ball `cone_limit` (when `limited`) bounds the Y and Z swing, twist is
-  free. The Scene view draws green outlines of the selected entity's
-  colliders (and its descendants'; a mesh collider as its model bounds).
+  is a world position). With `auto_anchor` (default) `anchor` is the pivot
+  on this body and the ancestor side is worked out so the pair keeps its
+  current pose when the joint is made (hinge limits count from that pose);
+  without it both anchors are used as given. Hinge and slider axes and the
+  ball cone are in the pair's relative frame (the axis is local to this
+  body). A `Joint` on an entity without a `RigidBody` warns once and does
+  nothing. Ball `cone_limit` (when `limited`) bounds the Y and Z swing,
+  twist is free. `PreviousTransform` is added to dynamic bodies and removed
+  again when the body stops being dynamic (an entity the game gave one keeps
+  it). Layers and gravity: `melon_core::PhysicsSettings`
+  (`config/physics.ron`, Project Settings ▸ Physics, pending until Apply,
+  gravity applied live) holds 32 layer names; a collider's `membership` /
+  `filter` show them as checkboxes (`WidgetKind::Layers`) and are saved as
+  raw bits. The Scene view draws outlines of the selected entity's colliders
+  (and its descendants'): green for solid ones, another colour for sensors
+  (`theme::colors::COLLIDER_SENSOR`); a mesh collider is drawn as its model
+  bounds, not its triangles.
 - **Hierarchy.** Parents use bevy's `ChildOf` / `Children`. `Transform` is
   local to the parent; for world poses use `melon_core::hierarchy`
   (`world_matrix`, `set_world_transform`, `set_parent_keep_world`,
