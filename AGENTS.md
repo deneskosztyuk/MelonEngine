@@ -130,9 +130,11 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   editor, or both files in Explorer), or references to it break. The
   editor's `asset_db::reconcile` writes missing `.meta` files at startup;
   `melon_core` only reads them (`AssetServer::scan_metas`).
-- **Scene format.** RON, `SCENE_VERSION = 3` in `melon_editor/src/scene.rs`:
+- **Scene format.** RON, `SCENE_VERSION = 4` in `melon_editor/src/scene.rs`:
   `parent` is an index into `entities`, `transform` is local (versions 1 and 2
-  still load, all roots). Adding a saved component means changing
+  still load, all roots). `model` is the path (`#mesh<N>` included) and
+  `model_guid` the file's GUID; the GUID wins when it resolves, so a scene
+  written by hand may give only `model`. Adding a saved component means changing
   `SceneEntity`, `scene_to_data` and `spawn_scene_entity`. Bump the version on
   breaking changes and keep reading the old one.
 - **Light direction sign.** `Light::direction` is the direction light travels
