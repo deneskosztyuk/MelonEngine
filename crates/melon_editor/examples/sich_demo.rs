@@ -7,9 +7,9 @@ use std::path::Path;
 
 use glam::{Quat, Vec3};
 use melon_core::{
-    Aabb, AlphaMode, AssetServer, AudioSource, Collider, ColliderShape, Core, Handle,
-    MaterialAsset, MaterialSlot, MeshMaterials, Model, Name, PointLight, RigidBody, RigidBodyKind,
-    SpotLight, Transform,
+    Aabb, AlphaMode, AssetServer, AudioSource, Collider, ColliderShape, Core, EnvironmentAsset,
+    Handle, MaterialAsset, MaterialSlot, MeshMaterials, Model, Name, PointLight, RigidBody,
+    RigidBodyKind, SpotLight, Transform,
 };
 
 const DIR: &str = "assets/demo/sich";
@@ -104,6 +104,19 @@ fn main() -> anyhow::Result<()> {
         AlphaMode::Blend,
     );
 
+    let mut golden_hour = EnvironmentAsset::default();
+    golden_hour.sun.elevation = 7.0;
+    golden_hour.sun.azimuth = -115.0;
+    golden_hour.sun.color = Vec3::new(1.35, 0.68, 0.32);
+    golden_hour.ambient.share = 0.3;
+    golden_hour.ambient.sky = Vec3::new(0.55, 0.52, 0.85);
+    golden_hour.ambient.ground = Vec3::new(0.6, 0.4, 0.26);
+    golden_hour.sky.zenith = Vec3::new(0.09, 0.1, 0.3);
+    golden_hour.sky.horizon = Vec3::new(1.05, 0.55, 0.3);
+    golden_hour.fog.density = 0.0025;
+    golden_hour.bloom.intensity = 0.12;
+    golden_hour.save(Path::new(&format!("{DIR}/golden_hour.env")))?;
+
     let mut core = Core::new();
     let mut server = AssetServer::new(root.to_path_buf());
     // Write `.meta` files for the copied models, sounds and new materials so
@@ -137,10 +150,14 @@ fn main() -> anyhow::Result<()> {
     ));
     // Golden hour into dusk: a low warm sun in the west-southwest, a deep
     // blue-violet zenith over an amber horizon, light warm haze.
+    let environment = melon_core::AssetRef::for_path(
+        core.world.resource::<AssetServer>(),
+        &format!("{DIR}/golden_hour.env"),
+    );
     core.world.spawn((
-        Name("Golden Hour Lighting".into()),
+        Name("World Environment".into()),
         Transform::default(),
-        melon_core::WorldEnvironment::default(),
+        melon_core::WorldEnvironment { environment },
     ));
     // Pond: a thin blended slab with reeds and lily pads.
     let pond = slot(&mut core, "materials/pond.mat");

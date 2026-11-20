@@ -2,13 +2,13 @@
     version: 6,
     entities: [
         (
-            name: "Golden Hour Lighting",
+            name: "World Environment",
             parent: None,
             model: None,
             model_guid: None,
             components: {
                 "melon_core::components::Transform": (translation: (x: 0.0, y: 0.0, z: 0.0), rotation: (x: 0.0, y: 0.0, z: 0.0, w: 1.0), scale: (x: 1.0, y: 1.0, z: 1.0)),
-                "melon_core::scene_lighting::SceneLighting": (sun_elevation: 7.0, sun_azimuth: -115.0, sun_color: (x: 1.35, y: 0.68, z: 0.32), ambient: 0.3, sky_ambient: (x: 0.55, y: 0.52, z: 0.85), ground_ambient: (x: 0.6, y: 0.4, z: 0.26), zenith_color: (x: 0.09, y: 0.1, z: 0.3), horizon_color: (x: 1.05, y: 0.55, z: 0.3), fog_density: 0.0025, bloom_intensity: 0.12),
+                "melon_core::world_environment::WorldEnvironment": (environment: (guid: "f762959d-d2cf-4a84-90c0-56087643e607", path: "assets/demo/sich/golden_hour.env")),
             },
             uid: Some("8951a749-18e8-4a8a-b4df-2f1f6fa64bad"),
         ),
