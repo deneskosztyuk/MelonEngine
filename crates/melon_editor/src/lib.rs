@@ -124,7 +124,8 @@ pub struct Editor {
     /// it could not start (Refresh still works).
     watcher: Option<asset_watch::AssetWatcher>,
     /// glTF mesh counts for the Inspector's Asset card, by file and its
-    /// modified time (re-read only when the file changes).
+    /// modified time (re-read only when the file changes). Holds only the
+    /// browser selection.
     mesh_counts: std::collections::HashMap<
         std::path::PathBuf,
         (Option<std::time::SystemTime>, Result<ModelInfo, String>),
@@ -1418,6 +1419,9 @@ impl Editor {
                 .and_then(|server| content::asset_details(server, path))
                 .map(|details| (path.to_path_buf(), details))
         });
+        // The card shows one file; keep nothing else.
+        self.mesh_counts
+            .retain(|cached, _| asset.as_ref().is_some_and(|(path, _)| path == cached));
         if let Some((path, details)) = &asset {
             self.asset_card(ui, path, details);
         }
@@ -3945,6 +3949,33 @@ mod tests {
             ctx.read_response(egui::Id::new("inspector_nothing"))
                 .is_some()
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn asset_card_cache_keeps_only_the_selection() {
+        let (mut editor, mut world, root) = browser_project("mesh_cache");
+        let x = root.join("assets/models/x.glb");
+        let y = root.join("assets/models/y.glb");
+        std::fs::write(&y, b"y").unwrap();
+        asset_db::reconcile(&mut world.resource_mut::<AssetServer>());
+        let ctx = egui::Context::default();
+        let mut show = |editor: &mut Editor, selection: Option<std::path::PathBuf>| {
+            editor.content.select(selection);
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                editor.build_inspector(&mut world, ui)
+            });
+        };
+        show(&mut editor, Some(x.clone()));
+        assert!(editor.mesh_counts.contains_key(&x));
+        show(&mut editor, Some(y.clone()));
+        assert_eq!(
+            editor.mesh_counts.keys().collect::<Vec<_>>(),
+            vec![&y],
+            "only the selected model stays cached"
+        );
+        show(&mut editor, None);
+        assert!(editor.mesh_counts.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
