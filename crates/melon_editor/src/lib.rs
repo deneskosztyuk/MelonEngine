@@ -123,6 +123,9 @@ pub struct Editor {
     /// Follows changes under `assets/` made outside the editor; `None` if
     /// it could not start (Refresh still works).
     watcher: Option<asset_watch::AssetWatcher>,
+    /// When `keep_watching` next checks the watcher; `None` until a
+    /// project is set.
+    watch_check: Option<std::time::Instant>,
     /// glTF mesh counts for the Inspector's Asset card, by file and its
     /// modified time (re-read only when the file changes). Holds only the
     /// browser selection.
@@ -187,6 +190,7 @@ impl Default for Editor {
             confirm_open: None,
             content_shown: false,
             watcher: None,
+            watch_check: None,
             mesh_counts: std::collections::HashMap::new(),
             focus_content_tab: false,
             status_message: None,
@@ -227,16 +231,16 @@ impl Editor {
     pub fn set_project_root(&mut self, root: &std::path::Path) {
         self.content = content::ContentBrowser::new(root.join("assets"));
         self.content_settings_file = root.join(content::settings_path());
-        self.watcher = match asset_watch::AssetWatcher::start(&root.join("assets")) {
-            Ok(watcher) => Some(watcher),
-            Err(error) => {
-                tracing::warn!("assets/ is not watched (use Refresh): {error}");
-                None
-            }
-        };
         self.content.load_settings(&self.content_settings_file);
         self.layout_file = root.join(layout::layout_path());
         self.project_root = root.to_path_buf();
+        let now = std::time::Instant::now();
+        self.watcher = None;
+        self.watch_check = Some(now);
+        self.keep_watching(now);
+        if self.watcher.is_none() {
+            tracing::warn!("assets/ is not watched yet (use Refresh); retrying");
+        }
         self.dock = layout::load_layout(&self.layout_file);
     }
 
@@ -637,10 +641,16 @@ impl Editor {
     /// Once outside changes under `assets/` settle: reconcile `.meta` files
     /// and refresh the browser.
     fn follow_asset_changes(&mut self, world: &mut World, ui: &egui::Ui) {
+        let now = std::time::Instant::now();
+        let restarted = self.keep_watching(now);
         let Some(watcher) = &mut self.watcher else {
+            if self.watch_check.is_some() {
+                ui.ctx().request_repaint_after(asset_watch::RETRY);
+            }
             return;
         };
-        let settled = watcher.poll(std::time::Instant::now());
+        // Changes made while nothing watched are caught up at once.
+        let settled = watcher.poll(now) || restarted;
         if watcher.pending() {
             // Settle even if the user does not move the mouse.
             ui.ctx().request_repaint_after(asset_watch::QUIET);
@@ -653,6 +663,37 @@ impl Editor {
         }
         asset_db::reconcile(&mut world.resource_mut::<AssetServer>());
         self.content.refresh();
+    }
+
+    /// Every `RETRY`: drop the watcher if `assets/` is gone (notify stops
+    /// silently then), start one if it is there. True when one started.
+    // shortcut: a delete and recreate within RETRY is not noticed; compare the folder's identity if that bites.
+    fn keep_watching(&mut self, now: std::time::Instant) -> bool {
+        if self.watch_check.is_none_or(|check| now < check) {
+            return false;
+        }
+        self.watch_check = Some(now + asset_watch::RETRY);
+        let assets = self.project_root.join("assets");
+        if !assets.is_dir() {
+            if self.watcher.take().is_some() {
+                tracing::warn!("assets/ is gone; live updates resume when it is back");
+            }
+            return false;
+        }
+        if self.watcher.is_some() {
+            return false;
+        }
+        match asset_watch::AssetWatcher::start(&assets) {
+            Ok(watcher) => {
+                tracing::info!("watching {} for outside changes", assets.display());
+                self.watcher = Some(watcher);
+                true
+            }
+            Err(error) => {
+                tracing::debug!("assets/ watcher did not start: {error}");
+                false
+            }
+        }
     }
 
     /// Run the file operations the Content Browser asked for this frame.
@@ -3952,6 +3993,36 @@ mod tests {
             ctx.read_response(egui::Id::new("inspector_nothing"))
                 .is_some()
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn watcher_starts_once_assets_exists_and_restarts_after_removal() {
+        let root = std::env::temp_dir().join(format!("melon_rewatch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut editor = Editor::new();
+        editor.set_project_root(&root);
+        assert!(editor.watcher.is_none(), "no assets/ yet");
+        let t0 = std::time::Instant::now();
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        assert!(!editor.keep_watching(t0), "not due before the retry");
+        assert!(editor.keep_watching(t0 + asset_watch::RETRY));
+        assert!(editor.watcher.is_some());
+        std::fs::remove_dir_all(root.join("assets")).unwrap();
+        assert!(!editor.keep_watching(t0 + asset_watch::RETRY * 2));
+        assert!(editor.watcher.is_none(), "the watched root is gone");
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        assert!(editor.keep_watching(t0 + asset_watch::RETRY * 3));
+        // The new watcher sees changes.
+        let watcher = editor.watcher.as_mut().unwrap();
+        std::fs::write(root.join("assets/new.glb"), b"x").unwrap();
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !watcher.poll(std::time::Instant::now()) {
+            assert!(std::time::Instant::now() < give_up, "no event within 5 s");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        drop(editor);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -13,6 +13,10 @@ use notify::Watcher;
 /// reacting in between would split them.
 pub const QUIET: Duration = Duration::from_millis(300);
 
+/// How often the editor checks that `assets/` exists and is watched: it
+/// may be missing at startup, or deleted and recreated while running.
+pub const RETRY: Duration = Duration::from_secs(2);
+
 /// Fires once after events stop for `QUIET`.
 #[derive(Default)]
 pub struct Debounce {
