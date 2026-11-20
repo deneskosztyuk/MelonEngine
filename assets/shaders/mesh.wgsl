@@ -80,6 +80,17 @@ struct VsOut {
 @group(0) @binding(2) var shadow_map: texture_depth_2d;
 @group(0) @binding(3) var shadow_sampler: sampler_comparison;
 @group(0) @binding(4) var<uniform> env: EnvironmentUniform;
+// Image-based ambient (ibl.rs): irradiance / pi as SH9, the environment
+// prefiltered per roughness (equirect mips) and the split-sum BRDF lookup.
+struct IblUniform {
+    sh: array<vec4f, 9>,
+    // x highest mip.
+    params: vec4f,
+};
+@group(0) @binding(7) var<uniform> ibl: IblUniform;
+@group(0) @binding(8) var ibl_specular: texture_2d<f32>;
+@group(0) @binding(9) var ibl_sampler: sampler;
+@group(0) @binding(10) var ibl_brdf: texture_2d<f32>;
 @group(2) @binding(0) var base_color_tex: texture_2d<f32>;
 @group(2) @binding(1) var material_sampler: sampler;
 // G = roughness, B = metallic (linear).
@@ -180,13 +191,23 @@ fn shadow_factor(world_pos: vec3f, normal: vec3f) -> f32 {
     return sum / 9.0;
 }
 
-// Sky radiance along `dir`, as sky.wgsl draws it (without the sun disc):
-// horizon-to-zenith above, the dim hemisphere ground below.
-fn sky_radiance(dir: vec3f) -> vec3f {
-    let above = mix(env.horizon_color, env.zenith_color, sqrt(max(dir.y, 0.0)));
-    let ground = light.ambient * light.ground_color;
-    let below = mix(env.horizon_color, ground, smoothstep(0.0, 0.3, -dir.y));
-    return select(below, above, dir.y >= 0.0);
+// Diffuse ambient (irradiance / pi) of the environment around `n`.
+fn ibl_irradiance(n: vec3f) -> vec3f {
+    var c = ibl.sh[0].rgb * 0.282095;
+    c += ibl.sh[1].rgb * (0.488603 * n.y) + ibl.sh[2].rgb * (0.488603 * n.z)
+        + ibl.sh[3].rgb * (0.488603 * n.x);
+    c += ibl.sh[4].rgb * (1.092548 * n.x * n.y) + ibl.sh[5].rgb * (1.092548 * n.y * n.z)
+        + ibl.sh[6].rgb * (0.315392 * (3.0 * n.z * n.z - 1.0))
+        + ibl.sh[7].rgb * (1.092548 * n.x * n.z)
+        + ibl.sh[8].rgb * (0.546274 * (n.x * n.x - n.y * n.y));
+    return max(c, vec3f(0.0));
+}
+
+// The environment along `dir`, blurred for `roughness` (equirect: u around
+// +Y, v from up to down).
+fn ibl_prefiltered(dir: vec3f, roughness: f32) -> vec3f {
+    let uv = vec2f(atan2(dir.z, dir.x) / (2.0 * PI) + 0.5, acos(clamp(dir.y, -1.0, 1.0)) / PI);
+    return textureSampleLevel(ibl_specular, ibl_sampler, uv, roughness * ibl.params.x).rgb;
 }
 
 fn fresnel_schlick(cos_theta: f32, f0: vec3f) -> vec3f {
@@ -328,11 +349,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     // mirror direction, fading toward the hemisphere around the normal as
     // roughness blurs the reflection. SSAO occludes both.
     let ao = ambient_occlusion(in.clip_pos.xy);
-    let hemi = light.ambient * mix(light.ground_color, light.sky_color, n.y * 0.5 + 0.5);
+    let hemi = ibl_irradiance(n);
     let f_amb = fresnel_schlick_roughness(ndv, f0, roughness);
-    let reflected = mix(sky_radiance(reflect(-v, n)), hemi, roughness);
+    // Split sum: the prefiltered environment times the scale and bias of F0.
+    let brdf = textureSampleLevel(ibl_brdf, ibl_sampler, vec2f(ndv, roughness), 0.0).rg;
+    let reflected = ibl_prefiltered(reflect(-v, n), roughness) * (f0 * brdf.x + brdf.y);
     var ambient = (1.0 - f_amb) * (1.0 - metallic) * base * hemi * ao
-        + f_amb * reflected * specular_occlusion(ndv, ao, roughness);
+        + reflected * specular_occlusion(ndv, ao, roughness);
     // GI on: the backend's light replaces the hemisphere in the diffuse
     // term. GI off is a pipeline built with GI_MODE GI_OFF: the branch
     // compiles away and the image matches the renderer without GI exactly
@@ -343,7 +366,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
         if (gi_only()) {
             return vec4f(diffuse, 1.0);
         }
-        ambient = diffuse + f_amb * reflected * specular_occlusion(ndv, ao, roughness);
+        ambient = diffuse + reflected * specular_occlusion(ndv, ao, roughness);
     }
 
     let locals = local_light_radiance(in.clip_pos.xy, in.world_pos, n, v, base, metallic, alpha, f0);

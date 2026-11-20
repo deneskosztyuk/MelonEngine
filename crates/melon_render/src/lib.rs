@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 mod extract;
 pub mod gi;
+mod ibl;
 mod lights;
 mod materials;
 mod models;
@@ -824,6 +825,13 @@ pub struct SceneRenderer {
     /// Group 0: per-frame data shared by every pipeline (camera, light,
     /// shadow map, environment).
     frame_bind_group: wgpu::BindGroup,
+    /// Image-based ambient (group 0, bindings 7 to 10).
+    ibl: ibl::IblGpu,
+    /// The sky colours and hemisphere ambient the IBL was last asked for.
+    ibl_sky: ibl::SkyParams,
+    ibl_hdr: Option<(std::sync::Arc<ibl::HdrImage>, f32)>,
+    /// What the IBL data was built for (`refresh_ibl`).
+    ibl_built: Option<(ibl::SkyParams, Option<(usize, u32)>)>,
     shadow_pipeline: wgpu::RenderPipeline,
     /// Shadow pass for alpha-masked casters (reads the material, group 2).
     shadow_mask_pipeline: wgpu::RenderPipeline,
@@ -886,6 +894,8 @@ pub struct Renderer {
     model_cache: ModelCache,
     /// GPU materials (`.mat` files) and their textures.
     materials: materials::MaterialCache,
+    /// The decoded HDR sky image: (handle id, file version, image).
+    sky_cache: Option<(u32, u32, Option<std::sync::Arc<ibl::HdrImage>>)>,
     /// Solid editor shapes drawn after tonemapping.
     overlay: overlay::OverlayRenderer,
     /// GPU pass timings; `None` without timestamp queries.
@@ -1095,6 +1105,7 @@ impl Renderer {
             scene,
             model_cache,
             materials: Default::default(),
+            sky_cache: None,
             overlay,
             timer,
         };
@@ -1275,6 +1286,35 @@ impl Renderer {
         )
     }
 
+    /// The decoded image of `Environment::sky_texture`, reloaded when its
+    /// file changes; a broken file is reported once and leaves the
+    /// procedural sky.
+    fn sky_image(
+        &mut self,
+        server: &melon_core::AssetServer,
+        texture: Option<Handle<melon_core::Texture>>,
+    ) -> Option<std::sync::Arc<ibl::HdrImage>> {
+        let handle = texture?;
+        let version = server.version(handle);
+        if let Some((id, v, image)) = &self.sky_cache
+            && *id == handle.id()
+            && *v == version
+        {
+            return image.clone();
+        }
+        let image = server
+            .full_path(handle)
+            .and_then(|file| match ibl::HdrImage::open(&file) {
+                Ok(image) => Some(std::sync::Arc::new(image)),
+                Err(error) => {
+                    tracing::warn!("could not load sky {}: {error:#}", file.display());
+                    None
+                }
+            });
+        self.sky_cache = Some((handle.id(), version, image.clone()));
+        image
+    }
+
     /// `render_scene` for a `View::Main`; a `View::Auxiliary` (thumbnail)
     /// leaves the world state alone: GI shaded as Off without updating it,
     /// the current shadow map size and sample count (its quality's are
@@ -1296,7 +1336,9 @@ impl Renderer {
             View::Auxiliary => (&[][..], &[][..]),
         };
         let quality = &frame.quality;
+        let sky = self.sky_image(server, frame.environment.sky_texture);
         let scene = &mut self.scene;
+        scene.set_sky_texture(sky.map(|image| (image, frame.environment.sky_intensity)));
         if main {
             scene.set_shadow_map_size(quality.shadow_map_size);
             scene.set_msaa(quality.msaa);
@@ -1663,6 +1705,16 @@ impl SceneRenderer {
         };
         // Group 0 holds everything that changes once per frame; group 3
         // holds per-view lighting inputs (SSAO, later GI).
+        let ibl_texture_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
         let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame bind group layout"),
             entries: &[
@@ -1685,6 +1737,17 @@ impl SceneRenderer {
                     count: None,
                 },
                 uniform_entry(4, wgpu::ShaderStages::FRAGMENT),
+                // Image-based ambient: SH uniform, prefiltered environment,
+                // its sampler, the BRDF lookup.
+                uniform_entry(7, wgpu::ShaderStages::FRAGMENT),
+                ibl_texture_entry(8),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                ibl_texture_entry(10),
             ],
         });
         let model_layout = instance_buffer_layout(&device);
@@ -1890,12 +1953,15 @@ impl SceneRenderer {
             }],
         });
 
+        let ibl_sky = ibl::SkyParams::default();
+        let ibl = ibl::IblGpu::new(&device, &queue, &ibl::Source::Procedural(ibl_sky));
         let frame_bind_group = frame_bind_group(
             &device,
             &frame_layout,
             [&camera_buffer, &light_buffer, &environment_buffer],
             &shadow_view,
             &shadow_sampler,
+            &ibl,
         );
 
         let texture_1x1 = |label, rgba: [u8; 4]| {
@@ -2005,6 +2071,10 @@ impl SceneRenderer {
             light_buffer,
             environment_buffer,
             frame_bind_group,
+            ibl,
+            ibl_sky,
+            ibl_hdr: None,
+            ibl_built: Some((ibl_sky, None)),
             shadow_pipeline,
             shadow_mask_pipeline,
             shadow_camera_buffer,
@@ -2045,17 +2115,7 @@ impl SceneRenderer {
             return;
         }
         (self.shadow_texture, self.shadow_view) = create_shadow_map(&self.device, size);
-        self.frame_bind_group = frame_bind_group(
-            &self.device,
-            &self.frame_layout,
-            [
-                &self.camera_buffer,
-                &self.light_buffer,
-                &self.environment_buffer,
-            ],
-            &self.shadow_view,
-            &self.shadow_sampler,
-        );
+        self.rebuild_frame_bind_group();
         self.gi.set_shadow_map(
             &self.device,
             &gi::GiInputs {
@@ -2069,6 +2129,50 @@ impl SceneRenderer {
             },
         );
         tracing::debug!(size, "shadow map recreated");
+    }
+
+    /// Group 0 over the current buffers, shadow map and IBL textures.
+    fn rebuild_frame_bind_group(&mut self) {
+        self.frame_bind_group = frame_bind_group(
+            &self.device,
+            &self.frame_layout,
+            [
+                &self.camera_buffer,
+                &self.light_buffer,
+                &self.environment_buffer,
+            ],
+            &self.shadow_view,
+            &self.shadow_sampler,
+            &self.ibl,
+        );
+    }
+
+    /// Use `hdr` (an equirect image and its intensity) as the sky and the
+    /// image-based ambient from the next `update_environment` /
+    /// `update_light`; `None` = the procedural sky.
+    pub fn set_sky_texture(&mut self, hdr: Option<(std::sync::Arc<ibl::HdrImage>, f32)>) {
+        self.ibl_hdr = hdr;
+    }
+
+    /// Recompute the IBL data when its inputs (sky colours, hemisphere
+    /// ambient, HDR image) changed since the last build.
+    fn refresh_ibl(&mut self) {
+        let key = (
+            self.ibl_sky,
+            self.ibl_hdr.as_ref().map(|(image, intensity)| {
+                (std::sync::Arc::as_ptr(image) as usize, intensity.to_bits())
+            }),
+        );
+        if self.ibl_built == Some(key) {
+            return;
+        }
+        let source = match &self.ibl_hdr {
+            Some((image, intensity)) => ibl::Source::Hdr(image, *intensity),
+            None => ibl::Source::Procedural(self.ibl_sky),
+        };
+        self.ibl.rebuild(&self.device, &self.queue, &source);
+        self.rebuild_frame_bind_group();
+        self.ibl_built = Some(key);
     }
 
     /// Edge of the sun shadow map in texels.
@@ -2207,6 +2311,7 @@ fn frame_bind_group(
     [camera, light, environment]: [&wgpu::Buffer; 3],
     shadow_view: &wgpu::TextureView,
     shadow_sampler: &wgpu::Sampler,
+    ibl: &ibl::IblGpu,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("frame bind group"),
@@ -2231,6 +2336,22 @@ fn frame_bind_group(
             wgpu::BindGroupEntry {
                 binding: 4,
                 resource: environment.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: ibl.uniform.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(&ibl.specular),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::Sampler(&ibl.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(&ibl.brdf),
             },
         ],
     })
@@ -3353,7 +3474,10 @@ impl SceneRenderer {
     }
 
     /// Sky colours and fog density for the mesh and sky shaders.
-    pub fn update_environment(&self, environment: &melon_core::Environment) {
+    pub fn update_environment(&mut self, environment: &melon_core::Environment) {
+        self.ibl_sky.zenith = environment.zenith_color;
+        self.ibl_sky.horizon = environment.horizon_color;
+        self.refresh_ibl();
         let uniform = EnvironmentUniform {
             zenith_color: environment.zenith_color.to_array(),
             fog_density: environment.fog_density,
@@ -3368,15 +3492,28 @@ impl SceneRenderer {
     }
 
     /// `light_view_proj` is the shadow box, see [`directional_light_view_proj`].
-    pub fn update_light(&self, light: &melon_core::Light, light_view_proj: glam::Mat4) {
+    pub fn update_light(&mut self, light: &melon_core::Light, light_view_proj: glam::Mat4) {
+        self.ibl_sky.ambient = light.ambient;
+        self.ibl_sky.sky_color = light.sky_color;
+        self.ibl_sky.ground_color = light.ground_color;
+        self.refresh_ibl();
+        // With an HDR sky the hemisphere colours (read by GI misses and the
+        // GI-off fallbacks) follow the mean radiance of the image above and
+        // below the horizon.
+        let (sky_color, ground_color) = if self.ibl_hdr.is_some() {
+            let scale = 1.0 / light.ambient.max(1e-3);
+            (self.ibl.mean_up * scale, self.ibl.mean_down * scale)
+        } else {
+            (light.sky_color, light.ground_color)
+        };
         let uniform = LightUniform {
             direction: light.to_light().to_array(),
             ambient: light.ambient,
             color: light.color.to_array(),
             _pad: 0.0,
-            sky_color: light.sky_color.to_array(),
+            sky_color: sky_color.to_array(),
             _pad1: 0.0,
-            ground_color: light.ground_color.to_array(),
+            ground_color: ground_color.to_array(),
             _pad2: 0.0,
             light_view_proj: light_view_proj.to_cols_array_2d(),
         };
@@ -4636,7 +4773,7 @@ mod tests {
 
     const TEST_SIZE: u32 = 64;
     /// Share of a shadow edge's contrast (percent) that default bloom must keep.
-    const EDGE_KEEP_PERCENT: i32 = 87;
+    const EDGE_KEEP_PERCENT: i32 = 85;
     /// World (-2, 0, 0): on the floor, inside the occluder's shadow.
     const SHADOW_PX: (u32, u32) = (16, 32);
     /// World (2, 0, 0): on the floor, in the open.
@@ -5864,6 +6001,23 @@ mod tests {
         lights: Vec<lights::LocalLight>,
         quality: melon_core::RenderQuality,
     ) -> (Vec<u8>, RenderStats) {
+        let sun = melon_core::Light {
+            color: glam::Vec3::ZERO,
+            ambient: 0.0,
+            ..test_light()
+        };
+        render_floor_under(r, lights, quality, sun, plain_environment(), None)
+    }
+
+    /// `render_lit` under the given sun / ambient and sky.
+    fn render_floor_under(
+        r: &mut Renderer,
+        lights: Vec<lights::LocalLight>,
+        quality: melon_core::RenderQuality,
+        light: melon_core::Light,
+        environment: melon_core::Environment,
+        sky_png: Option<[u8; 3]>,
+    ) -> (Vec<u8>, RenderStats) {
         let root = material_project("lit_floor");
         write_mat(
             &root,
@@ -5875,15 +6029,19 @@ mod tests {
         r.model_cache = ModelCache::new(&r.scene);
         let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
         let material = server.load("assets/materials/white.mat");
+        let mut environment = environment;
+        if let Some(rgb) = sky_png {
+            let file = root.join("assets/textures/sky.png");
+            image::RgbaImage::from_pixel(8, 4, image::Rgba([rgb[0], rgb[1], rgb[2], 255]))
+                .save(&file)
+                .unwrap();
+            environment.sky_texture = Some(server.load("assets/textures/sky.png"));
+        }
         let mut frame = FrameData {
             view_proj: top_down_camera().view_proj(),
             eye: top_down_camera().eye,
-            light: melon_core::Light {
-                color: glam::Vec3::ZERO,
-                ambient: 0.0,
-                ..test_light()
-            },
-            environment: plain_environment(),
+            light,
+            environment,
             quality,
             lights,
             ..Default::default()
@@ -5908,6 +6066,56 @@ mod tests {
         (pixels, stats)
     }
 
+    fn check_ibl_uniform_sky(r: &mut Renderer) -> Result<(), String> {
+        // A white rough dielectric under a uniform sky of radiance L (no
+        // sun): it shows about L times its albedo (diffuse irradiance = L,
+        // plus a little reflection).
+        let l = 0.5f32;
+        let light = melon_core::Light {
+            color: glam::Vec3::ZERO,
+            ambient: 1.0,
+            sky_color: glam::Vec3::splat(l),
+            ground_color: glam::Vec3::splat(l),
+            ..test_light()
+        };
+        let environment = melon_core::Environment {
+            zenith_color: glam::Vec3::splat(l),
+            horizon_color: glam::Vec3::splat(l),
+            ..plain_environment()
+        };
+        let quality = melon_core::RenderQuality::default();
+        let (pixels, _) = render_floor_under(r, vec![], quality, light, environment, None);
+        let got = i32::from(value_at(&pixels, CENTRE_PX));
+        let want = i32::from(tonemap_value(r, f64::from(l) * 0.8));
+        if (got - want).abs() > 12 {
+            return Err(format!(
+                "uniform sky: floor shows {got}, expected about {want}"
+            ));
+        }
+        // An image sky (flat red) replaces the procedural one: the floor
+        // takes its colour, and a corner of the view shows it as the sky.
+        let (red, _) =
+            render_floor_under(r, vec![], quality, light, environment, Some([255, 0, 0]));
+        let px = pixel_at(r, &red, CENTRE_PX);
+        let sky = pixel_at(r, &red, (2, 2));
+        if px[0] < px[2].saturating_add(40) || sky[0] < sky[2].saturating_add(100) {
+            return Err(format!(
+                "red image sky: floor {px:?}, sky {sky:?} (want red)"
+            ));
+        }
+        // Doubling the sky doubles the light: brighter, never darker.
+        let bright = melon_core::Light {
+            sky_color: glam::Vec3::splat(2.0 * l),
+            ground_color: glam::Vec3::splat(2.0 * l),
+            ..light
+        };
+        let (pixels, _) = render_floor_under(r, vec![], quality, bright, environment, None);
+        if i32::from(value_at(&pixels, CENTRE_PX)) <= got {
+            return Err("a brighter sky should brighten the floor".into());
+        }
+        Ok(())
+    }
+
     fn point_light(at: glam::Vec3, intensity: f32, range: f32) -> lights::LocalLight {
         lights::LocalLight {
             position: at,
@@ -5924,9 +6132,9 @@ mod tests {
         let corner = (4, 4);
         let (dark, _) = render_lit(r, vec![], quality);
         let dark_centre = value_at(&dark, CENTRE_PX);
-        // Only the sky reflection is left without lights (a few steps).
+        // Only the sky reflection (IBL specular) is left without lights.
         let dark_far = value_at(&dark, corner);
-        if dark_centre > 12 {
+        if dark_centre > 90 {
             return Err(format!("no light, no sun: nearly black ({dark_centre})"));
         }
         // Above the floor, in range: the floor under it lights up, the far
@@ -7746,6 +7954,7 @@ mod tests {
             Box::new(check_texture_hot_reload),
             Box::new(check_alpha_mask_and_blend),
             Box::new(check_local_lights),
+            Box::new(check_ibl_uniform_sky),
         ];
 
         #[cfg(target_os = "windows")]

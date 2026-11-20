@@ -2412,6 +2412,7 @@ dependencies = [
  "bytemuck",
  "glam 0.33.2",
  "gltf",
+ "half",
  "image",
  "melon_core",
  "pollster 0.4.0",
