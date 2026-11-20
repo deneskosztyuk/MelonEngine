@@ -69,7 +69,8 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
       textures per primitive (base colour, metallic-roughness, normal,
       emissive), tangents read or generated, Cook-Torrance sun plus sky
       ambient specular.
-- [x] Directional (sun) shadow map with 3x3 PCF.
+- [x] Directional (sun) shadow map with 3x3 PCF, no culling, slope bias and
+      normal-offset sampling (no light leaks at contact seams).
 - [ ] Point and spot lights, their shadows, cascaded sun shadows.
 - [x] Hemisphere ambient: sky and ground colours on `Light`.
 - [x] HDR target + ACES tonemap pass.

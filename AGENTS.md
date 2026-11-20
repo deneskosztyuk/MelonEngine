@@ -157,6 +157,15 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   (default 1; 0 skips the passes and matches the pre-SSAO image exactly) and
   `ao_radius` (metres, default 0.5). GPU tests that are not about AO set
   `ao_strength: 0.0`.
+- **Sun shadow setup.** The shadow pass culls nothing (front faces of
+  closed meshes store depth; single-sided quads cast from both sides) with
+  a small slope-scaled bias (`constant: 1, slope_scale: 1.5`), and
+  `shadow_factor` in `mesh.wgsl` offsets the lookup along the geometric
+  normal by about 1.5 shadow texels, scaled by the sun's grazing angle.
+  Do not go back to front-face culling: it stores a resting object's
+  underside, level with the floor, and with the bias light leaks along
+  every contact seam (`no_light_leak_at_contact`). Back faces alone without
+  the normal offset bring acne on lit faces (`lit_floor_has_no_acne`).
 - **Environment.** Optional `melon_core::Environment` resource (default when
   absent, not registered in `Core::new`): procedural sky (`zenith_color`,
   `horizon_color`) and exponential distance fog (`fog_density`). The fog
@@ -165,8 +174,9 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 - **Camera conventions.** Right-handed, DirectX depth (near = 0, far = 1).
   Screen helpers take logical points.
 - **Checking rendering.** Agents verify rendering with the snapshot example
-  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd] [--ao-only|--no-ao]`;
-  `--ao-only` saves the SSAO term as a grey image; `crowd` adds about
+  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd] [--ao-only] [--no-ao] [--no-shadow]`;
+  `--ao-only` saves the SSAO term as a grey image; `--no-shadow` moves scene
+  and camera outside the shadow box (no sun shadows, debug only); `crowd` adds about
   10,000 instances; it prints the mean frame time and `RenderStats`),
   never by opening the editor or game window.
 - **GPU tests** open a window, so they need a display and adapter.
