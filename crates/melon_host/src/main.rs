@@ -7,7 +7,7 @@ use melon_core::bevy_ecs::world::{Mut, World};
 use melon_core::glam::{Quat, Vec2, Vec3};
 use melon_core::{
     Aabb, BodyInfo, BodyKind, Camera, FrameCounter, GameInputGate, Input, InputButton, KeyCode,
-    Light, Name, RawPresses, Time, Transform,
+    Light, Name, RawPresses, RenderQuality, RenderTimings, Time, Transform,
 };
 use melon_editor::Editor;
 use melon_editor::EditorOverlay;
@@ -268,6 +268,8 @@ struct App {
     last_frame: Option<Instant>,
     /// Frame cap, set when the present mode does not wait for vblank.
     pacer: Option<pacing::FrameDeadline>,
+    /// The monitor's refresh period (frame cap and GPU budget).
+    frame_period: std::time::Duration,
     /// `MELON_FRAME_STATS=1` timings.
     stats: pacing::FrameStats,
 }
@@ -371,6 +373,7 @@ impl App {
             quality_broken,
             last_frame: None,
             pacer: None,
+            frame_period: pacing::frame_period(None),
             stats: pacing::FrameStats::from_env(),
         }
     }
@@ -425,7 +428,7 @@ impl ApplicationHandler for App {
                 .expect("failed to create window"),
         );
 
-        let renderer = match pollster::block_on(melon_render::Renderer::new(window.clone())) {
+        let mut renderer = match pollster::block_on(melon_render::Renderer::new(window.clone())) {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("renderer init failed: {e:?}");
@@ -452,6 +455,8 @@ impl ApplicationHandler for App {
             camera.set_aspect(aspect);
         }
 
+        let present = self.core.world.resource::<RenderQuality>().present;
+        renderer.set_present(present);
         tracing::info!(
             "renderer ready: {}x{} {:?} {:?} {:?}",
             size.width,
@@ -460,17 +465,13 @@ impl ApplicationHandler for App {
             renderer.backend(),
             renderer.present_mode()
         );
-        if renderer.present_mode() == wgpu::PresentMode::Mailbox {
-            // ponytail: the rate is read once; moving the window to another
-            // monitor keeps the first one's cap.
-            let refresh = window
-                .current_monitor()
-                .and_then(|m| m.refresh_rate_millihertz());
-            self.pacer = Some(pacing::FrameDeadline::new(
-                pacing::frame_period(refresh),
-                Instant::now(),
-            ));
-        }
+        // ponytail: the rate is read once; moving the window to another
+        // monitor keeps the first one's cap and budget.
+        let refresh = window
+            .current_monitor()
+            .and_then(|m| m.refresh_rate_millihertz());
+        self.frame_period = pacing::frame_period(refresh);
+        self.pacer = pacing::frame_cap(renderer.present_mode(), self.frame_period);
         tracing::info!(
             "viewport: right-drag look, right+WASD/QE fly, Alt+left orbit, middle pan, scroll zoom, F frame"
         );
@@ -548,6 +549,17 @@ impl ApplicationHandler for App {
                     .unwrap_or(0);
                 let _frame_span = tracing::info_span!("frame", n = frame_n).entered();
 
+                // Frame cap: sleep to the deadline here. Waiting in the event
+                // loop (WaitUntil) missed deadlines by ~100 ms while input
+                // events streamed in.
+                if let Some(pacer) = self.pacer.as_ref() {
+                    let next = pacer.next();
+                    std::thread::sleep(pacing::sleep_until_deadline(
+                        next,
+                        Instant::now(),
+                        pacer.period(),
+                    ));
+                }
                 self.stats.frame_start();
                 let now = Instant::now();
                 if let Some(pacer) = self.pacer.as_mut() {
@@ -576,6 +588,10 @@ impl ApplicationHandler for App {
                 else {
                     return;
                 };
+                let present = self.core.world.resource::<RenderQuality>().present;
+                if renderer.set_present(present) {
+                    self.pacer = pacing::frame_cap(renderer.present_mode(), self.frame_period);
+                }
                 let Some(mut frame) = renderer.begin_frame() else {
                     // No editor pass this frame (e.g. minimised): drop the presses anyway.
                     clear_raw_presses(&mut self.core.world);
@@ -631,7 +647,7 @@ impl ApplicationHandler for App {
                 }
 
                 let frame_data = melon_render::extract(&mut self.core.world);
-                if let Some(target) = self.viewport_target.as_ref() {
+                if let Some(target) = self.viewport_target.as_mut() {
                     let mut server = self.core.world.resource_mut::<melon_core::AssetServer>();
                     renderer.render_scene(
                         &mut frame.encoder,
@@ -649,11 +665,11 @@ impl ApplicationHandler for App {
                 self.stats.lap(pacing::Stage::Render);
                 renderer.end_frame(frame);
                 self.stats.lap(pacing::Stage::Submit);
-
-                // Capped frames are requested in `about_to_wait`.
-                if self.pacer.is_none() {
-                    window.request_redraw();
-                }
+                self.core.world.insert_resource(RenderTimings {
+                    budget_ms: Some(self.frame_period.as_secs_f32() * 1000.0),
+                    ..renderer.timings()
+                });
+                window.request_redraw();
             }
             _ => {}
         }
@@ -668,18 +684,6 @@ impl ApplicationHandler for App {
             && let Some(mut input) = self.core.world.get_resource_mut::<Input>()
         {
             input.mouse_delta += Vec2::new(x as f32, y as f32);
-        }
-    }
-
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // ControlFlow::Poll already spins continuously — no redraw request needed.
-        // With the frame cap, sleep until the deadline (winit's Windows wait
-        // uses a high-resolution timer), still handling input meanwhile.
-        if let (Some(pacer), Some(window)) = (self.pacer.as_ref(), self.window.as_ref()) {
-            if Instant::now() >= pacer.next() {
-                window.request_redraw();
-            }
-            event_loop.set_control_flow(ControlFlow::WaitUntil(pacer.next()));
         }
     }
 }

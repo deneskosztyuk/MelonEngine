@@ -38,6 +38,10 @@ impl FrameDeadline {
         self.next
     }
 
+    pub fn period(&self) -> Duration {
+        self.period
+    }
+
     /// A frame starts at `now`: move to the following deadline. More than a
     /// period late (a hitch), the next frame may start at once and the grid
     /// restarts there, instead of a burst of frames catching up.
@@ -47,6 +51,20 @@ impl FrameDeadline {
             self.next = now;
         }
     }
+}
+
+/// The frame cap for `mode`: on only with `Mailbox`, which does not wait for
+/// vblank (FIFO paces itself).
+pub fn frame_cap(mode: wgpu::PresentMode, period: Duration) -> Option<FrameDeadline> {
+    (mode == wgpu::PresentMode::Mailbox).then(|| FrameDeadline::new(period, Instant::now()))
+}
+
+/// How long a capped frame sleeps at `now` before its deadline `next`:
+/// never negative, never more than one `period`. `std::thread::sleep` on
+/// Windows waits on a high-resolution waitable timer (Windows 10 1803+), so
+/// no spin is needed.
+pub fn sleep_until_deadline(next: Instant, now: Instant, period: Duration) -> Duration {
+    next.saturating_duration_since(now).min(period)
 }
 
 /// Host frame stages, in frame order.
@@ -227,6 +245,21 @@ mod tests {
         assert_eq!(deadline.next(), late);
         deadline.advance(late + MS);
         assert_eq!(deadline.next(), late + period);
+    }
+
+    #[test]
+    fn deadline_sleep_is_clamped_to_one_period() {
+        let t0 = Instant::now();
+        let period = 8 * MS;
+        assert_eq!(sleep_until_deadline(t0 + 3 * MS, t0, period), 3 * MS);
+        assert_eq!(sleep_until_deadline(t0, t0 + MS, period), Duration::ZERO);
+        assert_eq!(sleep_until_deadline(t0 + 50 * MS, t0, period), period);
+    }
+
+    #[test]
+    fn frame_cap_only_with_mailbox() {
+        assert!(frame_cap(wgpu::PresentMode::Mailbox, 8 * MS).is_some());
+        assert!(frame_cap(wgpu::PresentMode::Fifo, 8 * MS).is_none());
     }
 
     #[test]
