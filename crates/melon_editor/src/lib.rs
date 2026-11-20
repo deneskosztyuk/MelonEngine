@@ -9,7 +9,8 @@ use melon_core::hierarchy::{
     depth_first, mark_for_delete, set_parent_keep_world, set_world_transform, world_matrix,
 };
 use melon_core::{
-    Aabb, AssetServer, BodyInfo, Camera, Handle, Model, Name, SimulationState, Spin, Transform,
+    Aabb, AssetServer, BodyInfo, Camera, GameInputGate, Handle, InputFocus, Model, Name,
+    SimulationState, Spin, Transform,
 };
 use melon_render::LineVertex;
 use tracing::instrument;
@@ -256,14 +257,21 @@ impl Editor {
                 egui::Key::W,
                 egui::Key::E,
                 egui::Key::R,
+                egui::Key::Escape,
             ]
             .into_iter()
             .filter(|key| i.key_pressed(*key))
             .filter_map(|key| shortcut_for(key, i.modifiers.command, typing, self.flying))
             .collect()
         });
+        let game_focus = input_focus(world) == InputFocus::Game;
         for shortcut in pressed {
+            // With game focus the keys belong to the game; only Esc takes them back.
+            if game_focus && shortcut != Shortcut::ReleaseGame {
+                continue;
+            }
             match shortcut {
+                Shortcut::ReleaseGame => world.insert_resource(InputFocus::Editor),
                 Shortcut::Save => self.save(world),
                 Shortcut::Delete => self.delete_selected(world),
                 Shortcut::Move => self.gizmo_mode = GizmoMode::Move,
@@ -359,13 +367,14 @@ impl Editor {
             let controls_width =
                 7.0 * theme::sizes::TOOL_BUTTON.x + 7.0 * spacing + theme::sizes::SPACING;
             ui.add_space(((ui.available_width() - controls_width) * 0.5).max(0.0));
+            let tools_enabled = input_focus(world) == InputFocus::Editor;
             for (mode, icon) in [
                 (GizmoMode::Move, ToolbarIcon::Move),
                 (GizmoMode::Rotate, ToolbarIcon::Rotate),
                 (GizmoMode::Scale, ToolbarIcon::Scale),
             ] {
                 if icon
-                    .button(ui, true, Some(self.gizmo_mode == mode))
+                    .button(ui, tools_enabled, Some(self.gizmo_mode == mode))
                     .clicked()
                 {
                     self.gizmo_mode = mode;
@@ -612,6 +621,14 @@ impl Editor {
                     );
             });
         self.dock = dock;
+
+        // Written after every focus change of this frame; the host applies it next frame.
+        let gate = game_input_gate(
+            input_focus(world),
+            sim_state(world),
+            ui.ctx().text_edit_focused(),
+        );
+        world.insert_resource(GameInputGate(gate));
     }
 
     /// The scene viewport: image, camera navigation, gizmo, click select,
@@ -645,32 +662,42 @@ impl Editor {
             self.gizmo_drag = None;
         }
         self.flying = vp.right_down;
-        let dt = world
-            .get_resource::<melon_core::Time>()
-            .map_or(1.0 / 60.0, |t| t.delta_seconds);
-
-        self.camera
-            .apply(&viewport::camera_input(&vp, self.gizmo_drag.is_some()), dt);
-        if vp.f_pressed
-            && let Some((center, radius)) =
-                self.selected.and_then(|e| viewport::frame_target(world, e))
-        {
-            self.camera.frame(center, radius);
-        }
-        if let Some(mut camera) = world.get_resource_mut::<Camera>() {
-            self.camera.write(&mut camera);
-        }
-
-        self.build_gizmo(world, ui, &vp);
-
-        let on_gizmo = self.hovered.is_some() || self.gizmo_drag.is_some();
-        if viewport::left_action(vp.alt, on_gizmo, vp.left_clicked) == viewport::LeftAction::Select
-            && let (Some(pointer), Some(camera)) =
-                (vp.pointer, world.get_resource::<Camera>().copied())
-        {
-            let (origin, dir) = camera.screen_to_world_ray(pointer, vp.size);
-            self.selected = viewport::pick(world, origin, dir);
+        let focus = focus_after_click(sim_state(world), input_focus(world), vp.left_clicked);
+        world.insert_resource(focus);
+        // With game focus the game owns keyboard, mouse and `Camera`: no editor
+        // navigation, gizmo or picking (the click that took focus selects nothing).
+        if focus == InputFocus::Game {
+            self.hovered = None;
             self.gizmo_drag = None;
+        } else {
+            let dt = world
+                .get_resource::<melon_core::Time>()
+                .map_or(1.0 / 60.0, |t| t.delta_seconds);
+
+            self.camera
+                .apply(&viewport::camera_input(&vp, self.gizmo_drag.is_some()), dt);
+            if vp.f_pressed
+                && let Some((center, radius)) =
+                    self.selected.and_then(|e| viewport::frame_target(world, e))
+            {
+                self.camera.frame(center, radius);
+            }
+            if let Some(mut camera) = world.get_resource_mut::<Camera>() {
+                self.camera.write(&mut camera);
+            }
+
+            self.build_gizmo(world, ui, &vp);
+
+            let on_gizmo = self.hovered.is_some() || self.gizmo_drag.is_some();
+            if viewport::left_action(vp.alt, on_gizmo, vp.left_clicked)
+                == viewport::LeftAction::Select
+                && let (Some(pointer), Some(camera)) =
+                    (vp.pointer, world.get_resource::<Camera>().copied())
+            {
+                let (origin, dir) = camera.screen_to_world_ray(pointer, vp.size);
+                self.selected = viewport::pick(world, origin, dir);
+                self.gizmo_drag = None;
+            }
         }
 
         self.world_line_vertices = viewport::grid_lines();
@@ -1713,6 +1740,8 @@ pub enum Shortcut {
     Move,
     Rotate,
     Scale,
+    /// Esc: input focus back to the editor (the game keeps running).
+    ReleaseGame,
 }
 
 /// Map a pressed key to a shortcut. Nothing fires while typing in a text
@@ -1727,8 +1756,35 @@ pub fn shortcut_for(key: egui::Key, ctrl: bool, typing: bool, flying: bool) -> O
         egui::Key::W if !flying && !ctrl => Some(Shortcut::Move),
         egui::Key::E if !flying && !ctrl => Some(Shortcut::Rotate),
         egui::Key::R if !flying && !ctrl => Some(Shortcut::Scale),
+        egui::Key::Escape => Some(Shortcut::ReleaseGame),
         _ => None,
     }
+}
+
+/// Focus after a frame: a left click on the Scene viewport while Playing
+/// gives the game focus; Editing always has editor focus.
+pub fn focus_after_click(
+    state: SimulationState,
+    focus: InputFocus,
+    clicked_viewport: bool,
+) -> InputFocus {
+    match state {
+        SimulationState::Editing => InputFocus::Editor,
+        SimulationState::Playing if clicked_viewport => InputFocus::Game,
+        _ => focus,
+    }
+}
+
+/// Value of `GameInputGate`: game focus, Playing and nobody typing.
+fn game_input_gate(focus: InputFocus, state: SimulationState, typing: bool) -> bool {
+    focus == InputFocus::Game && state == SimulationState::Playing && !typing
+}
+
+fn input_focus(world: &World) -> InputFocus {
+    world
+        .get_resource::<InputFocus>()
+        .copied()
+        .unwrap_or_default()
 }
 
 /// Routes each dock tab to its panel.
@@ -2746,5 +2802,117 @@ mod tests {
         let e = world.spawn(Transform::default()).id();
         snap_previous_transform(&mut world, e);
         assert!(world.get::<melon_core::PreviousTransform>(e).is_none());
+    }
+
+    #[test]
+    fn escape_returns_focus_to_editor_while_playing() {
+        assert_eq!(
+            shortcut_for(egui::Key::Escape, false, false, false),
+            Some(Shortcut::ReleaseGame)
+        );
+        let mut world = World::new();
+        world.insert_resource(SimulationState::Playing);
+        world.insert_resource(InputFocus::Game);
+        let mut editor = Editor::new();
+        key_frame(&mut editor, &mut world, egui::Key::Escape, Vec::new());
+        assert_eq!(*world.resource::<InputFocus>(), InputFocus::Editor);
+        assert_eq!(sim_state(&world), SimulationState::Playing);
+    }
+
+    #[test]
+    fn click_on_viewport_while_playing_takes_game_focus() {
+        assert_eq!(
+            focus_after_click(SimulationState::Playing, InputFocus::Editor, true),
+            InputFocus::Game
+        );
+        assert_eq!(
+            focus_after_click(SimulationState::Playing, InputFocus::Editor, false),
+            InputFocus::Editor
+        );
+        assert_eq!(
+            focus_after_click(SimulationState::Editing, InputFocus::Editor, true),
+            InputFocus::Editor
+        );
+        assert_eq!(
+            focus_after_click(SimulationState::Paused, InputFocus::Editor, true),
+            InputFocus::Editor
+        );
+    }
+
+    /// One frame of shortcuts plus the Scene viewport (100 x 100 at the
+    /// origin, pointer inside) with `key` pressed and `extra` events.
+    fn key_frame(editor: &mut Editor, world: &mut World, key: egui::Key, extra: Vec<egui::Event>) {
+        editor.viewport_texture = Some(egui::TextureId::default());
+        let ctx = egui::Context::default();
+        let pos = egui::pos2(50.0, 50.0);
+        let mut events = vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        events.extend(extra);
+        // The first frame only moves the pointer in, so the viewport is hovered on the second.
+        for events in [vec![egui::Event::PointerMoved(pos)], events] {
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(100.0, 100.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                editor.handle_shortcuts(world, ui);
+                editor.viewport_panel(world, ui);
+            });
+        }
+    }
+
+    #[test]
+    fn game_focus_blocks_editor_camera_and_tool_keys() {
+        let wheel = || {
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 3.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        };
+        let mut world = World::new();
+        world.insert_resource(Camera::default());
+        world.insert_resource(SimulationState::Playing);
+
+        // Editor focus: W picks Move and the wheel zooms (the test can see both).
+        let mut editor = Editor::new();
+        editor.gizmo_mode = GizmoMode::Rotate;
+        let distance = editor.camera.distance;
+        key_frame(&mut editor, &mut world, egui::Key::W, wheel());
+        assert_eq!(editor.gizmo_mode, GizmoMode::Move);
+        assert_ne!(editor.camera.distance, distance);
+
+        world.insert_resource(InputFocus::Game);
+        let mut editor = Editor::new();
+        editor.gizmo_mode = GizmoMode::Rotate;
+        let before = editor.camera;
+        key_frame(&mut editor, &mut world, egui::Key::W, wheel());
+        assert_eq!(editor.gizmo_mode, GizmoMode::Rotate);
+        let after = editor.camera;
+        assert_eq!(
+            (before.pivot, before.distance, before.yaw, before.pitch),
+            (after.pivot, after.distance, after.yaw, after.pitch)
+        );
+    }
+
+    #[test]
+    fn gate_is_false_while_typing_or_editing() {
+        use InputFocus::{Editor as EditorFocus, Game};
+        use SimulationState::{Editing, Paused, Playing};
+        assert!(game_input_gate(Game, Playing, false));
+        assert!(!game_input_gate(Game, Playing, true), "typing");
+        assert!(!game_input_gate(Game, Editing, false));
+        assert!(!game_input_gate(Game, Paused, false));
+        assert!(!game_input_gate(EditorFocus, Playing, false));
     }
 }

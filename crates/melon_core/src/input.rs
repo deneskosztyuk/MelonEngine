@@ -19,6 +19,20 @@ pub struct Input {
     pub cursor: Option<Vec2>,
 }
 
+/// Who owns keyboard and mouse inside the editor. `Game` only while playing.
+#[derive(Resource, Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputFocus {
+    #[default]
+    Editor,
+    Game,
+}
+
+/// True when the game's `Input` should receive raw input this frame: focus is
+/// `Game`, the simulation is Playing and no text field has keyboard focus.
+/// The editor writes it every frame; the host reads it.
+#[derive(Resource, Default, Clone, Copy)]
+pub struct GameInputGate(pub bool);
+
 /// A physical key, named by its position on a US layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum KeyCode {

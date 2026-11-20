@@ -26,7 +26,7 @@ pub use components::{
 };
 pub use glam;
 pub use hierarchy::{ChildOf, Children, GlobalTransform};
-pub use input::{Input, InputButton, KeyCode, MouseButton};
+pub use input::{GameInputGate, Input, InputButton, InputFocus, KeyCode, MouseButton};
 pub use resources::{Camera, Light, NameCounter, SimulationState, Time};
 pub use stages::{FixedUpdate, PostUpdate, PreUpdate, Update};
 
@@ -86,6 +86,8 @@ impl Core {
         world.init_resource::<SimulationState>();
         world.insert_resource(AssetServer::new(".".into()));
         world.init_resource::<Input>();
+        world.init_resource::<InputFocus>();
+        world.init_resource::<GameInputGate>();
         world.init_resource::<InputMap>();
         world.init_resource::<Actions>();
 

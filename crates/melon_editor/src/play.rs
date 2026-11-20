@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use bevy_ecs::resource::Resource;
 use bevy_ecs::world::World;
-use melon_core::{SimulationState, Time};
+use melon_core::{InputFocus, SimulationState, Time};
 use melon_physics::PhysicsWorld;
 
 use crate::scene::{SceneData, apply_scene, scene_to_data};
@@ -31,7 +31,7 @@ fn rebuild(world: &mut World, data: &SceneData) -> Result<()> {
 
 /// From `Editing`: snapshot the scene, rebuild it from the snapshot so physics
 /// matches every edit-mode change, then start playing. From `Paused`: resume.
-/// On error nothing changes.
+/// Either way the game takes input focus. On error nothing changes.
 pub fn play(world: &mut World) -> Result<()> {
     match state(world) {
         SimulationState::Editing => {
@@ -46,26 +46,31 @@ pub fn play(world: &mut World) -> Result<()> {
         SimulationState::Paused => world.insert_resource(SimulationState::Playing),
         SimulationState::Playing => {}
     }
+    world.insert_resource(InputFocus::Game);
     Ok(())
 }
 
-/// Freeze a running game. Does nothing unless `Playing`.
+/// Freeze a running game (does nothing unless `Playing`); the editor takes input focus.
 pub fn pause(world: &mut World) {
+    world.insert_resource(InputFocus::Editor);
     if state(world) == SimulationState::Playing {
         world.insert_resource(SimulationState::Paused);
     }
 }
 
-/// Advance one fixed step while `Paused`. Does nothing in other states.
+/// Advance one fixed step while `Paused` (does nothing in other states); the
+/// editor takes input focus.
 pub fn step(world: &mut World) {
+    world.insert_resource(InputFocus::Editor);
     if state(world) == SimulationState::Paused {
         world.insert_resource(melon_core::StepOnce);
     }
 }
 
 /// Restore the scene from the Play snapshot and return to `Editing`, with play
-/// time reset. Does nothing without a snapshot.
+/// time reset. Does nothing without a snapshot. The editor takes input focus.
 pub fn stop(world: &mut World) -> Result<()> {
+    world.insert_resource(InputFocus::Editor);
     let Some(PlaySnapshot(snapshot)) = world.remove_resource::<PlaySnapshot>() else {
         return Ok(());
     };
@@ -298,5 +303,25 @@ mod tests {
         assert!((box_transform(&mut world).translation.y - 3.0).abs() < 1e-6);
         stop(&mut world).unwrap();
         assert_eq!(state(&world), SimulationState::Editing);
+    }
+
+    #[test]
+    fn play_gives_game_focus_stop_and_pause_give_editor() {
+        use melon_core::InputFocus;
+        let focus = |world: &World| *world.resource::<InputFocus>();
+        let mut world = edit_world();
+        play(&mut world).unwrap();
+        assert_eq!(focus(&world), InputFocus::Game);
+        pause(&mut world);
+        assert_eq!(focus(&world), InputFocus::Editor);
+        play(&mut world).unwrap();
+        assert_eq!(focus(&world), InputFocus::Game, "resume");
+        pause(&mut world);
+        world.insert_resource(InputFocus::Game);
+        step(&mut world);
+        assert_eq!(focus(&world), InputFocus::Editor);
+        play(&mut world).unwrap();
+        stop(&mut world).unwrap();
+        assert_eq!(focus(&world), InputFocus::Editor);
     }
 }
