@@ -1474,9 +1474,13 @@ impl Renderer {
                 }],
             },
             primitive: wgpu::PrimitiveState {
-                // Back faces (from the sun) store depth, so lit front faces
-                // sit in front of their own stored depth: less acne.
-                cull_mode: Some(wgpu::Face::Front),
+                // No culling: the nearest surface (a closed mesh's front
+                // faces) stores depth, and single-sided quads cast from both
+                // sides. Culling front faces stores a resting object's
+                // underside, level with the floor, and light leaks along its
+                // base. Acne on lit faces is handled by the small bias plus
+                // the receiver's normal offset in mesh.wgsl.
+                cull_mode: None,
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -1485,8 +1489,8 @@ impl Renderer {
                 depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState {
-                    constant: 2,
-                    slope_scale: 2.0,
+                    constant: 1,
+                    slope_scale: 1.5,
                     clamp: 0.0,
                 },
             }),
@@ -4372,6 +4376,92 @@ mod tests {
                 } else {
                     Err(format!(
                         "occluder_casts_shadow: SHADOW_PX={shadow} (want < 170), LIT_PX={lit} (want > 200)"
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
+                // A 1 m cube resting on the floor, sun from +X: its shadow
+                // covers the floor from x = -0.5 to -1.5. Seen from above
+                // with a narrow lens (about 8 mm per pixel) so the floor
+                // right at the base on the shadow side resolves.
+                use glam::{Mat4, Quat, Vec3};
+                let mut server = melon_core::AssetServer::new(".".into());
+                let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+                let floor = Mat4::from_scale_rotation_translation(
+                    Vec3::new(8.0, 0.2, 8.0),
+                    Quat::IDENTITY,
+                    Vec3::new(0.0, -0.1, 0.0),
+                );
+                let camera = melon_core::Camera {
+                    eye: Vec3::new(-0.6, 6.0, 0.0),
+                    center: Vec3::new(-0.6, 0.0, 0.0),
+                    up: Vec3::NEG_Z,
+                    fov_y_radians: 5f32.to_radians(),
+                    aspect: 1.0,
+                    ..Default::default()
+                };
+                let pixels = render_frame(
+                    renderer,
+                    camera,
+                    test_light(),
+                    plain_environment(),
+                    vec![(floor, cube), (Mat4::from_translation(Vec3::Y * 0.5), cube)],
+                    &mut server,
+                );
+                let at = |x: f32| {
+                    let px = screen_px(camera.view_proj(), Vec3::new(x, 0.0, 0.0));
+                    (px, value_at(&pixels, px))
+                };
+                // About 2 px from the base, and 30 px into the shadow.
+                let ((edge_px, edge), (inside_px, inside)) = (at(-0.515), at(-0.75));
+                if edge.abs_diff(inside) <= 4 && inside < 170 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "no_light_leak_at_contact: floor at the base {edge_px:?}={edge}, inside the shadow {inside_px:?}={inside} (want within 4, inside < 170)"
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
+                // The open floor around LIT_PX, far from the occluder's
+                // shadow, must match the same floor with no shadow map at all
+                // (shadow box moved away): no acne, at 45 and 15 degrees.
+                let mut worst = Vec::new();
+                for elevation in [45f32, 15.0] {
+                    let e = elevation.to_radians();
+                    let light = melon_core::Light {
+                        direction: -glam::Vec3::new(e.cos(), e.sin(), 0.0),
+                        ..test_light()
+                    };
+                    let shadowed =
+                        render_test_scene(renderer, &light, false, glam::Vec3::ZERO, 20.0);
+                    let unshadowed = render_test_scene(
+                        renderer,
+                        &light,
+                        false,
+                        glam::Vec3::new(100.0, 0.0, 0.0),
+                        1.0,
+                    );
+                    let region = (LIT_PX.0 - 4..=LIT_PX.0 + 4)
+                        .flat_map(|x| (LIT_PX.1 - 4..=LIT_PX.1 + 4).map(move |y| (x, y)));
+                    let diff = region
+                        .clone()
+                        .map(|px| value_at(&shadowed, px).abs_diff(value_at(&unshadowed, px)))
+                        .max()
+                        .unwrap_or(0);
+                    let values: Vec<u8> = region.map(|px| value_at(&shadowed, px)).collect();
+                    let (min, max) = (values.iter().min(), values.iter().max());
+                    worst.push((elevation, diff, min.copied(), max.copied()));
+                }
+                let lit_45 = worst[0].2.unwrap_or(0);
+                if worst.iter().all(|&(_, diff, min, max)| {
+                    diff <= 1 && max.unwrap_or(0) - min.unwrap_or(0) <= 2
+                }) && lit_45 > 200
+                {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "lit_floor_has_no_acne: (elevation, max diff vs no shadow map, min, max) {worst:?} (want diff <= 1, spread <= 2, min at 45 deg > 200)"
                     ))
                 }
             }),

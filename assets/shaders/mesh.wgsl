@@ -106,8 +106,17 @@ fn vs_main(in: VsIn, @builtin(instance_index) instance: u32) -> VsOut {
 }
 
 // 1.0 = fully lit, 0.0 = fully shadowed. 3x3 PCF over the sun's shadow map.
-fn shadow_factor(world_pos: vec3f) -> f32 {
-    let ls = light.light_view_proj * vec4f(world_pos, 1.0);
+// `normal` is the geometric world normal: the lookup moves along it by about
+// 1.5 shadow texels, more as the sun grazes the surface (normal-offset
+// sampling), so lit faces do not shadow themselves.
+fn shadow_factor(world_pos: vec3f, normal: vec3f) -> f32 {
+    let m = light.light_view_proj;
+    // The ortho box maps 2 * radius world units onto the map's width.
+    let texel_world = 2.0 / (length(vec3f(m[0].x, m[1].x, m[2].x))
+        * f32(textureDimensions(shadow_map).x));
+    let ndl = clamp(dot(normal, light.direction), 0.0, 1.0);
+    let offset = normal * (1.5 * texel_world * sqrt(1.0 - ndl * ndl));
+    let ls = m * vec4f(world_pos + offset, 1.0);
     let ndc = ls.xyz / ls.w;
     // Clip space y points up, texture v points down.
     let uv = ndc.xy * vec2f(0.5, -0.5) + 0.5;
@@ -207,7 +216,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let specular = distribution_ggx(ndh, alpha) * visibility_smith_ggx(ndv, ndl, alpha) * f;
     let diffuse = (1.0 - f) * (1.0 - metallic) * base / PI;
     let sun = (diffuse + specular) * PI * (1.0 - light.ambient) * light.color * ndl
-        * shadow_factor(in.world_pos);
+        * shadow_factor(in.world_pos, normalize(in.world_normal));
 
     // Ambient. Diffuse: the sky/ground hemisphere. Specular: the sky in the
     // mirror direction, fading toward the hemisphere around the normal as
