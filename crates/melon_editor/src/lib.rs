@@ -1975,8 +1975,6 @@ impl EditorOverlay {
         }
     }
 
-    /// Show `target`'s colour texture in the viewport panel. Call again after
-    /// the target is recreated (resize).
     /// Give egui a thumbnail view: updates `existing`, or registers a new
     /// texture. Returns its id.
     pub fn register_thumbnail(
@@ -2001,6 +1999,8 @@ impl EditorOverlay {
         }
     }
 
+    /// Show `target`'s colour texture in the viewport panel. Call again after
+    /// the target is recreated (resize).
     pub fn set_viewport_target(
         &mut self,
         device: &wgpu::Device,

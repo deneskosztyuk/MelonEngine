@@ -65,6 +65,16 @@ impl ModelCache {
         }
     }
 
+    /// `handle` has a loaded model in the cache.
+    pub fn contains(&self, handle: Handle<Model>) -> bool {
+        self.models.contains_key(&handle.id())
+    }
+
+    /// Drop `handle`'s GPU model (it loads again on its next use).
+    pub fn evict(&mut self, handle: Handle<Model>) {
+        self.models.remove(&handle.id());
+    }
+
     /// `prepare` then `model`.
     pub fn get(
         &mut self,

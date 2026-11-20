@@ -514,6 +514,11 @@ impl Renderer {
         server.bounds(handle)
     }
 
+    /// `handle`'s model is loaded in the GPU cache.
+    pub fn model_cached(&self, handle: melon_core::Handle<melon_core::Model>) -> bool {
+        self.model_cache.contains(handle)
+    }
+
     /// Render a thumbnail of one model and return a view egui can sample
     /// (non-sRGB, like `ViewportTarget::ui_view`). `None` if it fails to load.
     /// Records and submits its own command buffer: call it after the frame's
@@ -543,7 +548,16 @@ impl Renderer {
             (target.size().width, target.size().height),
             (THUMBNAIL_SIZE, THUMBNAIL_SIZE)
         );
-        let (min, max) = self.model_bounds(server, handle)?;
+        // A model only the thumbnail needed is freed after the render (a
+        // folder of models would otherwise stay in VRAM); one the scene
+        // already drew stays.
+        let was_cached = self.model_cache.contains(handle);
+        let Some((min, max)) = self.model_bounds(server, handle) else {
+            if !was_cached {
+                self.model_cache.evict(handle);
+            }
+            return None;
+        };
         let (view_proj, eye) = thumbnail_camera(min, max);
         let frame = FrameData {
             view_proj,
@@ -577,6 +591,9 @@ impl Renderer {
             source.size(),
         );
         self.queue().submit([encoder.finish()]);
+        if !was_cached {
+            self.model_cache.evict(handle);
+        }
         Some(texture)
     }
 
@@ -2735,6 +2752,37 @@ mod tests {
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
+            Box::new(|renderer| {
+                let root = temp_project("thumb_evict");
+                std::fs::write(root.join("assets/models/m.gltf"), TWO_NODE_GLTF).unwrap();
+                std::fs::write(root.join("assets/models/n.gltf"), TWO_NODE_GLTF).unwrap();
+                let mut server = fresh_ids_server(root.clone(), 4000);
+                let only_thumb: melon_core::Handle<melon_core::Model> =
+                    server.load("assets/models/m.gltf");
+                let in_scene: melon_core::Handle<melon_core::Model> =
+                    server.load("assets/models/n.gltf");
+                let target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(
+                    THUMBNAIL_SIZE,
+                    THUMBNAIL_SIZE,
+                ));
+                // The scene already draws `in_scene`: its model is cached.
+                renderer.model_bounds(&mut server, in_scene);
+                let a = renderer.render_thumbnail(&mut server, only_thumb, &target);
+                let b = renderer.render_thumbnail(&mut server, in_scene, &target);
+                let _ = std::fs::remove_dir_all(&root);
+                if a.is_none() || b.is_none() {
+                    return Err("thumbnail_frees_models_only_it_loaded: no thumbnail".into());
+                }
+                match (
+                    renderer.model_cached(only_thumb),
+                    renderer.model_cached(in_scene),
+                ) {
+                    (false, true) => Ok(()),
+                    other => Err(format!(
+                        "thumbnail_frees_models_only_it_loaded: cached (thumb-only, in-scene) = {other:?}"
+                    )),
+                }
+            }),
             Box::new(|renderer| {
                 let root = temp_project("thumb");
                 std::fs::write(root.join("assets/models/m.gltf"), TWO_NODE_GLTF).unwrap();
