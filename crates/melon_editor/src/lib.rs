@@ -18,6 +18,7 @@ use winit::event::WindowEvent;
 use winit::window::Window;
 
 pub mod asset_db;
+pub mod asset_ops;
 pub mod console;
 pub mod content;
 mod content_view;

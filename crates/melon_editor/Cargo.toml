@@ -16,6 +16,7 @@ egui_dock.workspace = true
 winit.workspace = true
 wgpu.workspace = true
 tracing.workspace = true
+trash.workspace = true
 tracing-subscriber.workspace = true
 glam.workspace = true
 bevy_ecs.workspace = true
