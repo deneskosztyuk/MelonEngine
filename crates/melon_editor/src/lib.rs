@@ -19,6 +19,7 @@ use winit::window::Window;
 
 pub mod asset_db;
 pub mod asset_ops;
+pub mod asset_watch;
 pub mod console;
 pub mod content;
 mod content_view;
@@ -116,6 +117,9 @@ pub struct Editor {
     confirm_open: Option<std::path::PathBuf>,
     /// The Content Browser tab was drawn last frame (it takes OS file drops).
     content_shown: bool,
+    /// Follows changes under `assets/` made outside the editor; `None` if
+    /// it could not start (Refresh still works).
+    watcher: Option<asset_watch::AssetWatcher>,
     status_message: Option<(String, StatusKind, std::time::Instant)>,
     /// egui texture showing the scene (set by `EditorOverlay`).
     viewport_texture: Option<egui::TextureId>,
@@ -169,6 +173,7 @@ impl Default for Editor {
             delete_confirm: None,
             confirm_open: None,
             content_shown: false,
+            watcher: None,
             status_message: None,
             viewport_texture: None,
             viewport_size: winit::dpi::PhysicalSize::new(1, 1),
@@ -207,6 +212,13 @@ impl Editor {
     pub fn set_project_root(&mut self, root: &std::path::Path) {
         self.content = content::ContentBrowser::new(root.join("assets"));
         self.content_settings_file = root.join(content::settings_path());
+        self.watcher = match asset_watch::AssetWatcher::start(&root.join("assets")) {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                tracing::warn!("assets/ is not watched (use Refresh): {error}");
+                None
+            }
+        };
         self.content.load_settings(&self.content_settings_file);
         self.layout_file = root.join(layout::layout_path());
         self.project_root = root.to_path_buf();
@@ -607,6 +619,27 @@ impl Editor {
         }
     }
 
+    /// Once outside changes under `assets/` settle: reconcile `.meta` files
+    /// and refresh the browser.
+    fn follow_asset_changes(&mut self, world: &mut World, ui: &egui::Ui) {
+        let Some(watcher) = &mut self.watcher else {
+            return;
+        };
+        let settled = watcher.poll(std::time::Instant::now());
+        if watcher.pending() {
+            // Settle even if the user does not move the mouse.
+            ui.ctx().request_repaint_after(asset_watch::QUIET);
+        }
+        if !settled {
+            return;
+        }
+        if !world.contains_resource::<AssetServer>() {
+            world.insert_resource(AssetServer::new(self.project_root.clone()));
+        }
+        asset_db::reconcile(&mut world.resource_mut::<AssetServer>());
+        self.content.refresh();
+    }
+
     /// Run the file operations the Content Browser asked for this frame.
     pub fn apply_content_requests(&mut self, world: &mut World) {
         for request in self.content.take_requests() {
@@ -961,6 +994,7 @@ impl Editor {
             .show(ui, |ui| self.status_bar(world, ui));
         self.about_window(ui);
         self.project_settings_window(world, ui);
+        self.follow_asset_changes(world, ui);
         self.delete_dialog(world, ui);
         self.open_scene_dialog(world, ui);
         self.take_dropped_files(ui);
@@ -3681,6 +3715,43 @@ mod tests {
         editor_key(&mut editor, &mut world, egui::Key::Enter);
         assert!(editor.confirm_open.is_none());
         assert!(editor.content.take_requests().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn editor_follows_outside_move_with_meta() {
+        let (mut editor, mut world, root) = browser_project("outside_move");
+        let x = root.join("assets/models/x.glb");
+        let guid = world
+            .resource::<AssetServer>()
+            .guid_of("assets/models/x.glb")
+            .unwrap();
+        let h: Handle<Model> = world
+            .resource_mut::<AssetServer>()
+            .load("assets/models/x.glb");
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            editor.build_ui(&mut world, ui)
+        });
+        let y = root.join("assets/y.glb");
+        std::fs::rename(&x, &y).unwrap();
+        std::fs::rename(melon_core::meta_path(&x), melon_core::meta_path(&y)).unwrap();
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while world.resource::<AssetServer>().path(h) != "assets/y.glb" {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "move not followed within 5 s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                editor.build_ui(&mut world, ui)
+            });
+        }
+        assert_eq!(
+            world.resource::<AssetServer>().guid_of("assets/y.glb"),
+            Some(guid)
+        );
+        assert!(melon_core::meta_path(&y).exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -83,7 +83,9 @@ pub fn reconcile(server: &mut AssetServer) {
     for (guid, old) in before {
         if let Some(new) = server.path_of_guid(guid).map(str::to_string)
             && new != old
-            && !root.join(&old).exists()
+            // A case-only rename: the old spelling still "exists" on a
+            // case-insensitive file system.
+            && (!root.join(&old).exists() || old.eq_ignore_ascii_case(&new))
         {
             server.rename_path(&old, &new);
         }
@@ -264,6 +266,24 @@ mod tests {
             notes.exists(),
             "a .meta that is not ours must not be deleted"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reconcile_follows_case_only_rename() {
+        let root = temp_root("case_only");
+        let a = write(&root, "assets/models/a.glb");
+        let g = AssetGuid::new();
+        write_meta_for(&a, g);
+        let mut server = AssetServer::new(root.clone());
+        reconcile(&mut server);
+        let h: Handle<Model> = server.load("assets/models/a.glb");
+        let upper = root.join("assets/models/A.glb");
+        std::fs::rename(&a, &upper).unwrap();
+        std::fs::rename(meta_path(&a), meta_path(&upper)).unwrap();
+        reconcile(&mut server);
+        assert_eq!(server.path(h), "assets/models/A.glb");
+        assert_eq!(server.path_of_guid(g), Some("assets/models/A.glb"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

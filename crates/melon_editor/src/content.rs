@@ -572,6 +572,9 @@ impl ContentBrowser {
     /// below it whose name contains the search (case-insensitive). Clears
     /// the tree cache.
     pub fn refresh(&mut self) {
+        if self.selected.as_ref().is_some_and(|p| !p.exists()) {
+            self.selected = None;
+        }
         // The folder may have been deleted or renamed outside the editor.
         while !self.current.is_dir() && self.current != self.root {
             match self.current.parent() {
@@ -1036,6 +1039,18 @@ mod tests {
         assert_eq!(browser.current(), dir.join("a"));
         browser.go_back();
         assert_eq!(browser.current(), dir, "Back leaves the folder we are in");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_drops_a_vanished_selection() {
+        let dir = temp_dir("vanished");
+        touch(&dir, "x.glb");
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.select(Some(dir.join("x.glb")));
+        std::fs::remove_file(dir.join("x.glb")).unwrap();
+        browser.refresh();
+        assert_eq!(browser.selected(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
