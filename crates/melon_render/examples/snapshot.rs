@@ -1,14 +1,18 @@
 // Renders the fixed review scene offscreen and saves it as a PNG.
 // Run: cargo run -p melon_render --example snapshot -- <out.png> [view] [flag]
 // Views: overview (default), low, sun, materials, corner, crowd (overview
-// plus about 10,000 grey cubes and spheres). Prints the mean frame time and
-// the `RenderStats`.
+// plus about 10,000 grey cubes and spheres), cornell (the review scene plus
+// a red/green open-front room at (-13, 0, -13), seen through its opening).
+// Prints the mean frame time and the `RenderStats`. The timed frames run
+// before the capture, so the GI probes have converged.
 // Debug flags (any order): --ao-only saves the SSAO term (grey, white =
 // open) instead of the image; --no-ao renders with `ao_strength` 0;
 // --no-shadow moves the scene and camera far outside the fixed shadow box, so
 // nothing casts or receives sun shadows (the image is otherwise unchanged);
 // --no-bloom renders with `bloom_intensity` 0; --bloom-only renders with
-// `bloom_intensity` 1, so the tonemapped image is the bloom alone.
+// `bloom_intensity` 1, so the tonemapped image is the bloom alone;
+// --no-gi renders with `gi_intensity` 0; --gi-only saves the indirect
+// diffuse term alone (bloom off).
 
 use std::sync::Arc;
 
@@ -116,6 +120,41 @@ fn crowd(server: &mut AssetServer) -> Vec<(Mat4, Handle<Model>)> {
         .collect()
 }
 
+/// The GI review room: grey floor, back wall and ceiling, red left wall,
+/// green right wall (seen from the front), open toward -z where the sun
+/// comes in. Interior 5 x 4 x 5 m centred on (-13, 0, -13), walls 0.4 m:
+/// inside the GI volume and the sun's shadow box, just off the review floor.
+fn cornell(server: &mut AssetServer) -> Vec<(Mat4, Handle<Model>)> {
+    let grey: Handle<Model> = server.load("assets/models/review/grey_cube.glb");
+    let red: Handle<Model> = server.load("assets/models/review/red_panel.glb");
+    let green: Handle<Model> = server.load("assets/models/review/green_panel.glb");
+    let slab = |size: Vec3, center: Vec3| {
+        Mat4::from_scale_rotation_translation(size, Quat::IDENTITY, center)
+    };
+    vec![
+        (
+            slab(Vec3::new(5.8, 0.1, 7.0), Vec3::new(-13.0, -0.05, -14.0)),
+            grey,
+        ),
+        (
+            slab(Vec3::new(0.4, 4.4, 5.4), Vec3::new(-10.3, 2.2, -12.8)),
+            red,
+        ),
+        (
+            slab(Vec3::new(0.4, 4.4, 5.4), Vec3::new(-15.7, 2.2, -12.8)),
+            green,
+        ),
+        (
+            slab(Vec3::new(5.8, 4.4, 0.4), Vec3::new(-13.0, 2.2, -10.3)),
+            grey,
+        ),
+        (
+            slab(Vec3::new(5.8, 0.4, 5.4), Vec3::new(-13.0, 4.2, -12.8)),
+            grey,
+        ),
+    ]
+}
+
 /// Named camera presets.
 fn camera(view: &str) -> Result<Camera> {
     let (eye, center) = match view {
@@ -139,8 +178,12 @@ fn camera(view: &str) -> Result<Camera> {
         "materials" => (Vec3::new(0.0, 2.4, 0.0), Vec3::new(1.0, 0.9, 6.5)),
         // Close over the cubes at the origin toward the two-wall corner.
         "corner" => (Vec3::new(-2.5, 3.0, 4.0), Vec3::new(3.0, 0.2, -3.0)),
+        // In front of the GI room's opening, looking in.
+        "cornell" => (Vec3::new(-13.0, 2.0, -21.5), Vec3::new(-13.0, 1.9, -12.0)),
         _ => {
-            bail!("unknown view {view:?}; expected overview, low, sun, materials, corner or crowd")
+            bail!(
+                "unknown view {view:?}; expected overview, low, sun, materials, corner, crowd or cornell"
+            )
         }
     };
     Ok(Camera {
@@ -188,12 +231,14 @@ const NO_SHADOW_OFFSET: Vec3 = Vec3::new(200.0, 0.0, 0.0);
 
 fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Result<()> {
     for flag in flags {
-        const FLAGS: [&str; 5] = [
+        const FLAGS: [&str; 7] = [
             "--ao-only",
             "--no-ao",
             "--no-shadow",
             "--no-bloom",
             "--bloom-only",
+            "--no-gi",
+            "--gi-only",
         ];
         if !FLAGS.contains(&flag.as_str()) {
             bail!("unknown flag {flag:?}; expected one of {FLAGS:?}");
@@ -201,6 +246,7 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
     }
     let has = |f: &str| flags.iter().any(|x| x == f);
     let ao_only = has("--ao-only");
+    let gi_only = has("--gi-only");
     let offset = if has("--no-shadow") {
         NO_SHADOW_OFFSET
     } else {
@@ -210,6 +256,7 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
     camera.eye += offset;
     camera.center += offset;
     let mut renderer = pollster::block_on(Renderer::new(window))?;
+    renderer.set_gi_only(gi_only);
     let target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(WIDTH, HEIGHT));
     let mut server = AssetServer::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..").into());
     let mut frame = FrameData {
@@ -218,19 +265,23 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
         light: Light::default(),
         environment: Environment {
             ao_strength: if has("--no-ao") { 0.0 } else { 1.0 },
-            bloom_intensity: if has("--no-bloom") {
+            bloom_intensity: if has("--no-bloom") || gi_only {
                 0.0
             } else if has("--bloom-only") {
                 1.0
             } else {
                 Environment::default().bloom_intensity
             },
+            gi_intensity: if has("--no-gi") { 0.0 } else { 1.0 },
             ..Default::default()
         },
         models: review_scene(&mut server),
     };
     if view == "crowd" {
         frame.models.extend(crowd(&mut server));
+    }
+    if view == "cornell" {
+        frame.models.extend(cornell(&mut server));
     }
     for (matrix, _) in &mut frame.models {
         *matrix = Mat4::from_translation(offset) * *matrix;
@@ -339,7 +390,7 @@ impl ApplicationHandler for App {
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let out = args.next().context(
-        "usage: snapshot <out.png> [overview|low|sun|materials|corner|crowd] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only]",
+        "usage: snapshot <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--no-gi] [--gi-only]",
     )?;
     let view = args.next().unwrap_or_else(|| "overview".into());
     let flags = args.collect();
@@ -377,7 +428,15 @@ mod tests {
     #[test]
     fn unknown_view_is_an_error() {
         assert!(camera("sideways").is_err());
-        for view in ["overview", "low", "sun", "materials", "corner", "crowd"] {
+        for view in [
+            "overview",
+            "low",
+            "sun",
+            "materials",
+            "corner",
+            "crowd",
+            "cornell",
+        ] {
             assert!(camera(view).is_ok(), "{view}");
         }
     }
