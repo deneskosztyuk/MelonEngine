@@ -214,12 +214,16 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   returns `RenderStats` (draws, instances, culled).
 - **Deleting entities.** Call `melon_core::hierarchy::mark_for_delete` (marks
   the subtree `PendingDelete`); `cleanup_deleted_system` removes the rapier
-  bodies and despawns. Do not despawn physics entities directly.
+  bodies and despawns. Do not despawn physics entities directly. Editor
+  code calls `History::delete` instead (it marks the subtree and records the
+  undo step); `mark_for_delete` stays for game and engine code.
 - **Hierarchy.** Parents use bevy's `ChildOf` / `Children`. `Transform` is
   local to the parent; for world poses use `melon_core::hierarchy`
   (`world_matrix`, `set_world_transform`, `set_parent_keep_world`,
   `render_matrices`) or `GlobalTransform` (written in `PostUpdate` and before
   physics sync). Fixed bodies follow their parent; dynamic bodies don't.
+  Root order is `melon_core::hierarchy::RootOrder` (the Hierarchy lists
+  roots through `root_order`; `move_root` reorders).
 - **Assets.** Reference files through `AssetServer::load::<Model>(path)` →
   `Handle<Model>`; paths are project-relative with forward slashes
   (`assets/models/x.glb`), plus `builtin:cube`; `x.glb#mesh2` draws one glTF
@@ -279,7 +283,9 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
 - **Scene format.** RON, `SCENE_VERSION = 5` in `melon_editor/src/scene.rs`:
   each entity has `name`, `parent` (index into `entities`), `model` (path,
   `#mesh<N>` included), `model_guid` (wins when it resolves, so a scene
-  written by hand may give only `model`) and `components`, a map from type
+  written by hand may give only `model`), optional `uid`
+  (the entity's `EditorId`: assigned when missing, regenerated on load if two
+  entities share one; the version stays 5) and `components`, a map from type
   path to the component's RON written through the registry (`Transform` is
   local to the parent). Adding a saved component = `#[derive(Component,
   Reflect)]` + `register_component`; no `SceneEntity` edit. Unknown or

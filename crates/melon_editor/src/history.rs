@@ -302,6 +302,36 @@ impl History {
         self.base = None;
     }
 
+    /// Record the pending edit of the tracked entity (a gesture still going,
+    /// e.g. text typed in an Inspector field) as its own step. Call before
+    /// anything that would change or replace that entity.
+    fn flush(&mut self, world: &mut World) {
+        if !editing(world) {
+            return;
+        }
+        let Some(base) = self.base.take() else { return };
+        let hint = self.hint.take();
+        let Some(now) = capture(world, base.entity) else {
+            return;
+        };
+        if base.snap.same_content(&now) {
+            self.base = Some(base);
+            return;
+        }
+        let label = hint.unwrap_or_else(|| label_for(&base.snap, &now));
+        let id = base.snap.id;
+        self.push(Step {
+            label,
+            changes: vec![Change {
+                id,
+                before: Some(base.snap),
+                after: Some(now),
+            }],
+            sel_before: Some(id),
+            sel_after: Some(id),
+        });
+    }
+
     /// Snapshots to hand to `commit`: take them before the edit.
     pub fn begin(&self, world: &mut World, entities: &[Entity]) -> Vec<Snap> {
         snaps(world, entities)
@@ -356,6 +386,7 @@ impl History {
     /// entity to select), `None` when there was nothing to undo or the world
     /// is not `Editing`.
     pub fn undo(&mut self, world: &mut World) -> Option<Option<Entity>> {
+        self.flush(world);
         if !editing(world) || self.cursor == 0 {
             return None;
         }
@@ -376,6 +407,7 @@ impl History {
 
     /// Redo the step after the cursor; see `undo`.
     pub fn redo(&mut self, world: &mut World) -> Option<Option<Entity>> {
+        self.flush(world);
         if !editing(world) || self.cursor >= self.steps.len() {
             return None;
         }
@@ -479,12 +511,14 @@ impl History {
         label: String,
         sel_before: Option<Entity>,
     ) {
+        self.flush(world);
         let created = subtree(world, root);
         self.commit(world, Vec::new(), &created, label, sel_before, Some(root));
     }
 
     /// Delete `entity` with its children, recorded as one step.
     pub fn delete(&mut self, world: &mut World, entity: Entity, selected: Option<Entity>) {
+        self.flush(world);
         let label = format!("Delete {}", name_of(world, entity));
         let before = self.begin(world, &subtree(world, entity));
         mark_for_delete(world, entity);
@@ -503,6 +537,7 @@ impl History {
         if new_name.is_empty() {
             return Err("A name can't be empty".to_string());
         }
+        self.flush(world);
         let before = self.begin(world, &[entity]);
         let Some(mut name) = world.get_mut::<Name>(entity) else {
             return Ok(());
@@ -524,6 +559,7 @@ impl History {
         target: Option<Entity>,
         selected: Option<Entity>,
     ) -> Result<(), String> {
+        self.flush(world);
         let label = format!("Reparent {}", name_of(world, dragged));
         let before = self.begin(world, &[dragged]);
         crate::hierarchy_drop(world, dragged, target)?;
@@ -539,6 +575,7 @@ impl History {
         entity: Entity,
         selected: Option<Entity>,
     ) -> Option<Entity> {
+        self.flush(world);
         if !editing(world) {
             return None;
         }
@@ -599,7 +636,19 @@ fn free_name(world: &mut World, entity: Entity, original: &str) -> String {
         .and_then(|s| s.rsplit_once(" ("))
         .filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
         .map_or(original, |(stem, _)| stem);
-    let siblings: Vec<Entity> = match world.get::<ChildOf>(entity).map(ChildOf::parent) {
+    let parent = world.get::<ChildOf>(entity).map(ChildOf::parent);
+    unused_name(world, parent, stem, false)
+}
+
+/// A name for a new child of `parent` (a root for `None`): `stem` itself if
+/// `bare_ok` and free, else `stem (N)` with the first N not used by a sibling.
+pub(crate) fn unused_name(
+    world: &mut World,
+    parent: Option<Entity>,
+    stem: &str,
+    bare_ok: bool,
+) -> String {
+    let siblings: Vec<Entity> = match parent {
         Some(p) => world
             .get::<Children>(p)
             .map(|c| c.iter().copied().collect())
@@ -610,6 +659,9 @@ fn free_name(world: &mut World, entity: Entity, original: &str) -> String {
             .collect(),
     };
     let taken: Vec<String> = siblings.iter().map(|&e| name_of(world, e)).collect();
+    if bare_ok && !taken.iter().any(|t| t == stem) {
+        return stem.to_string();
+    }
     (1..)
         .map(|n| format!("{stem} ({n})"))
         .find(|candidate| !taken.contains(candidate))
@@ -1327,5 +1379,50 @@ mod tests {
         }
         let per = start.elapsed().as_secs_f64() * 1e6 / n as f64;
         println!("track: {per:.1} us per frame");
+    }
+
+    #[test]
+    fn unused_name_starts_with_the_bare_name_then_numbers() {
+        let mut world = world();
+        assert_eq!(unused_name(&mut world, None, "Cube", true), "Cube");
+        spawn(&mut world, "Cube", 0.0);
+        assert_eq!(unused_name(&mut world, None, "Cube", true), "Cube (1)");
+        spawn(&mut world, "Cube (1)", 0.0);
+        assert_eq!(unused_name(&mut world, None, "Cube", true), "Cube (2)");
+        let p = spawn(&mut world, "P", 0.0);
+        assert_eq!(unused_name(&mut world, Some(p), "Cube", true), "Cube");
+        assert_eq!(unused_name(&mut world, Some(p), "Cube", false), "Cube (1)");
+    }
+
+    #[test]
+    fn undo_keeps_a_pending_edit_as_its_own_step() {
+        let mut world = world();
+        let mut h = History::default();
+        let a = spawn(&mut world, "A", 1.0);
+        h.track(&mut world, Some(a), false, None);
+        world.get_mut::<Transform>(a).unwrap().translation.x = 5.0;
+        h.track(&mut world, Some(a), true, None); // still typing
+        h.undo(&mut world).unwrap();
+        assert_eq!(x_of(&world, a), 1.0, "the pending edit was undone");
+        assert!(h.can_redo(), "and is not lost");
+        h.redo(&mut world).unwrap();
+        assert_eq!(x_of(&world, a), 5.0);
+    }
+
+    #[test]
+    fn explicit_operations_keep_a_pending_edit_first() {
+        let mut world = world();
+        let mut h = History::default();
+        let a = spawn(&mut world, "A", 1.0);
+        h.track(&mut world, Some(a), false, None);
+        world.get_mut::<Transform>(a).unwrap().translation.x = 5.0;
+        h.track(&mut world, Some(a), true, None);
+        h.rename(&mut world, a, "B", Some(a)).unwrap();
+        assert_eq!(
+            h.labels().collect::<Vec<_>>(),
+            ["Edit Transform", "Rename A"]
+        );
+        h.undo(&mut world).unwrap();
+        assert_eq!((x_of(&world, a), name_of(&world, a)), (5.0, "A".into()));
     }
 }

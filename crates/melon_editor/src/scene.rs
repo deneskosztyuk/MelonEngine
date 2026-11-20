@@ -368,6 +368,21 @@ pub fn apply_scene(world: &mut World, physics: &mut PhysicsWorld, data: &SceneDa
             world.entity_mut(id).insert(ChildOf(ids[p as usize]));
         }
     }
+    // A hand-copied block can repeat a uid; steps would find the wrong entity.
+    let mut seen = HashSet::new();
+    let mut regenerated = 0;
+    for &id in &ids {
+        if let Some(uid) = world.get::<crate::history::EditorId>(id).map(|i| i.0)
+            && !seen.insert(uid)
+        {
+            let fresh = uuid::Uuid::new_v4();
+            world.entity_mut(id).insert(crate::history::EditorId(fresh));
+            regenerated += 1;
+        }
+    }
+    if regenerated > 0 {
+        tracing::warn!("{regenerated} entities shared an id with another; gave them new ones");
+    }
     let roots: Vec<Entity> = data
         .entities
         .iter()
@@ -1661,5 +1676,22 @@ mod tests {
         let data = scene_to_data(&mut melon_core::Core::new().world).unwrap();
         let mut bare = World::new();
         assert!(apply_scene(&mut bare, &mut PhysicsWorld::new(), &data).is_err());
+    }
+
+    #[test]
+    fn duplicate_uids_in_a_file_are_regenerated() {
+        let mut world = reg_world();
+        world.spawn((Name("A".into()), Transform::default()));
+        world.spawn((Name("B".into()), Transform::default()));
+        let mut data = scene_to_data(&mut world).unwrap();
+        data.entities[1].uid = data.entities[0].uid;
+        let mut physics = PhysicsWorld::new();
+        apply_scene(&mut world, &mut physics, &data).unwrap();
+        let ids: HashSet<_> = world
+            .query::<&crate::history::EditorId>()
+            .iter(&world)
+            .map(|i| i.0)
+            .collect();
+        assert_eq!(ids.len(), 2);
     }
 }

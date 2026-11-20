@@ -205,6 +205,31 @@ struct Renaming {
     text: String,
     /// First frame: take keyboard focus and select the text.
     fresh: bool,
+    /// Its row was drawn this frame.
+    drawn: bool,
+    /// Frames it has gone undrawn after the first; a hidden row cancels it.
+    undrawn: u8,
+}
+
+impl Renaming {
+    fn new(entity: Entity, text: String) -> Self {
+        Self {
+            entity,
+            text,
+            fresh: true,
+            drawn: false,
+            undrawn: 0,
+        }
+    }
+}
+
+/// What the Hierarchy row menu does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowAction {
+    Rename,
+    Duplicate,
+    Delete,
+    CreateChild,
 }
 
 impl Default for Editor {
@@ -307,7 +332,12 @@ impl Editor {
 
     /// Spawn a cube and record it as a step.
     fn create_cube_step(&mut self, world: &mut World) {
-        let cube = create_cube(world);
+        self.create_cube_step_in(world, None);
+    }
+
+    /// `create_cube_step` under `parent`.
+    fn create_cube_step_in(&mut self, world: &mut World, parent: Option<Entity>) {
+        let cube = create_cube_in(world, parent);
         let label = format!("Create {}", history::name_of(world, cube));
         self.history
             .record_created(world, cube, label, self.selected);
@@ -370,14 +400,24 @@ impl Editor {
         self.history.track(world, self.selected, active, hint);
     }
 
+    /// A rename whose row is not on screen (filtered out, panel closed) is
+    /// dropped, so it cannot pop up later.
+    fn cancel_hidden_rename(&mut self) {
+        if let Some(r) = &mut self.renaming {
+            if std::mem::take(&mut r.drawn) {
+                r.undrawn = 0;
+            } else if r.undrawn >= 1 {
+                self.renaming = None;
+            } else {
+                r.undrawn += 1;
+            }
+        }
+    }
+
     /// Open the inline rename on the selected Hierarchy row (F2).
     fn start_rename(&mut self, world: &World) {
         if let Some(entity) = self.selected {
-            self.renaming = Some(Renaming {
-                entity,
-                text: history::name_of(world, entity),
-                fresh: true,
-            });
+            self.renaming = Some(Renaming::new(entity, history::name_of(world, entity)));
         }
     }
 
@@ -1308,6 +1348,7 @@ impl Editor {
                     );
             });
         self.dock = dock;
+        self.cancel_hidden_rename();
         self.track_history(world, ui);
         self.drawer_ui(world, ui);
         if std::mem::take(&mut self.focus_content_tab) {
@@ -1504,7 +1545,7 @@ impl Editor {
 
         // Entity tree. Rows are drag sources (reparent) and drop targets for
         // entities and models; the space below the rows makes roots.
-        let mut to_delete: Option<Entity> = None;
+        let mut row_action: Option<(RowAction, Entity)> = None;
         let mut reparent: Option<(Entity, Option<Entity>)> = None;
         let mut model_drop: Option<(String, Option<Entity>)> = None;
         // Inline rename finished this frame: the new text, or `None` for Esc.
@@ -1586,15 +1627,24 @@ impl Editor {
                     }
                 }
                 if response.secondary_clicked() {
-                    to_delete = Some(entity);
+                    self.selected = Some(entity);
                 }
+                response.context_menu(|ui| {
+                    for (label, action) in [
+                        ("Rename", RowAction::Rename),
+                        ("Duplicate", RowAction::Duplicate),
+                        ("Delete", RowAction::Delete),
+                        ("Create Child", RowAction::CreateChild),
+                    ] {
+                        if ui.button(label).clicked() {
+                            row_action = Some((action, entity));
+                            ui.close();
+                        }
+                    }
+                });
                 if !searching && response.double_clicked() && !on_arrow {
                     self.selected = Some(entity);
-                    self.renaming = Some(Renaming {
-                        entity,
-                        text: name.clone(),
-                        fresh: true,
-                    });
+                    self.renaming = Some(Renaming::new(entity, name.clone()));
                 }
                 if !searching && response.drag_started() {
                     egui::DragAndDrop::set_payload(ui.ctx(), entity);
@@ -1638,6 +1688,7 @@ impl Editor {
                 };
                 let renaming_here = self.renaming.as_ref().is_some_and(|r| r.entity == entity);
                 if renaming_here && let Some(r) = self.renaming.as_mut() {
+                    r.drawn = true;
                     let edit_rect = egui::Rect::from_min_max(
                         egui::pos2(text_x, rect.top()),
                         rect.right_bottom(),
@@ -1725,11 +1776,29 @@ impl Editor {
             self.spawn_model_step(world, &path, glam::Vec3::ZERO, parent);
         }
 
-        if let Some(entity) = to_delete {
-            self.history.delete(world, entity, self.selected);
-            if self.selected == Some(entity) {
-                self.clear_selection();
+        if let Some((action, entity)) = row_action {
+            self.row_action(world, action, entity);
+        }
+    }
+
+    /// A Hierarchy row menu entry, recorded in the history like its shortcut.
+    fn row_action(&mut self, world: &mut World, action: RowAction, entity: Entity) {
+        match action {
+            RowAction::Rename => {
+                self.selected = Some(entity);
+                self.start_rename(world);
             }
+            RowAction::Duplicate => {
+                self.selected = Some(entity);
+                self.duplicate_selected(world);
+            }
+            RowAction::Delete => {
+                self.history.delete(world, entity, self.selected);
+                if self.selected == Some(entity) {
+                    self.clear_selection();
+                }
+            }
+            RowAction::CreateChild => self.create_cube_step_in(world, Some(entity)),
         }
     }
 
@@ -2442,15 +2511,19 @@ fn sim_state(world: &World) -> SimulationState {
         .unwrap_or_default()
 }
 
-/// Spawn a unit cube at the origin, named "Cube N".
+/// Spawn a unit cube at the origin, named "Cube", then "Cube (1)", "Cube (2)"
+/// (first free among its siblings).
 pub fn create_cube(world: &mut World) -> Entity {
-    let mut counter = world.get_resource_or_insert_with(melon_core::NameCounter::default);
-    let name = format!("Cube {}", counter.0);
-    counter.0 += 1;
+    create_cube_in(world, None)
+}
+
+/// `create_cube` as a child of `parent` (a root for `None`).
+pub fn create_cube_in(world: &mut World, parent: Option<Entity>) -> Entity {
+    let name = history::unused_name(world, parent, "Cube", true);
     let cube: Handle<Model> = world
         .get_resource_or_insert_with(|| AssetServer::new(".".into()))
         .load("builtin:cube");
-    world
+    let id = world
         .spawn((
             Name(name),
             melon_core::Transform::default(),
@@ -2459,7 +2532,11 @@ pub fn create_cube(world: &mut World) -> Entity {
                 half_extents: glam::Vec3::new(0.5, 0.5, 0.5),
             },
         ))
-        .id()
+        .id();
+    if let Some(p) = parent {
+        world.entity_mut(id).insert(melon_core::ChildOf(p));
+    }
+    id
 }
 
 /// Registered components Add Component offers for `entity`: addable, not on
@@ -3943,10 +4020,10 @@ mod tests {
     fn create_cube_spawns_named_cube() {
         let mut world = World::new();
         let e = create_cube(&mut world);
-        assert_eq!(world.get::<Name>(e).unwrap().0, "Cube 0");
+        assert_eq!(world.get::<Name>(e).unwrap().0, "Cube");
         assert!(world.get::<Handle<Model>>(e).is_some());
         let e2 = create_cube(&mut world);
-        assert_eq!(world.get::<Name>(e2).unwrap().0, "Cube 1");
+        assert_eq!(world.get::<Name>(e2).unwrap().0, "Cube (1)");
     }
 
     #[test]
@@ -5454,7 +5531,7 @@ mod tests {
         assert!(live_names(&mut world).is_empty());
 
         press(&mut editor, &mut world, egui::Key::Z, false);
-        assert_eq!(live_names(&mut world), ["Cube 0"]);
+        assert_eq!(live_names(&mut world), ["Cube"]);
         assert!(
             editor.selected.is_some(),
             "the deleted entity is selected again"
@@ -5476,10 +5553,10 @@ mod tests {
         let original = editor.selected.unwrap();
         press(&mut editor, &mut world, egui::Key::D, false);
         assert_ne!(editor.selected, Some(original));
-        assert_eq!(live_names(&mut world), ["Cube 0", "Cube 0 (1)"]);
+        assert_eq!(live_names(&mut world), ["Cube", "Cube (1)"]);
         assert_eq!(
             editor.history.undo_label(),
-            Some("Duplicate Cube 0"),
+            Some("Duplicate Cube"),
             "one step"
         );
     }
@@ -5530,7 +5607,7 @@ mod tests {
         frame(&mut editor, &mut world, vec![]);
         assert_eq!(world.get::<Name>(cube).unwrap().0, "Hero");
         assert!(editor.renaming.is_none());
-        assert_eq!(editor.history.undo_label(), Some("Rename Cube 0"));
+        assert_eq!(editor.history.undo_label(), Some("Rename Cube"));
 
         editor.start_rename(&world);
         frame(&mut editor, &mut world, vec![]);
@@ -5570,7 +5647,7 @@ mod tests {
         press(&mut editor, &mut world, egui::Key::Z, false);
         press(&mut editor, &mut world, egui::Key::Y, false);
         assert_eq!(editor.selected, Some(e));
-        assert_eq!(live_names(&mut world), ["Cube 0"]);
+        assert_eq!(live_names(&mut world), ["Cube"]);
     }
 
     #[test]
@@ -5591,7 +5668,7 @@ mod tests {
         let mut cleanup = bevy_ecs::schedule::Schedule::default();
         cleanup.add_systems(melon_physics::cleanup_deleted_system);
         cleanup.run(&mut world);
-        assert_eq!(live_names(&mut world), ["Cube 0"]);
+        assert_eq!(live_names(&mut world), ["Cube"]);
     }
 
     /// One frame: a text field (focused from the first frame when `typing`),
@@ -5639,10 +5716,45 @@ mod tests {
         let mut editor = Editor::new();
         editor.create_cube_step(&mut world);
         ctrl_z_frames(&mut editor, &mut world, true);
-        assert_eq!(live_names(&mut world), ["Cube 0"], "scene not undone");
+        assert_eq!(live_names(&mut world), ["Cube"], "scene not undone");
         assert!(editor.history.can_undo());
         // Control: with no text field focused the same keys undo.
         ctrl_z_frames(&mut editor, &mut world, false);
         assert!(!editor.history.can_undo());
+    }
+
+    #[test]
+    fn row_menu_actions_are_recorded() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        editor.create_cube_step(&mut world);
+        let cube = editor.selected.unwrap();
+        editor.row_action(&mut world, RowAction::CreateChild, cube);
+        let child = editor.selected.unwrap();
+        assert_eq!(
+            world.get::<melon_core::ChildOf>(child).unwrap().parent(),
+            cube
+        );
+        assert_eq!(world.get::<Name>(child).unwrap().0, "Cube");
+        assert_eq!(editor.history.undo_label(), Some("Create Cube"));
+        editor.row_action(&mut world, RowAction::Duplicate, child);
+        assert_eq!(editor.history.undo_label(), Some("Duplicate Cube"));
+        editor.row_action(&mut world, RowAction::Delete, child);
+        assert_eq!(editor.history.undo_label(), Some("Delete Cube"));
+        editor.row_action(&mut world, RowAction::Rename, cube);
+        assert_eq!(editor.renaming.as_ref().map(|r| r.entity), Some(cube));
+    }
+
+    #[test]
+    fn rename_is_cancelled_when_its_row_is_hidden() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        editor.create_cube_step(&mut world);
+        editor.hierarchy_query = "zzz".into();
+        editor.start_rename(&world);
+        let ctx = egui::Context::default();
+        full_frame(&ctx, &mut editor, &mut world, vec![]);
+        full_frame(&ctx, &mut editor, &mut world, vec![]);
+        assert!(editor.renaming.is_none());
     }
 }
