@@ -44,7 +44,10 @@ impl QualityPreset {
 
 /// Render quality settings. `Default` is the High preset.
 /// Nothing reads this yet: the renderer wiring is still to come.
+/// A field missing from a file takes its `Default` value and unknown fields
+/// are ignored, so adding a setting keeps old files and profiles loading.
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RenderQuality {
     pub gi_mode: GiMode,
     /// Screen-space ambient occlusion on or off.
@@ -371,6 +374,29 @@ mod tests {
             assert_eq!(quality, RenderQuality::default());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_field_takes_default_and_unknown_field_is_ignored() {
+        let dir = temp_dir("fields");
+        let path = dir.join("quality.ron");
+        // Low without `bloom`: the rest stays, bloom takes the High default.
+        std::fs::write(
+            &path,
+            "(gi_mode: Off, ao: false, shadow_map_size: 1024, msaa: 1, present: Vsync)",
+        )
+        .unwrap();
+        let mut expected = RenderQuality::preset(QualityPreset::Low);
+        expected.bloom = RenderQuality::default().bloom;
+        assert_eq!(RenderQuality::load(&path), (expected, LoadOutcome::Loaded));
+
+        let low = RenderQuality::preset(QualityPreset::Low);
+        let text = ron::to_string(&low)
+            .unwrap()
+            .replacen('(', "(future_knob: 3, ", 1);
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(RenderQuality::load(&path), (low, LoadOutcome::Loaded));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
