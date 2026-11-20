@@ -66,6 +66,9 @@ struct GizmoDrag {
 }
 
 /// Pending scene operation for the host to execute.
+/// Mesh count and bounds read from a glTF file for the Asset card.
+type ModelInfo = (usize, Option<(glam::Vec3, glam::Vec3)>);
+
 /// The answer to "Open <scene>?".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenChoice {
@@ -124,8 +127,11 @@ pub struct Editor {
     /// modified time (re-read only when the file changes).
     mesh_counts: std::collections::HashMap<
         std::path::PathBuf,
-        (Option<std::time::SystemTime>, Result<usize, String>),
+        (Option<std::time::SystemTime>, Result<ModelInfo, String>),
     >,
+    /// "Show" asked for the Content Browser tab; applied once the dock is
+    /// back in `self.dock` (panels draw while it is taken out).
+    focus_content_tab: bool,
     status_message: Option<(String, StatusKind, std::time::Instant)>,
     /// egui texture showing the scene (set by `EditorOverlay`).
     viewport_texture: Option<egui::TextureId>,
@@ -181,6 +187,7 @@ impl Default for Editor {
             content_shown: false,
             watcher: None,
             mesh_counts: std::collections::HashMap::new(),
+            focus_content_tab: false,
             status_message: None,
             viewport_texture: None,
             viewport_size: winit::dpi::PhysicalSize::new(1, 1),
@@ -1028,6 +1035,11 @@ impl Editor {
                     );
             });
         self.dock = dock;
+        if std::mem::take(&mut self.focus_content_tab)
+            && let Some(path) = self.dock.find_tab(&layout::EditorTab::ContentBrowser)
+        {
+            let _ = self.dock.set_active_tab(path);
+        }
 
         // Written after every focus change of this frame; the host applies it next frame.
         let gate = game_input_gate(
@@ -1407,7 +1419,7 @@ impl Editor {
                 .map(|details| (path.to_path_buf(), details))
         });
         if let Some((path, details)) = &asset {
-            self.asset_card(world, ui, path, details);
+            self.asset_card(ui, path, details);
         }
         let Some(entity) = self.selected else {
             if asset.is_none() {
@@ -1559,11 +1571,10 @@ impl Editor {
             let handle: Handle<Model> = world.resource_mut::<AssetServer>().load(&path);
             world.entity_mut(entity).insert(handle);
         }
-        if let Some(file) = ping {
-            self.content.ping(&file);
-            if let Some(path) = self.dock.find_tab(&layout::EditorTab::ContentBrowser) {
-                let _ = self.dock.set_active_tab(path);
-            }
+        if let Some(file) = ping
+            && self.content.ping(&file)
+        {
+            self.focus_content_tab = true;
         }
     }
 
@@ -2029,46 +2040,45 @@ impl Editor {
     /// The Content Browser's selected file or folder, read-only.
     fn asset_card(
         &mut self,
-        world: &mut World,
         ui: &mut egui::Ui,
         path: &std::path::Path,
         details: &content::AssetDetails,
     ) {
         let model = details.kind == content::AssetKind::Model;
-        let meshes = model.then(|| {
-            let entry = self
+        // Read from the file (not the GPU cache, which only knows what is
+        // drawn), again only when its modified time changes.
+        let info = model.then(|| {
+            let stale = self
                 .mesh_counts
-                .entry(path.to_path_buf())
-                .or_insert((None, Ok(0)));
-            if entry.0 != details.modified || entry.0.is_none() {
-                let count = melon_render::gltf_nodes(path)
-                    .map(|nodes| {
-                        nodes
-                            .iter()
-                            .filter_map(|n| n.mesh)
-                            .collect::<std::collections::HashSet<_>>()
-                            .len()
-                    })
-                    .map_err(|e| format!("{e:#}"));
-                *entry = (details.modified, count);
+                .get(path)
+                .is_none_or(|(modified, _)| *modified != details.modified);
+            if stale {
+                let read = melon_render::gltf_nodes(path).and_then(|nodes| {
+                    let meshes = nodes
+                        .iter()
+                        .filter_map(|n| n.mesh)
+                        .collect::<std::collections::HashSet<_>>()
+                        .len();
+                    Ok((meshes, melon_render::gltf_bounds(path)?))
+                });
+                self.mesh_counts.insert(
+                    path.to_path_buf(),
+                    (details.modified, read.map_err(|e| format!("{e:#}"))),
+                );
             }
-            match &entry.1 {
-                Ok(count) => count.to_string(),
-                Err(error) => error.clone(),
-            }
+            self.mesh_counts[path].1.clone()
         });
-        let bounds = model.then(|| {
-            let mut server = world.resource_mut::<AssetServer>();
-            let handle: Handle<Model> = server.load(&details.path);
-            server.bounds(handle).map_or_else(
-                || "not loaded yet".to_string(),
-                |(min, max)| {
-                    format!(
-                        "({:.2}, {:.2}, {:.2}) \u{2026} ({:.2}, {:.2}, {:.2})",
-                        min.x, min.y, min.z, max.x, max.y, max.z
-                    )
-                },
-            )
+        let meshes = info.as_ref().map(|info| match info {
+            Ok((count, _)) => count.to_string(),
+            Err(error) => error.clone(),
+        });
+        let bounds = info.as_ref().map(|info| match info {
+            Ok((_, Some((min, max)))) => format!(
+                "({:.2}, {:.2}, {:.2}) \u{2026} ({:.2}, {:.2}, {:.2})",
+                min.x, min.y, min.z, max.x, max.y, max.z
+            ),
+            Ok((_, None)) => "no meshes".to_string(),
+            Err(_) => "unknown".to_string(),
         });
         let mut fills = theme::colors::INSPECTOR_CARDS;
         inspector_card(ui, &mut fills, "Asset", |ui| {
@@ -4003,5 +4013,60 @@ mod tests {
             model: None,
         });
         assert_eq!(path, "builtin:cube");
+    }
+
+    #[test]
+    fn show_brings_content_browser_to_front() {
+        let (mut editor, mut world, root) = browser_project("show_front");
+        let model: Handle<Model> = world
+            .resource_mut::<AssetServer>()
+            .load("assets/models/x.glb");
+        let entity = world
+            .spawn((Name("X".to_string()), Transform::default(), model))
+            .id();
+        editor.set_selected(Some(entity));
+        if let Some(console) = editor.dock.find_tab(&layout::EditorTab::Console) {
+            let _ = editor.dock.set_active_tab(console);
+        }
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let run = |editor: &mut Editor, world: &mut World, events| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| editor.build_ui(world, ui));
+        };
+        run(&mut editor, &mut world, Vec::new());
+        run(&mut editor, &mut world, Vec::new());
+        assert!(!editor.content_shown, "browser starts behind the Console");
+        let combo = ctx
+            .read_response(egui::Id::new("inspector_mesh_drop"))
+            .expect("mesh field drawn")
+            .rect;
+        // "Show" sits just left of the combo box.
+        let pos = egui::pos2(combo.left() - 12.0, combo.center().y);
+        let press = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        run(
+            &mut editor,
+            &mut world,
+            vec![egui::Event::PointerMoved(pos), press(true), press(false)],
+        );
+        run(&mut editor, &mut world, Vec::new());
+        assert_eq!(
+            editor.content.selected(),
+            Some(root.join("assets/models/x.glb").as_path())
+        );
+        assert!(
+            editor.content_shown,
+            "Show brought the browser to the front"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

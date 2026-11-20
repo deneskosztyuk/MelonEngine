@@ -41,6 +41,16 @@ impl Debounce {
     }
 }
 
+/// Events only about `.meta.tmp` files come from the editor's own `.meta`
+/// writes; reacting to them could loop (a failing write retried forever).
+fn relevant(event: &notify::Event) -> bool {
+    event.paths.is_empty()
+        || event
+            .paths
+            .iter()
+            .any(|p| !p.to_string_lossy().ends_with(".meta.tmp"))
+}
+
 pub struct AssetWatcher {
     _watcher: notify::RecommendedWatcher,
     events: Receiver<notify::Result<notify::Event>>,
@@ -63,8 +73,10 @@ impl AssetWatcher {
     /// Drain events without blocking; true once they have settled.
     pub fn poll(&mut self, now: Instant) -> bool {
         while let Ok(event) = self.events.try_recv() {
-            if let Err(error) = event {
-                tracing::warn!("asset watcher: {error}");
+            match event {
+                Ok(event) if !relevant(&event) => continue,
+                Ok(_) => {}
+                Err(error) => tracing::warn!("asset watcher: {error}"),
             }
             self.debounce.note(now);
         }
@@ -112,5 +124,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn meta_tmp_events_are_ignored() {
+        let event = |paths: &[&str]| notify::Event {
+            kind: notify::EventKind::Any,
+            paths: paths.iter().map(std::path::PathBuf::from).collect(),
+            attrs: Default::default(),
+        };
+        assert!(!relevant(&event(&["a/x.glb.meta.tmp"])));
+        assert!(relevant(&event(&["a/x.glb.meta.tmp", "a/x.glb"])));
+        assert!(relevant(&event(&["a/x.glb.meta"])));
     }
 }

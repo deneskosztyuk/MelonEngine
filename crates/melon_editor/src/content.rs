@@ -367,7 +367,10 @@ impl ContentBrowser {
         if !file.is_file() || !self.inside_root(file) {
             return false;
         }
+        // A filtered-out kind would hide the item we are showing.
+        self.filter.insert(asset_kind(file, false));
         self.open(parent.to_path_buf());
+        self.refresh();
         self.set_search(String::new());
         self.select(Some(file.to_path_buf()));
         self.pinged = Some((file.to_path_buf(), None));
@@ -1201,6 +1204,23 @@ mod tests {
         assert_eq!(browser.current(), dir);
         assert_eq!(browser.selected(), None);
         let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ping_shows_a_filtered_out_kind() {
+        let dir = temp_dir("ping_kind");
+        touch(&dir, "a/x.glb");
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.toggle_kind(AssetKind::Model);
+        assert!(browser.ping(&dir.join("a/x.glb")));
+        assert!(browser.kind_enabled(AssetKind::Model));
+        assert!(
+            browser
+                .visible_entries()
+                .iter()
+                .any(|e| e.path == dir.join("a/x.glb"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -37,6 +37,52 @@ pub fn gltf_nodes_from_slice(bytes: &[u8]) -> Result<Vec<GltfNode>> {
     nodes_of(&gltf.document)
 }
 
+/// Bounds of a glTF / GLB file's default scene from the POSITION accessors'
+/// min / max and the node transforms (no vertex data is read). `None` if
+/// the scene has no meshes.
+pub fn gltf_bounds(path: &std::path::Path) -> Result<Option<(glam::Vec3, glam::Vec3)>> {
+    let gltf = gltf::Gltf::open(path)
+        .with_context(|| format!("failed to read glTF file: {}", path.display()))?;
+    bounds_of(&gltf.document)
+}
+
+/// `gltf_bounds` for a file already in memory.
+pub fn gltf_bounds_from_slice(bytes: &[u8]) -> Result<Option<(glam::Vec3, glam::Vec3)>> {
+    let gltf = gltf::Gltf::from_slice(bytes).context("failed to read glTF data")?;
+    bounds_of(&gltf.document)
+}
+
+fn bounds_of(document: &gltf::Document) -> Result<Option<(glam::Vec3, glam::Vec3)>> {
+    let scene = document
+        .default_scene()
+        .or_else(|| document.scenes().next())
+        .context("glTF file has no scene")?;
+    let mut bounds: Option<(glam::Vec3, glam::Vec3)> = None;
+    let mut stack: Vec<(gltf::Node, glam::Mat4)> =
+        scene.nodes().map(|n| (n, glam::Mat4::IDENTITY)).collect();
+    while let Some((node, parent)) = stack.pop() {
+        let world = parent * glam::Mat4::from_cols_array_2d(&node.transform().matrix());
+        for primitive in node.mesh().iter().flat_map(|m| m.primitives()) {
+            let b = primitive.bounding_box();
+            let (lo, hi) = (glam::Vec3::from_array(b.min), glam::Vec3::from_array(b.max));
+            for i in 0..8 {
+                let corner = glam::Vec3::new(
+                    if i & 1 == 0 { lo.x } else { hi.x },
+                    if i & 2 == 0 { lo.y } else { hi.y },
+                    if i & 4 == 0 { lo.z } else { hi.z },
+                );
+                let p = world.transform_point3(corner);
+                bounds = Some(match bounds {
+                    Some((min, max)) => (min.min(p), max.max(p)),
+                    None => (p, p),
+                });
+            }
+        }
+        stack.extend(node.children().map(|c| (c, world)));
+    }
+    Ok(bounds)
+}
+
 fn nodes_of(document: &gltf::Document) -> Result<Vec<GltfNode>> {
     let scene = document
         .default_scene()
@@ -2940,5 +2986,43 @@ mod tests {
             !runner.results.is_empty(),
             "GPU tests did not run (renderer init may have failed)"
         );
+    }
+
+    #[test]
+    fn gltf_bounds_follow_node_transforms() {
+        let json = r#"{
+            "asset": {"version": "2.0"},
+            "scenes": [{"nodes": [0, 1]}],
+            "nodes": [{"mesh": 0, "translation": [10, 0, 0]}, {}],
+            "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
+            "buffers": [{"byteLength": 36,
+                         "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}],
+            "bufferViews": [{"buffer": 0, "byteLength": 36}],
+            "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+                           "min": [-1, -1, -1], "max": [1, 1, 1]}]
+        }"#;
+        let (min, max) = gltf_bounds_from_slice(json.as_bytes()).unwrap().unwrap();
+        assert!(
+            (min - glam::Vec3::new(9.0, -1.0, -1.0)).length() < 1e-5,
+            "{min}"
+        );
+        assert!(
+            (max - glam::Vec3::new(11.0, 1.0, 1.0)).length() < 1e-5,
+            "{max}"
+        );
+    }
+
+    #[test]
+    fn gltf_bounds_none_without_meshes() {
+        let json = r#"{"asset": {"version": "2.0"}, "scenes": [{"nodes": [0]}], "nodes": [{}]}"#;
+        assert!(gltf_bounds_from_slice(json.as_bytes()).unwrap().is_none());
+    }
+
+    #[test]
+    fn gltf_bounds_of_cube_glb() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/models/cube.glb");
+        let (min, max) = gltf_bounds(std::path::Path::new(path)).unwrap().unwrap();
+        assert!(min.is_finite() && max.is_finite());
+        assert!((max - min).min_element() > 0.0);
     }
 }
