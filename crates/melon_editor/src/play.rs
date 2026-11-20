@@ -35,11 +35,15 @@ fn rebuild(world: &mut World, data: &SceneData) -> Result<()> {
 pub fn play(world: &mut World) -> Result<()> {
     match state(world) {
         SimulationState::Editing => {
-            let snapshot = scene_to_data(world);
-            if let Err(error) = rebuild(world, &snapshot) {
-                tracing::error!(?error, "play refused");
-                return Err(error);
-            }
+            let snapshot = scene_to_data(world)
+                .and_then(|snapshot| rebuild(world, &snapshot).map(|()| snapshot));
+            let snapshot = match snapshot {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::error!(?error, "play refused");
+                    return Err(error);
+                }
+            };
             world.insert_resource(PlaySnapshot(snapshot));
             world.insert_resource(SimulationState::Playing);
         }
@@ -100,7 +104,7 @@ mod tests {
     use melon_physics::RigidBodyComponent;
 
     fn edit_world() -> World {
-        let mut world = World::new();
+        let mut world = melon_core::Core::new().world;
         world.insert_resource(PhysicsWorld::new());
         world.insert_resource(Time::default());
         world.insert_resource(SimulationState::Editing);
