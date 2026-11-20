@@ -3,7 +3,9 @@
 //! stream from disk.
 
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use kira::{
     AudioManager, AudioManagerSettings, Decibels, DefaultBackend, Tween,
@@ -90,17 +92,30 @@ impl KiraBackend {
         }
     }
 
-    fn load(&mut self, path: &Path, version: u32) -> Result<Loaded, String> {
+    fn load(
+        &mut self,
+        path: &Path,
+        version: u32,
+        data: Option<&Arc<[u8]>>,
+    ) -> Result<Loaded, String> {
         if let Some((v, data)) = self.cache.get(path)
             && *v == version
         {
             return Ok(Loaded::Static(data.clone()));
         }
-        let stream = StreamingSoundData::from_file(path).map_err(|e| e.to_string())?;
+        let stream = match data {
+            Some(d) => StreamingSoundData::from_cursor(Cursor::new(d.clone())),
+            None => StreamingSoundData::from_file(path),
+        }
+        .map_err(|e| e.to_string())?;
         if should_stream(stream.duration()) {
             return Ok(Loaded::Stream(stream));
         }
-        let data = StaticSoundData::from_file(path).map_err(|e| e.to_string())?;
+        let data = match data {
+            Some(d) => StaticSoundData::from_cursor(Cursor::new(d.clone())),
+            None => StaticSoundData::from_file(path),
+        }
+        .map_err(|e| e.to_string())?;
         self.cache
             .insert(path.to_path_buf(), (version, data.clone()));
         Ok(Loaded::Static(data))
@@ -139,7 +154,7 @@ macro_rules! on_handle {
 
 impl Backend for KiraBackend {
     fn play(&mut self, voice: VoiceId, p: &PlayParams) -> Result<(), String> {
-        let loaded = self.load(&p.path, p.version)?;
+        let loaded = self.load(&p.path, p.version, p.data.as_ref())?;
         let Some(track) = self.track(&p.bus) else {
             return Ok(());
         };
@@ -265,6 +280,7 @@ mod tests {
     fn params(path: PathBuf) -> PlayParams {
         PlayParams {
             path,
+            data: None,
             version: 0,
             bus: "Sfx".into(),
             volume: 1.0,
@@ -336,8 +352,28 @@ mod tests {
         let path = dir.join("long.wav");
         std::fs::write(&path, wav(8000 * 6)).unwrap();
         let mut backend = KiraBackend::silent();
-        assert!(matches!(backend.load(&path, 0), Ok(Loaded::Stream(_))));
+        assert!(matches!(
+            backend.load(&path, 0, None),
+            Ok(Loaded::Stream(_))
+        ));
         assert!(backend.cache.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn packed_bytes_decode_without_the_file() {
+        let missing = Path::new("assets/sfx/gone.wav");
+        let mut backend = KiraBackend::silent();
+        assert!(backend.load(missing, 0, None).is_err());
+        let data: Arc<[u8]> = wav(800).into();
+        assert!(matches!(
+            backend.load(missing, 0, Some(&data)),
+            Ok(Loaded::Static(_))
+        ));
+        let long: Arc<[u8]> = wav(8000 * 6).into();
+        assert!(matches!(
+            backend.load(Path::new("assets/sfx/long.wav"), 0, Some(&long)),
+            Ok(Loaded::Stream(_))
+        ));
     }
 }

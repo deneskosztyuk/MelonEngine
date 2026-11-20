@@ -16,6 +16,7 @@ pub mod components;
 pub mod hierarchy;
 pub mod input;
 pub mod pack;
+pub mod package;
 pub mod physics;
 pub mod physics_settings;
 pub mod player;

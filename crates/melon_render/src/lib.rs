@@ -4,6 +4,7 @@ mod extract;
 pub mod gi;
 mod models;
 mod overlay;
+mod present;
 mod timings;
 
 pub use extract::{FrameData, blends, extract};
@@ -805,6 +806,8 @@ pub struct Renderer {
     model_cache: ModelCache,
     /// Solid editor shapes drawn after tonemapping.
     overlay: overlay::OverlayRenderer,
+    /// Copies a viewport image onto the swapchain (a game without the editor UI).
+    present: present::Present,
     /// GPU pass timings; `None` without timestamp queries.
     timer: Option<timings::GpuTimer>,
 }
@@ -942,13 +945,28 @@ fn create_instance_buffer(
 impl Renderer {
     #[instrument(skip(window), level = "info")]
     pub async fn new(window: Arc<Window>) -> Result<Self> {
+        Self::new_with_dx12_compiler(window, wgpu::Dx12Compiler::default()).await
+    }
+
+    /// `new` with the DX12 shader compiler used unless `WGPU_DX12_COMPILER` is set.
+    /// A packaged game passes `Fxc`, which ships with Windows; `Auto` looks for
+    /// `dxcompiler.dll` (a Windows SDK file) first.
+    #[instrument(skip(window), level = "info")]
+    pub async fn new_with_dx12_compiler(
+        window: Arc<Window>,
+        dx12_compiler: wgpu::Dx12Compiler,
+    ) -> Result<Self> {
         let forced = std::env::var("MELON_BACKEND").ok();
         let mut found = None;
         for backends in backend_order(cfg!(windows), forced.as_deref()) {
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            let mut descriptor = wgpu::InstanceDescriptor {
                 backends,
                 ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
-            });
+            };
+            if std::env::var_os("WGPU_DX12_COMPILER").is_none() {
+                descriptor.backend_options.dx12.shader_compiler = dx12_compiler.clone();
+            }
+            let instance = wgpu::Instance::new(descriptor);
             if let Ok(adapter) = instance
                 .request_adapter(&wgpu::RequestAdapterOptions::default())
                 .await
@@ -994,6 +1012,7 @@ impl Renderer {
         let model_cache = ModelCache::new(&scene);
         let overlay =
             overlay::OverlayRenderer::new(&scene.device, surface_format.add_srgb_suffix());
+        let present = present::Present::new(&scene.device, surface_format.add_srgb_suffix());
         tracing::info!(
             msaa = ?scene.msaa_counts,
             timestamps = timer.is_some(),
@@ -1012,6 +1031,7 @@ impl Renderer {
             scene,
             model_cache,
             overlay,
+            present,
             timer,
         };
         renderer.configure_surface();
@@ -1443,6 +1463,17 @@ impl Renderer {
                 multiview_mask: None,
             })
             .forget_lifetime()
+    }
+
+    /// Copy `target`'s finished image onto the swapchain image of `frame`
+    /// (a game without the editor UI). `target` must be window sized.
+    pub fn present_target(&self, frame: &mut Frame, target: &ViewportTarget) {
+        self.present.draw(
+            &self.scene.device,
+            &mut frame.encoder,
+            &target.color_view,
+            &frame.view,
+        );
     }
 
     pub fn scene_mut(&mut self) -> &mut SceneRenderer {
@@ -3369,9 +3400,32 @@ impl SceneRenderer {
     /// transform baked in. A mesh that fails gets its own error.
     #[instrument(skip(self), level = "info")]
     pub fn load_gltf_meshes(&self, path: &str) -> Result<Vec<Result<LoadedModel>>> {
-        let (document, buffers, images) =
+        let imported =
             gltf::import(path).with_context(|| format!("failed to import glTF file: {path}"))?;
-        Ok(document
+        Ok(self.meshes_of(path, imported))
+    }
+
+    /// `load_gltf_meshes` from memory (a packed game; embedded buffers only).
+    pub fn load_gltf_meshes_bytes(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<Vec<Result<LoadedModel>>> {
+        let imported = gltf::import_slice(bytes)
+            .with_context(|| format!("failed to import glTF data: {name}"))?;
+        Ok(self.meshes_of(name, imported))
+    }
+
+    fn meshes_of(
+        &self,
+        path: &str,
+        (document, buffers, images): (
+            gltf::Document,
+            Vec<gltf::buffer::Data>,
+            Vec<gltf::image::Data>,
+        ),
+    ) -> Vec<Result<LoadedModel>> {
+        document
             .meshes()
             .map(|gltf_mesh| {
                 let mut model = LoadedModel {
@@ -3393,7 +3447,7 @@ impl SceneRenderer {
                 }
                 Ok(model)
             })
-            .collect())
+            .collect()
     }
 
     /// Load one glTF mesh (`<file>#mesh<N>`); see `load_gltf_meshes`.

@@ -13,6 +13,44 @@ struct CachedModel {
     model: LoadedModel,
 }
 
+/// Where a model's glTF bytes come from: a file on disk (dev builds, so
+/// external buffers and textures resolve) or memory (the pack).
+enum Source {
+    File(std::path::PathBuf),
+    Packed { name: String, bytes: Vec<u8> },
+}
+
+impl Source {
+    fn of(server: &AssetServer, handle: Handle<Model>, path: &str) -> anyhow::Result<Self> {
+        if server.has_pack() {
+            let name = split_mesh_fragment(path).0.to_string();
+            let bytes = server
+                .read(&name)
+                .map_err(|e| anyhow::anyhow!("{name} is not in the pack: {e}"))?;
+            return Ok(Self::Packed { name, bytes });
+        }
+        server.full_path(handle).map(Self::File).ok_or_else(|| {
+            anyhow::anyhow!("unknown built-in asset (expected {BUILTIN_PREFIX}cube)")
+        })
+    }
+
+    fn model(&self, scene: &SceneRenderer, path: &str) -> anyhow::Result<LoadedModel> {
+        match self {
+            Self::File(file) => scene.load_gltf(&file.to_string_lossy()),
+            Self::Packed { bytes, .. } => scene
+                .load_gltf_bytes(bytes)
+                .map_err(|e| e.context(format!("packed model {path}"))),
+        }
+    }
+
+    fn meshes(&self, scene: &SceneRenderer) -> anyhow::Result<Vec<anyhow::Result<LoadedModel>>> {
+        match self {
+            Self::File(file) => scene.load_gltf_meshes(&file.to_string_lossy()),
+            Self::Packed { name, bytes } => scene.load_gltf_meshes_bytes(name, bytes),
+        }
+    }
+}
+
 pub struct ModelCache {
     models: HashMap<u32, CachedModel>,
     builtin_cube: LoadedModel,
@@ -31,15 +69,11 @@ impl ModelCache {
         server: &mut AssetServer,
         handle: Handle<Model>,
         file_path: &str,
-        file: &std::path::Path,
+        source: &Source,
         mesh: usize,
     ) -> anyhow::Result<LoadedModel> {
         let mut ours = None;
-        for (i, model) in scene
-            .load_gltf_meshes(&file.to_string_lossy())?
-            .into_iter()
-            .enumerate()
-        {
+        for (i, model) in source.meshes(scene)?.into_iter().enumerate() {
             if i == mesh {
                 ours = Some(model);
                 continue;
@@ -119,16 +153,14 @@ impl ModelCache {
         let version = server.version(handle);
         let stale = self.models.get(&id).is_none_or(|m| m.version != version);
         if stale && !self.failed.contains(&(id, version)) {
-            let result = match server.full_path(handle) {
-                Some(file) => match split_mesh_fragment(&path) {
+            let result = match Source::of(server, handle, &path) {
+                Ok(source) => match split_mesh_fragment(&path) {
                     (file_path, Some(mesh)) => {
-                        self.load_fragments(scene, server, handle, file_path, &file, mesh)
+                        self.load_fragments(scene, server, handle, file_path, &source, mesh)
                     }
-                    (_, None) => scene.load_gltf(&file.to_string_lossy()),
+                    (_, None) => source.model(scene, &path),
                 },
-                None => Err(anyhow::anyhow!(
-                    "unknown built-in asset (expected {BUILTIN_PREFIX}cube)"
-                )),
+                Err(error) => Err(error),
             };
             match result {
                 Ok(model) => {
