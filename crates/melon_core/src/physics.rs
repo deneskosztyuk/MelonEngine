@@ -126,7 +126,8 @@ pub struct CharacterController {
     /// Distance the character is pulled down to stay on the ground (metres, 0 = off).
     pub snap_to_ground: f32,
     #[reflect(ignore)]
-    desired: Vec3,
+    /// The pending move (set it with `move_by`).
+    pub desired: Vec3,
     /// On the ground after the last move.
     #[reflect(ignore)]
     pub grounded: bool,

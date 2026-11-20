@@ -98,9 +98,7 @@ mod tests {
     use super::*;
     use bevy_ecs::entity::Entity;
     use melon_core::glam::Vec3;
-    use melon_core::{
-        AssetServer, BodyInfo, BodyKind, Handle, Model, Name, NameCounter, Time, Transform,
-    };
+    use melon_core::{AssetServer, Handle, Model, Name, NameCounter, Time, Transform};
     use melon_physics::RigidBodyComponent;
 
     fn edit_world() -> World {
@@ -115,19 +113,21 @@ mod tests {
             Name("Floor".to_string()),
             Transform::from_translation(Vec3::new(0.0, -1.0, 0.0)),
             cube,
-            BodyInfo {
-                body_type: BodyKind::Fixed,
+            melon_core::RigidBody {
+                kind: melon_core::RigidBodyKind::Fixed,
+                ..Default::default()
+            },
+            melon_core::Collider {
                 half_extents: Vec3::new(5.0, 0.5, 5.0),
+                ..Default::default()
             },
         ));
         world.spawn((
             Name("Box".to_string()),
             Transform::from_translation(Vec3::new(0.0, 3.0, 0.0)),
             cube,
-            BodyInfo {
-                body_type: BodyKind::Dynamic,
-                half_extents: Vec3::splat(0.5),
-            },
+            melon_core::RigidBody::default(),
+            melon_core::Collider::default(),
         ));
         world
     }

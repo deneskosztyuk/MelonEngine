@@ -8,15 +8,12 @@ use std::time::Instant;
 use melon_core::bevy_ecs::world::{Mut, World};
 use melon_core::glam::{Quat, Vec2, Vec3};
 use melon_core::{
-    Aabb, BodyInfo, BodyKind, Camera, FrameCounter, GameInputGate, Input, InputButton, KeyCode,
-    Light, Name, RawPresses, RenderQuality, RenderTimings, Time, Transform,
+    Aabb, Camera, Collider, FrameCounter, GameInputGate, Input, InputButton, KeyCode, Light, Name,
+    RawPresses, RenderQuality, RenderTimings, RigidBody, RigidBodyKind, Time, Transform,
 };
 use melon_editor::Editor;
 use melon_editor::EditorOverlay;
-use melon_physics::rapier3d::dynamics::RigidBodyType;
-use melon_physics::{
-    ColliderComponent, PhysicsWorld, RigidBodyComponent as RigidBody, add_physics_systems,
-};
+use melon_physics::add_physics_systems;
 use tracing_subscriber::EnvFilter;
 use winit::event::{
     DeviceEvent, DeviceId, ElementState, MouseButton as WinitMouseButton, MouseScrollDelta,
@@ -286,35 +283,28 @@ struct App {
 // project path (CLI argument or project file).
 const PROJECT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
-fn spawn_default_scene(world: &mut World, physics: &mut PhysicsWorld) {
+fn spawn_default_scene(world: &mut World) {
     let cube: melon_core::Handle<melon_core::Model> = world
         .resource_mut::<melon_core::AssetServer>()
         .load("builtin:cube");
-    // Ground: flat cube scaled to 5x0.1x5, top surface at y=0
-    let half_extents = Vec3::new(2.5, 0.05, 2.5);
-    let translation = Vec3::new(0.0, -0.05, 0.0);
-    let (body_h, collider_h) =
-        physics.spawn_fixed_cuboid(translation, Quat::IDENTITY, half_extents);
+    // Ground: flat cube scaled to 5x0.1x5, top surface at y=0 (the box
+    // collider is the unit cube, scaled with it).
     world.spawn((
         Name("Ground".to_string()),
         Transform {
-            translation,
+            translation: Vec3::new(0.0, -0.05, 0.0),
             rotation: Quat::IDENTITY,
             scale: Vec3::new(5.0, 0.1, 5.0),
         },
         cube,
-        Aabb { half_extents },
+        Aabb {
+            half_extents: Vec3::new(2.5, 0.05, 2.5),
+        },
         RigidBody {
-            body_handle: body_h,
-            body_type: RigidBodyType::Fixed,
+            kind: RigidBodyKind::Fixed,
+            ..Default::default()
         },
-        ColliderComponent {
-            collider_handle: collider_h,
-        },
-        BodyInfo {
-            body_type: BodyKind::Fixed,
-            half_extents,
-        },
+        Collider::default(),
     ));
 }
 
@@ -356,9 +346,7 @@ impl App {
         let (quality, outcome) = melon_core::RenderQuality::load(&quality_path);
         let quality_broken = outcome.log(&quality_path, "quality settings");
         core.world.insert_resource(quality);
-        let mut physics = PhysicsWorld::new();
-        spawn_default_scene(&mut core.world, &mut physics);
-        core.world.insert_resource(physics);
+        spawn_default_scene(&mut core.world);
         #[cfg(not(feature = "hot-reload"))]
         core.add_plugin(&melon_game::GamePlugin);
         #[cfg(feature = "hot-reload")]
