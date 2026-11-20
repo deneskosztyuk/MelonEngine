@@ -368,6 +368,14 @@ pub fn apply_scene(world: &mut World, physics: &mut PhysicsWorld, data: &SceneDa
             world.entity_mut(id).insert(ChildOf(ids[p as usize]));
         }
     }
+    let roots: Vec<Entity> = data
+        .entities
+        .iter()
+        .zip(&ids)
+        .filter(|(e, _)| e.parent.is_none())
+        .map(|(_, &id)| id)
+        .collect();
+    world.insert_resource(melon_core::hierarchy::RootOrder(roots));
     for &id in &ids {
         if let Some(body_info) = world.get::<BodyInfo>(id).copied() {
             spawn_body(world, physics, id, body_info);

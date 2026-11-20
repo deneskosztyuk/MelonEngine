@@ -273,9 +273,9 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   Ctrl+D, F2 (not while typing or with the Content Browser focused, which
   owns F2 / Ctrl+D). A new editable thing that is not a registered
   component, `Name`, `Handle<Model>` or the hierarchy is invisible to
-  history. Root entities have no stored order (they follow query order), so
-  a duplicate of a root is not guaranteed to sit right after it; children
-  keep their position.
+  history. Root order is the `melon_core::hierarchy::RootOrder` resource (healed
+  by `root_order`, set from file order by `apply_scene`, so the scene
+  version stays 5); steps store a root's index like a child's.
 - **Scene format.** RON, `SCENE_VERSION = 5` in `melon_editor/src/scene.rs`:
   each entity has `name`, `parent` (index into `entities`), `model` (path,
   `#mesh<N>` included), `model_guid` (wins when it resolves, so a scene

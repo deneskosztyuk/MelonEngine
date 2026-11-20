@@ -13,7 +13,7 @@ use bevy_ecs::entity::Entity;
 use bevy_ecs::query::{With, Without};
 use bevy_ecs::reflect::AppTypeRegistry;
 use bevy_ecs::world::World;
-use melon_core::hierarchy::mark_for_delete;
+use melon_core::hierarchy::{mark_for_delete, move_root, root_index};
 use melon_core::{ChildOf, Children, Name, PendingDelete, SimulationState, Transform};
 use uuid::Uuid;
 
@@ -61,7 +61,7 @@ fn ids_map(world: &mut World) -> HashMap<Uuid, Entity> {
 pub struct Snap {
     id: Uuid,
     parent: Option<Uuid>,
-    /// Position among its parent's children (unused for roots).
+    /// Position among its parent's children (roots: among the roots).
     index: usize,
     entity: SceneEntity,
 }
@@ -81,9 +81,7 @@ impl Snap {
     }
 
     fn same(&self, other: &Snap) -> bool {
-        self.same_content(other)
-            && self.parent == other.parent
-            && (self.parent.is_none() || self.index == other.index)
+        self.same_content(other) && self.parent == other.parent && self.index == other.index
     }
 }
 
@@ -96,9 +94,13 @@ pub fn capture(world: &mut World, e: Entity) -> Option<Snap> {
     let id = id_of(world, e);
     let parent_entity = world.get::<ChildOf>(e).map(ChildOf::parent);
     let parent = parent_entity.map(|p| id_of(world, p));
-    let index = parent_entity
-        .and_then(|p| world.get::<Children>(p)?.iter().position(|&c| c == e))
-        .unwrap_or(0);
+    let index = match parent_entity {
+        Some(p) => world
+            .get::<Children>(p)
+            .and_then(|c| c.iter().position(|&x| x == e))
+            .unwrap_or(0),
+        None => root_index(world, e).unwrap_or(0),
+    };
     let registry = world.get_resource::<AppTypeRegistry>()?.clone();
     let registry = registry.read();
     match scene::capture_entity(world, &registry, e, None) {
@@ -219,6 +221,7 @@ fn place(world: &mut World, e: Entity, parent: Option<Entity>, index: usize) {
         if current.is_some() {
             world.entity_mut(e).remove::<ChildOf>();
         }
+        move_root(world, e, index);
         return;
     };
     let position = world
@@ -629,12 +632,15 @@ mod tests {
     }
 
     fn spawn(world: &mut World, name: &str, x: f32) -> Entity {
-        world
+        let e = world
             .spawn((
                 Name(name.to_string()),
                 Transform::from_translation(Vec3::new(x, 0.0, 0.0)),
             ))
-            .id()
+            .id();
+        // The Hierarchy lists roots every frame, which fixes their order.
+        melon_core::hierarchy::root_order(world);
+        e
     }
 
     fn child(world: &mut World, name: &str, parent: Entity) -> Entity {
@@ -1022,5 +1028,75 @@ mod tests {
         assert_eq!(world.get::<EditorId>(b).unwrap().0, id);
         h.undo(&mut world).unwrap();
         assert_eq!(name_of(&world, b), "A", "the step still finds its entity");
+    }
+
+    fn root_names(world: &mut World) -> Vec<String> {
+        melon_core::hierarchy::depth_first(world)
+            .into_iter()
+            .filter(|(_, d)| *d == 0)
+            .map(|(e, _)| name_of(world, e))
+            .collect()
+    }
+
+    #[test]
+    fn deleted_root_returns_to_its_position() {
+        let mut world = world();
+        let mut h = History::default();
+        let _a = spawn(&mut world, "A", 0.0);
+        let b = spawn(&mut world, "B", 0.0);
+        let _c = spawn(&mut world, "C", 0.0);
+        assert_eq!(root_names(&mut world), ["A", "B", "C"]);
+        h.delete(&mut world, b, None);
+        cleanup(&mut world);
+        assert_eq!(root_names(&mut world), ["A", "C"]);
+        h.undo(&mut world).unwrap();
+        assert_eq!(root_names(&mut world), ["A", "B", "C"]);
+    }
+
+    #[test]
+    fn duplicate_of_a_root_goes_right_after_it() {
+        let mut world = world();
+        let mut h = History::default();
+        let a = spawn(&mut world, "A", 0.0);
+        let _b = spawn(&mut world, "B", 0.0);
+        let _c = spawn(&mut world, "C", 0.0);
+        h.duplicate(&mut world, a, None).unwrap();
+        assert_eq!(root_names(&mut world), ["A", "A (1)", "B", "C"]);
+        h.undo(&mut world).unwrap();
+        cleanup(&mut world);
+        assert_eq!(root_names(&mut world), ["A", "B", "C"]);
+    }
+
+    #[test]
+    fn reparent_to_root_appends_and_undo_restores_the_old_place() {
+        let mut world = world();
+        let mut h = History::default();
+        let _a = spawn(&mut world, "A", 0.0);
+        let p = spawn(&mut world, "P", 0.0);
+        let k = child(&mut world, "K", p);
+        let _c = spawn(&mut world, "C", 0.0);
+        h.reparent(&mut world, k, None, None).unwrap();
+        assert_eq!(root_names(&mut world), ["A", "P", "C", "K"]);
+        h.undo(&mut world).unwrap();
+        assert_eq!(root_names(&mut world), ["A", "P", "C"]);
+        h.redo(&mut world).unwrap();
+        assert_eq!(root_names(&mut world), ["A", "P", "C", "K"]);
+    }
+
+    #[test]
+    fn scene_load_keeps_root_order() {
+        let mut world = world();
+        let _a = spawn(&mut world, "A", 0.0);
+        let b = spawn(&mut world, "B", 0.0);
+        world.entity_mut(b).insert(Spin); // different archetype
+        let _c = spawn(&mut world, "C", 0.0);
+        let data = scene::scene_to_data(&mut world).unwrap();
+        world
+            .try_resource_scope::<PhysicsWorld, _>(|world, mut physics| {
+                scene::apply_scene(world, &mut physics, &data)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_names(&mut world), ["A", "B", "C"]);
     }
 }
