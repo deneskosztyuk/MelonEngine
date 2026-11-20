@@ -3500,6 +3500,8 @@ mod tests {
     // White light on white albedo, so every colour channel holds the same value.
 
     const TEST_SIZE: u32 = 64;
+    /// Share of a shadow edge's contrast (percent) that default bloom must keep.
+    const EDGE_KEEP_PERCENT: i32 = 75;
     /// World (-2, 0, 0): on the floor, inside the occluder's shadow.
     const SHADOW_PX: (u32, u32) = (16, 32);
     /// World (2, 0, 0): on the floor, in the open.
@@ -4110,7 +4112,7 @@ mod tests {
         let assertions: Vec<GpuAssertion> = vec![
             Box::new(|renderer| {
                 // The review emissive cube 8 m away on black: about 8 pixels
-                // wide and HDR bright (4, 2, 0.5). Bloom lights up the black
+                // wide and HDR bright (2.5, 0.25, 0.03). Bloom lights up the black
                 // pixels beside it.
                 use glam::{Mat4, Vec3};
                 let mut server = melon_core::AssetServer::new(
@@ -4142,7 +4144,10 @@ mod tests {
                     let px = render_frame(renderer, camera, light, env, models, &mut server);
                     pixel_at(renderer, &px, beside)
                 };
-                let (off, on) = (px(0.0), px(0.04));
+                let (off, on) = (
+                    px(0.0),
+                    px(melon_core::Environment::default().bloom_intensity),
+                );
                 if off[0] <= 2 && on[0] >= off[0] + 8 {
                     Ok(())
                 } else {
@@ -4152,8 +4157,10 @@ mod tests {
                 }
             }),
             Box::new(|renderer| {
-                // Sunlit floor far from the cube and its shadow: no bright
-                // source near, so bloom leaves it as it was (no haze).
+                // Sunlit floor with the cube's shadow, at the default bloom.
+                // No bright source near, so bloom adds no haze far from the
+                // cube, and the shadow edge (lit floor 0.4 m outside, shadow
+                // 0.4 m inside) keeps nearly all its contrast.
                 use glam::{Mat4, Quat, Vec3};
                 let mut server = melon_core::AssetServer::new(".".into());
                 let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
@@ -4164,8 +4171,14 @@ mod tests {
                 );
                 let models = vec![(floor, cube), (Mat4::from_translation(Vec3::Y * 0.5), cube)];
                 let camera = top_down_camera();
-                let at = screen_px(camera.view_proj(), Vec3::new(2.5, 0.0, 2.5));
-                let mut px = |bloom_intensity| {
+                let px_of = |p: Vec3| screen_px(camera.view_proj(), p);
+                let (open, lit, shadow) = (
+                    px_of(Vec3::new(2.5, 0.0, 2.5)),
+                    // The shadow runs from x = -0.5 to -1.5 (sun at 45 degrees).
+                    px_of(Vec3::new(-1.9, 0.0, 0.0)),
+                    px_of(Vec3::new(-1.1, 0.0, 0.0)),
+                );
+                let mut render = |bloom_intensity| {
                     let env = melon_core::Environment {
                         bloom_intensity,
                         ..plain_environment()
@@ -4178,13 +4191,19 @@ mod tests {
                         models.clone(),
                         &mut server,
                     );
-                    pixel_at(renderer, &px, at)
+                    let at = |p| pixel_at(renderer, &px, p);
+                    (at(open), i32::from(at(lit)[0]) - i32::from(at(shadow)[0]))
                 };
-                let (off, on) = (px(0.0), px(0.04));
-                if off.iter().zip(on).all(|(&a, b)| a.abs_diff(b) <= 2) {
+                let (off, edge_off) = render(0.0);
+                let (on, edge_on) = render(melon_core::Environment::default().bloom_intensity);
+                let no_haze = off.iter().zip(on).all(|(&a, b)| a.abs_diff(b) <= 2);
+                if no_haze && edge_on * 100 >= edge_off * EDGE_KEEP_PERCENT {
                     Ok(())
                 } else {
-                    Err(format!("bloom_adds_no_haze: {at:?} off {off:?}, on {on:?}"))
+                    Err(format!(
+                        "bloom_adds_no_haze_keeps_edges: open {open:?} off {off:?}, on {on:?}; \
+                         edge contrast off {edge_off}, on {edge_on}"
+                    ))
                 }
             }),
             Box::new(|renderer| {

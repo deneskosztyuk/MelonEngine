@@ -169,7 +169,10 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   tent upsample added (blend One + One) level by level into mip 0. The
   tonemap pass mixes `mix(hdr, mip0 / levels, bloom_intensity)`; no
   threshold, so uniform areas stay as they were. `Environment::bloom_intensity`
-  (default 0.04; 0 skips the passes and binds black, the image matches the
+  (default 0.15; normalised, so this is a little below the halo strength of the
+  un-normalised CoD sum at 0.04; it also costs edges up to ~15% of their
+  local contrast, guarded at 75% kept by `bloom_adds_no_haze_keeps_edges`;
+  0 skips the passes and binds black, the image matches the
   pre-bloom one exactly). Bloom textures live in `ViewportTarget` and are
   rebuilt with it. `tonemap_pass(hdr)` alone never blooms. GPU tests that
   are not about bloom set `bloom_intensity: 0.0`.

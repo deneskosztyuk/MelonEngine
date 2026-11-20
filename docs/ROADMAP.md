@@ -77,7 +77,7 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
 - [x] Bloom: no threshold, 13-tap downsample (Karis average first) and
       3x3 tent upsample over a half-resolution mip chain of up to 6
       levels, mixed into the HDR colour before tonemapping.
-      `Environment::bloom_intensity` (default 0.04, 0 skips the passes).
+      `Environment::bloom_intensity` (default 0.15, 0 skips the passes).
       glTF emissive strength (`KHR_materials_emissive_strength`).
 - [x] MSAA 4x.
 - [x] SSAO: single-sample depth/normal prepass, 16-sample hemisphere AO
