@@ -80,3 +80,70 @@ fn packaged_game_starts_loads_its_scene_and_exits_cleanly() {
     assert!(log.contains("rendered 30 frames"), "log:\n{log}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Package a project whose `config/player.ron` is `player_ron` and run it.
+fn run_packaged(name: &str, player_ron: &str) -> (std::process::ExitStatus, String) {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let exe = build_player(&workspace, &mut |_| {}).expect("player builds");
+    let root = std::env::temp_dir().join(format!("melon_smoke_{name}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("config")).unwrap();
+    std::fs::write(root.join("config/player.ron"), player_ron).unwrap();
+    let settings = PlayerSettings {
+        game_name: name.into(),
+        ..Default::default()
+    };
+    let report = package_game(&root, &exe, &root.join("out"), &settings).unwrap();
+    let output = Command::new(&report.exe)
+        .args(["--frames", "5"])
+        .current_dir(std::env::temp_dir())
+        .output()
+        .expect("the packaged game starts");
+    let _ = std::fs::remove_dir_all(&root);
+    (
+        output.status,
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
+
+#[test]
+#[ignore = "needs a GPU and a full release build; run with --ignored"]
+fn missing_startup_scene_logs_an_error_and_runs_an_empty_world() {
+    let (status, log) = run_packaged("NoScene", r#"(startup_scene: "assets/scenes/nope.ron")"#);
+    assert!(
+        status.success(),
+        "exit {status}; log:
+{log}"
+    );
+    assert!(
+        log.contains("scene request assets/scenes/nope.ron failed"),
+        "log:
+{log}"
+    );
+    assert!(
+        log.contains("rendered 5 frames"),
+        "log:
+{log}"
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU and a full release build; run with --ignored"]
+fn invalid_window_size_falls_back_to_defaults_and_still_starts() {
+    let (status, log) = run_packaged("BadWindow", "(window_size: (0, 0))");
+    assert!(
+        status.success(),
+        "exit {status}; log:
+{log}"
+    );
+    assert!(
+        log.contains("player.ron"),
+        "the broken settings are reported; log:
+{log}"
+    );
+    assert!(
+        log.contains("rendered 5 frames"),
+        "log:
+{log}"
+    );
+}
