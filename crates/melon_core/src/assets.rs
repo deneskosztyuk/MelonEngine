@@ -25,6 +25,10 @@ pub struct Texture;
 /// Asset type tag for materials (`.mat` RON files, see `material`).
 pub struct Material;
 
+/// Asset type tag for environments (`.env` RON files, see
+/// `environment_asset`).
+pub struct EnvironmentFile;
+
 /// Prefix for assets that have no file (e.g. `builtin:cube`).
 pub const BUILTIN_PREFIX: &str = "builtin:";
 

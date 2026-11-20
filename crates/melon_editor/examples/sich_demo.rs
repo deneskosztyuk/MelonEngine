@@ -140,18 +140,7 @@ fn main() -> anyhow::Result<()> {
     core.world.spawn((
         Name("Golden Hour Lighting".into()),
         Transform::default(),
-        melon_core::SceneLighting {
-            sun_elevation: 7.0,
-            sun_azimuth: -115.0,
-            sun_color: Vec3::new(1.35, 0.68, 0.32),
-            ambient: 0.3,
-            sky_ambient: Vec3::new(0.55, 0.52, 0.85),
-            ground_ambient: Vec3::new(0.6, 0.4, 0.26),
-            zenith_color: Vec3::new(0.09, 0.1, 0.3),
-            horizon_color: Vec3::new(1.05, 0.55, 0.3),
-            fog_density: 0.0025,
-            bloom_intensity: 0.12,
-        },
+        melon_core::WorldEnvironment::default(),
     ));
     // Pond: a thin blended slab with reeds and lily pads.
     let pond = slot(&mut core, "materials/pond.mat");

@@ -31,14 +31,15 @@ pub mod reflect;
 pub mod resources;
 mod ron_file;
 pub mod scene;
-pub mod scene_lighting;
 pub mod stages;
+pub mod world_environment;
 
 pub use actions::{
     Action, ActionKind, Actions, AxisBinding, InputMap, LoadOutcome, update_actions_system,
 };
 pub use assets::{
-    AssetGuid, AssetMeta, AssetServer, Handle, META_VERSION, Material, Model, Texture, meta_path,
+    AssetGuid, AssetMeta, AssetServer, EnvironmentFile, Handle, META_VERSION, Material, Model,
+    Texture, meta_path,
 };
 pub use audio::{
     AudioBus, AudioClip, AudioListener, AudioPreview, AudioRequest, AudioRequests, AudioSettings,
@@ -80,8 +81,8 @@ pub use reflect::{
 };
 pub use resources::{Camera, Environment, Light, NameCounter, SimulationState, Time};
 pub use scene::{KeepOnSceneLoad, SceneRequests};
-pub use scene_lighting::SceneLighting;
 pub use stages::{FixedPostUpdate, FixedUpdate, PhysicsStep, PostUpdate, PreUpdate, Update};
+pub use world_environment::{EnvironmentPreview, WorldEnvironment};
 
 /// What a game crate needs to define and register components:
 /// `use melon_core::prelude::*;` then `#[derive(Component, Reflect)]`.
@@ -185,6 +186,7 @@ impl Core {
         world.init_resource::<scene::SceneRequests>();
         world.init_resource::<PlayerSettings>();
         world.init_resource::<Cursor>();
+        world.init_resource::<EnvironmentPreview>();
         world.init_resource::<AppExit>();
 
         let mut core = Self {
@@ -205,7 +207,7 @@ impl Core {
             (
                 clear_input_frame_system,
                 hierarchy::propagate_transforms_system,
-                scene_lighting::scene_lighting_system,
+                world_environment::world_environment_system,
             ),
         );
         core.add_systems(Update, assets::hot_reload_system);
@@ -223,7 +225,7 @@ impl Core {
             .register_component::<PointLight>()
             .register_component::<SpotLight>()
             .register_component::<Lod>()
-            .register_component::<SceneLighting>();
+            .register_component::<WorldEnvironment>();
         {
             let registry = core.world.resource::<AppTypeRegistry>().clone();
             let mut registry = registry.write();

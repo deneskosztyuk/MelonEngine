@@ -18,6 +18,7 @@ pub const ENVIRONMENT_EXTENSION: &str = "env";
 /// empty = unset.
 #[derive(Reflect, Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[reflect(Default)]
+#[serde(default)]
 pub struct AssetRef {
     pub guid: String,
     pub path: String,
