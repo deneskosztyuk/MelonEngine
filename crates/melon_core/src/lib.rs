@@ -11,6 +11,7 @@ pub mod assets;
 pub mod components;
 pub mod hierarchy;
 pub mod input;
+pub mod plugin;
 pub mod resources;
 pub mod stages;
 
@@ -27,6 +28,7 @@ pub use components::{
 pub use glam;
 pub use hierarchy::{ChildOf, Children, GlobalTransform};
 pub use input::{GameInputGate, Input, InputButton, InputFocus, KeyCode, MouseButton, RawPresses};
+pub use plugin::{App, Plugin, abi_fingerprint};
 pub use resources::{Camera, Light, NameCounter, SimulationState, Time};
 pub use stages::{FixedUpdate, PostUpdate, PreUpdate, Update};
 
@@ -73,6 +75,18 @@ fn log_frame_system(counter: Res<FrameCounter>, interval: Res<LogInterval>) {
 pub struct Core {
     pub world: World,
     pub schedules: Schedules,
+    /// Plugin systems, kept apart from `schedules` so `rebuild_plugins`
+    /// replaces exactly them. Each runs right after its engine stage.
+    pub plugin_schedules: Schedules,
+}
+
+fn stage_schedules() -> Schedules {
+    let mut schedules = Schedules::new();
+    schedules.insert(Schedule::new(PreUpdate));
+    schedules.insert(Schedule::new(FixedUpdate));
+    schedules.insert(Schedule::new(Update));
+    schedules.insert(Schedule::new(PostUpdate));
+    schedules
 }
 
 impl Core {
@@ -92,13 +106,11 @@ impl Core {
         world.init_resource::<InputMap>();
         world.init_resource::<Actions>();
 
-        let mut schedules = Schedules::new();
-        schedules.insert(Schedule::new(PreUpdate));
-        schedules.insert(Schedule::new(FixedUpdate));
-        schedules.insert(Schedule::new(Update));
-        schedules.insert(Schedule::new(PostUpdate));
-
-        let mut core = Self { world, schedules };
+        let mut core = Self {
+            world,
+            schedules: stage_schedules(),
+            plugin_schedules: stage_schedules(),
+        };
         core.add_systems(PreUpdate, update_actions_system);
         core.add_systems(Update, (frame_counter_system, log_frame_system));
         core.add_systems(
@@ -121,6 +133,24 @@ impl Core {
     ) -> &mut Self {
         self.schedules.add_systems(label, systems);
         self
+    }
+
+    /// Build a plugin into the plugin schedules.
+    pub fn add_plugin(&mut self, plugin: &dyn Plugin) {
+        plugin.build(&mut App {
+            world: &mut self.world,
+            schedules: &mut self.plugin_schedules,
+        });
+    }
+
+    /// Drop every plugin system and build again (game hot reload). The world,
+    /// its entities and resources stay.
+    pub fn rebuild_plugins(&mut self, build: impl FnOnce(&mut App)) {
+        self.plugin_schedules = stage_schedules();
+        build(&mut App {
+            world: &mut self.world,
+            schedules: &mut self.plugin_schedules,
+        });
     }
 
     /// Run one frame: `PreUpdate`, then `FixedUpdate` once per whole `Time::fixed_delta` of
@@ -166,8 +196,11 @@ impl Core {
         self.world.clear_trackers();
     }
 
-    fn run_stage(&mut self, label: impl ScheduleLabel) {
-        if let Some(schedule) = self.schedules.get_mut(label) {
+    fn run_stage(&mut self, label: impl ScheduleLabel + Clone) {
+        if let Some(schedule) = self.schedules.get_mut(label.clone()) {
+            schedule.run(&mut self.world);
+        }
+        if let Some(schedule) = self.plugin_schedules.get_mut(label) {
             schedule.run(&mut self.world);
         }
     }
