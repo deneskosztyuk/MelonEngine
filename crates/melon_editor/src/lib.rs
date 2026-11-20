@@ -4596,8 +4596,18 @@ mod tests {
         editor.create_cube_step(&mut world);
         editor.set_current_scene(root.join("assets/scenes/current.ron"));
         assert!(editor.history.can_undo());
+        world.insert_resource(melon_core::EnvironmentPreview(Some((
+            "assets/old.env".into(),
+            melon_core::EnvironmentAsset::default(),
+        ))));
         editor.pending_operation = Some(PendingOperation::NewScene);
         assert!(!editor.run_pending_operation(&mut world));
+        assert!(
+            world
+                .resource::<melon_core::EnvironmentPreview>()
+                .0
+                .is_none()
+        );
         assert_eq!(transform_count(&mut world), 1);
         let environments = world_environments(&mut world);
         assert_eq!(environments.len(), 1);

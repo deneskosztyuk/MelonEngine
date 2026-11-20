@@ -190,6 +190,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn a_drag_previews_while_the_pointer_is_down_and_saves_when_it_is_up() {
+        let root = project("drag");
+        let file = root.join("assets/a.env");
+        EnvironmentAsset::default().save(&file).unwrap();
+        let mut world = melon_core::Core::new().world;
+        let ctx = egui::Context::default();
+        frame(&ctx, &mut world, &root, vec![]);
+        frame(&ctx, &mut world, &root, vec![]);
+        // The sun's first field (elevation) sits just under its header.
+        let (from, to) = (egui::pos2(100.0, 28.0), egui::pos2(140.0, 28.0));
+        let press = vec![egui::Event::PointerMoved(from), button(from, true)];
+        frame(&ctx, &mut world, &root, press);
+        frame(&ctx, &mut world, &root, vec![egui::Event::PointerMoved(to)]);
+        let pending: EnvironmentAsset = ctx.data(|d| d.get_temp(pending_id())).expect("pending");
+        assert_ne!(pending, EnvironmentAsset::default(), "the drag edited it");
+        assert_eq!(
+            EnvironmentAsset::read(&file).unwrap(),
+            EnvironmentAsset::default(),
+            "nothing written mid-drag"
+        );
+        let preview = world.resource::<EnvironmentPreview>().0.clone();
+        assert_eq!(preview, Some(("assets/a.env".to_string(), pending.clone())));
+        frame(&ctx, &mut world, &root, vec![button(to, false)]);
+        assert_eq!(EnvironmentAsset::read(&file).unwrap(), pending, "saved");
+        let left: Option<EnvironmentAsset> = ctx.data(|d| d.get_temp(pending_id()));
+        assert!(left.is_none(), "pending cleared after the write");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn every_section_gets_a_header() {
         let root = project("headers");

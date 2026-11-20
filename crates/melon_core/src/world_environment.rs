@@ -269,6 +269,19 @@ mod tests {
     }
 
     #[test]
+    fn out_of_range_values_are_clamped() {
+        let mut a = EnvironmentAsset::default();
+        a.ambient.share = 1.5;
+        a.fog.density = -0.2;
+        a.bloom.intensity = -1.0;
+        assert_eq!(a.light().ambient, 1.0);
+        a.ambient.share = -0.5;
+        assert_eq!(a.light().ambient, 0.0);
+        let env = a.environment(None);
+        assert_eq!((env.fog_density, env.bloom_intensity), (0.0, 0.0));
+    }
+
+    #[test]
     fn removing_the_component_restores_the_defaults() {
         let (root, mut core) = project("remove");
         write(
@@ -307,6 +320,13 @@ mod tests {
             !env.last_changed()
                 .is_newer_than(tick, core.world.change_tick()),
             "rewritten although nothing changed"
+        );
+        let light = core.world.get_resource_ref::<Light>().expect("light");
+        assert!(
+            !light
+                .last_changed()
+                .is_newer_than(tick, core.world.change_tick()),
+            "light rewritten although nothing changed"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
