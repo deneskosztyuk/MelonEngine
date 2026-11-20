@@ -67,7 +67,7 @@ Core features all three share, and where MelonEngine stands (✅ done,
 | Editor | Viewport, gizmos, snapping | ✅ (no local/world toggle) |
 | Editor | Hierarchy, inspector | ✅ |
 | Editor | Content browser | ✅ |
-| Editor | Undo / redo | ❌ |
+| Editor | Undo / redo | ✅ |
 | Editor | Play in editor | ✅ |
 | Editor | Game view | ❌ |
 | Editor | Console / log | ✅ |
@@ -83,7 +83,7 @@ one; 10 comes after.
       Inspector (cards, Add / Remove Component) and scene files (format v5,
       no hand-listed `SceneEntity`); an agent can build levels as RON data.
       Next step: prefabs, built on the same registry.
-2. - [ ] **Undo / Redo** (command history), plus entity rename and duplicate.
+2. - [x] **Undo / Redo** (snapshot history, `history.rs`), plus entity rename and duplicate.
 3. - [ ] **Rendering:** `Handle<Texture>` / `Handle<Material>` assets; point
       and spot lights; image-based ambient; cascaded sun shadows, then
       point/spot shadows; LOD. (PBR, sky, GI, instancing and culling are
