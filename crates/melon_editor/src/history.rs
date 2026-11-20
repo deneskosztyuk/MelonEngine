@@ -1099,4 +1099,233 @@ mod tests {
             .unwrap();
         assert_eq!(root_names(&mut world), ["A", "B", "C"]);
     }
+
+    fn physics_world() -> World {
+        let mut world = world();
+        world.insert_resource(melon_core::Time::default());
+        world
+    }
+
+    fn dynamic() -> BodyInfo {
+        BodyInfo {
+            body_type: BodyKind::Dynamic,
+            half_extents: Vec3::splat(0.5),
+        }
+    }
+
+    #[test]
+    fn undo_of_add_physics_component_removes_the_body() {
+        let mut world = world();
+        let mut h = History::default();
+        let a = spawn(&mut world, "A", 0.0);
+        h.track(&mut world, Some(a), false, None);
+        // What the Inspector's Add Component does for a physics component.
+        world.entity_mut(a).insert(dynamic());
+        crate::rebuild_body(&mut world, a);
+        h.track(&mut world, Some(a), false, None);
+        assert_eq!(h.undo_label(), Some("Add Body Info"));
+        assert_eq!(body_count(&world), 1);
+        h.undo(&mut world).unwrap();
+        assert_eq!(body_count(&world), 0, "rapier body removed");
+        assert!(world.get::<BodyInfo>(a).is_none());
+        assert!(world.get::<melon_physics::RigidBodyComponent>(a).is_none());
+        h.redo(&mut world).unwrap();
+        assert_eq!(body_count(&world), 1);
+        assert!(world.get::<melon_physics::RigidBodyComponent>(a).is_some());
+    }
+
+    #[test]
+    fn undo_of_delete_keeps_unknown_components() {
+        let mut world = world();
+        let mut h = History::default();
+        let a = spawn(&mut world, "A", 0.0);
+        let unknown = "(hp: 3, tags: [\"a\"])";
+        world.entity_mut(a).insert(scene::KeptComponents(
+            [(
+                "game::Unknown".to_string(),
+                ron::value::RawValue::from_boxed_ron(unknown.to_string().into_boxed_str()).unwrap(),
+            )]
+            .into(),
+        ));
+        h.delete(&mut world, a, Some(a));
+        cleanup(&mut world);
+        h.undo(&mut world).unwrap();
+        let a = find(&mut world, "A").unwrap();
+        let kept = world.get::<scene::KeptComponents>(a).unwrap();
+        assert_eq!(kept.0["game::Unknown"].get_ron(), unknown);
+        h.redo(&mut world).unwrap();
+        cleanup(&mut world);
+        h.undo(&mut world).unwrap();
+        let a = find(&mut world, "A").unwrap();
+        assert!(world.get::<scene::KeptComponents>(a).is_some());
+    }
+
+    #[test]
+    fn entities_of_an_old_scene_get_ids_and_save_them() {
+        let mut world = world();
+        let mut h = History::default();
+        let data: scene::SceneData = ron::from_str(
+            r#"(version: 5, entities: [(name: "A", parent: None, model: None, model_guid: None, components: {"melon_core::components::Spin": ()})], name_counter: 0)"#,
+        )
+        .unwrap();
+        world
+            .try_resource_scope::<PhysicsWorld, _>(|world, mut physics| {
+                scene::apply_scene(world, &mut physics, &data)
+            })
+            .unwrap()
+            .unwrap();
+        let a = find(&mut world, "A").unwrap();
+        assert!(world.get::<EditorId>(a).is_none());
+        h.rename(&mut world, a, "B", None).unwrap();
+        let id = world.get::<EditorId>(a).unwrap().0;
+        let saved = scene::scene_to_data(&mut world).unwrap();
+        assert!(ron::to_string(&saved).unwrap().contains(&id.to_string()));
+        h.undo(&mut world).unwrap();
+        assert_eq!(name_of(&world, a), "A");
+    }
+
+    #[test]
+    fn rename_to_only_spaces_is_refused() {
+        let mut world = world();
+        let mut h = History::default();
+        let a = spawn(&mut world, "A", 0.0);
+        assert!(h.rename(&mut world, a, "   ", None).is_err());
+        assert_eq!(name_of(&world, a), "A");
+        assert!(!h.can_undo());
+    }
+
+    #[test]
+    fn duplicate_takes_the_first_free_number() {
+        let mut world = world();
+        let mut h = History::default();
+        let c = spawn(&mut world, "Cube", 0.0);
+        let _c1 = spawn(&mut world, "Cube (1)", 0.0);
+        let c3 = spawn(&mut world, "Cube (3)", 0.0);
+        let copy = h.duplicate(&mut world, c, None).unwrap();
+        assert_eq!(name_of(&world, copy), "Cube (2)");
+        let copy = h.duplicate(&mut world, c3, None).unwrap();
+        assert_eq!(name_of(&world, copy), "Cube (4)");
+    }
+
+    #[test]
+    fn a_duplicated_body_is_independent_of_the_original() {
+        let mut world = world();
+        let mut h = History::default();
+        let a = spawn(&mut world, "A", 0.0);
+        world.entity_mut(a).insert(dynamic());
+        crate::rebuild_body(&mut world, a);
+        let copy = h.duplicate(&mut world, a, None).unwrap();
+        let handle = |w: &World, e| {
+            w.get::<melon_physics::RigidBodyComponent>(e)
+                .unwrap()
+                .body_handle
+        };
+        assert_ne!(handle(&world, a), handle(&world, copy));
+        assert_eq!(body_count(&world), 2);
+        // Undoing the duplicate removes only the copy's body.
+        h.undo(&mut world).unwrap();
+        cleanup(&mut world);
+        assert_eq!(body_count(&world), 1);
+        assert!(
+            world
+                .resource::<PhysicsWorld>()
+                .bodies
+                .get(handle(&world, a))
+                .is_some(),
+            "the original keeps its body"
+        );
+    }
+
+    #[test]
+    fn redo_works_after_the_cap_trimmed_the_oldest() {
+        let mut world = world();
+        let mut h = History::default();
+        let a = spawn(&mut world, "A", 0.0);
+        for i in 0..MAX_STEPS + 5 {
+            h.rename(&mut world, a, &format!("N{i}"), None).unwrap();
+        }
+        for _ in 0..MAX_STEPS {
+            h.undo(&mut world).unwrap();
+        }
+        for _ in 0..MAX_STEPS {
+            h.redo(&mut world).unwrap();
+        }
+        assert!(!h.can_redo());
+        assert_eq!(name_of(&world, a), format!("N{}", MAX_STEPS + 4));
+    }
+
+    #[test]
+    fn undo_after_play_and_stop_works_with_no_bogus_steps() {
+        let mut world = physics_world();
+        let mut h = History::default();
+        let a = spawn(&mut world, "A", 0.0);
+        let _b = spawn(&mut world, "B", 0.0);
+        world.entity_mut(a).insert(dynamic());
+        crate::rebuild_body(&mut world, a);
+        h.rename(&mut world, a, "A2", Some(a)).unwrap();
+        h.track(&mut world, Some(a), false, None);
+        crate::play::play(&mut world).unwrap();
+        // The game spawns an entity (no EditorId) and the Hierarchy lists it.
+        let g = spawn(&mut world, "Bullet", 0.0);
+        h.track(&mut world, Some(g), false, None);
+        crate::play::stop(&mut world).unwrap();
+        assert!(find(&mut world, "Bullet").is_none());
+        let a = find(&mut world, "A2").unwrap();
+        // A stale selection (respawned entity) and the new one are both fine.
+        h.track(&mut world, Some(g), false, None);
+        h.track(&mut world, Some(a), false, None);
+        h.track(&mut world, Some(a), false, None);
+        assert_eq!(
+            h.labels().collect::<Vec<_>>(),
+            ["Rename A"],
+            "no bogus step"
+        );
+        assert_eq!(root_names(&mut world), ["A2", "B"]);
+        assert_eq!(body_count(&world), 1);
+        h.undo(&mut world).unwrap();
+        assert_eq!(root_names(&mut world), ["A", "B"]);
+        assert_eq!(body_count(&world), 1);
+        h.redo(&mut world).unwrap();
+        assert_eq!(root_names(&mut world), ["A2", "B"]);
+    }
+
+    #[test]
+    fn an_idle_selected_physics_entity_records_nothing() {
+        let mut world = world();
+        let mut h = History::default();
+        let a = spawn(&mut world, "A", 0.0);
+        world.entity_mut(a).insert(dynamic());
+        crate::rebuild_body(&mut world, a);
+        for _ in 0..5 {
+            h.track(&mut world, Some(a), false, None);
+        }
+        assert!(!h.can_undo());
+    }
+
+    /// `cargo test -p melon_editor --lib track_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement"]
+    fn track_cost() {
+        let mut world = world();
+        let mut h = History::default();
+        let a = spawn(&mut world, "A", 0.0);
+        world.entity_mut(a).insert((
+            dynamic(),
+            melon_core::Aabb {
+                half_extents: Vec3::ONE,
+            },
+            Spin,
+            melon_core::Bob,
+            melon_core::PreviousTransform(Transform::default()),
+        ));
+        crate::rebuild_body(&mut world, a);
+        h.track(&mut world, Some(a), false, None);
+        let n = 2000;
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            h.track(&mut world, Some(a), false, None);
+        }
+        let per = start.elapsed().as_secs_f64() * 1e6 / n as f64;
+        println!("track: {per:.1} us per frame");
+    }
 }

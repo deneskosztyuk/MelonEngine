@@ -5560,4 +5560,89 @@ mod tests {
         assert!(!editor.history.can_undo() && !editor.history.can_redo());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn ctrl_z_with_an_empty_history_changes_nothing() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        let e = create_cube(&mut world);
+        editor.selected = Some(e);
+        press(&mut editor, &mut world, egui::Key::Z, false);
+        press(&mut editor, &mut world, egui::Key::Y, false);
+        assert_eq!(editor.selected, Some(e));
+        assert_eq!(live_names(&mut world), ["Cube 0"]);
+    }
+
+    #[test]
+    fn undoing_a_create_leaves_no_stale_selection() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        editor.create_cube_step(&mut world);
+        press(&mut editor, &mut world, egui::Key::Z, false);
+        assert_eq!(editor.selected, None, "nothing was selected before");
+        press(&mut editor, &mut world, egui::Key::Z, true);
+        assert!(editor.selected.is_some());
+        // With a selection before the create, undo returns to it.
+        let first = editor.selected.unwrap();
+        editor.create_cube_step(&mut world);
+        assert_ne!(editor.selected, Some(first));
+        press(&mut editor, &mut world, egui::Key::Z, false);
+        assert_eq!(editor.selected, Some(first));
+        let mut cleanup = bevy_ecs::schedule::Schedule::default();
+        cleanup.add_systems(melon_physics::cleanup_deleted_system);
+        cleanup.run(&mut world);
+        assert_eq!(live_names(&mut world), ["Cube 0"]);
+    }
+
+    /// One frame: a text field (focused from the first frame when `typing`),
+    /// then the shortcuts with Ctrl+Z pressed on frame 3.
+    fn ctrl_z_frames(editor: &mut Editor, world: &mut World, typing: bool) {
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        for frame in 0..4 {
+            let modifiers = if frame == 3 {
+                egui::Modifiers::COMMAND
+            } else {
+                egui::Modifiers::NONE
+            };
+            let events = if frame == 3 {
+                vec![egui::Event::Key {
+                    key: egui::Key::Z,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }]
+            } else {
+                vec![]
+            };
+            let input = egui::RawInput {
+                modifiers,
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                if typing {
+                    let edit = ui.add(egui::TextEdit::singleline(&mut text).id(egui::Id::new("t")));
+                    if frame == 0 {
+                        edit.request_focus();
+                    }
+                }
+                editor.handle_shortcuts(world, ui);
+            });
+        }
+    }
+
+    #[test]
+    fn ctrl_z_in_a_focused_text_field_leaves_the_scene_alone() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        editor.create_cube_step(&mut world);
+        ctrl_z_frames(&mut editor, &mut world, true);
+        assert_eq!(live_names(&mut world), ["Cube 0"], "scene not undone");
+        assert!(editor.history.can_undo());
+        // Control: with no text field focused the same keys undo.
+        ctrl_z_frames(&mut editor, &mut world, false);
+        assert!(!editor.history.can_undo());
+    }
 }
