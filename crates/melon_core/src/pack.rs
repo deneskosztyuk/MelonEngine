@@ -132,6 +132,10 @@ pub fn project_files(root: &Path, excludes: &[String]) -> Vec<PackFile> {
 
 /// Write `files` into the pack at `out`.
 pub fn write_pack(out: &Path, files: &[PackFile]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    if let Some(f) = files.iter().find(|f| !seen.insert(f.path.as_str())) {
+        bail!("two files are packed as {}", f.path);
+    }
     let mut file = File::create(out).with_context(|| format!("cannot create {}", out.display()))?;
     file.write_all(&[0; HEADER_LEN as usize])?;
     let mut entries = Vec::with_capacity(files.len());
@@ -177,6 +181,34 @@ pub fn build_pack(root: &Path, excludes: &[String], out: &Path) -> Result<usize>
     Ok(files.len())
 }
 
+/// Parse `count` index entries; every blob must lie inside a file of `file_len` bytes.
+fn parse_index(bytes: &[u8], count: u32, file_len: u64) -> Result<HashMap<String, Entry>> {
+    let mut at = 0usize;
+    let mut take = |n: usize| -> Result<&[u8]> {
+        let s = at
+            .checked_add(n)
+            .and_then(|end| bytes.get(at..end))
+            .context("pack index is cut off")?;
+        at += n;
+        Ok(s)
+    };
+    let mut index = HashMap::new();
+    for _ in 0..count {
+        let len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+        let name = String::from_utf8(take(len)?.to_vec()).context("pack path")?;
+        let has_guid = take(1)?[0] != 0;
+        let guid = AssetGuid::from_bytes(take(16)?.try_into().unwrap());
+        let offset = u64::from_le_bytes(take(8)?.try_into().unwrap());
+        let size = u64::from_le_bytes(take(8)?.try_into().unwrap());
+        if offset.checked_add(size).is_none_or(|end| end > file_len) {
+            bail!("pack entry {name} lies outside the file");
+        }
+        let guid = has_guid.then_some(guid);
+        index.insert(name, Entry { guid, offset, size });
+    }
+    Ok(index)
+}
+
 impl Pack {
     pub fn open(path: &Path) -> Result<Self> {
         let mut file =
@@ -192,26 +224,21 @@ impl Pack {
             bail!("unsupported pack version {}", u32_at(8));
         }
         let (count, index_offset, index_len) = (u32_at(12), u64_at(16), u64_at(24));
+        let file_len = file.metadata()?.len();
+        if index_offset < HEADER_LEN
+            || index_offset
+                .checked_add(index_len)
+                .is_none_or(|e| e > file_len)
+        {
+            bail!(
+                "{} is cut off or corrupt (index outside the file)",
+                path.display()
+            );
+        }
         file.seek(SeekFrom::Start(index_offset))?;
         let mut bytes = vec![0u8; index_len as usize];
         file.read_exact(&mut bytes).context("pack index")?;
-        let mut at = 0usize;
-        let mut take = |n: usize| -> Result<&[u8]> {
-            let s = bytes.get(at..at + n).context("pack index is cut off")?;
-            at += n;
-            Ok(s)
-        };
-        let mut index = HashMap::new();
-        for _ in 0..count {
-            let len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
-            let name = String::from_utf8(take(len)?.to_vec()).context("pack path")?;
-            let has_guid = take(1)?[0] != 0;
-            let guid = AssetGuid::from_bytes(take(16)?.try_into().unwrap());
-            let offset = u64::from_le_bytes(take(8)?.try_into().unwrap());
-            let size = u64::from_le_bytes(take(8)?.try_into().unwrap());
-            let guid = has_guid.then_some(guid);
-            index.insert(name, Entry { guid, offset, size });
-        }
+        let index = parse_index(&bytes, count, file_len)?;
         Ok(Self {
             file: Mutex::new(file),
             index,
@@ -343,5 +370,127 @@ mod tests {
         std::fs::write(root.join("x.pak"), vec![7u8; 64]).unwrap();
         assert!(Pack::open(&root.join("x.pak")).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A pack with the given (path, bytes) files, written from a temp project.
+    fn pack_of(name: &str, files: &[(&str, &[u8])]) -> (PathBuf, PathBuf) {
+        let root = temp_project(name);
+        let mut list = Vec::new();
+        for (i, (path, bytes)) in files.iter().enumerate() {
+            let source = root.join(format!("src{i}.bin"));
+            std::fs::write(&source, bytes).unwrap();
+            list.push(PackFile {
+                path: path.to_string(),
+                guid: None,
+                source,
+            });
+        }
+        let out = root.join("game.pak");
+        write_pack(&out, &list).unwrap();
+        (root, out)
+    }
+
+    #[test]
+    fn an_empty_pack_opens_and_has_nothing() {
+        let (root, out) = pack_of("empty", &[]);
+        let pack = Pack::open(&out).unwrap();
+        assert_eq!(pack.entries().count(), 0);
+        assert!(pack.read("assets/a").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spaces_and_non_ascii_paths_round_trip_from_disk() {
+        let root = temp_project("unicode");
+        std::fs::create_dir_all(root.join("assets/ünï cödé")).unwrap();
+        let g = asset(&root, "assets/ünï cödé/モデル a b.bin", b"x");
+        let files = project_files(&root, &[]);
+        assert_eq!(files[0].path, "assets/ünï cödé/モデル a b.bin");
+        let out = root.join("game.pak");
+        write_pack(&out, &files).unwrap();
+        let pack = Pack::open(&out).unwrap();
+        assert_eq!(
+            pack.read("assets/ünï cödé/モデル a b.bin")
+                .unwrap()
+                .unwrap(),
+            b"x"
+        );
+        assert_eq!(pack.entries().next().unwrap().1, Some(g));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn duplicate_paths_are_refused_when_writing() {
+        let root = temp_project("dups");
+        let source = root.join("a.bin");
+        std::fs::write(&source, b"a").unwrap();
+        let f = PackFile {
+            path: "assets/a.bin".into(),
+            guid: None,
+            source,
+        };
+        assert!(write_pack(&root.join("game.pak"), &[f.clone(), f]).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_truncated_pack_is_an_error_not_a_panic() {
+        let (root, out) = pack_of(
+            "trunc",
+            &[("assets/a.bin", b"hello"), ("assets/b.bin", b"world!")],
+        );
+        let full = std::fs::read(&out).unwrap();
+        for len in 0..full.len() {
+            std::fs::write(&out, &full[..len]).unwrap();
+            assert!(
+                Pack::open(&out).is_err(),
+                "opened a pack cut to {len} bytes"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_corrupt_header_or_index_is_an_error_not_a_panic() {
+        let (root, out) = pack_of("corrupt", &[("assets/a.bin", b"hello")]);
+        let good = std::fs::read(&out).unwrap();
+        let patch = |at: usize, bytes: &[u8]| {
+            let mut v = good.clone();
+            v[at..at + bytes.len()].copy_from_slice(bytes);
+            std::fs::write(&out, v).unwrap();
+        };
+        patch(24, &u64::MAX.to_le_bytes()); // index length
+        assert!(Pack::open(&out).is_err(), "huge index length");
+        patch(16, &u64::MAX.to_le_bytes()); // index offset
+        assert!(Pack::open(&out).is_err(), "index offset past the end");
+        patch(12, &u32::MAX.to_le_bytes()); // entry count
+        assert!(Pack::open(&out).is_err(), "count larger than the index");
+        patch(8, &99u32.to_le_bytes());
+        assert!(Pack::open(&out).is_err(), "unknown version");
+        let at = good.len() - 16; // the entry's offset field
+        patch(at, &(u64::MAX - 2).to_le_bytes());
+        assert!(Pack::open(&out).is_err(), "blob offset past the end");
+        let at = good.len() - 8; // its size field
+        patch(at, &(1u64 << 62).to_le_bytes());
+        assert!(Pack::open(&out).is_err(), "huge blob size");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn offsets_past_4_gib_do_not_truncate() {
+        let offset = (5u64 << 32) + 8;
+        let mut index = Vec::new();
+        index.extend(5u32.to_le_bytes());
+        index.extend(b"a.bin");
+        index.push(0);
+        index.extend([0u8; 16]);
+        index.extend(offset.to_le_bytes());
+        index.extend(3u64.to_le_bytes());
+        let parsed = parse_index(&index, 1, offset + 8).unwrap();
+        assert_eq!((parsed["a.bin"].offset, parsed["a.bin"].size), (offset, 3));
+        assert!(
+            parse_index(&index, 1, offset + 2).is_err(),
+            "blob ends past the file"
+        );
     }
 }

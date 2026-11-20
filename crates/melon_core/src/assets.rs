@@ -741,6 +741,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn packed_guid_follows_an_asset_renamed_with_its_meta() {
+        let root = temp_root("pack_rename");
+        let guid = write_asset_with_meta(&root, "assets/models/a.glb");
+        for ext in ["", ".meta"] {
+            std::fs::rename(
+                root.join(format!("assets/models/a.glb{ext}")),
+                root.join(format!("assets/models/sub dir b.glb{ext}")),
+            )
+            .unwrap();
+        }
+        let out = root.join("game.pak");
+        crate::pack::build_pack(&root, &[], &out).unwrap();
+        let mut server = AssetServer::new(root.clone());
+        server.set_pack(std::sync::Arc::new(crate::pack::Pack::open(&out).unwrap()));
+        assert_eq!(
+            server.path_of_guid(guid),
+            Some("assets/models/sub dir b.glb")
+        );
+        assert!(server.read("assets/models/a.glb").is_err());
+        assert!(
+            server.read(r"assets\models\sub dir b.glb").is_ok(),
+            "backslashes are normalised"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Fixture: a `.meta` file as `AssetMeta::to_ron` writes it.
 
     #[test]

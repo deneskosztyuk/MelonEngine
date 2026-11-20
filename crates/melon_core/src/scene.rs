@@ -985,6 +985,70 @@ mod tests {
         assert!(core.world.resource::<SceneRequests>().pending().is_none());
     }
     #[test]
+    fn two_requests_in_one_frame_last_wins() {
+        let root = std::env::temp_dir().join(format!("melon_scene_two_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("assets/scenes")).unwrap();
+        for name in ["B", "C"] {
+            let mut other = Core::new();
+            other.world.insert_resource(AssetServer::new(".".into()));
+            other.world.spawn((Name(name.into()), Transform::default()));
+            let file = root.join(format!("assets/scenes/{}.scene", name.to_lowercase()));
+            save_scene(&mut other.world, &file).unwrap();
+        }
+        let mut core = Core::new();
+        core.world.insert_resource(AssetServer::new(root.clone()));
+        core.world.spawn((Name("A".into()), Transform::default()));
+        let mut requests = core.world.resource_mut::<SceneRequests>();
+        requests.load("assets/scenes/b.scene");
+        requests.load("assets/scenes/c.scene");
+        core.update();
+        let names: Vec<String> = core
+            .world
+            .query::<&Name>()
+            .iter(&core.world)
+            .map(|n| n.0.clone())
+            .collect();
+        assert_eq!(names, ["C"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unparsable_or_invalid_scene_request_keeps_the_current_scene() {
+        let root = std::env::temp_dir().join(format!("melon_scene_bad_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("assets/scenes")).unwrap();
+        std::fs::write(
+            root.join("assets/scenes/garbage.scene"),
+            "(version: 6, entit",
+        )
+        .unwrap();
+        std::fs::write(root.join("assets/scenes/binary.scene"), [0xff, 0xfe, 0x00]).unwrap();
+        std::fs::write(
+            root.join("assets/scenes/future.scene"),
+            "(version: 999, entities: [], name_counter: 0)",
+        )
+        .unwrap();
+        let mut core = Core::new();
+        core.world.insert_resource(AssetServer::new(root.clone()));
+        core.world.spawn((Name("A".into()), Transform::default()));
+        for bad in ["garbage", "binary", "future"] {
+            core.world
+                .resource_mut::<SceneRequests>()
+                .load(&format!("assets/scenes/{bad}.scene"));
+            core.update();
+            let names: Vec<String> = core
+                .world
+                .query::<&Name>()
+                .iter(&core.world)
+                .map(|n| n.0.clone())
+                .collect();
+            assert_eq!(names, ["A"], "{bad}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn save_load_roundtrip() {
         let mut world = world_with_entities();
 

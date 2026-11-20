@@ -60,6 +60,18 @@ impl PlayerSettings {
         {
             return Err(format!("the game name contains {c:?}"));
         }
+        // Windows device names (also with an extension) cannot be file names.
+        let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+        let numbered = |p: &str| {
+            stem.strip_prefix(p)
+                .is_some_and(|n| matches!(n.as_bytes(), [b'1'..=b'9']))
+        };
+        if ["CON", "PRN", "AUX", "NUL"].contains(&stem.as_str())
+            || numbered("COM")
+            || numbered("LPT")
+        {
+            return Err(format!("{name} is a reserved Windows file name"));
+        }
         if self.version.trim().is_empty() {
             return Err("the version is empty".into());
         }
@@ -145,6 +157,18 @@ mod tests {
             },
             PlayerSettings {
                 game_name: "x.".into(),
+                ..Default::default()
+            },
+            PlayerSettings {
+                game_name: "con".into(),
+                ..Default::default()
+            },
+            PlayerSettings {
+                game_name: "Nul.Debug".into(),
+                ..Default::default()
+            },
+            PlayerSettings {
+                window_size: [1280, u32::MAX],
                 ..Default::default()
             },
             PlayerSettings {

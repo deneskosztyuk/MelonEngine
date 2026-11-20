@@ -152,6 +152,54 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_project_and_default_excludes_package_cleanly() {
+        let root = temp("empty");
+        let exe = root.join("p.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        let out = root.join("out");
+        let settings = PlayerSettings::default();
+        let report = package_game(&root, &exe, &out, &settings).unwrap();
+        assert_eq!(report.files, 0);
+        assert_eq!(
+            Pack::open(&report.dir.join(PACK_FILE))
+                .unwrap()
+                .entries()
+                .count(),
+            0
+        );
+
+        std::fs::create_dir_all(root.join("assets/shaders")).unwrap();
+        std::fs::write(root.join("assets/shaders/x.wgsl"), "x").unwrap();
+        std::fs::write(root.join("assets/keep.bin"), "k").unwrap();
+        let report = package_game(&root, &exe, &out, &settings).unwrap();
+        let pack = Pack::open(&report.dir.join(PACK_FILE)).unwrap();
+        assert!(pack.contains("assets/keep.bin") && !pack.contains("assets/shaders/x.wgsl"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn every_invalid_windows_name_is_refused_before_anything_is_written() {
+        let root = temp("names");
+        let exe = root.join("p.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        let out = root.join("out");
+        for name in [
+            "CON", "aux.txt", "COM1", "a:b", "a<b", r"a\b", "..", "", " x", "x ", "a\nb",
+        ] {
+            let settings = PlayerSettings {
+                game_name: name.into(),
+                ..Default::default()
+            };
+            assert!(
+                package_game(&root, &exe, &out, &settings).is_err(),
+                "{name:?}"
+            );
+        }
+        assert!(!out.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn missing_player_or_bad_name_is_an_error_and_writes_nothing() {
         let root = temp("errors");
         let out = root.join("out");
