@@ -1,3 +1,6 @@
+#[cfg(feature = "hot-reload")]
+mod game_loader;
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -262,6 +265,9 @@ struct App {
     /// `config/input.ron` failed to load: the editor backs it up before its first save.
     input_map_broken: bool,
     last_frame: Option<Instant>,
+    /// Dev builds load the game plugin from its dylib and reload it live.
+    #[cfg(feature = "hot-reload")]
+    game: game_loader::GameLoader,
 }
 
 /// Project folder asset paths are relative to.
@@ -337,7 +343,10 @@ impl App {
         let mut physics = PhysicsWorld::new();
         spawn_default_scene(&mut core.world, &mut physics);
         core.world.insert_resource(physics);
+        #[cfg(not(feature = "hot-reload"))]
         core.add_plugin(&melon_game::GamePlugin);
+        #[cfg(feature = "hot-reload")]
+        let game = game_loader::GameLoader::start(&mut core);
         add_physics_systems(&mut core);
         // `--play` skips edit mode, for quick game runs.
         if std::env::args().any(|arg| arg == "--play")
@@ -357,6 +366,8 @@ impl App {
             game_input: false,
             input_map_broken,
             last_frame: None,
+            #[cfg(feature = "hot-reload")]
+            game,
         }
     }
 
@@ -519,14 +530,16 @@ impl ApplicationHandler for App {
                 let _frame_span = tracing::info_span!("frame", n = frame_n).entered();
 
                 let now = Instant::now();
+                let dt = self
+                    .last_frame
+                    .map(|t| now.duration_since(t).as_secs_f32())
+                    .unwrap_or(1.0 / 60.0);
                 if let Some(mut time) = self.core.world.get_resource_mut::<Time>() {
-                    let dt = self
-                        .last_frame
-                        .map(|t| now.duration_since(t).as_secs_f32())
-                        .unwrap_or(1.0 / 60.0);
                     time.update(dt);
                 }
                 self.last_frame = Some(now);
+                #[cfg(feature = "hot-reload")]
+                self.game.poll(dt, &mut self.core);
 
                 self.core.update();
 

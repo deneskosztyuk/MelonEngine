@@ -162,6 +162,22 @@ mod tests {
     }
 
     #[test]
+    fn build_entry_spins_while_playing_and_rebuilds() {
+        let mut core = Core::new();
+        let log = tracing::Dispatch::none();
+        core.rebuild_plugins(|app| melon_game_build(app, &log));
+        // A second build (a reload) replaces the first without panicking.
+        core.rebuild_plugins(|app| melon_game_build(app, &log));
+        let e = core.world.spawn((Transform::default(), Spin)).id();
+        core.world.insert_resource(SimulationState::Playing);
+        core.world.resource_mut::<Time>().update(0.2);
+        core.update();
+        let rot = core.world.get::<Transform>(e).unwrap().rotation;
+        // One system copy, not two: 0.5 rad/s * 0.2 s.
+        assert!(rot.angle_between(Quat::from_rotation_y(0.1)) < 1e-5);
+    }
+
+    #[test]
     fn abi_entry_matches_core() {
         assert_eq!(melon_game_abi(), melon_core::abi_fingerprint());
     }

@@ -30,7 +30,7 @@ gate: fmt-check clippy check
 test: gate
     cargo test --workspace
 
-# Run the engine in release mode (optimized glam, no hot-reload overhead).
+# Run the engine in release mode (game plugin linked statically, no live reload).
 # Runs the gate first; only launches if gate passes.
 run: gate
     cargo run -p melon_host --release --no-default-features
@@ -39,11 +39,19 @@ run: gate
 fast-run:
     cargo run -p melon_host --release --no-default-features
 
-# Debug run — unoptimized, with hot-reload for melon_game. Use for game logic dev.
+# Debug run — with live reload of the melon_game plugin. Use for game logic dev.
 dev-run: gate
     cargo run -p melon_host
 
-# Ship build — release, hot-reload disabled (statically links melon_game).
+# Rebuild only the game plugin (same profile and features as dev-run); a running
+# dev-run reloads it live. The running host exe is locked, so only the game crate
+# rebuilds: the host's empty lib target builds its dependencies without linking
+# the exe. `cargo build -p melon_game` alone resolves other dependency features,
+# and the host refuses that library (ABI fingerprint mismatch).
+game:
+    cargo build -p melon_host --lib
+
+# Ship build — release, live reload disabled (statically links melon_game).
 ship:
     cargo build -p melon_host --release --no-default-features
 

@@ -5,6 +5,9 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[lib]
+path = "src/game_build.rs"
+
 [dependencies]
 melon_core.workspace = true
 melon_render.workspace = true
@@ -18,14 +21,14 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-log.workspace = true
 egui.workspace = true
-hot-lib-reloader.workspace = true
+libloading = { workspace = true, optional = true }
 
 [build-dependencies]
 embed-resource.workspace = true
 
 [features]
 default = ["hot-reload"]
-hot-reload = []
+hot-reload = ["dep:libloading"]
 
 
 [lints]
