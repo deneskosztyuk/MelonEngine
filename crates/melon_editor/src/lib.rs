@@ -1,16 +1,18 @@
 use std::sync::Arc;
 
 use bevy_ecs::entity::Entity;
+use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
 use bevy_ecs::world::World;
 use egui::ViewportId;
 use egui_wgpu::ScreenDescriptor;
+use melon_core::bevy_reflect::{TypePath, TypeRegistry, std_traits::ReflectDefault};
 use melon_core::glam;
 use melon_core::hierarchy::{
     depth_first, mark_for_delete, set_parent_keep_world, set_world_transform, world_matrix,
 };
 use melon_core::{
     Aabb, AssetServer, BodyInfo, Camera, GameInputGate, Handle, InputFocus, Model, Name,
-    SimulationState, Spin, Transform,
+    SimulationState, Transform,
 };
 use melon_render::LineVertex;
 use tracing::instrument;
@@ -177,6 +179,8 @@ pub struct Editor {
     /// Project folder: asset paths are relative to it.
     project_root: std::path::PathBuf,
     hierarchy_query: String,
+    /// Add Component popup's search text.
+    component_search: String,
     /// Hierarchy rows whose children are hidden.
     collapsed: std::collections::HashSet<Entity>,
     /// Scene file last saved or loaded; File > Save writes here.
@@ -227,6 +231,7 @@ impl Default for Editor {
             layout_file: layout::layout_path(),
             project_root: ".".into(),
             hierarchy_query: String::new(),
+            component_search: String::new(),
             collapsed: std::collections::HashSet::new(),
             current_scene: None,
             flying: false,
@@ -1651,34 +1656,48 @@ impl Editor {
             }
         }
 
-        if let Some(body_info) = entity_mut.get::<BodyInfo>() {
-            let body_info = *body_info;
-            inspector_card(ui, &mut card_fills, "Rigidbody", |ui| {
-                ui.label("Type");
-                inspector_value(ui, format!("{:?}", body_info.body_type));
-                ui.end_row();
-                let h = body_info.half_extents;
-                ui.label("Half extents");
-                inspector_value(ui, format!("{:.2}  {:.2}  {:.2}", h.x, h.y, h.z));
-                ui.end_row();
-            });
+        // Every other registered component, by display name. The registry is
+        // an Arc cloned out of the world, so the world can change meanwhile.
+        let mut body_changed = false;
+        if let Some(registry) = world.get_resource::<AppTypeRegistry>().cloned() {
+            let infos = melon_core::registered_components(world);
+            let registry = registry.read();
+            for info in infos {
+                if info.type_path == Transform::type_path() {
+                    continue;
+                }
+                let Some(reflect) = registry
+                    .get_with_type_path(info.type_path)
+                    .and_then(|r| r.data::<ReflectComponent>())
+                else {
+                    continue;
+                };
+                let Some(value) = reflect.reflect(world.entity(entity)) else {
+                    continue;
+                };
+                // Edit a copy and apply only on change (quiet change detection).
+                let mut copy = value
+                    .reflect_clone()
+                    .map(|v| v.into_partial_reflect())
+                    .unwrap_or_else(|_| value.to_dynamic());
+                let id = egui::Id::new(("inspector_component", info.type_path));
+                let (changed, remove) =
+                    component_card(ui, &mut card_fills, &info.display_name, id, |ui| {
+                        inspect::reflect_ui(ui, id, copy.as_mut(), &registry)
+                    });
+                if remove {
+                    reflect.remove(&mut world.entity_mut(entity));
+                } else if changed {
+                    reflect.apply(world.entity_mut(entity), copy.as_ref());
+                }
+                body_changed |= (changed || remove) && info.type_path == BodyInfo::type_path();
+            }
+            if let Some(added) = self.add_component_ui(ui, world, entity, &registry) {
+                body_changed |= added == BodyInfo::type_path();
+            }
         }
-
-        let spins = entity_mut.get::<Spin>().is_some();
-        let bobs = entity_mut.get::<melon_core::Bob>().is_some();
-        if spins || bobs {
-            inspector_card(ui, &mut card_fills, "Behaviours", |ui| {
-                if spins {
-                    ui.label("Spin");
-                    inspector_value(ui, "Rotates about Y while playing");
-                    ui.end_row();
-                }
-                if bobs {
-                    ui.label("Bob");
-                    inspector_value(ui, "Moves up and down while playing");
-                    ui.end_row();
-                }
-            });
+        if body_changed {
+            rebuild_body(world, entity);
         }
 
         if transform_edited {
@@ -1693,6 +1712,64 @@ impl Editor {
         {
             self.focus_content_tab = true;
         }
+    }
+
+    /// "Add Component" button and its searchable popup; inserts the chosen
+    /// component's default value. Returns the type path it added.
+    fn add_component_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        world: &mut World,
+        entity: Entity,
+        registry: &TypeRegistry,
+    ) -> Option<&'static str> {
+        ui.add_space(theme::sizes::SPACING);
+        let button = ui.add_sized(
+            [ui.available_width(), 0.0],
+            egui::Button::new("Add Component"),
+        );
+        // Fixed id over the button (widget ids are positional).
+        ui.interact(
+            button.rect,
+            egui::Id::new("inspector_add_component"),
+            egui::Sense::hover(),
+        );
+        let popup_id = egui::Id::new("inspector_add_popup");
+        let mut chosen = None;
+        egui::Popup::from_toggle_button_response(&button)
+            .id(popup_id)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .width(button.rect.width())
+            .show(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.component_search)
+                        .id(egui::Id::new("inspector_add_search"))
+                        .hint_text("Search")
+                        .desired_width(f32::INFINITY),
+                );
+                let choices = add_component_choices(world, entity, &self.component_search);
+                if choices.is_empty() {
+                    ui.weak("No components to add");
+                }
+                for c in choices {
+                    let row = egui::Id::new(("inspector_add", c.type_path));
+                    if content_view::id_label(ui, row, &c.display_name, false).clicked() {
+                        chosen = Some(c.type_path);
+                    }
+                }
+            });
+        let path = chosen?;
+        egui::Popup::close_id(ui.ctx(), popup_id);
+        self.component_search.clear();
+        let registration = registry.get_with_type_path(path)?;
+        let component = registration.data::<ReflectComponent>()?;
+        let default = registration.data::<ReflectDefault>()?.default();
+        component.insert(
+            &mut world.entity_mut(entity),
+            default.as_partial_reflect(),
+            registry,
+        );
+        Some(path)
     }
 
     /// After an inspector edit of `Transform`: push it into rapier and snap
@@ -2150,30 +2227,109 @@ pub fn create_cube(world: &mut World) -> Entity {
         .id()
 }
 
+/// Registered components Add Component offers for `entity`: addable, not on
+/// it yet, display name containing `search` (any case).
+fn add_component_choices(
+    world: &World,
+    entity: Entity,
+    search: &str,
+) -> Vec<melon_core::ComponentInfo> {
+    let Some(registry) = world.get_resource::<AppTypeRegistry>() else {
+        return Vec::new();
+    };
+    let infos = melon_core::registered_components(world);
+    let registry = registry.read();
+    let search = search.to_lowercase();
+    infos
+        .into_iter()
+        .filter(|c| c.addable && c.display_name.to_lowercase().contains(&search))
+        .filter(|c| {
+            registry
+                .get_with_type_path(c.type_path)
+                .and_then(|r| r.data::<ReflectComponent>())
+                .is_some_and(|r| !r.contains(world.entity(entity)))
+        })
+        .collect()
+}
+
+/// Rebuild `entity`'s rapier body from its `BodyInfo`, or remove it when
+/// the entity has none.
+fn rebuild_body(world: &mut World, entity: Entity) {
+    world.try_resource_scope(
+        |world, mut physics: bevy_ecs::world::Mut<melon_physics::PhysicsWorld>| {
+            let mut e = world.entity_mut(entity);
+            if let Some(old) = e.take::<melon_physics::RigidBodyComponent>() {
+                physics.remove_body(old.body_handle);
+            }
+            e.remove::<melon_physics::ColliderComponent>();
+            if let Some(info) = e.get::<BodyInfo>().copied() {
+                scene::spawn_body(world, &mut physics, entity, info);
+            }
+        },
+    );
+}
+
+fn card_frame(fill: egui::Color32) -> egui::Frame {
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, theme::colors::BORDER))
+        .corner_radius(theme::sizes::RADIUS)
+        .inner_margin(theme::sizes::SPACING)
+}
+
+/// A registered component's card: header with its name and a remove "×"
+/// (fixed ids `id.with("header")`, `id.with("remove")`), then `body`.
+/// Returns (what `body` returned, remove clicked).
+fn component_card(
+    ui: &mut egui::Ui,
+    fills: &mut [egui::Color32; 2],
+    title: &str,
+    id: egui::Id,
+    body: impl FnOnce(&mut egui::Ui) -> bool,
+) -> (bool, bool) {
+    let mut changed = false;
+    let mut remove = false;
+    card_frame(fills[0]).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            id.with("open"),
+            true,
+        )
+        .show_header(ui, |ui| {
+            let label = ui.label(title);
+            ui.interact(label.rect, id.with("header"), egui::Sense::hover());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                remove = content_view::id_label(ui, id.with("remove"), "\u{d7}", false)
+                    .on_hover_text("Remove component")
+                    .clicked();
+            });
+        })
+        .body_unindented(|ui| changed = body(ui));
+    });
+    fills.swap(0, 1);
+    (changed, remove)
+}
+
 fn inspector_card(
     ui: &mut egui::Ui,
     fills: &mut [egui::Color32; 2],
     title: &str,
     rows: impl FnOnce(&mut egui::Ui),
 ) {
-    egui::Frame::new()
-        .fill(fills[0])
-        .stroke(egui::Stroke::new(1.0, theme::colors::BORDER))
-        .corner_radius(theme::sizes::RADIUS)
-        .inner_margin(theme::sizes::SPACING)
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            egui::CollapsingHeader::new(title)
-                .id_salt(title)
-                .default_open(true)
-                .show_unindented(ui, |ui| {
-                    egui::Grid::new(("inspector_rows", title))
-                        .num_columns(2)
-                        .spacing([8.0, theme::sizes::SPACING])
-                        .with_row_color(|row, _| Some(theme::colors::INSPECTOR_ROWS[row % 2]))
-                        .show(ui, rows);
-                });
-        });
+    card_frame(fills[0]).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        egui::CollapsingHeader::new(title)
+            .id_salt(title)
+            .default_open(true)
+            .show_unindented(ui, |ui| {
+                egui::Grid::new(("inspector_rows", title))
+                    .num_columns(2)
+                    .spacing([8.0, theme::sizes::SPACING])
+                    .with_row_color(|row, _| Some(theme::colors::INSPECTOR_ROWS[row % 2]))
+                    .show(ui, rows);
+            });
+    });
     fills.swap(0, 1);
 }
 
@@ -2678,6 +2834,8 @@ fn snap_previous_transform(world: &mut World, entity: Entity) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy_ecs::change_detection::DetectChanges;
+    use melon_core::Spin;
 
     #[test]
     fn double_click_resets_drag_value_to_its_field_default() {
@@ -4688,5 +4846,236 @@ mod tests {
             ["assets/models/x.glb".to_string()]
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn type_path<T: melon_core::bevy_reflect::TypePath>() -> &'static str {
+        T::type_path()
+    }
+
+    fn card_id<T: melon_core::bevy_reflect::TypePath>() -> egui::Id {
+        egui::Id::new(("inspector_component", type_path::<T>()))
+    }
+
+    fn add_row_id<T: melon_core::bevy_reflect::TypePath>() -> egui::Id {
+        egui::Id::new(("inspector_add", type_path::<T>()))
+    }
+
+    /// The Inspector alone, headless, with `entity` selected.
+    struct InspectorHarness {
+        editor: Editor,
+        world: World,
+        entity: Entity,
+        ctx: egui::Context,
+        time: f64,
+    }
+
+    impl InspectorHarness {
+        fn new(world: World, entity: Entity) -> Self {
+            let mut editor = Editor::new();
+            editor.set_selected(Some(entity));
+            let mut h = Self {
+                editor,
+                world,
+                entity,
+                ctx: egui::Context::default(),
+                time: 0.0,
+            };
+            // egui's first frame is a sizing pass: clicks need a second one.
+            h.frame(Vec::new());
+            h.frame(Vec::new());
+            h
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            self.time += 0.05;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 900.0),
+                )),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            let (editor, world) = (&mut self.editor, &mut self.world);
+            let _ = self
+                .ctx
+                .run_ui(input, |ui| editor.build_inspector(world, ui));
+        }
+
+        fn has(&self, id: egui::Id) -> bool {
+            self.ctx.read_response(id).is_some()
+        }
+
+        /// Move, press, release, then one quiet frame.
+        fn click(&mut self, id: egui::Id) {
+            let pos = self
+                .ctx
+                .read_response(id)
+                .unwrap_or_else(|| panic!("no widget with id {id:?}"))
+                .rect
+                .center();
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            for events in [
+                vec![egui::Event::PointerMoved(pos)],
+                vec![button(true)],
+                vec![button(false)],
+                vec![],
+            ] {
+                self.frame(events);
+            }
+        }
+
+        fn open_add_component(&mut self) {
+            self.click(egui::Id::new("inspector_add_component"));
+        }
+    }
+
+    fn entity_with(bundle: impl bevy_ecs::bundle::Bundle) -> InspectorHarness {
+        let mut world = melon_core::Core::new().world;
+        let e = world
+            .spawn((Name("E".to_string()), Transform::default(), bundle))
+            .id();
+        InspectorHarness::new(world, e)
+    }
+
+    /// An entity with a fixed rapier body built from its `BodyInfo`.
+    fn fixed_body_entity() -> InspectorHarness {
+        let mut world = melon_core::Core::new().world;
+        let mut physics = melon_physics::PhysicsWorld::new();
+        let half = glam::Vec3::splat(0.5);
+        let (body, collider) =
+            physics.spawn_fixed_cuboid(glam::Vec3::ZERO, glam::Quat::IDENTITY, half);
+        world.insert_resource(physics);
+        let e = world
+            .spawn((
+                Name("Body".to_string()),
+                Transform::default(),
+                BodyInfo {
+                    body_type: melon_core::BodyKind::Fixed,
+                    half_extents: half,
+                },
+                melon_physics::RigidBodyComponent {
+                    body_handle: body,
+                    body_type: melon_physics::RigidBodyType::Fixed,
+                },
+                melon_physics::ColliderComponent {
+                    collider_handle: collider,
+                },
+            ))
+            .id();
+        InspectorHarness::new(world, e)
+    }
+
+    #[test]
+    fn every_registered_component_gets_a_card() {
+        let mut h = entity_with((Aabb::default(), Spin));
+        assert!(h.has(card_id::<Aabb>().with("header")));
+        assert!(h.has(card_id::<Spin>().with("header")));
+        assert!(!h.has(card_id::<melon_core::Bob>().with("header")));
+        // Drawing without edits writes nothing back.
+        h.world.clear_trackers();
+        h.frame(Vec::new());
+        let aabb = h.world.entity(h.entity).get_ref::<Aabb>().unwrap();
+        assert!(!aabb.is_changed());
+    }
+
+    #[test]
+    fn name_and_transform_have_no_remove() {
+        let h = entity_with(Spin);
+        assert!(!h.has(card_id::<Transform>().with("remove")));
+        // `Name` is not reflected: it is the header, never a card.
+        let name = egui::Id::new(("inspector_component", std::any::type_name::<Name>()));
+        assert!(!h.has(name.with("remove")));
+        assert!(h.has(card_id::<Spin>().with("remove")));
+    }
+
+    #[test]
+    fn removing_spin_removes_the_component() {
+        let mut h = entity_with(Spin);
+        h.click(card_id::<Spin>().with("remove"));
+        assert!(h.world.get::<Spin>(h.entity).is_none());
+        assert!(h.world.get::<Transform>(h.entity).is_some());
+    }
+
+    #[test]
+    fn add_component_lists_only_missing_addable() {
+        let mut h = entity_with(Spin);
+        h.open_add_component();
+        assert!(h.has(add_row_id::<melon_core::Bob>()));
+        assert!(h.has(add_row_id::<BodyInfo>()));
+        assert!(h.has(add_row_id::<Aabb>()));
+        assert!(!h.has(add_row_id::<Spin>()));
+        assert!(!h.has(add_row_id::<Transform>()));
+    }
+
+    #[test]
+    fn add_component_inserts_the_default() {
+        let mut h = entity_with(Spin);
+        h.open_add_component();
+        h.click(add_row_id::<melon_core::Bob>());
+        assert!(h.world.get::<melon_core::Bob>(h.entity).is_some());
+        assert!(h.world.get::<Spin>(h.entity).is_some());
+    }
+
+    #[test]
+    fn add_component_list_has_no_duplicates_after_reregister() {
+        let mut core = melon_core::Core::new();
+        core.register_component::<Spin>();
+        let mut world = core.world;
+        let e = world
+            .spawn((Name("E".to_string()), Transform::default()))
+            .id();
+        let spins = add_component_choices(&world, e, "")
+            .into_iter()
+            .filter(|c| c.type_path == type_path::<Spin>())
+            .count();
+        assert_eq!(spins, 1);
+        let mut h = InspectorHarness::new(world, e);
+        h.open_add_component();
+        assert!(h.has(add_row_id::<Spin>()));
+    }
+
+    #[test]
+    fn editing_body_info_rebuilds_the_body() {
+        let mut h = fixed_body_entity();
+        let body_type = card_id::<BodyInfo>().with("body_type");
+        h.click(body_type);
+        h.click(body_type.with("Dynamic"));
+        let info = h.world.get::<BodyInfo>(h.entity).unwrap();
+        assert_eq!(info.body_type, melon_core::BodyKind::Dynamic);
+        let rb = *h
+            .world
+            .get::<melon_physics::RigidBodyComponent>(h.entity)
+            .unwrap();
+        assert_eq!(rb.body_type, melon_physics::RigidBodyType::Dynamic);
+        let physics = h.world.resource::<melon_physics::PhysicsWorld>();
+        assert!(physics.bodies.get(rb.body_handle).unwrap().is_dynamic());
+        assert_eq!(physics.bodies.len(), 1, "the old body is removed");
+    }
+
+    #[test]
+    fn removing_body_info_removes_the_body() {
+        let mut h = fixed_body_entity();
+        h.click(card_id::<BodyInfo>().with("remove"));
+        assert!(h.world.get::<BodyInfo>(h.entity).is_none());
+        assert!(
+            h.world
+                .get::<melon_physics::RigidBodyComponent>(h.entity)
+                .is_none()
+        );
+        assert!(
+            h.world
+                .get::<melon_physics::ColliderComponent>(h.entity)
+                .is_none()
+        );
+        let physics = h.world.resource::<melon_physics::PhysicsWorld>();
+        assert_eq!(physics.bodies.len(), 0);
+        assert_eq!(physics.colliders.len(), 0);
     }
 }

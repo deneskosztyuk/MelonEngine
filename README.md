@@ -118,6 +118,10 @@ Editor:
   in the Content Browser within about half a second (move a file together
   with its `.meta` to keep references). Selecting a file in the browser shows
   its details (path, size, GUID, meshes, bounds) in the Inspector.
+- **Inspector:** a card for every component on the selected entity (Transform
+  first, then by name), edited in place. **Add Component** lists the
+  components it can add (with a search field); **×** in a card's header
+  removes that component (Transform and the name stay).
 - **Hierarchy:** drag an entity onto another to make it a child (it keeps its
   place in the world), or onto the empty space below to make it a root.
   Deleting an entity deletes its children.

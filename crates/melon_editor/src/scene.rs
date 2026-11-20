@@ -530,7 +530,12 @@ fn spawn_scene_entity(
 }
 
 /// Create the rapier body for `id` at its world pose.
-fn spawn_body(world: &mut World, physics: &mut PhysicsWorld, id: Entity, body_info: BodyInfo) {
+pub(crate) fn spawn_body(
+    world: &mut World,
+    physics: &mut PhysicsWorld,
+    id: Entity,
+    body_info: BodyInfo,
+) {
     let pose = Transform::from_mat4(world_matrix(world, id));
     let (kind, (body_h, collider_h)) = match body_info.body_type {
         BodyKind::Dynamic => (

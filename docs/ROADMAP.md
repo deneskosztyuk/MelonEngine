@@ -39,8 +39,8 @@ Core features all three share, and where MelonEngine stands (✅ done,
 | Runtime | Fixed-step game loop, interpolation | ✅ |
 | Runtime | Gameplay code with hot reload | ✅ Rust plugin |
 | Runtime | Input action mapping | ✅ |
-| Runtime | Reflection / component registry | ❌ |
-| Runtime | Scene save / load | 🟡 hand-listed components |
+| Runtime | Reflection / component registry | ✅ |
+| Runtime | Scene save / load | ✅ |
 | Runtime | Prefabs | ❌ |
 | Assets | Stable asset IDs, watched folder | ✅ |
 | Assets | Import pipeline with settings | 🟡 glTF only, no settings |
@@ -64,7 +64,7 @@ Core features all three share, and where MelonEngine stands (✅ done,
 | Gameplay | Navigation mesh | ❌ |
 | Gameplay | Networking | ❌ (not core for a first game) |
 | Editor | Viewport, gizmos, snapping | ✅ (no local/world toggle) |
-| Editor | Hierarchy, inspector | 🟡 hand-written inspector |
+| Editor | Hierarchy, inspector | ✅ |
 | Editor | Content browser | ✅ |
 | Editor | Undo / redo | ❌ |
 | Editor | Play in editor | ✅ |
@@ -78,9 +78,10 @@ Core features all three share, and where MelonEngine stands (✅ done,
 Priorities 1–6 are the minimum to make any 3D game; 7–9 are needed to ship
 one; 10 comes after.
 
-1. - [ ] **Component reflection / registry.** One registry drives the
-      Inspector, scene files and prefabs (no hand-listed `SceneEntity`); an
-      agent can build levels as RON data. Prefabs follow.
+1. - [x] **Component reflection / registry.** One registry drives the
+      Inspector (cards, Add / Remove Component) and scene files (format v5,
+      no hand-listed `SceneEntity`); an agent can build levels as RON data.
+      Next step: prefabs, built on the same registry.
 2. - [ ] **Undo / Redo** (command history), plus entity rename and duplicate.
 3. - [ ] **Rendering:** `Handle<Texture>` / `Handle<Material>` assets; point
       and spot lights; image-based ambient; cascaded sun shadows, then
@@ -198,5 +199,5 @@ one; 10 comes after.
       rendering. `Core` already runs without a window. Partly done: the
       `snapshot` example renders a fixed review scene to a PNG offscreen
       (no world or scene file yet).
-- [ ] Component registry so an agent can build levels as RON data (priority 1).
+- [x] Component registry so an agent can build levels as RON data (priority 1).
 - [ ] Runtime console (stdin or socket) to query and edit world state.
