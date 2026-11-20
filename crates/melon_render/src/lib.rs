@@ -7130,6 +7130,60 @@ mod tests {
         );
     }
 
+    /// KNOWN GAP: a packed `.gltf` whose buffer is a separate `.bin` cannot
+    /// load, because packed models are imported from memory
+    /// (`gltf::import_slice`, embedded buffers only). Run with `--ignored`.
+    #[test]
+    #[ignore = "known gap: packed .gltf with an external .bin / textures does not load (only .glb)"]
+    fn packed_gltf_with_external_bin_loads_from_the_pack() {
+        use melon_core::{AssetServer, Handle, Model};
+        let root = temp_project("packed_external");
+        let gltf = TWO_NODE_GLTF.replace(
+            r#""uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAA""#,
+            r#""uri": "m.bin""#,
+        );
+        assert!(gltf.contains("m.bin"));
+        std::fs::write(root.join("assets/models/m.gltf"), gltf).unwrap();
+        let mut bin = vec![0u8; 36];
+        bin[12..16].copy_from_slice(&1.0f32.to_le_bytes()); // (1, 0, 0)
+        bin[28..32].copy_from_slice(&1.0f32.to_le_bytes()); // (0, 1, 0)
+        std::fs::write(root.join("assets/models/m.bin"), bin).unwrap();
+        let pak = root.join("game.pak");
+        melon_core::pack::build_pack(&root, &[], &pak).unwrap();
+        let assertion: GpuAssertion = Box::new(move |renderer| {
+            let mut server = AssetServer::new(root.clone());
+            server.set_pack(Arc::new(melon_core::pack::Pack::open(&pak).unwrap()));
+            let h: Handle<Model> = server.load("assets/models/m.gltf");
+            let mut cache = ModelCache::new(renderer.scene());
+            let bounds = cache.get(renderer.scene(), &mut server, h).bounds;
+            let _ = std::fs::remove_dir_all(&root);
+            if bounds.1.x >= 3.0 {
+                Ok(())
+            } else {
+                Err(format!("placeholder cube instead of the model: {bounds:?}"))
+            }
+        });
+
+        #[cfg(target_os = "windows")]
+        let event_loop = {
+            use winit::platform::windows::EventLoopBuilderExtWindows;
+            let mut builder = EventLoop::builder();
+            builder.with_any_thread(true);
+            builder.build().expect("failed to create event loop")
+        };
+        #[cfg(not(target_os = "windows"))]
+        let event_loop = EventLoop::new().expect("failed to create event loop");
+        event_loop.set_control_flow(ControlFlow::Poll);
+        let mut runner = GpuTestRunner::new(vec![assertion]);
+        let _ = event_loop.run_app(&mut runner);
+        assert!(!runner.results.is_empty(), "GPU test did not run");
+        for result in &runner.results {
+            if let Err(msg) = result {
+                panic!("{msg}");
+            }
+        }
+    }
+
     #[test]
     fn gltf_bounds_follow_node_transforms() {
         let json = r#"{

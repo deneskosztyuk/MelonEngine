@@ -1133,6 +1133,33 @@ mod tests {
     }
 
     #[test]
+    fn scene_request_removes_the_old_scenes_rapier_bodies() {
+        let root = std::env::temp_dir().join(format!("melon_phys_scene_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("assets/scenes")).unwrap();
+        std::fs::write(
+            root.join("assets/scenes/empty.scene"),
+            "(version: 6, entities: [], name_counter: 0)",
+        )
+        .unwrap();
+        let mut c = core();
+        c.world
+            .insert_resource(melon_core::AssetServer::new(root.clone()));
+        let e = dynamic(&mut c, at(0.0, 5.0, 0.0), cube());
+        frames(&mut c, 2);
+        assert_eq!(c.world.resource::<PhysicsWorld>().bodies.len(), 1);
+
+        c.world
+            .resource_mut::<melon_core::SceneRequests>()
+            .load("assets/scenes/empty.scene");
+        frames(&mut c, 2);
+        assert!(c.world.get_entity(e).is_err(), "old entity despawned");
+        let pw = c.world.resource::<PhysicsWorld>();
+        assert_eq!((pw.bodies.len(), pw.colliders().len()), (0, 0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn cleanup_handles_entity_without_physics() {
         let mut c = core();
         let e = c
