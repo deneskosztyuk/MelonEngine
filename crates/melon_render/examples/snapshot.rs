@@ -131,21 +131,23 @@ fn cornell(server: &mut AssetServer) -> Vec<(Mat4, Handle<Model>)> {
     let slab = |size: Vec3, center: Vec3| {
         Mat4::from_scale_rotation_translation(size, Quat::IDENTITY, center)
     };
+    // Walls end under the ceiling and at the back wall: overlapping slabs
+    // share face planes, which z-fight (striped edges).
     vec![
         (
             slab(Vec3::new(5.8, 0.1, 7.0), Vec3::new(-13.0, -0.05, -14.0)),
             grey,
         ),
         (
-            slab(Vec3::new(0.4, 4.4, 5.4), Vec3::new(-10.3, 2.2, -12.8)),
+            slab(Vec3::new(0.4, 4.0, 5.0), Vec3::new(-10.3, 2.0, -13.0)),
             red,
         ),
         (
-            slab(Vec3::new(0.4, 4.4, 5.4), Vec3::new(-15.7, 2.2, -12.8)),
+            slab(Vec3::new(0.4, 4.0, 5.0), Vec3::new(-15.7, 2.0, -13.0)),
             green,
         ),
         (
-            slab(Vec3::new(5.8, 4.4, 0.4), Vec3::new(-13.0, 2.2, -10.3)),
+            slab(Vec3::new(5.8, 4.0, 0.4), Vec3::new(-13.0, 2.0, -10.3)),
             grey,
         ),
         (
