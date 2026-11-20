@@ -96,6 +96,46 @@ const STAGE_NAMES: [&str; 6] = [
 /// Seconds between `MELON_FRAME_STATS` lines.
 const REPORT_INTERVAL: Duration = Duration::from_secs(2);
 
+/// A frame interval above this prints its callback timeline (a stall line).
+const STALL: f32 = 0.050;
+/// Callbacks kept per frame for the stall line.
+const TIMELINE_CAP: usize = 48;
+
+/// One winit callback (or a mark) of the frame interval in flight.
+#[derive(Clone)]
+struct Callback {
+    /// Seconds since the frame started.
+    at: f32,
+    name: String,
+    /// Seconds spent inside it; `None` for a mark.
+    took: Option<f32>,
+}
+
+/// `stall 200.50 ms: frame end +12.00, CursorMoved +12.10 (0.02), ...`:
+/// every callback's start (ms since the frame started) and time inside it,
+/// so the gap holding the stall shows. `None` below [`STALL`].
+fn stall_line(interval: f32, timeline: &[Callback]) -> Option<String> {
+    if interval <= STALL {
+        return None;
+    }
+    let mut parts: Vec<String> = timeline
+        .iter()
+        .take(TIMELINE_CAP)
+        .map(|c| match c.took {
+            Some(took) => format!("{} +{:.2} ({:.2})", c.name, c.at * 1000.0, took * 1000.0),
+            None => format!("{} +{:.2}", c.name, c.at * 1000.0),
+        })
+        .collect();
+    if timeline.len() > TIMELINE_CAP {
+        parts.push(format!("{} more", timeline.len() - TIMELINE_CAP));
+    }
+    Some(format!(
+        "stall {:.2} ms: {}",
+        interval * 1000.0,
+        parts.join(", ")
+    ))
+}
+
 /// One report window of frame timings. Off (`MELON_FRAME_STATS` unset) every
 /// method returns at once: no clock reads, no output.
 #[derive(Default)]
@@ -120,6 +160,8 @@ pub struct FrameStats {
     gpu_total: Option<f32>,
     window_events: u32,
     device_events: u32,
+    /// Callbacks of the interval in flight, for the stall line.
+    timeline: Vec<Callback>,
 }
 
 impl FrameStats {
@@ -151,6 +193,31 @@ impl FrameStats {
         }
     }
 
+    /// A callback named `name` that started at `start` (from
+    /// [`Self::clock`]) ends now: one timeline entry.
+    pub fn callback(&mut self, start: Option<Instant>, name: &str) {
+        if let (Some(start), Some(frame)) = (start, self.frame_start) {
+            self.timeline.push(Callback {
+                at: start.saturating_duration_since(frame).as_secs_f32(),
+                name: name.into(),
+                took: Some(start.elapsed().as_secs_f32()),
+            });
+        }
+    }
+
+    /// A point in the interval (e.g. the frame's own end), for the timeline.
+    pub fn mark(&mut self, name: &str) {
+        if self.on
+            && let Some(frame) = self.frame_start
+        {
+            self.timeline.push(Callback {
+                at: frame.elapsed().as_secs_f32(),
+                name: name.into(),
+                took: None,
+            });
+        }
+    }
+
     /// The frame cap sleep that started at `start` (from [`Self::clock`])
     /// ends now. Measured, so an oversleep shows.
     pub fn sleep_done(&mut self, start: Option<Instant>) {
@@ -172,6 +239,12 @@ impl FrameStats {
             return;
         }
         let now = Instant::now();
+        if let Some(start) = self.frame_start
+            && let Some(line) = stall_line((now - start).as_secs_f32(), &self.timeline)
+        {
+            eprintln!("{line}");
+        }
+        self.timeline.clear();
         if let Some(line) = self.frame_start_at(now) {
             eprintln!("{line}");
         }
@@ -411,6 +484,34 @@ mod tests {
             }
         }
         panic!("no report line after 2 s");
+    }
+
+    #[test]
+    fn a_stall_lists_the_frames_callbacks() {
+        let call = |at: f32, name: &str, took: Option<f32>| Callback {
+            at,
+            name: name.into(),
+            took,
+        };
+        let timeline = vec![
+            call(0.012, "frame end", None),
+            call(0.0121, "CursorMoved", Some(0.00002)),
+            call(0.190, "CursorMoved", Some(0.00001)),
+        ];
+        assert_eq!(stall_line(0.030, &timeline), None, "not a stall");
+        assert_eq!(
+            stall_line(0.2005, &timeline).as_deref(),
+            Some(
+                "stall 200.50 ms: frame end +12.00, CursorMoved +12.10 (0.02), \
+                 CursorMoved +190.00 (0.01)"
+            )
+        );
+        let long = vec![call(0.001, "Moved", Some(0.0)); TIMELINE_CAP + 5];
+        assert!(
+            stall_line(0.1, &long)
+                .unwrap()
+                .ends_with("Moved +1.00 (0.00), 5 more"),
+        );
     }
 
     #[test]

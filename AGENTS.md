@@ -148,6 +148,8 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   (`backend_order`): AMD's Windows Vulkan driver offers no Mailbox, so
   Vulkan meant FIFO stalls. DX12 offers Mailbox (flip model, no tearing).
   `MELON_BACKEND=vulkan|dx12|auto` overrides it (dev switch; unknown = auto).
+  wgpu's own `WGPU_*` variables apply too (`new_without_display_handle_from_env`),
+  e.g. `WGPU_DX12_PRESENTATION_SYSTEM=visual` (DirectComposition swapchain).
   The "renderer ready" line names the backend and present mode. Every
   shader also goes through naga to HLSL: run the tests under both backends
   when you touch WGSL.
@@ -159,6 +161,10 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   and `other` (the rest: outside every callback, in winit and the OS),
   then `gpu` (the averaged `RenderTimings::total`; above the budget means
   GPU-bound) and window/device events per frame. Off, it reads no clock.
+  A frame over 50 ms also prints a `stall` line: every winit callback of
+  that interval (name, start in ms since the frame began, time inside in
+  parentheses) plus `frame end`, `new_events` and `about_to_wait` marks,
+  so the gap holding the stall shows.
   Redirect stderr to a file (`2> stats.txt`): a pipe filter can block it. Nothing in the engine runs on
   a 0.5 s beat except the asset poll, one `fs::metadata` per file-backed
   asset (built-ins skipped).

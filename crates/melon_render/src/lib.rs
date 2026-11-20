@@ -947,7 +947,7 @@ impl Renderer {
         for backends in backend_order(cfg!(windows), forced.as_deref()) {
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends,
-                ..wgpu::InstanceDescriptor::new_without_display_handle()
+                ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
             });
             if let Ok(adapter) = instance
                 .request_adapter(&wgpu::RequestAdapterOptions::default())

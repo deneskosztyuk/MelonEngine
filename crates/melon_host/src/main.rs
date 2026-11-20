@@ -561,11 +561,17 @@ impl App {
             editor_ui.thumbnail_done(&request, id);
         }
         self.stats.lap(pacing::Stage::Thumbnail);
+        self.stats.mark("frame end");
     }
 }
 
 impl ApplicationHandler for App {
+    fn new_events(&mut self, _: &ActiveEventLoop, _: winit::event::StartCause) {
+        self.stats.mark("new_events");
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.stats.mark("about_to_wait");
         // Minimized: no frames (and no game updates), as when frames waited
         // for `WM_PAINT`, which a minimized window never gets.
         if self
@@ -686,6 +692,7 @@ impl ApplicationHandler for App {
         } else {
             self.stats.clock()
         };
+        let name = event_start.map(|_| event_name(&event));
         // Whether egui used an event no longer matters: the raw stream records
         // everything and the gate decides what the game gets. While the game has
         // the mouse, egui gets no pointer input (the hidden cursor would click the UI).
@@ -742,6 +749,8 @@ impl ApplicationHandler for App {
             _ => {}
         }
         self.stats.event_done(event_start);
+        self.stats
+            .callback(event_start, name.as_deref().unwrap_or_default());
     }
 
     /// Raw mouse motion (unaccelerated, works with a confined cursor) drives
@@ -756,7 +765,18 @@ impl ApplicationHandler for App {
             input.mouse_delta += Vec2::new(x as f32, y as f32);
         }
         self.stats.event_done(start);
+        self.stats.callback(start, "device");
     }
+}
+
+/// `CursorMoved { .. }` -> `CursorMoved`: the variant name, for the stall line.
+fn event_name(event: &WindowEvent) -> String {
+    let debug = format!("{event:?}");
+    debug
+        .split([' ', '(', '{'])
+        .next()
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn main() {
