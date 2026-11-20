@@ -33,6 +33,7 @@ pub use input::{GameInputGate, Input, InputButton, InputFocus, KeyCode, MouseBut
 pub use plugin::{App, Plugin, abi_fingerprint};
 pub use quality::{
     GiMode, PresentPreference, QualityPreset, QualitySetting, RenderQuality, RenderTimings,
+    SsgiResolution,
 };
 pub use resources::{Camera, Environment, Light, NameCounter, SimulationState, Time};
 pub use stages::{FixedUpdate, PostUpdate, PreUpdate, Update};

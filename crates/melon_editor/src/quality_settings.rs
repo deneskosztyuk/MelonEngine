@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use bevy_ecs::world::World;
 use egui::{Align, Layout, RichText, vec2};
-use melon_core::quality::{self, GiMode, PresentPreference};
+use melon_core::quality::{self, GiMode, PresentPreference, SsgiResolution};
 use melon_core::{QualityPreset, QualitySetting, RenderQuality, RenderTimings};
 
 use crate::{StatusKind, theme};
@@ -28,6 +28,7 @@ const GROUPS: [(&str, &[QualitySetting]); 3] = [
         "Lighting",
         &[
             QualitySetting::Gi,
+            QualitySetting::SsgiResolution,
             QualitySetting::Ao,
             QualitySetting::ShadowMap,
         ],
@@ -158,7 +159,12 @@ impl QualitySettings {
         ui.horizontal(|ui| {
             ui.label(caption("GPU frame cost, last second"));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(caption(&cost_caption(&timings)));
+                let text = caption(&cost_caption(&timings));
+                ui.label(if over_budget(&timings) {
+                    text.color(theme::colors::WARNING)
+                } else {
+                    text
+                });
             });
         });
         cost_bar(ui, &shown, &timings);
@@ -313,7 +319,8 @@ fn cost_bar(ui: &mut egui::Ui, shown: &RenderQuality, timings: &RenderTimings) {
         let (Some(ms), Some(color)) = (cost(timings, setting), pass_color(setting)) else {
             continue;
         };
-        if !enabled(shown, setting) {
+        // The SSGI resolution row shows GI's cost, already in the GI segment.
+        if !enabled(shown, setting) || setting == QualitySetting::SsgiResolution {
             continue;
         }
         let w = (ms / scale * width).min(rect.right() - x);
@@ -395,6 +402,7 @@ fn setting_id(setting: QualitySetting) -> usize {
 fn name(setting: QualitySetting) -> &'static str {
     match setting {
         QualitySetting::Gi => "Global illumination",
+        QualitySetting::SsgiResolution => "SSGI resolution",
         QualitySetting::Ao => "Ambient occlusion",
         QualitySetting::ShadowMap => "Shadow map",
         QualitySetting::Msaa => "Anti-aliasing",
@@ -406,6 +414,7 @@ fn name(setting: QualitySetting) -> &'static str {
 fn options(setting: QualitySetting) -> &'static [&'static str] {
     match setting {
         QualitySetting::Gi => &["Off", "SSGI", "DDGI"],
+        QualitySetting::SsgiResolution => &["Half", "Quarter"],
         QualitySetting::Ao | QualitySetting::Bloom => &["Off", "On"],
         QualitySetting::ShadowMap => &["1024", "2048", "4096"],
         QualitySetting::Msaa => &["Off", "MSAA 2x", "MSAA 4x"],
@@ -414,6 +423,7 @@ fn options(setting: QualitySetting) -> &'static [&'static str] {
 }
 
 const GI_MODES: [GiMode; 3] = [GiMode::Off, GiMode::Ssgi, GiMode::Ddgi];
+const SSGI_RESOLUTIONS: [SsgiResolution; 2] = [SsgiResolution::Half, SsgiResolution::Quarter];
 const PRESENTS: [PresentPreference; 2] =
     [PresentPreference::Vsync, PresentPreference::MailboxCapped];
 
@@ -422,6 +432,9 @@ fn selected(q: &RenderQuality, setting: QualitySetting) -> usize {
     let pos = |found: Option<usize>| found.unwrap_or_default();
     match setting {
         QualitySetting::Gi => pos(GI_MODES.iter().position(|&m| m == q.gi_mode)),
+        QualitySetting::SsgiResolution => pos(SSGI_RESOLUTIONS
+            .iter()
+            .position(|&r| r == q.ssgi_resolution)),
         QualitySetting::Ao => q.ao as usize,
         QualitySetting::ShadowMap => pos(quality::SHADOW_MAP_SIZES
             .iter()
@@ -435,6 +448,7 @@ fn selected(q: &RenderQuality, setting: QualitySetting) -> usize {
 fn select(q: &mut RenderQuality, setting: QualitySetting, index: usize) {
     match setting {
         QualitySetting::Gi => q.gi_mode = GI_MODES[index],
+        QualitySetting::SsgiResolution => q.ssgi_resolution = SSGI_RESOLUTIONS[index],
         QualitySetting::Ao => q.ao = index == 1,
         QualitySetting::ShadowMap => q.shadow_map_size = quality::SHADOW_MAP_SIZES[index],
         QualitySetting::Msaa => q.msaa = quality::MSAA_SAMPLES[index],
@@ -447,6 +461,7 @@ fn select(q: &mut RenderQuality, setting: QualitySetting, index: usize) {
 fn enabled(q: &RenderQuality, setting: QualitySetting) -> bool {
     match setting {
         QualitySetting::Gi => q.gi_mode != GiMode::Off,
+        QualitySetting::SsgiResolution => q.gi_mode == GiMode::Ssgi,
         QualitySetting::Ao => q.ao,
         QualitySetting::Bloom => q.bloom,
         _ => true,
@@ -455,7 +470,7 @@ fn enabled(q: &RenderQuality, setting: QualitySetting) -> bool {
 
 fn cost(t: &RenderTimings, setting: QualitySetting) -> Option<f32> {
     match setting {
-        QualitySetting::Gi => t.gi,
+        QualitySetting::Gi | QualitySetting::SsgiResolution => t.gi,
         QualitySetting::Ao => t.ao,
         QualitySetting::ShadowMap => t.shadows,
         QualitySetting::Msaa => t.aa,
@@ -467,7 +482,7 @@ fn cost(t: &RenderTimings, setting: QualitySetting) -> Option<f32> {
 fn pass_color(setting: QualitySetting) -> Option<egui::Color32> {
     use theme::colors::*;
     match setting {
-        QualitySetting::Gi => Some(PASS_GI),
+        QualitySetting::Gi | QualitySetting::SsgiResolution => Some(PASS_GI),
         QualitySetting::Ao => Some(PASS_AO),
         QualitySetting::ShadowMap => Some(PASS_SHADOWS),
         QualitySetting::Msaa => Some(PASS_AA),
@@ -485,6 +500,11 @@ fn cost_text(q: &RenderQuality, t: &RenderTimings, setting: QualitySetting) -> S
     } else {
         cost(t, setting).map_or("—".into(), |ms| format!("{ms:.1} ms"))
     }
+}
+
+/// Whether the measured GPU total is over the frame budget.
+fn over_budget(t: &RenderTimings) -> bool {
+    matches!((t.total, t.budget_ms), (Some(total), Some(budget)) if total > budget)
 }
 
 /// "4.6 ms of 8.3 ms budget (120 Hz)"; "—" for what is not measured.
@@ -639,6 +659,39 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cost_caption(&t), "4.6 ms of 8.3 ms budget (120 Hz)");
+    }
+
+    #[test]
+    fn total_over_budget_only_when_both_are_measured() {
+        let t = |total, budget_ms| RenderTimings {
+            total,
+            budget_ms,
+            ..Default::default()
+        };
+        assert!(over_budget(&t(Some(9.0), Some(8.3))));
+        assert!(!over_budget(&t(Some(8.3), Some(8.3))));
+        assert!(!over_budget(&t(Some(4.6), Some(8.3))));
+        assert!(!over_budget(&t(None, Some(8.3))));
+        assert!(!over_budget(&t(Some(9.0), None)));
+    }
+
+    #[test]
+    fn ssgi_resolution_row_shows_gi_cost_only_with_ssgi() {
+        let t = RenderTimings {
+            gi: Some(0.8),
+            ..Default::default()
+        };
+        let medium = RenderQuality::preset(QualityPreset::Medium);
+        let row = QualitySetting::SsgiResolution;
+        assert_eq!(cost_text(&medium, &t, row), "0.8 ms");
+        assert_eq!(options(row)[selected(&medium, row)], "Quarter");
+        let high = RenderQuality::preset(QualityPreset::High);
+        assert_eq!(
+            cost_text(&high, &t, row),
+            "off",
+            "DDGI: SSGI is not running"
+        );
+        assert_eq!(options(row)[selected(&high, row)], "Half");
     }
 
     /// The panel draws without panicking, with and without pending edits.

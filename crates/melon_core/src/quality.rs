@@ -23,6 +23,27 @@ pub enum GiMode {
     Ddgi,
 }
 
+/// Resolution of the SSGI trace and denoise passes, relative to the view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SsgiResolution {
+    /// One texel per 2x2 pixels, 5x5 denoise.
+    #[default]
+    Half,
+    /// One texel per 4x4 pixels, 3x3 denoise: about a quarter of the cost,
+    /// softer contact bounce and thin objects drop out.
+    Quarter,
+}
+
+impl SsgiResolution {
+    /// View pixels per SSGI texel along each axis.
+    pub fn scale(self) -> u32 {
+        match self {
+            Self::Half => 2,
+            Self::Quarter => 4,
+        }
+    }
+}
+
 /// How frames are presented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PresentPreference {
@@ -54,6 +75,8 @@ impl QualityPreset {
 #[serde(default)]
 pub struct RenderQuality {
     pub gi_mode: GiMode,
+    /// SSGI pass resolution (used only with `GiMode::Ssgi`).
+    pub ssgi_resolution: SsgiResolution,
     /// Screen-space ambient occlusion on or off.
     pub ao: bool,
     /// Sun shadow map edge in texels: 1024, 2048 or 4096.
@@ -77,6 +100,7 @@ impl Default for RenderQuality {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QualitySetting {
     Gi,
+    SsgiResolution,
     Ao,
     ShadowMap,
     Msaa,
@@ -85,8 +109,9 @@ pub enum QualitySetting {
 }
 
 impl QualitySetting {
-    pub const ALL: [QualitySetting; 6] = [
+    pub const ALL: [QualitySetting; 7] = [
         Self::Gi,
+        Self::SsgiResolution,
         Self::Ao,
         Self::ShadowMap,
         Self::Msaa,
@@ -104,14 +129,16 @@ impl QualitySetting {
 impl RenderQuality {
     pub fn preset(preset: QualityPreset) -> Self {
         use PresentPreference::*;
-        let (gi_mode, ao, shadow_map_size, msaa, bloom, present) = match preset {
-            QualityPreset::Low => (GiMode::Off, false, 1024, 1, false, Vsync),
-            QualityPreset::Medium => (GiMode::Ssgi, true, 2048, 2, true, Vsync),
-            QualityPreset::High => (GiMode::Ddgi, true, 2048, 4, true, MailboxCapped),
-            QualityPreset::Max => (GiMode::Ddgi, true, 4096, 4, true, MailboxCapped),
+        use SsgiResolution::*;
+        let (gi_mode, ssgi_resolution, ao, shadow_map_size, msaa, bloom, present) = match preset {
+            QualityPreset::Low => (GiMode::Off, Quarter, false, 1024, 1, false, Vsync),
+            QualityPreset::Medium => (GiMode::Ssgi, Quarter, true, 2048, 2, true, Vsync),
+            QualityPreset::High => (GiMode::Ddgi, Half, true, 2048, 4, true, MailboxCapped),
+            QualityPreset::Max => (GiMode::Ddgi, Half, true, 4096, 4, true, MailboxCapped),
         };
         Self {
             gi_mode,
+            ssgi_resolution,
             ao,
             shadow_map_size,
             msaa,
@@ -251,6 +278,7 @@ mod tests {
 
     fn q(
         gi_mode: GiMode,
+        ssgi_resolution: SsgiResolution,
         ao: bool,
         shadow_map_size: u32,
         msaa: u32,
@@ -259,6 +287,7 @@ mod tests {
     ) -> RenderQuality {
         RenderQuality {
             gi_mode,
+            ssgi_resolution,
             ao,
             shadow_map_size,
             msaa,
@@ -270,22 +299,23 @@ mod tests {
     #[test]
     fn preset_values_are_as_specced() {
         use PresentPreference::*;
+        use SsgiResolution::*;
         let p = RenderQuality::preset;
         assert_eq!(
             p(QualityPreset::Low),
-            q(GiMode::Off, false, 1024, 1, false, Vsync)
+            q(GiMode::Off, Quarter, false, 1024, 1, false, Vsync)
         );
         assert_eq!(
             p(QualityPreset::Medium),
-            q(GiMode::Ssgi, true, 2048, 2, true, Vsync)
+            q(GiMode::Ssgi, Quarter, true, 2048, 2, true, Vsync)
         );
         assert_eq!(
             p(QualityPreset::High),
-            q(GiMode::Ddgi, true, 2048, 4, true, MailboxCapped)
+            q(GiMode::Ddgi, Half, true, 2048, 4, true, MailboxCapped)
         );
         assert_eq!(
             p(QualityPreset::Max),
-            q(GiMode::Ddgi, true, 4096, 4, true, MailboxCapped)
+            q(GiMode::Ddgi, Half, true, 4096, 4, true, MailboxCapped)
         );
     }
 
@@ -296,6 +326,14 @@ mod tests {
             RenderQuality::preset(QualityPreset::High)
         );
         assert_eq!(GiMode::default(), GiMode::Ddgi);
+        assert_eq!(SsgiResolution::default(), SsgiResolution::Half);
+        assert_eq!(
+            [
+                SsgiResolution::Half.scale(),
+                SsgiResolution::Quarter.scale()
+            ],
+            [2, 4]
+        );
     }
 
     #[test]
@@ -303,11 +341,17 @@ mod tests {
         for preset in QualityPreset::ALL {
             let base = RenderQuality::preset(preset);
             assert_eq!(base.matching_preset(), Some(preset));
-            let edits: [fn(&mut RenderQuality); 6] = [
+            let edits: [fn(&mut RenderQuality); 7] = [
                 |q| {
                     q.gi_mode = match q.gi_mode {
                         GiMode::Off => GiMode::Ssgi,
                         _ => GiMode::Off,
+                    }
+                },
+                |q| {
+                    q.ssgi_resolution = match q.ssgi_resolution {
+                        SsgiResolution::Half => SsgiResolution::Quarter,
+                        SsgiResolution::Quarter => SsgiResolution::Half,
                     }
                 },
                 |q| q.ao = !q.ao,
@@ -338,7 +382,7 @@ mod tests {
     #[test]
     fn live_and_rebuild_settings() {
         use QualitySetting::*;
-        for s in [Gi, Ao, Bloom, Present] {
+        for s in [Gi, SsgiResolution, Ao, Bloom, Present] {
             assert!(!s.needs_rebuild(), "{s:?}");
         }
         for s in [ShadowMap, Msaa] {
@@ -386,7 +430,8 @@ mod tests {
     fn missing_field_takes_default_and_unknown_field_is_ignored() {
         let dir = temp_dir("fields");
         let path = dir.join("quality.ron");
-        // Low without `bloom`: the rest stays, bloom takes the High default.
+        // Low without `bloom` (and `ssgi_resolution`): the rest stays, they
+        // take the High defaults.
         std::fs::write(
             &path,
             "(gi_mode: Off, ao: false, shadow_map_size: 1024, msaa: 1, present: Vsync)",
@@ -394,6 +439,20 @@ mod tests {
         .unwrap();
         let mut expected = RenderQuality::preset(QualityPreset::Low);
         expected.bloom = RenderQuality::default().bloom;
+        expected.ssgi_resolution = RenderQuality::default().ssgi_resolution;
+        assert_eq!(RenderQuality::load(&path), (expected, LoadOutcome::Loaded));
+
+        // A file from before `ssgi_resolution`: Medium loads with the
+        // default (Half), everything else as saved.
+        std::fs::write(
+            &path,
+            "(gi_mode: Ssgi, ao: true, shadow_map_size: 2048, msaa: 2, bloom: true, present: Vsync)",
+        )
+        .unwrap();
+        let expected = RenderQuality {
+            ssgi_resolution: SsgiResolution::Half,
+            ..RenderQuality::preset(QualityPreset::Medium)
+        };
         assert_eq!(RenderQuality::load(&path), (expected, LoadOutcome::Loaded));
 
         let low = RenderQuality::preset(QualityPreset::Low);
