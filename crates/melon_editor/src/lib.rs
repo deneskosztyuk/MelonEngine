@@ -31,6 +31,7 @@ pub mod gizmo;
 pub mod history;
 pub mod inspect;
 pub mod layout;
+mod material_card;
 pub mod physics_settings;
 pub mod play;
 pub mod project_settings;
@@ -1050,6 +1051,15 @@ impl Editor {
                 self.content.start_rename(dir.clone());
                 Some(dir)
             }
+            Request::NewMaterial(parent) => {
+                let file =
+                    asset_ops::create_material(&mut world.resource_mut::<AssetServer>(), &parent)?;
+                self.content.open(parent);
+                self.content.set_search(String::new());
+                self.content.refresh();
+                self.content.start_rename(file.clone());
+                Some(file)
+            }
             Request::Rename(path, name) => {
                 let new =
                     asset_ops::rename(&mut world.resource_mut::<AssetServer>(), &path, &name)?;
@@ -1922,6 +1932,9 @@ impl Editor {
             .retain(|cached, _| asset.as_ref().is_some_and(|(path, _)| path == cached));
         if let Some((path, details)) = &asset {
             self.asset_card(ui, path, details);
+            if details.kind == content::AssetKind::Material {
+                material_card::show(ui, path, world.get_resource::<AssetServer>());
+            }
         }
         let Some(entity) = self.selected else {
             if asset.is_none() {

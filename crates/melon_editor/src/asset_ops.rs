@@ -68,6 +68,15 @@ pub fn create_folder(server: &mut AssetServer, parent: &Path) -> anyhow::Result<
     Ok(dir)
 }
 
+/// Write a default `New Material.mat` into `parent` (a free name).
+pub fn create_material(server: &mut AssetServer, parent: &Path) -> anyhow::Result<PathBuf> {
+    let file = unique_path(parent, "New Material.mat");
+    std::fs::write(&file, melon_core::MaterialAsset::new_default().to_ron())
+        .with_context(|| format!("could not create {}", file.display()))?;
+    reconcile(server);
+    Ok(file)
+}
+
 pub fn rename(server: &mut AssetServer, path: &Path, new_name: &str) -> anyhow::Result<PathBuf> {
     validate_name(new_name)?;
     let (Some(parent), Some(old_name)) = (path.parent(), path.file_name()) else {
@@ -443,6 +452,22 @@ mod tests {
         assert_eq!(unique_path(&dir, "A.GLB"), dir.join("A 3.GLB"));
         assert_eq!(unique_path(&dir, "models"), dir.join("models 2"));
         assert_eq!(unique_path(&dir, "b.glb"), dir.join("b.glb"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_material_writes_a_loadable_default_with_a_meta() {
+        let (root, mut server) = project("create_material");
+        let assets = root.join("assets");
+        let first = create_material(&mut server, &assets).unwrap();
+        let second = create_material(&mut server, &assets).unwrap();
+        assert_eq!(first, assets.join("New Material.mat"));
+        assert_eq!(second, assets.join("New Material 2.mat"));
+        assert_eq!(
+            melon_core::MaterialAsset::read(&first).unwrap(),
+            melon_core::MaterialAsset::new_default()
+        );
+        assert!(melon_core::meta_path(&first).is_file());
         let _ = std::fs::remove_dir_all(&root);
     }
 

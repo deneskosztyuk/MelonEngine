@@ -54,6 +54,8 @@ struct MaterialUniform {
     metallic: f32,
     roughness: f32,
     normal_scale: f32,
+    // Alpha mask: fragments below it are discarded; 0 = no mask.
+    alpha_cutoff: f32,
 };
 
 struct VsIn {
@@ -99,6 +101,9 @@ const GI_OFF: u32 = 0u;
 const GI_SSGI: u32 = 1u;
 const GI_DDGI: u32 = 2u;
 override GI_MODE: u32 = GI_DDGI;
+// Alpha-blended variant: the fragment's alpha goes to the target (the opaque
+// variants write 1).
+override ALPHA_BLEND: bool = false;
 
 @vertex
 fn vs_main(in: VsIn, @builtin(instance_index) instance: u32) -> VsOut {
@@ -232,8 +237,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let ndv = max(dot(n, v), 1e-4);
     let ndh = max(dot(n, h), 0.0);
 
-    let base = (textureSample(base_color_tex, material_sampler, in.uv) * material.base_color).rgb;
+    let base_rgba = textureSample(base_color_tex, material_sampler, in.uv) * material.base_color;
+    let base = base_rgba.rgb;
     let mr = textureSample(metallic_roughness_tex, material_sampler, in.uv);
+    let emissive_texel = textureSample(emissive_tex, material_sampler, in.uv).rgb;
+    if (material.alpha_cutoff > 0.0 && base_rgba.a < material.alpha_cutoff) {
+        discard;
+    }
     let metallic = clamp(mr.b * material.metallic, 0.0, 1.0);
     // Floor keeps GGX's highlight finite on a perfect mirror.
     let roughness = clamp(mr.g * material.roughness, 0.045, 1.0);
@@ -271,11 +281,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
         ambient = diffuse + f_amb * reflected * specular_occlusion(ndv, ao, roughness);
     }
 
-    let emissive = (textureSample(emissive_tex, material_sampler, in.uv).rgb * material.emissive);
+    let emissive = emissive_texel * material.emissive;
     let color = sun + ambient + emissive;
 
     let fog = 1.0 - exp(-env.fog_density * distance(in.world_pos, camera.eye));
-    return vec4f(mix(color, env.horizon_color, fog), 1.0);
+    return vec4f(mix(color, env.horizon_color, fog), select(1.0, base_rgba.a, ALPHA_BLEND));
 }
 
 // Voxel passes: every instance in the GI volume, projected orthographically
@@ -308,9 +318,13 @@ fn vs_voxel(in: VsIn, @builtin(instance_index) instance: u32) -> VsOut {
 @fragment
 fn fs_voxel(in: VsOut) -> @location(0) vec4f {
     let n = normalize(in.world_normal);
-    let base = (textureSample(base_color_tex, material_sampler, in.uv) * material.base_color).rgb;
+    let base_rgba = textureSample(base_color_tex, material_sampler, in.uv) * material.base_color;
+    let base = base_rgba.rgb;
     let mr = textureSample(metallic_roughness_tex, material_sampler, in.uv);
     let emissive = textureSample(emissive_tex, material_sampler, in.uv).rgb * material.emissive;
+    if (material.alpha_cutoff > 0.0 && base_rgba.a < material.alpha_cutoff) {
+        discard;
+    }
     let metallic = clamp(mr.b * material.metallic, 0.0, 1.0);
     let sun = (1.0 - light.ambient) * light.color * max(dot(n, light.direction), 0.0)
         * shadow_factor(in.world_pos, n);

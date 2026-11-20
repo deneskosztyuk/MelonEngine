@@ -1,11 +1,17 @@
 //! Extraction: the ECS world turned into plain data the renderer draws.
 
+use std::collections::HashMap;
+
 use glam::Mat4;
 use melon_core::bevy_ecs::world::World;
 use melon_core::hierarchy::render_matrices;
-use melon_core::{Camera, Environment, Handle, Light, Model, RenderQuality, SimulationState, Time};
+use melon_core::{
+    AssetServer, Camera, Environment, Handle, Light, Material, MeshMaterials, Model, RenderQuality,
+    SimulationState, Time,
+};
 
 /// Everything one view needs to draw a frame.
+#[derive(Default)]
 pub struct FrameData {
     pub view_proj: Mat4,
     /// Camera position (overlay shading).
@@ -18,6 +24,9 @@ pub struct FrameData {
     pub quality: RenderQuality,
     /// World matrix and model of every entity with a `Handle<Model>`.
     pub models: Vec<(Mat4, Handle<Model>)>,
+    /// Material per mesh part for the `models` entries (by index) that have
+    /// `MeshMaterials`; `None` keeps the part's glTF material.
+    pub overrides: HashMap<usize, Vec<Option<Handle<Material>>>>,
 }
 
 /// Blend fixed-step entities while Playing and Paused (alpha is frozen while
@@ -51,11 +60,28 @@ pub fn extract(world: &mut World) -> FrameData {
         .copied()
         .unwrap_or(SimulationState::Editing);
     let matrices = render_matrices(world, alpha, blends(state));
-    let models = world
-        .query::<(melon_core::bevy_ecs::entity::Entity, &Handle<Model>)>()
-        .iter(world)
-        .filter_map(|(e, h)| matrices.get(&e).map(|m| (*m, *h)))
-        .collect();
+    let mut models = Vec::new();
+    let mut slots = Vec::new();
+    let mut query = world.query::<(
+        melon_core::bevy_ecs::entity::Entity,
+        &Handle<Model>,
+        Option<&MeshMaterials>,
+    )>();
+    for (e, h, materials) in query.iter(world) {
+        if let Some(m) = matrices.get(&e) {
+            if let Some(materials) = materials {
+                slots.push((models.len(), materials.clone()));
+            }
+            models.push((*m, *h));
+        }
+    }
+    let mut overrides = HashMap::new();
+    if let Some(mut server) = world.get_resource_mut::<AssetServer>() {
+        for (index, materials) in slots {
+            let handles = materials.parts.iter().map(|s| s.resolve(&mut server));
+            overrides.insert(index, handles.collect());
+        }
+    }
     FrameData {
         view_proj,
         eye,
@@ -63,6 +89,7 @@ pub fn extract(world: &mut World) -> FrameData {
         environment,
         quality,
         models,
+        overrides,
     }
 }
 
@@ -95,6 +122,34 @@ mod tests {
         assert_eq!(frame.models.len(), 1);
         assert_eq!(translation(frame.models[0].0), Vec3::new(1.0, 2.0, 3.0));
         assert_eq!(frame.models[0].1, h);
+    }
+
+    #[test]
+    fn mesh_materials_resolve_to_handles_by_model_index() {
+        use melon_core::{MaterialSlot, MeshMaterials};
+        let mut world = World::new();
+        let h = cube(&mut world);
+        world.spawn((Transform::default(), h));
+        world.spawn((
+            Transform::default(),
+            h,
+            MeshMaterials {
+                parts: vec![
+                    MaterialSlot::default(),
+                    MaterialSlot {
+                        guid: String::new(),
+                        path: "assets/m.mat".into(),
+                    },
+                ],
+            },
+        ));
+        let frame = extract(&mut world);
+        assert_eq!(frame.overrides.len(), 1);
+        let parts = frame.overrides.values().next().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].is_none());
+        let server = world.resource::<AssetServer>();
+        assert_eq!(server.path(parts[1].unwrap()), "assets/m.mat");
     }
 
     #[test]

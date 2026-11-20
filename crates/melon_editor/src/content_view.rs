@@ -39,6 +39,7 @@ fn kind_color(kind: AssetKind) -> Color32 {
         AssetKind::Folder => colors::WARNING,
         AssetKind::Model => colors::ACCENT_HOVER,
         AssetKind::Texture => colors::SUCCESS,
+        AssetKind::Material => colors::ACCENT,
         AssetKind::Shader => colors::ERROR,
         AssetKind::Scene => colors::INFO,
         AssetKind::Audio => colors::ACCENT,
@@ -99,6 +100,11 @@ pub(crate) fn id_label(
 fn folder_menu(ui: &mut egui::Ui, dir: &Path, actions: &mut Vec<Action>) {
     if ui.button("New Folder").clicked() {
         actions.push(Action::Request(BrowserRequest::NewFolder(
+            dir.to_path_buf(),
+        )));
+    }
+    if ui.button("New Material").clicked() {
+        actions.push(Action::Request(BrowserRequest::NewMaterial(
             dir.to_path_buf(),
         )));
     }

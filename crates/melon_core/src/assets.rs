@@ -19,6 +19,12 @@ use crate::Time;
 /// Asset type tag for 3D models (glTF files, or `builtin:cube`).
 pub struct Model;
 
+/// Asset type tag for textures (png, jpg, hdr files).
+pub struct Texture;
+
+/// Asset type tag for materials (`.mat` RON files, see `material`).
+pub struct Material;
+
 /// Prefix for assets that have no file (e.g. `builtin:cube`).
 pub const BUILTIN_PREFIX: &str = "builtin:";
 

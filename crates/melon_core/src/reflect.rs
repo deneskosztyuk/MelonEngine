@@ -189,6 +189,7 @@ mod tests {
                 "Character Controller",
                 "Collider",
                 "Joint",
+                "Mesh Materials",
                 "Rigid Body",
                 "Spin",
                 "Transform"

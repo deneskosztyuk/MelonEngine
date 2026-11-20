@@ -347,6 +347,7 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
         },
         quality,
         models: review_scene(&mut server),
+        overrides: Default::default(),
     };
     if view == "crowd" {
         frame.models.extend(crowd(&mut server));
