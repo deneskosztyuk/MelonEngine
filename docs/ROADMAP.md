@@ -91,7 +91,7 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
       `Environment::gi_intensity` (default 1, 0 skips the passes). Limits:
       fixed 40 x 20 x 40 m volume at the origin; walls under 0.35 m leak;
       hard edges where one probe dominates; about +2.2 to 2.4 ms on the dev GPU.
-- [x] GI modes: `Environment::gi_mode` (`Off`, `Ssgi`, `Ddgi`, default
+- [x] GI modes: `RenderQuality::gi_mode` (`Off`, `Ssgi`, `Ddgi`, default
       `Ddgi`), switchable frame to frame; `gi/` front with one module per
       backend and one mesh pipeline variant per mode.
 - [x] SSGI: half-resolution screen-space diffuse GI, 6 cosine rays per
@@ -147,9 +147,16 @@ Goal: an editor that looks and works like Unity / Unreal / Godot.
       first on Windows for Mailbox (`MELON_BACKEND=vulkan|dx12|auto`).
 - [x] Quality settings (part a): `RenderQuality` presets, profiles,
       `config/quality.ron`, Project Settings ▸ Quality panel.
-- [ ] Quality settings part b: renderer reads `RenderQuality` (GI/AO/bloom
-      switches, shadow map and MSAA rebuilds, present mode) and GPU
-      timestamp timings fill `RenderTimings`.
+- [x] Quality settings part b: the renderer reads `RenderQuality` (GI/AO/bloom
+      live; shadow map 1024/2048/4096 and MSAA 1/2/4 rebuilt in place,
+      pipelines cached per sample count; present mode Vsync / Mailbox +
+      cap); `Environment` is the look only; SSGI textures allocated only
+      while SSGI runs; default = High, snapshots byte-identical.
+- [x] GPU timings: timestamp queries between the passes, async readback
+      ring, 1 s averages into `RenderTimings` (Quality panel cost bar).
+- [x] Frame cap sleeps at the frame start instead of `WaitUntil` (drag
+      stutter with Mailbox).
+
 - [ ] Undo / Redo (command history), rename, duplicate.
 - [ ] Game view (game camera) next to the Scene view.
 - [ ] Gizmo upgrades: plane handles, local/world toggle.

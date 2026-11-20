@@ -66,6 +66,9 @@ Editor:
 
 - **W / E / R** — Move / Rotate / Scale tool
 - **Delete** — delete the selected entity
+- **Edit ▸ Project Settings ▸ Quality** — render quality presets (Low / Medium / High / Max) and
+  each setting (GI, AO, shadow map, MSAA, bloom, frame pacing), with the measured GPU ms per pass;
+  Apply to use, Save as / Load for named profiles
 - **Ctrl+S** — save the scene (File ▸ Save As… the first time)
 - **Models:** drag a `.glb` / `.gltf` from the Content Browser into the Scene
   (lands on the ground under the cursor) or the Hierarchy (at the origin, or

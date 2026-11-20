@@ -63,23 +63,57 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   editor UI (rebinding capture).
 - **Render quality vs look.** `RenderQuality` (`melon_core::quality`) is
   what the GPU spends time on: GI mode, AO and bloom on/off, shadow map
-  size, MSAA, present mode. `Environment` is the look (sky, fog, strengths,
-  radii). Presets are data (`RenderQuality::preset`, `matching_preset`;
-  `Default` = High = today's renderer). Saved as `config/quality.ron`
-  (loaded by the host), named profiles as `config/quality_profiles/<name>.ron`;
-  edited in Edit ▸ Project Settings ▸ Quality, pending until Apply.
-  `RenderTimings` holds per-pass GPU ms (`None` = not measured).
-  Part b pending: nothing reads `RenderQuality` or fills `RenderTimings` yet.
+  size, MSAA, present mode. `Environment` is the look only (sky, fog,
+  strengths, radii; no on/off switches). Presets are data
+  (`RenderQuality::preset`, `matching_preset`; `Default` = High = the
+  renderer before quality settings, snapshots byte-identical). Saved as
+  `config/quality.ron` (loaded by the host), named profiles as
+  `config/quality_profiles/<name>.ron`; edited in Edit ▸ Project Settings ▸
+  Quality, pending until Apply. `extract` copies it into
+  `FrameData::quality`. Live, per frame: `gi_mode`, `ao`, `bloom` (a pass
+  runs only if the quality turns it on AND its `Environment` strength is
+  above 0). Rebuilt in `render_scene` before the frame that uses them:
+  `shadow_map_size` (`set_shadow_map_size`: shadow texture, frame bind
+  group, DDGI voxel groups; clamped 256..device limit) and `msaa`
+  (`set_msaa`: falls back to the largest supported count not above it,
+  `msaa_counts`, 2x needs `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`; the
+  target's MSAA colour, depth and overlay textures are recreated in place,
+  the display image and egui's handle stay). The 3D pass pipelines (mesh
+  per GI mode, sky, world lines) and the overlay shape pipelines are cached
+  per sample count (`MsaaPipelines`, `msaa_slot`), built on first use and
+  kept, so switching back is instant. At 1 sample the 3D pass draws
+  straight into the resolved HDR texture (`HdrTarget::resolve_target`
+  `None`). `present` is applied by the host (`Renderer::set_present`).
+  A view's SSGI textures exist only while it runs SSGI
+  (`match_gi_view` creates or drops them and rebuilds its group 3); DDGI
+  world resources stay allocated (bound in every group 3).
+- **GPU timings (`timings.rs`).** When the adapter has `TIMESTAMP_QUERY` +
+  `TIMESTAMP_QUERY_INSIDE_ENCODERS` (requested only then), `render_scene`
+  writes encoder timestamps between its stages (start, shadows, prepass +
+  SSAO, GI, 3D pass + resolve, bloom, end), resolves them into one of 3
+  readback buffers mapped with `map_buffer_on_submit` (never waited on;
+  read at the start of a later `render_scene`; no free buffer = untimed
+  frame) and averages per pass over 1 s windows. `Renderer::timings()`
+  gives `RenderTimings` (`None` = pass off or unsupported); the host
+  inserts it each frame with `budget_ms` = 1000 / monitor refresh, and the
+  Quality panel reads it. `total` includes tonemap and overlay. The prepass
+  counts as GI when it runs for SSGI alone. Every encoder that recorded a
+  `render_scene` must be submitted (or its readback slot stays busy).
 - **Frame pacing (`melon_host/src/pacing.rs`).** Raw device events are off
   (`DeviceEvents::Never`) and turn on (`WhenFocused`) only while
   `GameInputGate` is open: mouse look is their only user, and while the
   editor has input they were ~3,000 wake-ups/s that dropped frames on
-  right-drag. The surface presents with `Mailbox` when offered, else `Fifo`
-  (`MELON_PRESENT=fifo` forces FIFO, a debug A/B switch). Mailbox does not
-  wait for vblank, so the host caps frames at the monitor refresh rate
-  (60 Hz if unknown): `about_to_wait` sets `ControlFlow::WaitUntil` the next
-  deadline (previous deadline + period, no drift; a hitch restarts the grid)
-  and requests the redraw when it is due. FIFO keeps `Poll` + redraw.
+  right-drag. `RenderQuality::present` picks the mode (`Renderer::set_present`,
+  checked by the host before each frame): `Vsync` = `Fifo`, `MailboxCapped`
+  = `Mailbox` when offered, else `Fifo` (`MELON_PRESENT=fifo` forces FIFO,
+  a debug A/B switch). Mailbox does not wait for vblank, so the host caps
+  frames at the monitor refresh rate (60 Hz if unknown;
+  `pacing::frame_cap`, on only with Mailbox): the loop stays `Poll` with a
+  redraw requested every frame, and `RedrawRequested` first sleeps
+  (`std::thread::sleep`, a high-resolution waitable timer on Windows) until
+  the deadline (previous deadline + period, no drift; a hitch restarts the
+  grid; at most one period). Do not go back to `ControlFlow::WaitUntil`:
+  it missed deadlines by ~100 ms while input events streamed in (drag).
   On Windows `Renderer::new` tries DX12 first, then the default backends
   (`backend_order`): AMD's Windows Vulkan driver offers no Mailbox, so
   Vulkan meant FIFO stalls. DX12 offers Mailbox (flip model, no tearing).
@@ -217,7 +251,8 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   k, for more glow: lights want emissive strength well above 1 (the review
   cube is 12, about 10x a sunlit floor). GPU tests that
   are not about bloom set `bloom_intensity: 0.0`.
-- **GI modes (`gi/`).** `Environment::gi_mode` (`Off`, `Ssgi`, `Ddgi`,
+- **GI modes (`gi/`).** `RenderQuality::gi_mode` (`Off`, `Ssgi`, `Ddgi`,
+
   default `Ddgi`) picks the technique per frame; `gi_intensity` scales it
   and 0 means `Off` (`gi::frame_mode`). Switching works frame to frame.
   `gi/mod.rs` is the front: mode dispatch (`Gi::update`, `Gi::render`,
@@ -328,22 +363,32 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 - **Camera conventions.** Right-handed, DirectX depth (near = 0, far = 1).
   Screen helpers take logical points.
 - **Checking rendering.** Agents verify rendering with the snapshot example
-  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only]`;
-  `--ao-only` saves the SSAO term as a grey image; `--no-shadow` moves scene
+  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only]`;
+  `--quality` starts from that `RenderQuality` preset (default high), the
+  other flags override it; `--ao-only` saves the SSAO term as a grey
+  image; `--no-ao` turns `RenderQuality::ao` off; `--no-shadow` moves scene
   and camera outside the shadow box (no sun shadows, debug only); `--no-bloom`
-  sets `bloom_intensity` 0, `--bloom-only` sets it to 1 (the image is the
-  bloom alone); `--gi` picks `gi_mode` (default ddgi; `--no-gi` is
+  turns `RenderQuality::bloom` off, `--bloom-only` sets `bloom_intensity`
+  to 1 (the image is the
+  bloom alone); `--gi` picks `RenderQuality::gi_mode` (default ddgi; `--no-gi` is
   `--gi off`), `--gi-only` saves that mode's indirect diffuse term alone; `crowd` adds about
   10,000 instances; `cornell` adds an open-front red/green room at
   (-13, 0, -13) seen through its opening; the 100 timed frames run
   before the capture, so GI has converged (SSGI too: 300 frames differ
-  by at most 2 sRGB steps); it prints the mean frame time
-  and `RenderStats`),
+  by at most 2 sRGB steps); it prints the mean frame time,
+  `RenderStats`, the quality with its MSAA count and the GPU
+  `RenderTimings`; GPU and wall times swing about 3x with the laptop
+  GPU's clocks, so compare runs back to back),
   never by opening the editor or game window.
 - **GPU tests** open a window, so they need a display and adapter. Tests
   that are not about GI set `gi_intensity: 0.0` (and end GI tests on a
   GI-off frame: the mesh pipeline follows the last `render_scene`). GI
   tests render 60 frames (`render_converged`, which also drops cached
   models: handle ids restart with every `AssetServer`); `render_sequence`
-  renders one frame per environment into one target (mode switching).
+  renders one frame per (environment, quality) into one target (mode
+  switching); `render_qualities` reads back every frame and fails on a
+  wgpu validation error (rebuild checks). Checks that change the shadow
+  map size or MSAA end back on the default, since later checks share the
+  renderer.
+
   SSGI tests need the bouncing surface on screen.
