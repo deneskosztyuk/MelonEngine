@@ -4055,7 +4055,9 @@ mod tests {
 
     /// Release `drag` over the Inspector's Mesh field for a selected cube.
     fn drop_on_mesh_field(drag: content::AssetDrag) -> String {
-        let (mut editor, mut world, root) = browser_project("mesh_drop");
+        // One temp project per test: they run in parallel.
+        let name = format!("mesh_drop_{}", drag.model.is_some());
+        let (mut editor, mut world, root) = browser_project(&name);
         let cube: Handle<Model> = world.resource_mut::<AssetServer>().load("builtin:cube");
         let entity = world
             .spawn((Name("Cube".to_string()), Transform::default(), cube))
