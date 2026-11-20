@@ -8,7 +8,7 @@ missing for a core 3D engine. Update this file when an item lands.
 | Crate | What exists |
 |---|---|
 | `melon_core` | `Core` wraps a bevy_ecs `World` + `Schedule`. Components: `Transform`, `Name`, `MeshRef`, `Aabb`, `BodyInfo`, `Spin`, `Bob`, `PendingDelete`. Resources: `Camera` (fly camera, `world_to_screen`, `screen_to_world_ray`), one directional `Light`, `Time`, `SimulationState`, `Input`, `NameCounter`. |
-| `melon_render` | wgpu forward renderer. Frame: sun shadow pass (directional shadow map, 3x3 PCF), 3D pass into an HDR target, ACES tonemap pass onto the display. Textured Lambert + hemisphere ambient mesh pipeline, line pipeline (gizmos), depth buffer, dynamic-offset model uniforms, checkerboard fallback texture, glTF loader (positions, normals, uv0, indices, base color texture), offscreen `ViewportTarget`, surface lost/outdated recovery. |
+| `melon_render` | wgpu forward renderer. Frame: sun shadow pass (directional shadow map, 3x3 PCF), 3D pass into an HDR target, ACES tonemap pass onto the display. glTF metallic-roughness PBR mesh pipeline (normal maps, emissive, hemisphere and sky ambient), line pipeline (gizmos), depth buffer, dynamic-offset model uniforms, checkerboard fallback texture, glTF loader (positions, normals, uv0, tangents, indices, metallic-roughness materials), offscreen `ViewportTarget`, surface lost/outdated recovery. |
 | `melon_physics` | rapier3d wrapper: dynamic and fixed cuboids, ECS to rapier sync both ways, `PendingDelete` cleanup. |
 | `melon_editor` | egui editor with dockable panels (Hierarchy, Scene, Inspector, Content Browser, Console), menu bar, toolbar, status bar, Move/Rotate/Scale gizmos with snapping, Play/Pause/Step/Stop, RON scene save/load (versioned, atomic write, validated). |
 | `melon_game` | Hot-reloadable dylib with two demo systems. |
@@ -65,7 +65,10 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
 
 ### Tier 1: looks like a 3D game
 
-- [ ] PBR metallic-roughness materials, normal maps.
+- [x] PBR metallic-roughness materials, normal maps: glTF factors and
+      textures per primitive (base colour, metallic-roughness, normal,
+      emissive), tangents read or generated, Cook-Torrance sun plus sky
+      ambient specular.
 - [x] Directional (sun) shadow map with 3x3 PCF.
 - [ ] Point and spot lights, their shadows, cascaded sun shadows.
 - [x] Hemisphere ambient: sky and ground colours on `Light`.

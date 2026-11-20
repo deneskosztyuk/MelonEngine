@@ -13,7 +13,7 @@ Current state and planned work: `docs/ROADMAP.md`.
 | `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), Project Settings window (`project_settings.rs`). |
 | `crates/melon_game` | Game logic as an `rlib` + `dylib`, hot-reloaded in dev builds. |
 | `crates/melon_host` | Binary: winit event loop, input mapping, frame order (core update, editor, extract, render_scene, ui pass). No render pass code. |
-| `assets/models` | glTF models. `cube.glb` loads at startup. |
+| `assets/models` | glTF models. `cube.glb` loads at startup. `review/` holds the snapshot scene's material test models (`grey_cube`, `material_spheres`, `normal_panel`), written by `cargo run -p melon_render --example gen_review_assets` from the repo root; commit them when regenerated. |
 | `assets/shaders` | WGSL shaders, compiled in with `wgpu::include_wgsl!` (no runtime reload). |
 
 Dependency direction: `core` <- `render`, `physics` <- `editor` <- `host`.
@@ -114,6 +114,26 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   (from the light into the scene). Shaders want the opposite; pass
   `Light::to_light()`.
 - **Ambient.** A sky/ground hemisphere on `Light` (`sky_color`, `ground_color`, scaled by `ambient`), blended by the world normal's y.
+- **Materials.** glTF metallic-roughness per primitive (`MaterialUniform`:
+  base colour, metallic, roughness, normal scale, emissive). Group 2 of the
+  mesh pipeline: 0 base colour (sRGB), 1 sampler, 2 metallic-roughness
+  (linear, G = roughness, B = metallic), 3 normal (linear, tangent space),
+  4 emissive (sRGB), 5 `MaterialUniform`. Missing textures bind 1x1 white /
+  flat normal / black, so every material has this layout; build one with
+  `create_material_bind_group`. `LoadedModel::material_bind_groups` has one
+  per mesh; `builtin:cube` is the checkerboard on a rough white dielectric.
+- **Shading.** Sun: Cook-Torrance (GGX, height-correlated Smith, Schlick).
+  `Light::color` is scaled so a white Lambert surface facing the sun shows
+  `(1 - ambient) * color` (the shader uses radiance `PI * color`); `ambient`
+  still splits light between sun and hemisphere, which keeps the pre-PBR
+  brightness. Ambient specular is the sky gradient in the mirror direction,
+  faded toward the hemisphere as roughness rises. Shadows touch the sun
+  term only; emissive is added before fog.
+- **Tangents.** `Vertex` is 48 bytes: position, normal, uv, tangent
+  (`[f32; 4]`, w = bitangent sign, glTF convention: bitangent =
+  cross(normal, tangent) * w). glTF `TANGENT` is read when present, else
+  `generate_tangents` builds them from positions and UVs. Node transforms
+  are baked into tangents too (w flips under mirroring).
 - **Environment.** Optional `melon_core::Environment` resource (default when
   absent, not registered in `Core::new`): procedural sky (`zenith_color`,
   `horizon_color`) and exponential distance fog (`fog_density`). The fog
@@ -122,6 +142,6 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 - **Camera conventions.** Right-handed, DirectX depth (near = 0, far = 1).
   Screen helpers take logical points.
 - **Checking rendering.** Agents verify rendering with the snapshot example
-  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun]`),
+  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials]`),
   never by opening the editor or game window.
 - **GPU tests** open a window, so they need a display and adapter.
