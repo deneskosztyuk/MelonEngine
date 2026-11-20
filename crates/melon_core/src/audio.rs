@@ -38,7 +38,8 @@ pub struct AudioSource {
     pub volume: f32,
     pub pitch: f32,
     pub looping: bool,
-    /// Start when Play starts (once), never in edit mode.
+    /// Start when Play starts (once), never in edit mode. On by default,
+    /// like Unity's Play On Awake.
     pub play_on_start: bool,
     /// Attenuate and pan from the listener; off plays flat.
     pub spatial: bool,
@@ -57,7 +58,7 @@ impl Default for AudioSource {
             volume: 1.0,
             pitch: 1.0,
             looping: false,
-            play_on_start: false,
+            play_on_start: true,
             spatial: false,
             min_distance: 1.0,
             max_distance: 30.0,
@@ -269,6 +270,11 @@ mod tests {
     fn set(settings: &mut AudioSettings, bus: &str, volume: f32, mute: bool) {
         let b = settings.buses.iter_mut().find(|b| b.name == bus).unwrap();
         (b.volume, b.mute) = (volume, mute);
+    }
+
+    #[test]
+    fn new_sources_play_on_start() {
+        assert!(AudioSource::default().play_on_start);
     }
 
     #[test]

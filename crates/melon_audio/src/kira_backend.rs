@@ -51,6 +51,15 @@ fn decibels(volume: f32) -> Decibels {
     }
 }
 
+/// The bus a sound plays on: its own when it exists, else `Master`.
+fn resolve<'a>(gains: &HashMap<String, f32>, bus: &'a str) -> &'a str {
+    if gains.contains_key(bus) {
+        bus
+    } else {
+        "Master"
+    }
+}
+
 impl KiraBackend {
     /// Opens the default output device. Without one it logs a single
     /// warning and the backend stays silent.
@@ -100,11 +109,7 @@ impl KiraBackend {
     /// The bus's track, made on first use; an unknown bus is `Master`.
     fn track(&mut self, bus: &str) -> Option<&mut TrackHandle> {
         let manager = self.manager.as_mut()?;
-        let name = if self.gains.contains_key(bus) {
-            bus
-        } else {
-            "Master"
-        };
+        let name = resolve(&self.gains, bus);
         if !self.tracks.contains_key(name) {
             let gain = self.gains.get(name).copied().unwrap_or(1.0);
             let track = manager
@@ -217,6 +222,12 @@ impl Backend for KiraBackend {
             .is_none_or(|p| on_handle!(&p.handle, h => h.state()) == PlaybackState::Stopped)
     }
 
+    fn retain_buses(&mut self, buses: &[&str]) {
+        // Dropping a track handle removes the track.
+        self.gains.retain(|name, _| buses.contains(&name.as_str()));
+        self.tracks.retain(|name, _| buses.contains(&name.as_str()));
+    }
+
     fn set_bus_gain(&mut self, bus: &str, gain: f32) {
         if self.gains.get(bus) == Some(&gain) {
             return;
@@ -261,6 +272,22 @@ mod tests {
             pitch: 1.0,
             looping: false,
         }
+    }
+
+    #[test]
+    fn dropped_bus_resolves_to_master() {
+        let mut backend = KiraBackend::silent();
+        for (bus, gain) in [("Master", 1.0), ("Music", 0.5), ("Sfx", 1.0)] {
+            backend.set_bus_gain(bus, gain);
+        }
+        assert_eq!(resolve(&backend.gains, "Music"), "Music");
+        backend.retain_buses(&["Master", "Sfx"]);
+        assert_eq!(resolve(&backend.gains, "Music"), "Master");
+        assert_eq!(resolve(&backend.gains, "Sfx"), "Sfx");
+        assert_eq!(resolve(&backend.gains, "Never"), "Master");
+        // A bus brought back under the same name works again.
+        backend.set_bus_gain("Music", 0.5);
+        assert_eq!(resolve(&backend.gains, "Music"), "Music");
     }
 
     #[test]

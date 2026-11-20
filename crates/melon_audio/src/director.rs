@@ -4,8 +4,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-use bevy_ecs::{entity::Entity, query::With, world::World};
+use bevy_ecs::{entity::Entity, query::QueryState, query::With, world::World};
 use glam::Vec3;
 use melon_core::audio::UI;
 use melon_core::hierarchy::world_matrix;
@@ -45,6 +46,9 @@ pub trait Backend {
     fn finished(&self, voice: VoiceId) -> bool;
     /// Composed bus gain (bus times master, mute applied).
     fn set_bus_gain(&mut self, bus: &str, gain: f32);
+    /// The buses that exist now; every other bus is dropped. Sounds on a
+    /// dropped bus are cut, so the director restarts them first.
+    fn retain_buses(&mut self, buses: &[&str]);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -67,6 +71,9 @@ enum Kind {
 struct Voice {
     kind: Kind,
     clip: String,
+    /// Bus and looping the voice started with; a source edited since restarts.
+    bus: String,
+    looping: bool,
     version: u32,
     /// Paused by a `Pause` request: Play resume of the game leaves it paused.
     user_paused: bool,
@@ -79,15 +86,34 @@ pub struct Director {
     /// Sources `play_on_start` already started this play session.
     started: HashSet<Entity>,
     next_one_shot: u64,
+    /// Bus names of the last frame, to notice a removed or renamed bus.
+    buses: Vec<String>,
+    /// Last failure warning per clip, so a spammed source cannot flood the Console.
+    warned: HashMap<String, Instant>,
+    listeners: Option<QueryState<Entity, With<AudioListener>>>,
+    sources: Option<QueryState<(Entity, &'static AudioSource)>>,
+}
+
+/// One failure warning per clip per second.
+const WARN_EVERY: Duration = Duration::from_secs(1);
+
+fn should_warn(warned: &mut HashMap<String, Instant>, clip: &str, now: Instant) -> bool {
+    warned.retain(|_, at| now.saturating_duration_since(*at) < WARN_EVERY);
+    if warned.contains_key(clip) {
+        return false;
+    }
+    warned.insert(clip.to_string(), now);
+    true
 }
 
 /// Position and right vector the sound is heard from: an `AudioListener`
 /// entity, else the camera.
-fn listener(world: &mut World) -> Option<(Vec3, Vec3)> {
-    let entity = world
-        .query_filtered::<Entity, With<AudioListener>>()
-        .iter(world)
-        .next();
+fn listener(
+    world: &mut World,
+    query: &mut Option<QueryState<Entity, With<AudioListener>>>,
+) -> Option<(Vec3, Vec3)> {
+    let query = query.get_or_insert_with(|| QueryState::new(world));
+    let entity = query.iter(world).next();
     if let Some(entity) = entity {
         let m = world_matrix(world, entity);
         return Some((m.w_axis.truncate(), m.x_axis.truncate()));
@@ -115,13 +141,7 @@ impl Director {
             .get_resource_mut::<AudioRequests>()
             .map(|mut q| q.drain())
             .unwrap_or_default();
-        let settings = world
-            .get_resource::<AudioSettings>()
-            .cloned()
-            .unwrap_or_default();
-        for bus in &settings.buses {
-            backend.set_bus_gain(&bus.name, settings.gain(&bus.name));
-        }
+        self.sync_buses(world, backend);
 
         let prev = std::mem::replace(&mut self.prev, state);
         match (prev, state) {
@@ -159,6 +179,66 @@ impl Director {
             if preview.0 != now {
                 preview.0 = now;
             }
+        }
+    }
+
+    /// Push bus gains; when a bus was removed or renamed, restart its
+    /// voices after the backend dropped it, so they fall back to Master.
+    fn sync_buses(&mut self, world: &mut World, backend: &mut dyn Backend) {
+        let default;
+        let settings = match world.get_resource::<AudioSettings>() {
+            Some(settings) => settings,
+            None => {
+                default = AudioSettings::default();
+                &default
+            }
+        };
+        for bus in &settings.buses {
+            backend.set_bus_gain(&bus.name, settings.gain(&bus.name));
+        }
+        let same = self.buses.len() == settings.buses.len()
+            && self
+                .buses
+                .iter()
+                .zip(&settings.buses)
+                .all(|(a, b)| *a == b.name);
+        if same {
+            return;
+        }
+        let names: Vec<&str> = settings.buses.iter().map(|b| b.name.as_str()).collect();
+        let gone: Vec<String> = self
+            .buses
+            .iter()
+            .filter(|old| !names.contains(&old.as_str()))
+            .cloned()
+            .collect();
+        backend.retain_buses(&names);
+        let new = settings.buses.iter().map(|b| b.name.clone()).collect();
+        self.buses = new;
+        let ids: Vec<VoiceId> = self
+            .voices
+            .iter()
+            .filter(|(_, v)| gone.contains(&v.bus))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.restart(world, backend, id);
+        }
+    }
+
+    /// Stop a voice and start it again from the top with the current values.
+    fn restart(&mut self, world: &mut World, backend: &mut dyn Backend, id: VoiceId) {
+        let Some(voice) = self.voices.remove(&id) else {
+            return;
+        };
+        backend.stop(id);
+        match (id, voice.kind) {
+            // A source reads its clip, bus and looping from the component.
+            (VoiceId::Source(entity), _) => self.start_source(world, backend, entity),
+            (_, kind) => self.start(world, backend, id, kind, voice.clip),
+        }
+        if self.prev == SimulationState::Paused && id != VoiceId::Preview {
+            backend.pause(id);
         }
     }
 
@@ -263,8 +343,9 @@ impl Director {
     /// `play_on_start` sources start once per play session, also when they
     /// are spawned while playing.
     fn start_play_on_start(&mut self, world: &mut World, backend: &mut dyn Backend) {
-        let entities: Vec<Entity> = world
-            .query::<(Entity, &AudioSource)>()
+        self.started.retain(|e| world.get_entity(*e).is_ok());
+        let query = self.sources.get_or_insert_with(|| QueryState::new(world));
+        let entities: Vec<Entity> = query
             .iter(world)
             .filter(|(e, s)| s.play_on_start && !self.started.contains(e))
             .map(|(e, _)| e)
@@ -283,7 +364,7 @@ impl Director {
         kind: Kind,
         clip: String,
     ) {
-        let ears = listener(world);
+        let ears = listener(world, &mut self.listeners);
         let Some(mix) = mix_of(world, ears, id, &kind) else {
             return;
         };
@@ -309,7 +390,7 @@ impl Director {
         let params = PlayParams {
             path,
             version,
-            bus,
+            bus: bus.clone(),
             volume: mix.volume,
             pan: mix.pan,
             pitch: mix.pitch,
@@ -322,19 +403,25 @@ impl Director {
                     Voice {
                         kind,
                         clip,
+                        bus,
+                        looping,
                         version,
                         user_paused: false,
                     },
                 );
             }
-            Err(error) => tracing::warn!("audio: cannot play `{clip}`: {error}"),
+            Err(error) => {
+                if should_warn(&mut self.warned, &clip, Instant::now()) {
+                    tracing::warn!("audio: cannot play `{clip}`: {error}");
+                }
+            }
         }
     }
 
     /// Drop finished or orphaned voices, restart ones whose file changed,
     /// push volume and pan. Game voices stand still while `Paused`.
     fn maintain(&mut self, world: &mut World, backend: &mut dyn Backend, state: SimulationState) {
-        let ears = listener(world);
+        let ears = listener(world, &mut self.listeners);
         let ids: Vec<VoiceId> = self.voices.keys().copied().collect();
         for id in ids {
             let is_preview = id == VoiceId::Preview;
@@ -356,14 +443,12 @@ impl Director {
             };
             let renamed = matches!(id, VoiceId::Source(e)
                 if world.get::<AudioSource>(e).is_some_and(|s| s.clip != voice.clip));
-            if (renamed || current != voice.version) && !matches!(voice.kind, Kind::OneShot { .. })
+            let edited = matches!(id, VoiceId::Source(e)
+                if world.get::<AudioSource>(e).is_some_and(|s| s.looping != voice.looping || s.bus != voice.bus));
+            if (renamed || edited || current != voice.version)
+                && !matches!(voice.kind, Kind::OneShot { .. })
             {
-                let clip = voice.clip.clone();
-                self.remove(backend, id);
-                match id {
-                    VoiceId::Source(e) => self.start_source(world, backend, e),
-                    _ => self.start_preview(world, backend, &clip),
-                }
+                self.restart(world, backend, id);
                 continue;
             }
             if let Some(mix) = mix_of(world, ears, id, &voice.kind) {
@@ -440,6 +525,8 @@ mod tests {
         fail: bool,
         done: HashSet<VoiceId>,
         last: HashMap<VoiceId, (f32, f32, f32)>,
+        retained: Vec<Vec<String>>,
+        played_bus: Vec<String>,
     }
 
     impl Mock {
@@ -459,6 +546,7 @@ mod tests {
                 VoiceId::Preview => "preview",
             };
             self.log.push(format!("play {name} {}", params.bus));
+            self.played_bus.push(params.bus.clone());
             self.last
                 .insert(voice, (params.volume, params.pan, params.pitch));
             Ok(())
@@ -477,6 +565,10 @@ mod tests {
         }
         fn finished(&self, voice: VoiceId) -> bool {
             self.done.contains(&voice)
+        }
+        fn retain_buses(&mut self, buses: &[&str]) {
+            self.retained
+                .push(buses.iter().map(|b| b.to_string()).collect());
         }
         fn set_bus_gain(&mut self, bus: &str, gain: f32) {
             self.gains.insert(bus.to_string(), gain);
@@ -949,5 +1041,112 @@ mod tests {
             (m.gains["Master"], m.gains["Music"], m.gains["Sfx"]),
             (0.5, 0.5, 0.0)
         );
+    }
+
+    fn on_music(w: &mut World) -> Entity {
+        w.spawn((
+            AudioSource {
+                clip: "assets/a.ogg".into(),
+                play_on_start: true,
+                bus: "Music".into(),
+                ..AudioSource::default()
+            },
+            Transform::default(),
+        ))
+        .id()
+    }
+
+    #[test]
+    fn removed_bus_drops_it_and_restarts_its_voices() {
+        let mut w = world(SimulationState::Playing);
+        on_music(&mut w);
+        let (mut d, mut m) = (Director::default(), Mock::default());
+        step(&mut d, &mut w, &mut m);
+        assert_eq!(m.count("play source Music"), 1);
+        w.resource_mut::<AudioSettings>().buses.remove(1); // Music
+        step(&mut d, &mut w, &mut m);
+        assert_eq!(m.retained.last().unwrap(), &["Master", "Sfx", "Ui"]);
+        assert_eq!((m.count("stop source"), m.count("play source")), (1, 2));
+        assert_eq!(d.voices.len(), 1, "still playing, not cut");
+        step(&mut d, &mut w, &mut m);
+        assert_eq!(m.count("play source"), 2, "restarted once");
+    }
+
+    #[test]
+    fn voices_on_other_buses_survive_a_bus_removal() {
+        let mut w = world(SimulationState::Playing);
+        source(&mut w, true); // Sfx
+        let (mut d, mut m) = (Director::default(), Mock::default());
+        step(&mut d, &mut w, &mut m);
+        w.resource_mut::<AudioSettings>().buses.remove(1);
+        step(&mut d, &mut w, &mut m);
+        assert_eq!((m.count("stop"), m.count("play")), (0, 1));
+    }
+
+    #[test]
+    fn renamed_bus_restarts_voices_on_the_old_name() {
+        let mut w = world(SimulationState::Playing);
+        on_music(&mut w);
+        let (mut d, mut m) = (Director::default(), Mock::default());
+        step(&mut d, &mut w, &mut m);
+        w.resource_mut::<AudioSettings>().buses[1].name = "Tunes".into();
+        step(&mut d, &mut w, &mut m);
+        assert_eq!(m.count("play source"), 2);
+        assert_eq!(
+            m.played_bus.last().unwrap(),
+            "Music",
+            "unknown: backend uses Master"
+        );
+    }
+
+    #[test]
+    fn changing_looping_or_bus_restarts_the_source() {
+        let mut w = world(SimulationState::Playing);
+        let e = source(&mut w, true);
+        let (mut d, mut m) = (Director::default(), Mock::default());
+        step(&mut d, &mut w, &mut m);
+        w.get_mut::<AudioSource>(e).unwrap().looping = true;
+        step(&mut d, &mut w, &mut m);
+        assert_eq!(m.count("play source"), 2);
+        w.get_mut::<AudioSource>(e).unwrap().bus = "Music".into();
+        step(&mut d, &mut w, &mut m);
+        assert_eq!(m.count("play source"), 3);
+        assert_eq!(m.played_bus.last().unwrap(), "Music");
+        step(&mut d, &mut w, &mut m);
+        assert_eq!(m.count("play source"), 3, "stable afterwards");
+    }
+
+    #[test]
+    fn started_set_forgets_despawned_entities() {
+        let mut w = world(SimulationState::Playing);
+        let e = source(&mut w, true);
+        let (mut d, mut m) = (Director::default(), Mock::default());
+        step(&mut d, &mut w, &mut m);
+        assert!(d.started.contains(&e));
+        w.despawn(e);
+        step(&mut d, &mut w, &mut m);
+        assert!(d.started.is_empty());
+    }
+
+    #[test]
+    fn failure_warning_is_rate_limited_per_clip() {
+        let t0 = Instant::now();
+        let mut warned = HashMap::new();
+        assert!(should_warn(&mut warned, "a.ogg", t0));
+        assert!(!should_warn(
+            &mut warned,
+            "a.ogg",
+            t0 + Duration::from_millis(900)
+        ));
+        assert!(should_warn(
+            &mut warned,
+            "b.ogg",
+            t0 + Duration::from_millis(900)
+        ));
+        assert!(should_warn(
+            &mut warned,
+            "a.ogg",
+            t0 + Duration::from_millis(1100)
+        ));
     }
 }
