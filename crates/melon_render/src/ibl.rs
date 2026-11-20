@@ -36,8 +36,8 @@ pub struct HdrImage {
 
 impl HdrImage {
     /// Decode any image file the `image` crate reads (`.hdr`, `.png`, ...).
-    pub fn open(path: &std::path::Path) -> anyhow::Result<Self> {
-        let image = image::open(path)?.to_rgb32f();
+    pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        let image = image::load_from_memory(bytes)?.to_rgb32f();
         Ok(Self {
             width: image.width(),
             height: image.height(),

@@ -11,6 +11,7 @@ use melon_core::{Action, ActionKind, AxisBinding, InputButton, InputMap, KeyCode
 
 use crate::audio_settings::AudioSettingsPanel;
 use crate::physics_settings::PhysicsSettingsPanel;
+use crate::player_settings::PlayerSettingsPanel;
 use crate::quality_settings::QualitySettings;
 use crate::{StatusKind, theme};
 
@@ -26,6 +27,7 @@ pub enum Section {
     Quality,
     Audio,
     Physics,
+    Player,
 }
 
 /// The binding the next raw press goes to (index into `InputMap::actions`).
@@ -50,6 +52,7 @@ pub struct ProjectSettings {
     quality: QualitySettings,
     audio: AudioSettingsPanel,
     physics: PhysicsSettingsPanel,
+    player: PlayerSettingsPanel,
 }
 
 impl ProjectSettings {
@@ -65,6 +68,10 @@ impl ProjectSettings {
     /// `config/physics.ron` failed to load: the first Apply backs it up.
     pub fn set_physics_broken(&mut self, broken: bool) {
         self.physics.set_broken_on_load(broken);
+    }
+    /// `config/player.ron` failed to load: the first Apply backs it up.
+    pub fn set_player_broken(&mut self, broken: bool) {
+        self.player.set_broken_on_load(broken);
     }
 
     /// `config/audio.ron` failed to load: the first Apply backs it up.
@@ -115,6 +122,7 @@ impl ProjectSettings {
                         ui.selectable_value(&mut self.section, Section::Quality, "Quality");
                         ui.selectable_value(&mut self.section, Section::Audio, "Audio");
                         ui.selectable_value(&mut self.section, Section::Physics, "Physics");
+                        ui.selectable_value(&mut self.section, Section::Player, "Player");
                     });
                     ui.separator();
                     ui.vertical(|ui| match self.section {
@@ -124,6 +132,9 @@ impl ProjectSettings {
                         }
                         Section::Audio => {
                             panel_status = self.audio.ui(ui, world, project_root);
+                        }
+                        Section::Player => {
+                            panel_status = self.player.ui(ui, world, project_root);
                         }
                         Section::Physics => {
                             panel_status = self.physics.ui(ui, world, project_root);

@@ -7,13 +7,13 @@ Current state and planned work: `docs/ROADMAP.md`.
 
 | Path | Role |
 |---|---|
-| `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera. No GPU or window code. |
+| `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera, scenes (`scene.rs`), asset pack (`pack.rs`), player settings (`player.rs`), packaging (`package.rs`). No GPU or window code. |
 | `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache` and `MaterialCache`) records the sun cascade passes and the point / spot shadow atlas pass, depth/normal prepass, SSAO passes, the GI mode's passes (`gi/`: DDGI voxel and probe passes or SSGI), 3D pass into HDR target, bloom passes, tonemap pass; `ui_pass` for the editor. |
 | `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource): component sync (`sync.rs`), scene queries (`queries.rs`), character controller, mesh collider triangles. See "Physics" below. |
 | `crates/melon_audio` | kira playback: `Director` (decisions, tested with a mock `Backend`), `KiraBackend` (device, bus tracks), `spatial` (attenuation, pan), `AudioEngine` (host calls `update` once per frame). The game-facing types are in `melon_core::audio`. |
-| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), Content Drawer (`drawer.rs`), asset `.meta` files (`asset_db.rs`), file operations (`asset_ops.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), undo history (`history.rs`), Project Settings window (`project_settings.rs`, with `quality_settings.rs` and `audio_settings.rs`). |
+| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), Content Drawer (`drawer.rs`), asset `.meta` files (`asset_db.rs`), file operations (`asset_ops.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), scene wrappers that add physics (`scene.rs`; the scene code itself is `melon_core::scene`), undo history (`history.rs`), Project Settings window (`project_settings.rs`, with `quality_settings.rs`, `audio_settings.rs`, `player_settings.rs`), File > Build (`build_window.rs`). |
 | `crates/melon_game` | Game logic as an `rlib` + `dylib`, hot-reloaded in dev builds. |
-| `crates/melon_host` | Binary: winit event loop, input mapping, frame order (core update, editor, extract, render_scene, ui pass). No render pass code. |
+| `crates/melon_host` | Binaries. `melon_host`: winit event loop, input mapping, frame order (core update, editor, extract, render_scene, ui pass); with `--no-default-features` it is the player (`player.rs`, no `melon_editor` linked). `melon_package`: `just package`. No render pass code. |
 | `assets/models` | glTF models. `cube.glb` loads at startup. `review/` holds the snapshot scene's material test models (`grey_cube`, `material_spheres`, `normal_panel`, `emissive_cube`, `red_panel`, `green_panel`), written by `cargo run -p melon_render --example gen_review_assets` from the repo root; commit them when regenerated. |
 | `assets/shaders` | WGSL shaders, compiled in with `wgpu::include_wgsl!` (no runtime reload). Shared pieces are prepended with `concat!(include_str!(..))` (WGSL has no include): `mesh.wgsl` = `gi_common` + `ddgi_common` + `gi_ddgi` + `gi_ssgi` + `mesh`; `ddgi_update.wgsl` = `gi_common` + `ddgi_common` + it; `ssgi.wgsl` = `gi_common` + it. |
 
@@ -23,11 +23,12 @@ Dependency direction: `core` <- `render`, `physics`, `audio`; `render`, `physics
 ## Commands
 
 ```powershell
-just gate        # fmt-check + clippy -D warnings + check. Run before every commit.
+just gate        # fmt-check + clippy -D warnings + check, also of the player build. Run before every commit.
 just test        # gate, then cargo test --workspace
 just dev-run     # debug build with melon_game live reload
 just game        # rebuild only melon_game; a running dev-run reloads it
 just fast-run    # release run, no gate, no hot reload
+just package <out>  # build the player, write <out>/<GameName>/ (exe + game.pak)
 just snapshot    # render the review scene offscreen to target/review/snapshot.png
 ```
 
@@ -417,7 +418,7 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   history. Root order is the `melon_core::hierarchy::RootOrder` resource (healed
   by `root_order`, set from file order by `apply_scene`, so the scene
   version is unaffected); steps store a root's index like a child's.
-- **Scene format.** RON, `SCENE_VERSION = 6` in `melon_editor/src/scene.rs`:
+- **Scene format.** RON, `SCENE_VERSION = 6` in `melon_core/src/scene.rs` (`SceneData`, `apply_scene`, `load_scene`, `read_scene_asset`; the editor wraps `apply_scene` / `load_scene` to clear and re-sync `PhysicsWorld`):
   each entity has `name`, `parent` (index into `entities`), `model` (path,
   `#mesh<N>` included), `model_guid` (wins when it resolves, so a scene
   written by hand may give only `model`), optional `uid`
@@ -434,6 +435,78 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   converted on load). Scene code needs the world's `AppTypeRegistry`: tests
   use `Core::new().world`, not `World::new()`. Bump the version on breaking
   changes and keep reading the old one.
+- **Scene changes at runtime.** Game code asks with
+  `SceneRequests::load("assets/scenes/level2.ron")` (a `ResMut` in any
+  system). `scene_requests_system` (first in `PreUpdate`) reads the file
+  through the `AssetServer` (pack or disk), despawns every entity with a
+  `Transform` and spawns the new scene; so a request made in frame N lands
+  at the start of frame N+1. A broken file is logged and the old scene
+  stays. Physics bodies of the old scene go through the component hooks,
+  the new ones come from `sync_components_system` in `PostUpdate`. Entities
+  with the `KeepOnSceneLoad` marker (and their children) survive a request
+  (Unity's DontDestroyOnLoad; not saved in scenes); the editor's Play / Stop
+  rebuilds do not keep them. The system runs `.before(update_actions_system)`.
+- **Player mode.** `cargo run -p melon_host --no-default-features` is the
+  player: no editor, game plugin linked statically (`core.add_plugin`),
+  `Playing` from frame 1, `GameInputGate` open, Esc is the game's, the
+  cursor follows the `Cursor` resource (default free and visible; a game
+  sets `*cursor = Cursor::locked()` for mouse look; the player applies it when
+  it changes and again on focus regain, and frees it while unfocused). Window title, mode and size,
+  startup scene come from `config/player.ron` (`PlayerSettings`, edited in
+  Edit > Project Settings > Player; vsync is `RenderQuality::present`).
+  `--frames N` renders N frames, logs `rendered N frames; exiting` and exits
+  0 (1 on a startup error). A game quits with
+  `world.resource_mut::<AppExit>().request()` (the player closes at the end of
+  the frame; the editor's Play stops Play instead and stays open; the editor
+  applies the game's `Cursor` only while the game has input, and its own free
+  cursor after Esc / Stop). A missing or broken startup scene logs an error
+  and the game runs an empty world (exit 0). The project root is the executable's folder when
+  `game.pak` lies beside it, else the source tree. Features of `melon_host`:
+  `editor` (links `melon_editor`), `hot-reload` (implies `editor`); the
+  editor builds need `--no-default-features --features editor` (the
+  `just run` / `ship` recipes do). Keep shared host code (`map_key`,
+  `record_button`, `pacing`) free of editor types.
+- **Asset pack (`game.pak`, `melon_core::pack`).** Little endian: 32-byte
+  header (`MELONPAK`, version u32 = 1, count u32, index offset u64, index
+  length u64), each file's bytes padded to 8, then the index (per file:
+  path_len u32, UTF-8 project-relative path, has_guid u8, guid 16 bytes,
+  offset u64, size u64). No compression. It holds everything under `assets/`
+  (not `.meta` sidecars: their GUIDs are in the index; nothing starting with
+  `.`) and `config/*.ron`, minus the exclude globs of `PlayerSettings`
+  (`*` in a segment, `**` across, `?`). `AssetServer::set_pack` serves
+  `read` and the GUID index from the pack and stops hot reload; models
+  (`melon_render::models::Source`) and audio (`PlayParams::data`) read bytes
+  from it. A packed `.gltf` also reads its external `.bin` / image files
+  through the `AssetServer` (`packed_gltf.rs`: URIs are percent-decoded and
+  resolved against the model's pack path). Settings loaders
+  (`ron_file::load`) read `config/*.ron` from the installed pack
+  (`pack::install`) without a disk fallback.
+- **Packaging.** `just package <out>` (binary `melon_package`) and the
+  editor's File > Build run the same steps: `build_player` builds the
+  player with `cargo build -p melon_host --release --no-default-features
+  --target-dir target/package` and `RUSTFLAGS=-C target-feature=+crt-static`,
+  then `package_game` writes `<out>/<GameName>/<GameName>.exe` and
+  `game.pak`. The separate target dir keeps the changed flags from
+  rebuilding the normal release. Nothing else ships: the static C runtime
+  needs no VC++ redistributable, and the player asks wgpu for the DX12
+  **FXC** shader compiler (`Renderer::new_with_dx12_compiler`; FXC is part of
+  Windows) instead of `Auto`, which looks for `dxcompiler.dll` / `dxil.dll`
+  (Windows SDK files, redistributable only under their own licence). Set
+  `WGPU_DX12_COMPILER` to override. The editor's own DX12 stays on `Auto`.
+  Safety: `package_game` refuses an output that is, holds or lies inside
+  the project folder, `assets/`, `config/`, `crates/` or `.git/`, and only
+  replaces a game folder that holds `game.pak` and `build.manifest` (written
+  by a previous build). `build_player` finds cargo via `$CARGO`, PATH, then
+  `~/.cargo/bin`; File > Build can cancel (kills cargo and its children),
+  remembers the output folder in `.melon/build_output.txt` and offers Open
+  Folder / Run. cargo also builds the `melon_game` dylib in that build (it
+  builds every crate type of a dependency); harmless, not shipped.
+  `just test-fxc` runs the renderer GPU tests under FXC (all pass). First
+  start of the player under FXC took about 2.5 s to "renderer ready"
+  (about 1.0 s with DXC), then 60 frames in 0.5 s.
+  End-to-end check: `cargo test -p melon_host --test package_smoke --
+  --ignored` (builds the player, packages a temp project, runs it with
+  `--frames 30`).
 - **Light direction sign.** `Light::direction` is the direction light travels
   (from the light into the scene). Shaders want the opposite; pass
   `Light::to_light()`.

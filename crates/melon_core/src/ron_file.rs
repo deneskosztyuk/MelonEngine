@@ -36,7 +36,10 @@ impl LoadOutcome {
 
 /// Missing or unreadable files give `T::default()`; the file is left untouched.
 pub(crate) fn load<T: DeserializeOwned + Default>(path: &Path) -> (T, LoadOutcome) {
-    let text = match std::fs::read_to_string(path) {
+    let text = match crate::pack::installed_read(path)
+        .unwrap_or_else(|| std::fs::read(path))
+        .and_then(|b| String::from_utf8(b).map_err(std::io::Error::other))
+    {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return (T::default(), LoadOutcome::Missing);
@@ -75,4 +78,33 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(suffix);
     s.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[derive(serde::Deserialize, Default, PartialEq, Debug)]
+    struct Cfg {
+        n: i32,
+    }
+
+    #[test]
+    fn config_loads_from_the_installed_pack_not_the_disk() {
+        let root = std::env::temp_dir().join(format!("melon_ron_pack_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::write(root.join("config/x.ron"), "(n: 7)").unwrap();
+        crate::pack::build_pack(&root, &[], &root.join("game.pak")).unwrap();
+        std::fs::remove_file(root.join("config/x.ron")).unwrap();
+
+        let (missing, outcome) = load::<Cfg>(&root.join("config/x.ron"));
+        assert_eq!((missing, outcome), (Cfg::default(), LoadOutcome::Missing));
+        let pack = crate::pack::Pack::open(&root.join("game.pak")).unwrap();
+        crate::pack::install(&root, Arc::new(pack));
+        let (cfg, outcome) = load::<Cfg>(&root.join("config/x.ron"));
+        assert_eq!((cfg, outcome), (Cfg { n: 7 }, LoadOutcome::Loaded));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -26,6 +26,8 @@ pub enum VoiceId {
 
 pub struct PlayParams {
     pub path: PathBuf,
+    /// The file's bytes when the game is packed (`path` is then only the cache key).
+    pub data: Option<std::sync::Arc<[u8]>>,
     /// `AssetServer` version of the file: a change means the cached decode is stale.
     pub version: u32,
     pub bus: String,
@@ -379,16 +381,22 @@ impl Director {
             Kind::OneShot { bus, .. } => (bus.clone(), false),
             Kind::Preview => (UI.to_string(), false),
         };
-        let (path, version) = {
+        let (path, data, version) = {
             let mut server = world.resource_mut::<AssetServer>();
             let handle = server.load::<AudioClip>(&clip);
-            (
-                server.full_path(handle).unwrap_or_default(),
-                server.version(handle),
-            )
+            let data = server
+                .has_pack()
+                .then(|| server.read(server.path(handle)).ok().map(Into::into))
+                .flatten();
+            let path = match server.has_pack() {
+                true => PathBuf::from(server.path(handle)),
+                false => server.full_path(handle).unwrap_or_default(),
+            };
+            (path, data, server.version(handle))
         };
         let params = PlayParams {
             path,
+            data,
             version,
             bus: bus.clone(),
             volume: mix.volume,

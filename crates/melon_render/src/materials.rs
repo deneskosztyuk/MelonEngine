@@ -68,15 +68,18 @@ impl MaterialCache {
         {
             return;
         }
-        let texture = match server.full_path(handle) {
-            Some(file) => match image::open(&file) {
-                Ok(img) => Some(scene.create_texture_from_image_as(&img, srgb)),
-                Err(error) => {
-                    tracing::warn!("could not load texture {}: {error}", file.display());
-                    None
-                }
-            },
-            None => None,
+        // `read` serves the pack in a shipped game, the project folder otherwise.
+        let path = server.path(handle).to_string();
+        let texture = match server
+            .read(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| Ok(image::load_from_memory(&bytes)?))
+        {
+            Ok(img) => Some(scene.create_texture_from_image_as(&img, srgb)),
+            Err(error) => {
+                tracing::warn!("could not load texture {path}: {error}");
+                None
+            }
         };
         self.textures
             .insert(key, CachedTexture { version, texture });
@@ -99,13 +102,15 @@ impl MaterialCache {
         if current || self.failed.contains(&(id, version)) {
             return;
         }
-        let Some(file) = server.full_path(handle) else {
-            return;
-        };
-        let asset = match MaterialAsset::read(&file) {
+        let path = server.path(handle).to_string();
+        let asset = match server
+            .read(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| MaterialAsset::parse(&String::from_utf8(bytes)?))
+        {
             Ok(asset) => asset,
             Err(error) => {
-                tracing::warn!("could not load material {}: {error:#}", file.display());
+                tracing::warn!("could not load material {path}: {error:#}");
                 self.failed.insert((id, version));
                 return;
             }

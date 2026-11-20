@@ -10,6 +10,8 @@ mod local_shadows;
 mod materials;
 mod models;
 mod overlay;
+mod packed_gltf;
+mod present;
 mod timings;
 
 pub use extract::{FrameData, blends, extract};
@@ -929,6 +931,8 @@ pub struct Renderer {
     sky_cache: Option<(u32, u32, Option<std::sync::Arc<ibl::HdrImage>>)>,
     /// Solid editor shapes drawn after tonemapping.
     overlay: overlay::OverlayRenderer,
+    /// Copies a viewport image onto the swapchain (a game without the editor UI).
+    present: present::Present,
     /// GPU pass timings; `None` without timestamp queries.
     timer: Option<timings::GpuTimer>,
 }
@@ -1066,13 +1070,28 @@ fn create_instance_buffer(
 impl Renderer {
     #[instrument(skip(window), level = "info")]
     pub async fn new(window: Arc<Window>) -> Result<Self> {
+        Self::new_with_dx12_compiler(window, wgpu::Dx12Compiler::default()).await
+    }
+
+    /// `new` with the DX12 shader compiler used unless `WGPU_DX12_COMPILER` is set.
+    /// A packaged game passes `Fxc`, which ships with Windows; `Auto` looks for
+    /// `dxcompiler.dll` (a Windows SDK file) first.
+    #[instrument(skip(window), level = "info")]
+    pub async fn new_with_dx12_compiler(
+        window: Arc<Window>,
+        dx12_compiler: wgpu::Dx12Compiler,
+    ) -> Result<Self> {
         let forced = std::env::var("MELON_BACKEND").ok();
         let mut found = None;
         for backends in backend_order(cfg!(windows), forced.as_deref()) {
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            let mut descriptor = wgpu::InstanceDescriptor {
                 backends,
                 ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
-            });
+            };
+            if std::env::var_os("WGPU_DX12_COMPILER").is_none() {
+                descriptor.backend_options.dx12.shader_compiler = dx12_compiler.clone();
+            }
+            let instance = wgpu::Instance::new(descriptor);
             if let Ok(adapter) = instance
                 .request_adapter(&wgpu::RequestAdapterOptions::default())
                 .await
@@ -1118,6 +1137,7 @@ impl Renderer {
         let model_cache = ModelCache::new(&scene);
         let overlay =
             overlay::OverlayRenderer::new(&scene.device, surface_format.add_srgb_suffix());
+        let present = present::Present::new(&scene.device, surface_format.add_srgb_suffix());
         tracing::info!(
             msaa = ?scene.msaa_counts,
             timestamps = timer.is_some(),
@@ -1138,6 +1158,7 @@ impl Renderer {
             materials: Default::default(),
             sky_cache: None,
             overlay,
+            present,
             timer,
         };
         renderer.configure_surface();
@@ -1376,15 +1397,18 @@ impl Renderer {
         {
             return image.clone();
         }
-        let image = server
-            .full_path(handle)
-            .and_then(|file| match ibl::HdrImage::open(&file) {
-                Ok(image) => Some(std::sync::Arc::new(image)),
-                Err(error) => {
-                    tracing::warn!("could not load sky {}: {error:#}", file.display());
-                    None
-                }
-            });
+        let path = server.path(handle).to_string();
+        let image = match server
+            .read(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| ibl::HdrImage::from_bytes(&bytes))
+        {
+            Ok(image) => Some(std::sync::Arc::new(image)),
+            Err(error) => {
+                tracing::warn!("could not load sky {path}: {error:#}");
+                None
+            }
+        };
         self.sky_cache = Some((handle.id(), version, image.clone()));
         image
     }
@@ -1855,6 +1879,17 @@ impl Renderer {
                 multiview_mask: None,
             })
             .forget_lifetime()
+    }
+
+    /// Copy `target`'s finished image onto the swapchain image of `frame`
+    /// (a game without the editor UI). `target` must be window sized.
+    pub fn present_target(&self, frame: &mut Frame, target: &ViewportTarget) {
+        self.present.draw(
+            &self.scene.device,
+            &mut frame.encoder,
+            &target.color_view,
+            &frame.view,
+        );
     }
 
     pub fn scene_mut(&mut self) -> &mut SceneRenderer {
@@ -4216,9 +4251,32 @@ impl SceneRenderer {
     /// transform baked in. A mesh that fails gets its own error.
     #[instrument(skip(self), level = "info")]
     pub fn load_gltf_meshes(&self, path: &str) -> Result<Vec<Result<LoadedModel>>> {
-        let (document, buffers, images) =
+        let imported =
             gltf::import(path).with_context(|| format!("failed to import glTF file: {path}"))?;
-        Ok(document
+        Ok(self.meshes_of(path, imported))
+    }
+
+    /// `load_gltf_meshes` from memory (a packed game; external files in `files`, see `packed_gltf`).
+    pub fn load_gltf_meshes_bytes(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        files: &std::collections::HashMap<String, Vec<u8>>,
+    ) -> Result<Vec<Result<LoadedModel>>> {
+        let imported = packed_gltf::import_with(name, bytes, files)?;
+        Ok(self.meshes_of(name, imported))
+    }
+
+    fn meshes_of(
+        &self,
+        path: &str,
+        (document, buffers, images): (
+            gltf::Document,
+            Vec<gltf::buffer::Data>,
+            Vec<gltf::image::Data>,
+        ),
+    ) -> Vec<Result<LoadedModel>> {
+        document
             .meshes()
             .map(|gltf_mesh| {
                 let mut model = LoadedModel {
@@ -4242,7 +4300,7 @@ impl SceneRenderer {
                 }
                 Ok(model)
             })
-            .collect())
+            .collect()
     }
 
     /// Load one glTF mesh (`<file>#mesh<N>`); see `load_gltf_meshes`.
@@ -4320,6 +4378,18 @@ impl SceneRenderer {
             part_bounds: vec![(glam::Vec3::splat(-0.5), glam::Vec3::splat(0.5))],
             bounds: (glam::Vec3::splat(-0.5), glam::Vec3::splat(0.5)),
         }
+    }
+
+    /// Load a glTF from the pack: `name` is its pack path, `files` its external
+    /// buffers and images (`packed_gltf::external_files`).
+    pub fn load_gltf_packed(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        files: &std::collections::HashMap<String, Vec<u8>>,
+    ) -> Result<LoadedModel> {
+        let (document, buffers, images) = packed_gltf::import_with(name, bytes, files)?;
+        self.build_model(&document, &buffers, &images)
     }
 
     /// The procedural unit cube with the checkerboard (`builtin:cube`).
@@ -6922,6 +6992,40 @@ mod tests {
         Ok(())
     }
 
+    fn check_packed_materials_textures_and_sky(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("packed_mat");
+        write_mat(
+            &root,
+            "m",
+            "(metallic: 0.0, base_color_texture: Some((guid: None, path: \"assets/textures/t.png\")))",
+        );
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .save(root.join("assets/textures/t.png"))
+            .unwrap();
+        let pak = root.join("game.pak");
+        melon_core::pack::build_pack(&root, &[], &pak).unwrap();
+        // Only the pack may serve them now.
+        std::fs::remove_file(root.join("assets/materials/m.mat")).unwrap();
+        std::fs::remove_file(root.join("assets/textures/t.png")).unwrap();
+        let mut server = fresh_ids_server(root.clone(), 7700);
+        server.set_pack(Arc::new(melon_core::pack::Pack::open(&pak).unwrap()));
+        r.materials = Default::default();
+        let material: melon_core::Handle<melon_core::Material> =
+            server.load("assets/materials/m.mat");
+        let texture: melon_core::Handle<melon_core::Texture> = server.load("assets/textures/t.png");
+        r.materials.prepare(&r.scene, &mut server, material);
+        let built = r.materials.get(material).is_some();
+        let loaded = r.materials.texture(texture, true).is_some();
+        let sky = r.sky_image(&server, Some(texture)).is_some();
+        let _ = std::fs::remove_dir_all(&root);
+        if !built || !loaded || !sky {
+            return Err(format!(
+                "packed assets: material {built}, texture {loaded}, sky {sky} (want all true)"
+            ));
+        }
+        Ok(())
+    }
+
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
@@ -8701,6 +8805,36 @@ mod tests {
             Box::new(check_local_light_shadows),
             Box::new(check_hdr_sky_is_drawn),
             Box::new(check_material_thumbnail),
+            Box::new(|renderer| {
+                // A packed `.gltf` whose buffer is a separate `.bin` loads
+                // through the AssetServer (`packed_gltf`), not a placeholder cube.
+                use melon_core::{AssetServer, Handle, Model};
+                let root = temp_project("packed_external");
+                let gltf = TWO_NODE_GLTF.replace(
+                    r#""uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAA""#,
+                    r#""uri": "m.bin""#,
+                );
+                assert!(gltf.contains("m.bin"));
+                std::fs::write(root.join("assets/models/m.gltf"), gltf).unwrap();
+                let mut bin = vec![0u8; 36];
+                bin[12..16].copy_from_slice(&1.0f32.to_le_bytes()); // (1, 0, 0)
+                bin[28..32].copy_from_slice(&1.0f32.to_le_bytes()); // (0, 1, 0)
+                std::fs::write(root.join("assets/models/m.bin"), bin).unwrap();
+                let pak = root.join("game.pak");
+                melon_core::pack::build_pack(&root, &[], &pak).unwrap();
+                let mut server = AssetServer::new(root.clone());
+                server.set_pack(Arc::new(melon_core::pack::Pack::open(&pak).unwrap()));
+                let h: Handle<Model> = server.load("assets/models/m.gltf");
+                let mut cache = ModelCache::new(renderer.scene());
+                let bounds = cache.get(renderer.scene(), &mut server, h).bounds;
+                let _ = std::fs::remove_dir_all(&root);
+                if bounds.1.x >= 3.0 {
+                    Ok(())
+                } else {
+                    Err(format!("placeholder cube instead of the model: {bounds:?}"))
+                }
+            }),
+            Box::new(check_packed_materials_textures_and_sky),
         ];
 
         #[cfg(target_os = "windows")]
