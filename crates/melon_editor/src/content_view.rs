@@ -57,7 +57,7 @@ fn kind_glyph(kind: AssetKind) -> &'static str {
 /// tests and other code can find it with `Context::read_response`. Painted
 /// like egui's selectable label; it is the only widget on its rect, so it
 /// gets hover.
-fn id_label(
+pub(crate) fn id_label(
     ui: &mut egui::Ui,
     id: Id,
     text: impl Into<egui::WidgetText>,
