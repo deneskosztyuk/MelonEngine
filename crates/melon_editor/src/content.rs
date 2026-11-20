@@ -55,7 +55,7 @@ pub fn asset_kind(path: &Path, is_dir: bool) -> AssetKind {
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     match ext.as_str() {
-        "glb" | "gltf" => AssetKind::Model,
+        "glb" | "gltf" | "fbx" => AssetKind::Model,
         "png" | "jpg" | "jpeg" | "hdr" => AssetKind::Texture,
         "mat" => AssetKind::Material,
         "wgsl" => AssetKind::Shader,
@@ -219,11 +219,11 @@ pub fn is_scene_path(project_root: &Path, path: &Path) -> bool {
 /// A file the asset pipeline can load as a model.
 pub fn is_model_path(path: &str) -> bool {
     let path = path.to_lowercase();
-    path.ends_with(".glb") || path.ends_with(".gltf")
+    path.ends_with(".glb") || path.ends_with(".gltf") || path.ends_with(".fbx")
 }
 
 /// Every model the Inspector can assign: `builtin:cube`, then each
-/// `.glb` / `.gltf` under `<project>/assets/models` (recursive) as a
+/// `.glb` / `.gltf` / `.fbx` under `<project>/assets/models` (recursive) as a
 /// project-relative, forward-slash path, sorted.
 pub fn model_list(project_root: &Path) -> Vec<String> {
     let mut models = Vec::new();
@@ -822,9 +822,10 @@ mod tests {
     }
 
     #[test]
-    fn is_model_path_accepts_glb_gltf_only() {
+    fn is_model_path_accepts_glb_gltf_fbx_only() {
         assert!(is_model_path("assets/models/a.GLB"));
         assert!(is_model_path("assets/models/b.gltf"));
+        assert!(is_model_path("assets/models/c.Fbx"));
         assert!(!is_model_path("assets/README.md"));
         assert!(!is_model_path("assets/shaders/mesh.wgsl"));
     }
@@ -836,13 +837,15 @@ mod tests {
         std::fs::create_dir_all(models.join("sub")).unwrap();
         std::fs::write(models.join("b.glb"), "").unwrap();
         std::fs::write(models.join("sub/a.gltf"), "").unwrap();
+        std::fs::write(models.join("sub/c.fbx"), "").unwrap();
         std::fs::write(models.join("notes.txt"), "").unwrap();
         assert_eq!(
             model_list(&root),
             [
                 "builtin:cube",
                 "assets/models/b.glb",
-                "assets/models/sub/a.gltf"
+                "assets/models/sub/a.gltf",
+                "assets/models/sub/c.fbx"
             ]
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -900,6 +903,7 @@ mod tests {
     fn asset_kind_by_extension_case_insensitive() {
         assert_eq!(asset_kind(Path::new("a/B.GLB"), false), AssetKind::Model);
         assert_eq!(asset_kind(Path::new("a/b.gltf"), false), AssetKind::Model);
+        assert_eq!(asset_kind(Path::new("a/c.FBX"), false), AssetKind::Model);
         assert_eq!(asset_kind(Path::new("t.JPeG"), false), AssetKind::Texture);
         assert_eq!(asset_kind(Path::new("s.wgsl"), false), AssetKind::Shader);
         assert_eq!(asset_kind(Path::new("m.MAT"), false), AssetKind::Material);

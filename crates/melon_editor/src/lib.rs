@@ -4183,6 +4183,97 @@ mod tests {
             .map(|h| world.resource::<AssetServer>().path(*h).to_string())
     }
 
+    /// One triangle at (3, 0, 0) with a green material, in metres, Y up.
+    pub(crate) const TRIANGLE_FBX: &str = r#"; FBX 7.3.0 project file
+FBXHeaderExtension:  {
+	FBXHeaderVersion: 1003
+	FBXVersion: 7300
+}
+GlobalSettings:  {
+	Version: 1000
+	Properties70:  {
+		P: "UpAxis", "int", "Integer", "",1
+		P: "UpAxisSign", "int", "Integer", "",1
+		P: "FrontAxis", "int", "Integer", "",2
+		P: "FrontAxisSign", "int", "Integer", "",1
+		P: "CoordAxis", "int", "Integer", "",0
+		P: "CoordAxisSign", "int", "Integer", "",1
+		P: "UnitScaleFactor", "double", "Number", "",100
+	}
+}
+Objects:  {
+	Geometry: 1000, "Geometry::Tri", "Mesh" {
+		Vertices: *9 { a: 0,0,0,1,0,0,0,1,0 }
+		PolygonVertexIndex: *3 { a: 0,1,-3 }
+		LayerElementMaterial: 0 {
+			Version: 101
+			Name: ""
+			MappingInformationType: "AllSame"
+			ReferenceInformationType: "IndexToDirect"
+			Materials: *1 { a: 0 }
+		}
+		Layer: 0 {
+			Version: 100
+			LayerElement:  {
+				Type: "LayerElementMaterial"
+				TypedIndex: 0
+			}
+		}
+	}
+	Model: 2000, "Model::Tri", "Mesh" {
+		Version: 232
+		Properties70:  {
+			P: "Lcl Translation", "Lcl Translation", "", "A",3,0,0
+		}
+	}
+	Material: 3000, "Material::Paint", "" {
+		Version: 102
+		ShadingModel: "lambert"
+		Properties70:  {
+			P: "DiffuseColor", "Color", "", "A",0,1,0
+		}
+	}
+}
+Connections:  {
+	C: "OO",2000,0
+	C: "OO",1000,2000
+	C: "OO",3000,2000
+}
+"#;
+
+    #[test]
+    fn unpacked_fbx_drop_spawns_root_and_node_child() {
+        let root_dir = two_node_project("fbx_tree");
+        std::fs::write(root_dir.join("assets/models/tri.fbx"), TRIANGLE_FBX).unwrap();
+        let mut world = World::new();
+        let root = spawn_model(
+            &mut world,
+            &root_dir,
+            "assets/models/tri.fbx",
+            glam::Vec3::ZERO,
+            None,
+        );
+        assert!(model_path(&world, root).is_none());
+        let children: Vec<Entity> = world
+            .get::<melon_core::Children>(root)
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(children.len(), 1);
+        let child = children[0];
+        assert_eq!(world.get::<Name>(child).unwrap().0, "Tri");
+        assert_eq!(
+            world.get::<Transform>(child).unwrap().translation,
+            glam::Vec3::new(3.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            model_path(&world, child).as_deref(),
+            Some("assets/models/tri.fbx#mesh0")
+        );
+        let _ = std::fs::remove_dir_all(&root_dir);
+    }
+
     #[test]
     fn unpacked_drop_spawns_root_and_node_children() {
         let root_dir = two_node_project("tree");
