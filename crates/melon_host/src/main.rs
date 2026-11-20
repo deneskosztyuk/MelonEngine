@@ -3,11 +3,11 @@ use std::time::Instant;
 
 use melon_core::bevy_ecs::schedule::IntoScheduleConfigs;
 use melon_core::bevy_ecs::system::Res;
-use melon_core::bevy_ecs::world::World;
+use melon_core::bevy_ecs::world::{Mut, World};
 use melon_core::glam::{Quat, Vec2, Vec3};
 use melon_core::{
-    Aabb, BodyInfo, BodyKind, Camera, FrameCounter, Input, InputButton, KeyCode, Light, Name,
-    SimulationState, Time, Transform, Update,
+    Aabb, BodyInfo, BodyKind, Camera, FrameCounter, GameInputGate, Input, InputButton, KeyCode,
+    Light, Name, RawPresses, SimulationState, Time, Transform, Update,
 };
 use melon_editor::Editor;
 use melon_editor::EditorOverlay;
@@ -16,12 +16,15 @@ use melon_physics::{
     ColliderComponent, PhysicsWorld, RigidBodyComponent as RigidBody, add_physics_systems,
 };
 use tracing_subscriber::EnvFilter;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{
+    DeviceEvent, DeviceId, ElementState, MouseButton as WinitMouseButton, MouseScrollDelta,
+    WindowEvent,
+};
 use winit::keyboard::{KeyCode as WinitKeyCode, PhysicalKey};
 use winit::{
     application::ApplicationHandler,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    window::{Window, WindowId},
+    window::{CursorGrabMode, Window, WindowId},
 };
 
 #[cfg(feature = "hot-reload")]
@@ -41,16 +44,174 @@ mod hot_game {
 }
 
 fn map_key(code: &WinitKeyCode) -> Option<KeyCode> {
+    use WinitKeyCode as W;
     Some(match code {
-        WinitKeyCode::KeyW => KeyCode::W,
-        WinitKeyCode::KeyA => KeyCode::A,
-        WinitKeyCode::KeyS => KeyCode::S,
-        WinitKeyCode::KeyD => KeyCode::D,
-        WinitKeyCode::Space => KeyCode::Space,
-        WinitKeyCode::ShiftLeft => KeyCode::ShiftLeft,
-        WinitKeyCode::ShiftRight => KeyCode::ShiftRight,
+        W::KeyA => KeyCode::A,
+        W::KeyB => KeyCode::B,
+        W::KeyC => KeyCode::C,
+        W::KeyD => KeyCode::D,
+        W::KeyE => KeyCode::E,
+        W::KeyF => KeyCode::F,
+        W::KeyG => KeyCode::G,
+        W::KeyH => KeyCode::H,
+        W::KeyI => KeyCode::I,
+        W::KeyJ => KeyCode::J,
+        W::KeyK => KeyCode::K,
+        W::KeyL => KeyCode::L,
+        W::KeyM => KeyCode::M,
+        W::KeyN => KeyCode::N,
+        W::KeyO => KeyCode::O,
+        W::KeyP => KeyCode::P,
+        W::KeyQ => KeyCode::Q,
+        W::KeyR => KeyCode::R,
+        W::KeyS => KeyCode::S,
+        W::KeyT => KeyCode::T,
+        W::KeyU => KeyCode::U,
+        W::KeyV => KeyCode::V,
+        W::KeyW => KeyCode::W,
+        W::KeyX => KeyCode::X,
+        W::KeyY => KeyCode::Y,
+        W::KeyZ => KeyCode::Z,
+        W::Digit0 => KeyCode::Digit0,
+        W::Digit1 => KeyCode::Digit1,
+        W::Digit2 => KeyCode::Digit2,
+        W::Digit3 => KeyCode::Digit3,
+        W::Digit4 => KeyCode::Digit4,
+        W::Digit5 => KeyCode::Digit5,
+        W::Digit6 => KeyCode::Digit6,
+        W::Digit7 => KeyCode::Digit7,
+        W::Digit8 => KeyCode::Digit8,
+        W::Digit9 => KeyCode::Digit9,
+        W::F1 => KeyCode::F1,
+        W::F2 => KeyCode::F2,
+        W::F3 => KeyCode::F3,
+        W::F4 => KeyCode::F4,
+        W::F5 => KeyCode::F5,
+        W::F6 => KeyCode::F6,
+        W::F7 => KeyCode::F7,
+        W::F8 => KeyCode::F8,
+        W::F9 => KeyCode::F9,
+        W::F10 => KeyCode::F10,
+        W::F11 => KeyCode::F11,
+        W::F12 => KeyCode::F12,
+        W::ArrowUp => KeyCode::ArrowUp,
+        W::ArrowDown => KeyCode::ArrowDown,
+        W::ArrowLeft => KeyCode::ArrowLeft,
+        W::ArrowRight => KeyCode::ArrowRight,
+        W::Space => KeyCode::Space,
+        W::Enter => KeyCode::Enter,
+        W::Escape => KeyCode::Escape,
+        W::Tab => KeyCode::Tab,
+        W::Backspace => KeyCode::Backspace,
+        W::Delete => KeyCode::Delete,
+        W::Insert => KeyCode::Insert,
+        W::Home => KeyCode::Home,
+        W::End => KeyCode::End,
+        W::PageUp => KeyCode::PageUp,
+        W::PageDown => KeyCode::PageDown,
+        W::ShiftLeft => KeyCode::ShiftLeft,
+        W::ShiftRight => KeyCode::ShiftRight,
+        W::ControlLeft => KeyCode::ControlLeft,
+        W::ControlRight => KeyCode::ControlRight,
+        W::AltLeft => KeyCode::AltLeft,
+        W::AltRight => KeyCode::AltRight,
+        W::Minus => KeyCode::Minus,
+        W::Equal => KeyCode::Equal,
+        W::BracketLeft => KeyCode::BracketLeft,
+        W::BracketRight => KeyCode::BracketRight,
+        W::Backslash => KeyCode::Backslash,
+        W::Semicolon => KeyCode::Semicolon,
+        W::Quote => KeyCode::Quote,
+        W::Comma => KeyCode::Comma,
+        W::Period => KeyCode::Period,
+        W::Slash => KeyCode::Slash,
+        W::Backquote => KeyCode::Backquote,
+        W::Numpad0 => KeyCode::Numpad0,
+        W::Numpad1 => KeyCode::Numpad1,
+        W::Numpad2 => KeyCode::Numpad2,
+        W::Numpad3 => KeyCode::Numpad3,
+        W::Numpad4 => KeyCode::Numpad4,
+        W::Numpad5 => KeyCode::Numpad5,
+        W::Numpad6 => KeyCode::Numpad6,
+        W::Numpad7 => KeyCode::Numpad7,
+        W::Numpad8 => KeyCode::Numpad8,
+        W::Numpad9 => KeyCode::Numpad9,
         _ => return None,
     })
+}
+
+fn map_mouse(button: WinitMouseButton) -> Option<melon_core::MouseButton> {
+    use melon_core::MouseButton as M;
+    Some(match button {
+        WinitMouseButton::Left => M::Left,
+        WinitMouseButton::Right => M::Right,
+        WinitMouseButton::Middle => M::Middle,
+        WinitMouseButton::Back => M::Back,
+        WinitMouseButton::Forward => M::Forward,
+        WinitMouseButton::Other(_) => return None,
+    })
+}
+
+/// Keys the editor keeps while it runs a game (release focus, play / pause / stop).
+const EDITOR_KEYS: [InputButton; 3] = [
+    InputButton::Key(KeyCode::Escape),
+    InputButton::Key(KeyCode::F5),
+    InputButton::Key(KeyCode::F6),
+];
+
+/// Record one button event: presses always go to `raw`, and to the game's
+/// `input` only through the gate. Key repeats are ignored.
+fn record_button(
+    input: &mut Input,
+    raw: &mut RawPresses,
+    button: InputButton,
+    pressed: bool,
+    repeat: bool,
+    gate: bool,
+) {
+    if repeat {
+        return;
+    }
+    if pressed {
+        raw.0.push(button);
+    }
+    if !gate || EDITOR_KEYS.contains(&button) {
+        return;
+    }
+    if pressed {
+        input.press(button);
+    } else {
+        input.release(button);
+    }
+}
+
+/// Apply this frame's `GameInputGate` against the last applied value (the
+/// editor re-inserts it every frame, so change detection would always fire).
+/// Closing the gate releases every held button. Returns true on a change.
+fn apply_gate(input: &mut Input, applied: &mut bool, gate: bool) -> bool {
+    if *applied == gate {
+        return false;
+    }
+    *applied = gate;
+    if !gate {
+        input.release_all();
+    }
+    true
+}
+
+/// Hide and confine the cursor for the game, or give it back to the editor.
+fn grab_cursor(window: &Window, grab: bool) {
+    let result = if grab {
+        window
+            .set_cursor_grab(CursorGrabMode::Confined)
+            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked))
+    } else {
+        window.set_cursor_grab(CursorGrabMode::None)
+    };
+    if let Err(error) = result {
+        tracing::warn!(?error, grab, "cursor grab failed");
+    }
+    window.set_cursor_visible(!grab);
 }
 
 struct App {
@@ -63,7 +224,8 @@ struct App {
     /// Offscreen image the scene renders into; the editor shows it in its viewport panel.
     viewport_target: Option<melon_render::ViewportTarget>,
     core: melon_core::Core,
-    last_cursor_pos: Option<Vec2>,
+    /// Last `GameInputGate` value applied (input routing and cursor grab).
+    game_input: bool,
     last_frame: Option<Instant>,
 }
 
@@ -142,9 +304,21 @@ impl App {
             editor_ui: None,
             viewport_target: None,
             core,
-            last_cursor_pos: None,
+            game_input: false,
             last_frame: None,
         }
+    }
+
+    /// Route one button event into `RawPresses` and, through the gate, `Input`.
+    fn record(&mut self, button: InputButton, pressed: bool, repeat: bool) {
+        let gate = self.game_input;
+        self.core
+            .world
+            .resource_scope(|world, mut raw: Mut<RawPresses>| {
+                if let Some(mut input) = world.get_resource_mut::<Input>() {
+                    record_button(&mut input, &mut raw, button, pressed, repeat, gate);
+                }
+            });
     }
 }
 
@@ -233,12 +407,12 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        // Forward events to egui first. If egui consumed the event, skip engine processing.
+        // egui sees every event; whether it used one no longer matters: the
+        // raw stream records everything and the gate decides what the game gets.
         if let Some(editor) = self.editor.as_mut()
             && let Some(window) = self.window.as_ref()
-            && editor.on_window_event(window, &event)
         {
-            return;
+            editor.on_window_event(window, &event);
         }
 
         match event {
@@ -258,41 +432,27 @@ impl ApplicationHandler for App {
                 if let PhysicalKey::Code(code) = event.physical_key
                     && let Some(mapped) = map_key(&code)
                 {
-                    let Some(mut input) = self.core.world.get_resource_mut::<Input>() else {
-                        return;
-                    };
-                    match event.state {
-                        ElementState::Pressed => input.press(InputButton::Key(mapped)),
-                        ElementState::Released => input.release(InputButton::Key(mapped)),
-                    }
+                    let pressed = event.state == ElementState::Pressed;
+                    self.record(InputButton::Key(mapped), pressed, event.repeat);
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Right {
-                    let Some(mut input) = self.core.world.get_resource_mut::<Input>() else {
-                        return;
-                    };
-                    let rmb = InputButton::Mouse(melon_core::MouseButton::Right);
-                    if state == ElementState::Pressed {
-                        input.press(rmb);
-                    } else {
-                        input.release(rmb);
-                        self.last_cursor_pos = None;
-                    }
+                if let Some(mapped) = map_mouse(button) {
+                    let pressed = state == ElementState::Pressed;
+                    self.record(InputButton::Mouse(mapped), pressed, false);
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                let new_pos = Vec2::new(position.x as f32, position.y as f32);
-                let Some(mut input) = self.core.world.get_resource_mut::<Input>() else {
-                    self.last_cursor_pos = Some(new_pos);
-                    return;
+            WindowEvent::MouseWheel { delta, .. } => {
+                let notches = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    // shortcut: 50 px per notch (egui's line height); tune per platform if needed.
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 50.0,
                 };
-                if input.pressed(InputButton::Mouse(melon_core::MouseButton::Right))
-                    && let Some(last) = self.last_cursor_pos
+                if self.game_input
+                    && let Some(mut input) = self.core.world.get_resource_mut::<Input>()
                 {
-                    input.mouse_delta += new_pos - last;
+                    input.wheel += notches;
                 }
-                self.last_cursor_pos = Some(new_pos);
             }
             WindowEvent::RedrawRequested => {
                 let frame_n = self
@@ -340,6 +500,17 @@ impl ApplicationHandler for App {
                     &mut self.core.world,
                     editor_ui,
                 );
+                // The editor wrote the gate during its UI pass; it applies from the next events on.
+                let gate = self
+                    .core
+                    .world
+                    .get_resource::<GameInputGate>()
+                    .is_some_and(|g| g.0);
+                if let Some(mut input) = self.core.world.get_resource_mut::<Input>()
+                    && apply_gate(&mut input, &mut self.game_input, gate)
+                {
+                    grab_cursor(window, gate);
+                }
                 if editor_ui.run_pending_operation(&mut self.core.world) {
                     event_loop.exit();
                 }
@@ -387,6 +558,17 @@ impl ApplicationHandler for App {
         }
     }
 
+    /// Raw mouse motion (unaccelerated, works with a confined cursor) drives
+    /// the game's mouse look.
+    fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        if let DeviceEvent::MouseMotion { delta: (x, y) } = event
+            && self.game_input
+            && let Some(mut input) = self.core.world.get_resource_mut::<Input>()
+        {
+            input.mouse_delta += Vec2::new(x as f32, y as f32);
+        }
+    }
+
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         // ControlFlow::Poll already spins continuously — no redraw request needed.
     }
@@ -419,24 +601,182 @@ fn main() {
 mod tests {
     use super::*;
 
+    use melon_core::{MouseButton as EngineMouse, RawPresses};
+    use winit::event::MouseButton as WinitMouse;
+
+    const W: InputButton = InputButton::Key(KeyCode::W);
+
+    /// Every winit code that `map_key` must handle.
+    const WINIT_KEYS: &[WinitKeyCode] = &[
+        WinitKeyCode::KeyA,
+        WinitKeyCode::KeyB,
+        WinitKeyCode::KeyC,
+        WinitKeyCode::KeyD,
+        WinitKeyCode::KeyE,
+        WinitKeyCode::KeyF,
+        WinitKeyCode::KeyG,
+        WinitKeyCode::KeyH,
+        WinitKeyCode::KeyI,
+        WinitKeyCode::KeyJ,
+        WinitKeyCode::KeyK,
+        WinitKeyCode::KeyL,
+        WinitKeyCode::KeyM,
+        WinitKeyCode::KeyN,
+        WinitKeyCode::KeyO,
+        WinitKeyCode::KeyP,
+        WinitKeyCode::KeyQ,
+        WinitKeyCode::KeyR,
+        WinitKeyCode::KeyS,
+        WinitKeyCode::KeyT,
+        WinitKeyCode::KeyU,
+        WinitKeyCode::KeyV,
+        WinitKeyCode::KeyW,
+        WinitKeyCode::KeyX,
+        WinitKeyCode::KeyY,
+        WinitKeyCode::KeyZ,
+        WinitKeyCode::Digit0,
+        WinitKeyCode::Digit1,
+        WinitKeyCode::Digit2,
+        WinitKeyCode::Digit3,
+        WinitKeyCode::Digit4,
+        WinitKeyCode::Digit5,
+        WinitKeyCode::Digit6,
+        WinitKeyCode::Digit7,
+        WinitKeyCode::Digit8,
+        WinitKeyCode::Digit9,
+        WinitKeyCode::F1,
+        WinitKeyCode::F2,
+        WinitKeyCode::F3,
+        WinitKeyCode::F4,
+        WinitKeyCode::F5,
+        WinitKeyCode::F6,
+        WinitKeyCode::F7,
+        WinitKeyCode::F8,
+        WinitKeyCode::F9,
+        WinitKeyCode::F10,
+        WinitKeyCode::F11,
+        WinitKeyCode::F12,
+        WinitKeyCode::ArrowUp,
+        WinitKeyCode::ArrowDown,
+        WinitKeyCode::ArrowLeft,
+        WinitKeyCode::ArrowRight,
+        WinitKeyCode::Space,
+        WinitKeyCode::Enter,
+        WinitKeyCode::Escape,
+        WinitKeyCode::Tab,
+        WinitKeyCode::Backspace,
+        WinitKeyCode::Delete,
+        WinitKeyCode::Insert,
+        WinitKeyCode::Home,
+        WinitKeyCode::End,
+        WinitKeyCode::PageUp,
+        WinitKeyCode::PageDown,
+        WinitKeyCode::ShiftLeft,
+        WinitKeyCode::ShiftRight,
+        WinitKeyCode::ControlLeft,
+        WinitKeyCode::ControlRight,
+        WinitKeyCode::AltLeft,
+        WinitKeyCode::AltRight,
+        WinitKeyCode::Minus,
+        WinitKeyCode::Equal,
+        WinitKeyCode::BracketLeft,
+        WinitKeyCode::BracketRight,
+        WinitKeyCode::Backslash,
+        WinitKeyCode::Semicolon,
+        WinitKeyCode::Quote,
+        WinitKeyCode::Comma,
+        WinitKeyCode::Period,
+        WinitKeyCode::Slash,
+        WinitKeyCode::Backquote,
+        WinitKeyCode::Numpad0,
+        WinitKeyCode::Numpad1,
+        WinitKeyCode::Numpad2,
+        WinitKeyCode::Numpad3,
+        WinitKeyCode::Numpad4,
+        WinitKeyCode::Numpad5,
+        WinitKeyCode::Numpad6,
+        WinitKeyCode::Numpad7,
+        WinitKeyCode::Numpad8,
+        WinitKeyCode::Numpad9,
+    ];
+
     #[test]
-    fn map_key_translates_supported_keys() {
+    fn map_key_covers_every_engine_key() {
+        let mapped: Vec<KeyCode> = WINIT_KEYS.iter().filter_map(map_key).collect();
+        for key in KeyCode::ALL {
+            assert!(mapped.contains(key), "no winit code maps to {key:?}");
+        }
         assert_eq!(map_key(&WinitKeyCode::KeyW), Some(KeyCode::W));
-        assert_eq!(map_key(&WinitKeyCode::KeyA), Some(KeyCode::A));
-        assert_eq!(map_key(&WinitKeyCode::KeyS), Some(KeyCode::S));
-        assert_eq!(map_key(&WinitKeyCode::KeyD), Some(KeyCode::D));
-        assert_eq!(map_key(&WinitKeyCode::Space), Some(KeyCode::Space));
-        assert_eq!(map_key(&WinitKeyCode::ShiftLeft), Some(KeyCode::ShiftLeft));
-        assert_eq!(
-            map_key(&WinitKeyCode::ShiftRight),
-            Some(KeyCode::ShiftRight)
-        );
+        assert_eq!(map_key(&WinitKeyCode::Numpad7), Some(KeyCode::Numpad7));
+        assert_eq!(map_key(&WinitKeyCode::CapsLock), None);
     }
 
     #[test]
-    fn map_key_returns_none_for_unsupported() {
-        assert_eq!(map_key(&WinitKeyCode::Escape), None);
-        assert_eq!(map_key(&WinitKeyCode::Enter), None);
-        assert_eq!(map_key(&WinitKeyCode::Tab), None);
+    fn map_mouse_covers_every_button() {
+        let mapped: Vec<EngineMouse> = [
+            WinitMouse::Left,
+            WinitMouse::Right,
+            WinitMouse::Middle,
+            WinitMouse::Back,
+            WinitMouse::Forward,
+        ]
+        .into_iter()
+        .filter_map(map_mouse)
+        .collect();
+        assert_eq!(mapped, EngineMouse::ALL);
+        assert_eq!(map_mouse(WinitMouse::Other(7)), None);
+    }
+
+    #[test]
+    fn repeat_events_do_not_press_again() {
+        let (mut input, mut raw) = (Input::default(), RawPresses::default());
+        record_button(&mut input, &mut raw, W, true, false, true);
+        input.clear_frame();
+        raw.0.clear();
+        record_button(&mut input, &mut raw, W, true, true, true);
+        assert!(input.pressed(W));
+        assert!(!input.just_pressed(W));
+        assert!(raw.0.is_empty(), "a repeat is not a press");
+    }
+
+    #[test]
+    fn gate_off_records_raw_only() {
+        let (mut input, mut raw) = (Input::default(), RawPresses::default());
+        record_button(&mut input, &mut raw, W, true, false, false);
+        assert!(!input.pressed(W));
+        assert_eq!(raw.0, vec![W]);
+        record_button(&mut input, &mut raw, W, false, false, false);
+        assert_eq!(raw.0, vec![W], "releases are not presses");
+    }
+
+    #[test]
+    fn editor_keys_never_reach_the_game() {
+        let (mut input, mut raw) = (Input::default(), RawPresses::default());
+        for key in [KeyCode::Escape, KeyCode::F5, KeyCode::F6] {
+            record_button(
+                &mut input,
+                &mut raw,
+                InputButton::Key(key),
+                true,
+                false,
+                true,
+            );
+            assert!(!input.key(key), "{key:?} reached the game");
+        }
+        assert_eq!(raw.0.len(), 3, "the raw stream still sees them");
+    }
+
+    #[test]
+    fn gate_turning_off_releases_held_keys() {
+        let (mut input, mut raw) = (Input::default(), RawPresses::default());
+        let mut applied = false;
+        assert!(apply_gate(&mut input, &mut applied, true));
+        record_button(&mut input, &mut raw, W, true, false, applied);
+        input.clear_frame();
+        assert!(!apply_gate(&mut input, &mut applied, true), "same value");
+        assert!(input.pressed(W));
+        assert!(apply_gate(&mut input, &mut applied, false));
+        assert!(!input.pressed(W));
+        assert!(input.just_released(W));
     }
 }

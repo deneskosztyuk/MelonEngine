@@ -26,7 +26,7 @@ pub use components::{
 };
 pub use glam;
 pub use hierarchy::{ChildOf, Children, GlobalTransform};
-pub use input::{GameInputGate, Input, InputButton, InputFocus, KeyCode, MouseButton};
+pub use input::{GameInputGate, Input, InputButton, InputFocus, KeyCode, MouseButton, RawPresses};
 pub use resources::{Camera, Light, NameCounter, SimulationState, Time};
 pub use stages::{FixedUpdate, PostUpdate, PreUpdate, Update};
 
@@ -51,9 +51,12 @@ pub struct LogInterval {
 
 /// End of frame: input edges, deltas and wheel start over, so a game system
 /// sees only this frame's changes.
-fn clear_input_frame_system(input: Option<ResMut<Input>>) {
+fn clear_input_frame_system(input: Option<ResMut<Input>>, raw: Option<ResMut<RawPresses>>) {
     if let Some(mut input) = input {
         input.clear_frame();
+    }
+    if let Some(mut raw) = raw {
+        raw.0.clear();
     }
 }
 
@@ -88,6 +91,7 @@ impl Core {
         world.init_resource::<Input>();
         world.init_resource::<InputFocus>();
         world.init_resource::<GameInputGate>();
+        world.init_resource::<RawPresses>();
         world.init_resource::<InputMap>();
         world.init_resource::<Actions>();
 
@@ -295,6 +299,17 @@ mod tests {
             core.world.resource::<crate::Input>().mouse_delta,
             glam::Vec2::ZERO
         );
+    }
+
+    #[test]
+    fn raw_presses_cleared_each_frame() {
+        let mut core = Core::new();
+        core.world
+            .resource_mut::<crate::RawPresses>()
+            .0
+            .push(crate::InputButton::Key(crate::KeyCode::W));
+        core.update();
+        assert!(core.world.resource::<crate::RawPresses>().0.is_empty());
     }
 
     #[test]

@@ -163,6 +163,18 @@ impl EditorCamera {
         self.distance = (radius / half_fov.tan()).max(MIN_DISTANCE);
     }
 
+    /// Take over the render camera's pose (eye and look target), e.g. where the
+    /// game left it. Fly speed stays; a degenerate eye == center keeps the angles.
+    pub fn adopt(&mut self, camera: &Camera) {
+        let offset = camera.center - camera.eye;
+        if let Some(forward) = offset.try_normalize() {
+            self.yaw = forward.z.atan2(forward.x);
+            self.pitch = forward.y.asin().clamp(-PITCH_LIMIT, PITCH_LIMIT);
+            self.distance = offset.length().max(MIN_DISTANCE);
+        }
+        self.pivot = camera.eye + self.forward() * self.distance;
+    }
+
     /// Copy the pose into the render camera (fov, aspect and clip planes stay).
     pub fn write(&self, camera: &mut Camera) {
         camera.eye = self.eye();
@@ -659,6 +671,21 @@ mod tests {
         assert!(approx(cam.pivot, Vec3::new(3.0, 1.0, -2.0)));
         let half_fov = melon_core::Camera::default().fov_y_radians / 2.0;
         assert!(cam.distance * half_fov.tan() >= radius - 1e-4);
+    }
+
+    #[test]
+    fn adopt_takes_the_camera_pose() {
+        let mut camera = Camera {
+            eye: Vec3::new(1.0, 3.0, 2.0),
+            center: Vec3::new(4.0, 1.0, -2.0),
+            ..Default::default()
+        };
+        let mut cam = EditorCamera::default();
+        cam.adopt(&camera);
+        let (eye, center) = (camera.eye, camera.center);
+        cam.write(&mut camera);
+        assert!(approx(camera.eye, eye), "{}", camera.eye);
+        assert!(approx(camera.center, center), "{}", camera.center);
     }
 
     #[test]

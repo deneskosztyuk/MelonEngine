@@ -33,6 +33,11 @@ pub enum InputFocus {
 #[derive(Resource, Default, Clone, Copy)]
 pub struct GameInputGate(pub bool);
 
+/// Every button pressed this frame (key repeats excluded), whatever the focus.
+/// The host fills it; cleared in `PostUpdate`. Read by the rebinding capture.
+#[derive(Resource, Default, Debug)]
+pub struct RawPresses(pub Vec<InputButton>);
+
 /// A physical key, named by its position on a US layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum KeyCode {

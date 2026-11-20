@@ -97,6 +97,10 @@ pub struct Editor {
     viewport_size: winit::dpi::PhysicalSize<u32>,
     /// Scene-view camera driven by the viewport (Unity controls).
     camera: viewport::EditorCamera,
+    /// Focus the Scene viewport saw last frame: Game -> Editor adopts the game's `Camera`.
+    last_viewport_focus: InputFocus,
+    /// The Scene viewport was drawn this frame (reset at the start of `build_ui`).
+    viewport_shown: bool,
     /// Grid and selection box, drawn depth-tested in the 3D pass.
     world_line_vertices: Vec<LineVertex>,
     /// Smoothed frame time in milliseconds, for the FPS readout.
@@ -136,6 +140,8 @@ impl Default for Editor {
             viewport_texture: None,
             viewport_size: winit::dpi::PhysicalSize::new(1, 1),
             camera: viewport::EditorCamera::default(),
+            last_viewport_focus: InputFocus::Editor,
+            viewport_shown: false,
             world_line_vertices: Vec::new(),
             frame_ms: 16.7,
             console: console::ConsoleLog::default(),
@@ -572,6 +578,7 @@ impl Editor {
         self.tick_frame_time(dt);
         self.poll_dialog(world);
         self.handle_shortcuts(world, ui);
+        self.viewport_shown = false;
 
         egui::Panel::top("menu_bar")
             .exact_size(theme::sizes::MENU_HEIGHT)
@@ -627,6 +634,7 @@ impl Editor {
             input_focus(world),
             sim_state(world),
             ui.ctx().text_edit_focused(),
+            self.viewport_shown,
         );
         world.insert_resource(GameInputGate(gate));
     }
@@ -643,6 +651,7 @@ impl Editor {
         let Some(texture) = self.viewport_texture else {
             return;
         };
+        self.viewport_shown = true;
         let response = ui.put(
             rect,
             egui::Image::new((texture, rect.size())).sense(egui::Sense::click_and_drag()),
@@ -664,6 +673,14 @@ impl Editor {
         self.flying = vp.right_down;
         let focus = focus_after_click(sim_state(world), input_focus(world), vp.left_clicked);
         world.insert_resource(focus);
+        // Esc / Pause / Step / Stop: keep the view where the game left it (Unreal eject).
+        if self.last_viewport_focus == InputFocus::Game
+            && focus == InputFocus::Editor
+            && let Some(camera) = world.get_resource::<Camera>()
+        {
+            self.camera.adopt(camera);
+        }
+        self.last_viewport_focus = focus;
         // With game focus the game owns keyboard, mouse and `Camera`: no editor
         // navigation, gizmo or picking (the click that took focus selects nothing).
         if focus == InputFocus::Game {
@@ -1775,9 +1792,15 @@ pub fn focus_after_click(
     }
 }
 
-/// Value of `GameInputGate`: game focus, Playing and nobody typing.
-fn game_input_gate(focus: InputFocus, state: SimulationState, typing: bool) -> bool {
-    focus == InputFocus::Game && state == SimulationState::Playing && !typing
+/// Value of `GameInputGate`: game focus, Playing, nobody typing and the Scene
+/// viewport on screen. The host also grabs the cursor while it is true.
+fn game_input_gate(
+    focus: InputFocus,
+    state: SimulationState,
+    typing: bool,
+    viewport_shown: bool,
+) -> bool {
+    focus == InputFocus::Game && state == SimulationState::Playing && !typing && viewport_shown
 }
 
 fn input_focus(world: &World) -> InputFocus {
@@ -2909,10 +2932,48 @@ mod tests {
     fn gate_is_false_while_typing_or_editing() {
         use InputFocus::{Editor as EditorFocus, Game};
         use SimulationState::{Editing, Paused, Playing};
-        assert!(game_input_gate(Game, Playing, false));
-        assert!(!game_input_gate(Game, Playing, true), "typing");
-        assert!(!game_input_gate(Game, Editing, false));
-        assert!(!game_input_gate(Game, Paused, false));
-        assert!(!game_input_gate(EditorFocus, Playing, false));
+        assert!(game_input_gate(Game, Playing, false, true));
+        assert!(!game_input_gate(Game, Playing, true, true), "typing");
+        assert!(!game_input_gate(Game, Editing, false, true));
+        assert!(!game_input_gate(Game, Paused, false, true));
+        assert!(!game_input_gate(EditorFocus, Playing, false, true));
+        assert!(
+            !game_input_gate(Game, Playing, false, false),
+            "Scene hidden"
+        );
+    }
+
+    #[test]
+    fn viewport_panel_marks_the_scene_shown() {
+        let mut world = World::new();
+        let mut editor = Editor::new();
+        assert!(!editor.viewport_shown);
+        key_frame(&mut editor, &mut world, egui::Key::W, Vec::new());
+        assert!(editor.viewport_shown);
+    }
+
+    #[test]
+    fn leaving_game_focus_adopts_the_game_camera() {
+        let mut world = World::new();
+        world.insert_resource(SimulationState::Playing);
+        world.insert_resource(InputFocus::Game);
+        // The game moved the camera while it had focus.
+        let game_camera = Camera {
+            eye: glam::Vec3::new(10.0, 2.0, -3.0),
+            center: glam::Vec3::new(10.0, 2.0, -8.0),
+            ..Default::default()
+        };
+        world.insert_resource(game_camera);
+        let mut editor = Editor::new();
+        // Frame 1 sees game focus; frame 2's Esc hands focus back.
+        key_frame(&mut editor, &mut world, egui::Key::Escape, Vec::new());
+        assert_eq!(*world.resource::<InputFocus>(), InputFocus::Editor);
+        let camera = world.resource::<Camera>();
+        assert!(
+            camera.eye.distance(game_camera.eye) < 1e-3,
+            "{}",
+            camera.eye
+        );
+        assert!(camera.center.distance(game_camera.center) < 1e-3);
     }
 }
