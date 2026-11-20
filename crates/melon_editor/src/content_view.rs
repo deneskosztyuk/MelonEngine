@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use egui::{Color32, Id, PointerButton, RichText, Sense};
 
 use crate::content::{
-    AssetKind, ContentBrowser, ContentEntry, format_size, is_model_path, list_dir,
+    AssetDrag, AssetKind, ContentBrowser, ContentEntry, format_size, is_model_path, list_dir,
 };
 use crate::theme::{colors, sizes};
 
@@ -336,22 +336,26 @@ impl ContentBrowser {
     /// One row (list) or tile; model files are drag sources carrying their
     /// project-relative path.
     fn item(&self, ui: &mut egui::Ui, entry: &ContentEntry, actions: &mut Vec<Action>) {
-        let model_path = (!entry.is_dir && is_model_path(&entry.name))
+        let model = (!entry.is_dir && is_model_path(&entry.name))
             .then(|| {
                 self.root()
                     .parent()
                     .and_then(|p| melon_core::assets::project_relative(p, &entry.path))
             })
             .flatten();
-        let response = match model_path {
-            Some(path) => {
-                ui.dnd_drag_source(Id::new(("content_drag", &entry.path)), path, |ui| {
-                    self.draw_item(ui, entry)
-                })
-                .inner
-            }
-            None => self.draw_item(ui, entry),
+        let drag = AssetDrag {
+            path: entry.path.clone(),
+            model,
         };
+        // Not `dnd_drag_source`: its drag-only widget on top hides this
+        // item's clicks (egui hit test), so the item senses both itself.
+        let response = self.draw_item(ui, entry);
+        if response.drag_started() {
+            egui::DragAndDrop::set_payload(ui.ctx(), drag);
+        }
+        if response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
         if response.clicked() {
             actions.push(Action::Select(entry.path.clone()));
         }
@@ -379,7 +383,7 @@ impl ContentBrowser {
             egui::vec2(tile, tile + sizes::TILE_LABEL)
         };
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-        let response = ui.interact(rect, id, Sense::click());
+        let response = ui.interact(rect, id, Sense::click_and_drag());
         let fill = if selected {
             colors::ACCENT_SOFT
         } else if response.hovered() {
@@ -648,6 +652,25 @@ mod tests {
             highlighted,
             "hovering a path segment paints a fill under it"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clicking_a_model_tile_selects_it() {
+        let dir = temp_dir("model_click");
+        let model = dir.join("a.glb");
+        std::fs::write(&model, b"x").unwrap();
+        let mut browser = ContentBrowser::new(dir.clone());
+        let ctx = egui::Context::default();
+        frame(&mut browser, &ctx, 0.0, Vec::new());
+        let pos = center(&ctx, egui::Id::new(("content_item", model.clone())));
+        frame(
+            &mut browser,
+            &ctx,
+            0.1,
+            click(pos, egui::PointerButton::Primary),
+        );
+        assert_eq!(browser.selected(), Some(model.as_path()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -701,7 +701,8 @@ impl Editor {
         );
         let vp = viewport_input(&ctx, &response, rect);
         // A model dragged from the Content Browser lands on the ground under the cursor.
-        if let Some(path) = response.dnd_release_payload::<String>()
+        if let Some(drag) = response.dnd_release_payload::<content::AssetDrag>()
+            && let Some(path) = drag.model.clone()
             && content::is_model_path(&path)
             && let (Some(pointer), Some(camera)) =
                 (vp.pointer, world.get_resource::<Camera>().copied())
@@ -885,7 +886,8 @@ impl Editor {
         // Read what is being dragged without taking it: egui's
         // `dnd_release_payload::<T>` takes the payload even when it isn't a `T`.
         let carried_entity = egui::DragAndDrop::payload::<Entity>(ui.ctx()).map(|e| *e);
-        let carried_model = egui::DragAndDrop::payload::<String>(ui.ctx()).map(|p| (*p).clone());
+        let carried_model = egui::DragAndDrop::payload::<content::AssetDrag>(ui.ctx())
+            .and_then(|drag| drag.model.clone());
         let carrying = carried_entity.is_some() || carried_model.is_some();
         let released = ui.ctx().input(|i| i.pointer.any_released());
         // Row the pointer was released over, if any (a row wins over the zone).
@@ -2309,11 +2311,31 @@ mod tests {
         drop_in_hierarchy(
             &mut editor,
             &mut world,
-            "assets/models/missing.glb".to_string(),
+            content::AssetDrag {
+                path: "assets/models/missing.glb".into(),
+                model: Some("assets/models/missing.glb".to_string()),
+            },
             Some(a),
         );
         let children = world.get::<melon_core::Children>(a).map_or(0, |c| c.len());
         assert_eq!(children, 1);
+    }
+
+    #[test]
+    fn non_model_asset_drag_spawns_nothing() {
+        let (mut world, a, _) = two_roots();
+        let mut editor = Editor::new();
+        drop_in_hierarchy(
+            &mut editor,
+            &mut world,
+            content::AssetDrag {
+                path: "assets/README.md".into(),
+                model: None,
+            },
+            Some(a),
+        );
+        let children = world.get::<melon_core::Children>(a).map_or(0, |c| c.len());
+        assert_eq!(children, 0);
     }
 
     fn pending_dir(name: &str) -> std::path::PathBuf {

@@ -100,6 +100,14 @@ pub fn list_dir(path: &Path) -> Vec<ContentEntry> {
     entries
 }
 
+/// What a Content Browser drag carries: the item, and for model files the
+/// project-relative asset path the Scene and Hierarchy spawn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AssetDrag {
+    pub path: PathBuf,
+    pub model: Option<String>,
+}
+
 /// A file the asset pipeline can load as a model.
 pub fn is_model_path(path: &str) -> bool {
     let path = path.to_lowercase();
