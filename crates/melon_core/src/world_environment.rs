@@ -40,14 +40,23 @@ struct Cache {
     carriers: (usize, Option<Entity>),
 }
 
-/// Every carrier in Hierarchy order (roots in `RootOrder`, then children
-/// depth first); only scene entities (`Name` + `Transform`) count.
+/// Every carrier: those in the Hierarchy (roots in `RootOrder`, then children
+/// depth first) first, then any others (no `Name` / `Transform`) by entity
+/// index.
 fn carriers(world: &mut World) -> Vec<Entity> {
-    crate::hierarchy::depth_first(world)
+    let mut found: Vec<Entity> = crate::hierarchy::depth_first(world)
         .into_iter()
         .map(|(e, _)| e)
         .filter(|&e| world.get::<WorldEnvironment>(e).is_some())
-        .collect()
+        .collect();
+    let mut rest: Vec<Entity> = world
+        .query_filtered::<Entity, bevy_ecs::query::With<WorldEnvironment>>()
+        .iter(world)
+        .filter(|e| !found.contains(e))
+        .collect();
+    rest.sort_by_key(|e| e.index());
+    found.extend(rest);
+    found
 }
 
 /// The entity whose `WorldEnvironment` applies.
@@ -445,6 +454,30 @@ mod tests {
         core.world.insert_resource(EnvironmentPreview(None));
         run(&mut core.world);
         assert_eq!(fog(&core.world), 0.02);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn carrier_without_transform_still_applies() {
+        let (root, mut core) = project("bare");
+        write(&root, "assets/a.env", "(fog: (density: 0.02))");
+        write(&root, "assets/b.env", "(fog: (density: 0.2))");
+        let bare = core
+            .world
+            .spawn(WorldEnvironment {
+                environment: AssetRef {
+                    guid: String::new(),
+                    path: "assets/a.env".into(),
+                },
+            })
+            .id();
+        run(&mut core.world);
+        assert_eq!(fog(&core.world), 0.02);
+        assert_eq!(active_environment(&mut core.world), Some(bare));
+        let listed = carrier(&mut core.world, "B", "assets/b.env");
+        run(&mut core.world);
+        assert_eq!(active_environment(&mut core.world), Some(listed));
+        assert_eq!(fog(&core.world), 0.2);
         let _ = std::fs::remove_dir_all(&root);
     }
 
