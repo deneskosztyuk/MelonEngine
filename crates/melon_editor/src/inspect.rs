@@ -50,6 +50,12 @@ pub enum WidgetKind {
     Degrees { min: f32, max: f32 },
     /// A linear `Vec3` colour edited with a colour picker.
     Color,
+    /// A `melon_core::AssetRef`: `Asset`'s picker and drop target on its
+    /// path; a change also sets the GUID from the file's `.meta`.
+    AssetRef {
+        root: PathBuf,
+        extensions: &'static [&'static str],
+    },
 }
 
 /// An angle stored in radians as a drag value in degrees. The stored value
@@ -282,6 +288,16 @@ fn widget_ui(
         WidgetKind::Asset { root, extensions } => {
             let v = value.try_downcast_mut::<String>()?;
             Some(asset_field(ui, id, v, root, extensions))
+        }
+        WidgetKind::AssetRef { root, extensions } => {
+            let v = value.try_downcast_mut::<melon_core::AssetRef>()?;
+            let mut path = v.path.clone();
+            let changed = asset_field(ui, id, &mut path, root, extensions);
+            if changed {
+                let guid = crate::material_assign::slot_for(root, &path).guid;
+                *v = melon_core::AssetRef { guid, path };
+            }
+            Some(changed)
         }
         WidgetKind::Degrees { min, max } => {
             let v = value.try_downcast_mut::<f32>()?;
@@ -876,6 +892,60 @@ mod tests {
             shown.contains("assets/m.mat") && shown.contains("Add part"),
             "{shown}"
         );
+    }
+
+    #[test]
+    fn asset_ref_widget_fills_path_and_guid_on_a_drop() {
+        let root = std::env::temp_dir().join(format!("melon_assetref_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let mut server = melon_core::AssetServer::new(root.clone());
+        let file = root.join("assets/a.env");
+        std::fs::write(&file, melon_core::EnvironmentAsset::default().to_ron()).unwrap();
+        crate::asset_db::reconcile(&mut server);
+        let guid = server.guid_of("assets/a.env").unwrap().to_string();
+        let widget = WidgetKind::AssetRef {
+            root: root.clone(),
+            extensions: &["env"],
+        };
+        let ctx = egui::Context::default();
+        let mut value = melon_core::AssetRef::default();
+        let frame = |events: Vec<egui::Event>, value: &mut melon_core::AssetRef| {
+            let mut changed = None;
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| changed = widget_ui(ui, egui::Id::new("ref"), value, &widget),
+            );
+            changed
+        };
+        frame(vec![], &mut value);
+        let pos = ctx
+            .read_response(egui::Id::new("ref").with("drop"))
+            .expect("drop target drawn")
+            .rect
+            .center();
+        frame(vec![egui::Event::PointerMoved(pos)], &mut value);
+        egui::DragAndDrop::set_payload(
+            &ctx,
+            AssetDrag {
+                path: file,
+                model: None,
+            },
+        );
+        let release = egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let changed = frame(vec![egui::Event::PointerMoved(pos), release], &mut value);
+        assert_eq!(changed, Some(true));
+        assert_eq!(value.path, "assets/a.env");
+        assert_eq!(value.guid, guid);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

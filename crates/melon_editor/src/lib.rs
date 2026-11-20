@@ -983,6 +983,18 @@ impl Editor {
                 },
             );
         }
+        if type_path == melon_core::WorldEnvironment::type_path() {
+            widgets.insert(
+                "environment",
+                FieldWidget {
+                    label: Some("Environment"),
+                    kind: WidgetKind::AssetRef {
+                        root: self.project_root.clone(),
+                        extensions: &["env"],
+                    },
+                },
+            );
+        }
         if type_path == melon_core::Collider::type_path() {
             let names = world
                 .get_resource::<melon_core::PhysicsSettings>()
@@ -1199,6 +1211,17 @@ impl Editor {
             Request::NewMaterial(parent) => {
                 let file =
                     asset_ops::create_material(&mut world.resource_mut::<AssetServer>(), &parent)?;
+                self.content.open(parent);
+                self.content.set_search(String::new());
+                self.content.refresh();
+                self.content.start_rename(file.clone());
+                Some(file)
+            }
+            Request::NewEnvironment(parent) => {
+                let file = asset_ops::create_environment(
+                    &mut world.resource_mut::<AssetServer>(),
+                    &parent,
+                )?;
                 self.content.open(parent);
                 self.content.set_search(String::new());
                 self.content.refresh();
