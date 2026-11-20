@@ -89,8 +89,16 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 - **Interpolation.** Add `PreviousTransform` to entities moved in
   `FixedUpdate` so they render smoothly. Dynamic physics bodies get it
   automatically. Do not add it to entities moved in `Update`.
-- **Entity cap.** The model uniform buffer holds 1024 entities
-  (`MAX_ENTITIES` in `melon_render/src/lib.rs`).
+- **Instancing (group 1).** Group 1 of the mesh, prepass and shadow
+  pipelines is a read-only storage buffer of `InstanceData` (model and
+  normal matrix), read at `@builtin(instance_index)`. `render_scene` culls
+  each entity's world AABB (model bounds under its matrix) against the
+  camera frustum (prepass, 3D) and the shadow box (shadow pass), groups the
+  survivors by model handle (contiguous records, input order kept) and
+  issues one `draw_indexed` per (model, part) with that instance range.
+  `update_instances` rewrites all records each frame; the buffer doubles
+  when it runs out (bind group rebuilt). No entity cap. `render_scene`
+  returns `RenderStats` (draws, instances, culled).
 - **Deleting entities.** Call `melon_core::hierarchy::mark_for_delete` (marks
   the subtree `PendingDelete`); `cleanup_deleted_system` removes the rapier
   bodies and despawns. Do not despawn physics entities directly.
@@ -140,7 +148,7 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   `textureLoad` at the fragment position). The DDGI probe data joins this
   group later. `draw_meshes_textured` takes the group; AO off binds a 1x1
   white one (`unoccluded_lighting`).
-- **SSAO.** Before the 3D pass `render_scene` draws every mesh once,
+- **SSAO.** Before the 3D pass `render_scene` draws the camera's batches once,
   single-sample, into the view's prepass targets (`Depth32Float` depth,
   `Rgba16Float` world normal + eye distance), then `ssao.wgsl` `fs_ssao`
   (16 hemisphere samples, range check, 4x4 Bayer rotation) and `fs_blur`
@@ -157,7 +165,8 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 - **Camera conventions.** Right-handed, DirectX depth (near = 0, far = 1).
   Screen helpers take logical points.
 - **Checking rendering.** Agents verify rendering with the snapshot example
-  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner] [--ao-only|--no-ao]`;
-  `--ao-only` saves the SSAO term as a grey image),
+  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd] [--ao-only|--no-ao]`;
+  `--ao-only` saves the SSAO term as a grey image; `crowd` adds about
+  10,000 instances; it prints the mean frame time and `RenderStats`),
   never by opening the editor or game window.
 - **GPU tests** open a window, so they need a display and adapter.

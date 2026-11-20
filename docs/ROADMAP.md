@@ -8,7 +8,7 @@ missing for a core 3D engine. Update this file when an item lands.
 | Crate | What exists |
 |---|---|
 | `melon_core` | `Core` wraps a bevy_ecs `World` + `Schedule`. Components: `Transform`, `Name`, `MeshRef`, `Aabb`, `BodyInfo`, `Spin`, `Bob`, `PendingDelete`. Resources: `Camera` (fly camera, `world_to_screen`, `screen_to_world_ray`), one directional `Light`, `Time`, `SimulationState`, `Input`, `NameCounter`. |
-| `melon_render` | wgpu forward renderer. Frame: sun shadow pass (directional shadow map, 3x3 PCF), SSAO (depth/normal prepass, AO, blur), 3D pass into an HDR target, ACES tonemap pass onto the display. glTF metallic-roughness PBR mesh pipeline (normal maps, emissive, hemisphere and sky ambient), line pipeline (gizmos), depth buffer, dynamic-offset model uniforms, checkerboard fallback texture, glTF loader (positions, normals, uv0, tangents, indices, metallic-roughness materials), offscreen `ViewportTarget`, surface lost/outdated recovery. |
+| `melon_render` | wgpu forward renderer. Frame: sun shadow pass (directional shadow map, 3x3 PCF), SSAO (depth/normal prepass, AO, blur), 3D pass into an HDR target, ACES tonemap pass onto the display. glTF metallic-roughness PBR mesh pipeline (normal maps, emissive, hemisphere and sky ambient), line pipeline (gizmos), depth buffer, instanced draws from a per-instance storage buffer with CPU frustum culling, checkerboard fallback texture, glTF loader (positions, normals, uv0, tangents, indices, metallic-roughness materials), offscreen `ViewportTarget`, surface lost/outdated recovery. |
 | `melon_physics` | rapier3d wrapper: dynamic and fixed cuboids, ECS to rapier sync both ways, `PendingDelete` cleanup. |
 | `melon_editor` | egui editor with dockable panels (Hierarchy, Scene, Inspector, Content Browser, Console), menu bar, toolbar, status bar, Move/Rotate/Scale gizmos with snapping, Play/Pause/Step/Stop, RON scene save/load (versioned, atomic write, validated). |
 | `melon_game` | Hot-reloadable dylib with two demo systems. |
@@ -25,8 +25,8 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
    `FixedUpdate` at 1/60 s.
 3. ~~**Demo systems ignore `Time`.**~~ Fixed: spin and bob use `Time`, bob no
    longer drifts.
-4. **1024 entity cap.** `MAX_ENTITIES` in `melon_render` sizes the model uniform
-   buffer. More entities overflow `write_buffer` and wgpu panics. No guard.
+4. ~~**1024 entity cap.**~~ Fixed: per-instance records live in a storage
+   buffer that doubles as needed; no model limit.
 5. ~~**No asset system.**~~ Fixed: `Handle<Model>` + `AssetServer`; any glTF
    in `assets/models` draws whole.
 6. ~~**glTF node tree flattened.**~~ Fixed: a dropped model unpacks into a
@@ -81,7 +81,11 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
 - [x] Skybox: procedural sky (horizon/zenith gradient, sun disc) from the
       `Environment` resource, plus exponential distance fog in the horizon
       colour.
-- [ ] Instancing or storage buffers (removes the 1024 cap, bug 4), frustum culling.
+- [x] Instancing: group 1 is a growable storage buffer of per-instance
+      records; one instanced draw per (model, part) in the prepass, shadow
+      and 3D passes. CPU frustum culling (camera planes for the camera
+      passes, the shadow box for the shadow pass). `render_scene` returns
+      `RenderStats`. Fixes bug 4.
 - [ ] `Camera` as a component; multiple cameras.
 - [ ] glTF: node tree, multiple meshes, materials, skinning, animation. Fixes bug 6.
 - [ ] Shader hot reload (shaders are compile-time `include_wgsl!` today).
