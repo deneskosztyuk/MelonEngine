@@ -51,12 +51,9 @@ pub struct LogInterval {
 
 /// End of frame: input edges, deltas and wheel start over, so a game system
 /// sees only this frame's changes.
-fn clear_input_frame_system(input: Option<ResMut<Input>>, raw: Option<ResMut<RawPresses>>) {
+fn clear_input_frame_system(input: Option<ResMut<Input>>) {
     if let Some(mut input) = input {
         input.clear_frame();
-    }
-    if let Some(mut raw) = raw {
-        raw.0.clear();
     }
 }
 
@@ -302,14 +299,14 @@ mod tests {
     }
 
     #[test]
-    fn raw_presses_cleared_each_frame() {
+    fn raw_presses_survive_the_frame_for_the_editor() {
         let mut core = Core::new();
         core.world
             .resource_mut::<crate::RawPresses>()
             .0
             .push(crate::InputButton::Key(crate::KeyCode::W));
         core.update();
-        assert!(core.world.resource::<crate::RawPresses>().0.is_empty());
+        assert_eq!(core.world.resource::<crate::RawPresses>().0.len(), 1);
     }
 
     #[test]

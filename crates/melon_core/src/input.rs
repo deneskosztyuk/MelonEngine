@@ -34,7 +34,8 @@ pub enum InputFocus {
 pub struct GameInputGate(pub bool);
 
 /// Every button pressed this frame (key repeats excluded), whatever the focus.
-/// The host fills it; cleared in `PostUpdate`. Read by the rebinding capture.
+/// The host fills it and clears it after the editor UI (not in `PostUpdate`,
+/// which runs before the editor), so the rebinding capture sees this frame's presses.
 #[derive(Resource, Default, Debug)]
 pub struct RawPresses(pub Vec<InputButton>);
 

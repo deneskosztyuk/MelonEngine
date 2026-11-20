@@ -199,6 +199,49 @@ fn apply_gate(input: &mut Input, applied: &mut bool, gate: bool) -> bool {
     true
 }
 
+/// How an event matters to egui while the game owns the mouse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EguiEvent {
+    /// Moves, presses, wheel, touch: the hidden cursor must not drive the UI.
+    Pointer,
+    /// A button release: always forwarded, so a press egui already saw ends.
+    ButtonRelease,
+    /// Keyboard and window events: Esc / F5 / F6 must reach the editor.
+    Other,
+}
+
+fn egui_event(event: &WindowEvent) -> EguiEvent {
+    match event {
+        WindowEvent::MouseInput {
+            state: ElementState::Released,
+            ..
+        } => EguiEvent::ButtonRelease,
+        WindowEvent::CursorMoved { .. }
+        | WindowEvent::CursorEntered { .. }
+        | WindowEvent::CursorLeft { .. }
+        | WindowEvent::MouseInput { .. }
+        | WindowEvent::MouseWheel { .. }
+        | WindowEvent::Touch(_)
+        | WindowEvent::TouchpadPressure { .. }
+        | WindowEvent::PinchGesture { .. }
+        | WindowEvent::PanGesture { .. }
+        | WindowEvent::RotationGesture { .. }
+        | WindowEvent::DoubleTapGesture { .. } => EguiEvent::Pointer,
+        _ => EguiEvent::Other,
+    }
+}
+
+fn forwards_to_egui(kind: EguiEvent, gate_open: bool) -> bool {
+    !(gate_open && kind == EguiEvent::Pointer)
+}
+
+/// End of the host frame, after the editor UI read this frame's presses.
+fn clear_raw_presses(world: &mut World) {
+    if let Some(mut raw) = world.get_resource_mut::<RawPresses>() {
+        raw.0.clear();
+    }
+}
+
 /// Hide and confine the cursor for the game, or give it back to the editor.
 fn grab_cursor(window: &Window, grab: bool) {
     let result = if grab {
@@ -407,10 +450,12 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        // egui sees every event; whether it used one no longer matters: the
-        // raw stream records everything and the gate decides what the game gets.
+        // Whether egui used an event no longer matters: the raw stream records
+        // everything and the gate decides what the game gets. While the game has
+        // the mouse, egui gets no pointer input (the hidden cursor would click the UI).
         if let Some(editor) = self.editor.as_mut()
             && let Some(window) = self.window.as_ref()
+            && forwards_to_egui(egui_event(&event), self.game_input)
         {
             editor.on_window_event(window, &event);
         }
@@ -487,6 +532,8 @@ impl ApplicationHandler for App {
                     return;
                 };
                 let Some(mut frame) = renderer.begin_frame() else {
+                    // No editor pass this frame (e.g. minimised): drop the presses anyway.
+                    clear_raw_presses(&mut self.core.world);
                     return;
                 };
 
@@ -500,6 +547,7 @@ impl ApplicationHandler for App {
                     &mut self.core.world,
                     editor_ui,
                 );
+                clear_raw_presses(&mut self.core.world);
                 // The editor wrote the gate during its UI pass; it applies from the next events on.
                 let gate = self
                     .core
@@ -764,6 +812,41 @@ mod tests {
             assert!(!input.key(key), "{key:?} reached the game");
         }
         assert_eq!(raw.0.len(), 3, "the raw stream still sees them");
+    }
+
+    #[test]
+    fn pointer_events_skip_egui_while_the_game_has_input() {
+        use EguiEvent::{ButtonRelease, Other, Pointer};
+        assert!(
+            !forwards_to_egui(Pointer, true),
+            "hidden cursor drives the UI"
+        );
+        assert!(forwards_to_egui(Pointer, false));
+        // A press egui saw before the gate opened must still end.
+        assert!(forwards_to_egui(ButtonRelease, true));
+        assert!(
+            forwards_to_egui(Other, true),
+            "Esc / F5 / F6 reach the editor"
+        );
+    }
+
+    #[test]
+    fn raw_presses_last_until_the_host_clears_them() {
+        let mut core = melon_core::Core::new();
+        core.world.insert_resource(Input::default());
+        core.world
+            .resource_scope(|world, mut raw: Mut<RawPresses>| {
+                let mut input = world.resource_mut::<Input>();
+                record_button(&mut input, &mut raw, W, true, false, false);
+            });
+        core.update();
+        assert_eq!(
+            core.world.resource::<RawPresses>().0,
+            vec![W],
+            "editor reads it"
+        );
+        clear_raw_presses(&mut core.world);
+        assert!(core.world.resource::<RawPresses>().0.is_empty());
     }
 
     #[test]
