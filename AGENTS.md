@@ -8,12 +8,12 @@ Current state and planned work: `docs/ROADMAP.md`.
 | Path | Role |
 |---|---|
 | `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera. No GPU or window code. |
-| `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache`) records sun shadow pass, SSAO passes, 3D pass into HDR target, tonemap pass; `ui_pass` for the editor. |
+| `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache`) records sun shadow pass, SSAO passes, 3D pass into HDR target, bloom passes, tonemap pass; `ui_pass` for the editor. |
 | `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource) and ECS sync systems. |
 | `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), Project Settings window (`project_settings.rs`). |
 | `crates/melon_game` | Game logic as an `rlib` + `dylib`, hot-reloaded in dev builds. |
 | `crates/melon_host` | Binary: winit event loop, input mapping, frame order (core update, editor, extract, render_scene, ui pass). No render pass code. |
-| `assets/models` | glTF models. `cube.glb` loads at startup. `review/` holds the snapshot scene's material test models (`grey_cube`, `material_spheres`, `normal_panel`), written by `cargo run -p melon_render --example gen_review_assets` from the repo root; commit them when regenerated. |
+| `assets/models` | glTF models. `cube.glb` loads at startup. `review/` holds the snapshot scene's material test models (`grey_cube`, `material_spheres`, `normal_panel`, `emissive_cube`), written by `cargo run -p melon_render --example gen_review_assets` from the repo root; commit them when regenerated. |
 | `assets/shaders` | WGSL shaders, compiled in with `wgpu::include_wgsl!` (no runtime reload). |
 
 Dependency direction: `core` <- `render`, `physics` <- `editor` <- `host`.
@@ -126,8 +126,9 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   base colour, metallic, roughness, normal scale, emissive). Group 2 of the
   mesh pipeline: 0 base colour (sRGB), 1 sampler, 2 metallic-roughness
   (linear, G = roughness, B = metallic), 3 normal (linear, tangent space),
-  4 emissive (sRGB), 5 `MaterialUniform`. Missing textures bind 1x1 white /
-  flat normal / black, so every material has this layout; build one with
+  4 emissive (sRGB), 5 `MaterialUniform`. Missing textures bind 1x1 white
+  (normal: flat), so the factors apply alone and every material has this
+  layout; build one with
   `create_material_bind_group`. `LoadedModel::material_bind_groups` has one
   per mesh; `builtin:cube` is the checkerboard on a rough white dielectric.
 - **Shading.** Sun: Cook-Torrance (GGX, height-correlated Smith, Schlick).
@@ -157,6 +158,21 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   (default 1; 0 skips the passes and matches the pre-SSAO image exactly) and
   `ao_radius` (metres, default 0.5). GPU tests that are not about AO set
   `ao_strength: 0.0`.
+- **Emissive.** `MaterialUniform::emissive` is linear HDR radiance:
+  `emissiveFactor` times `KHR_materials_emissive_strength` (the gltf
+  crate feature is on), so glTF emitters can exceed 1.
+- **Bloom.** After the 3D pass, before tonemapping: `render_scene` runs
+  `bloom.wgsl` over the resolved HDR image into the view's bloom chain (one
+  `Rgba16Float` texture at half resolution with up to `BLOOM_LEVELS` = 6
+  mips, `bloom_mip_sizes`; levels under 1 px are dropped, a 1x1 view has
+  none). Downsample with 13 taps (Karis average on the first), then 3x3
+  tent upsample added (blend One + One) level by level into mip 0. The
+  tonemap pass mixes `mix(hdr, mip0 / levels, bloom_intensity)`; no
+  threshold, so uniform areas stay as they were. `Environment::bloom_intensity`
+  (default 0.04; 0 skips the passes and binds black, the image matches the
+  pre-bloom one exactly). Bloom textures live in `ViewportTarget` and are
+  rebuilt with it. `tonemap_pass(hdr)` alone never blooms. GPU tests that
+  are not about bloom set `bloom_intensity: 0.0`.
 - **Sun shadow setup.** The shadow pass culls nothing (front faces of
   closed meshes store depth; single-sided quads cast from both sides) with
   a small slope-scaled bias (`constant: 1, slope_scale: 1.5`), and
@@ -174,9 +190,11 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 - **Camera conventions.** Right-handed, DirectX depth (near = 0, far = 1).
   Screen helpers take logical points.
 - **Checking rendering.** Agents verify rendering with the snapshot example
-  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd] [--ao-only] [--no-ao] [--no-shadow]`;
+  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only]`;
   `--ao-only` saves the SSAO term as a grey image; `--no-shadow` moves scene
-  and camera outside the shadow box (no sun shadows, debug only); `crowd` adds about
+  and camera outside the shadow box (no sun shadows, debug only); `--no-bloom`
+  sets `bloom_intensity` 0, `--bloom-only` sets it to 1 (the image is the
+  bloom alone); `crowd` adds about
   10,000 instances; it prints the mean frame time and `RenderStats`),
   never by opening the editor or game window.
 - **GPU tests** open a window, so they need a display and adapter.
