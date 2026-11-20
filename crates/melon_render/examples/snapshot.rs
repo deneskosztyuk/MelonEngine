@@ -14,7 +14,9 @@
 // --no-bloom turns `RenderQuality::bloom` off; --bloom-only renders with
 // `bloom_intensity` 1, so the tonemapped image is the bloom alone;
 // --gi off|ssgi|ddgi picks `RenderQuality::gi_mode` (--no-gi is --gi off);
-// --gi-only saves the indirect diffuse term of that mode alone (bloom off).
+// --gi-only saves the indirect diffuse term of that mode alone (bloom off);
+// --ssgi-res half|quarter picks `RenderQuality::ssgi_resolution`;
+// --size WxH renders at that size (default 1280x720).
 // After the timed frames it also prints the GPU pass timings (`RenderTimings`).
 
 use std::sync::Arc;
@@ -23,6 +25,7 @@ use anyhow::{Context, Result, bail};
 use glam::{Mat4, Quat, Vec3};
 use melon_core::{
     AssetServer, Camera, Environment, GiMode, Handle, Light, Model, QualityPreset, RenderQuality,
+    SsgiResolution,
 };
 use melon_render::{FrameData, RenderStats, Renderer};
 use winit::application::ApplicationHandler;
@@ -30,8 +33,8 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
-const WIDTH: u32 = 1280;
-const HEIGHT: u32 = 720;
+/// Default image size (`--size WxH` overrides it).
+const SIZE: (u32, u32) = (1280, 720);
 
 /// The review scene: grey floor, blocks, a tall pillar and a wall corner,
 /// one checkerboard `builtin:cube`, `cube.glb`, the material spheres, the
@@ -196,7 +199,7 @@ fn camera(view: &str) -> Result<Camera> {
     Ok(Camera {
         eye,
         center,
-        aspect: WIDTH as f32 / HEIGHT as f32,
+        aspect: SIZE.0 as f32 / SIZE.1 as f32,
         ..Camera::default()
     })
 }
@@ -246,6 +249,27 @@ fn gi_mode(name: Option<&str>) -> Result<GiMode> {
     }
 }
 
+/// The SSGI resolution named by `--ssgi-res <name>`.
+fn ssgi_resolution(name: Option<&str>) -> Result<SsgiResolution> {
+    match name {
+        Some("half") => Ok(SsgiResolution::Half),
+        Some("quarter") => Ok(SsgiResolution::Quarter),
+        other => bail!("--ssgi-res needs half or quarter, got {other:?}"),
+    }
+}
+
+/// The image size named by `--size WxH`.
+fn image_size(text: Option<&str>) -> Result<(u32, u32)> {
+    let parsed = text.and_then(|t| {
+        let (w, h) = t.split_once('x')?;
+        Some((w.parse().ok()?, h.parse().ok()?))
+    });
+    match parsed {
+        Some((w, h)) if w > 0 && h > 0 => Ok((w, h)),
+        _ => bail!("--size needs WxH, for example 2880x1659, got {text:?}"),
+    }
+}
+
 /// The preset named by `--quality <name>`.
 fn quality_preset(name: Option<&str>) -> Result<QualityPreset> {
     match name {
@@ -260,9 +284,11 @@ fn quality_preset(name: Option<&str>) -> Result<QualityPreset> {
 fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Result<()> {
     let mut gi = None;
     let mut preset = QualityPreset::High;
+    let mut size = SIZE;
+    let mut ssgi_res = None;
     let mut args = flags.iter();
     while let Some(flag) = args.next() {
-        const FLAGS: [&str; 9] = [
+        const FLAGS: [&str; 11] = [
             "--quality",
             "--ao-only",
             "--no-ao",
@@ -272,11 +298,15 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
             "--gi",
             "--no-gi",
             "--gi-only",
+            "--size",
+            "--ssgi-res",
         ];
         match flag.as_str() {
             "--quality" => preset = quality_preset(args.next().map(String::as_str))?,
             "--gi" => gi = Some(gi_mode(args.next().map(String::as_str))?),
             "--no-gi" => gi = Some(GiMode::Off),
+            "--size" => size = image_size(args.next().map(String::as_str))?,
+            "--ssgi-res" => ssgi_res = Some(ssgi_resolution(args.next().map(String::as_str))?),
             f if FLAGS.contains(&f) => {}
             _ => bail!("unknown flag {flag:?}; expected one of {FLAGS:?}"),
         }
@@ -292,11 +322,14 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
     let mut camera = camera(view)?;
     camera.eye += offset;
     camera.center += offset;
+    camera.aspect = size.0 as f32 / size.1 as f32;
+    let (width, height) = size;
     let mut renderer = pollster::block_on(Renderer::new(window))?;
     renderer.set_gi_only(gi_only);
-    let mut target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(WIDTH, HEIGHT));
+    let mut target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(width, height));
     let mut quality = RenderQuality::preset(preset);
     quality.gi_mode = gi.unwrap_or(quality.gi_mode);
+    quality.ssgi_resolution = ssgi_res.unwrap_or(quality.ssgi_resolution);
     quality.ao &= !has("--no-ao");
     quality.bloom &= !(has("--no-bloom") || gi_only);
     let mut server = AssetServer::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..").into());
@@ -354,11 +387,11 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
     } else {
         target.color_texture_handle()
     };
-    let row = WIDTH * texture.format().block_copy_size(None).unwrap_or(4);
+    let row = width * texture.format().block_copy_size(None).unwrap_or(4);
     let padded = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("snapshot readback"),
-        size: (padded * HEIGHT) as wgpu::BufferAddress,
+        size: (padded * height) as wgpu::BufferAddress,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -398,7 +431,7 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
     if let Some(dir) = std::path::Path::new(out).parent() {
         std::fs::create_dir_all(dir)?;
     }
-    image::save_buffer(out, &pixels, WIDTH, HEIGHT, color_type)
+    image::save_buffer(out, &pixels, width, height, color_type)
         .with_context(|| format!("failed to write {out}"))?;
     Ok(())
 }
@@ -432,7 +465,7 @@ impl ApplicationHandler for App {
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let out = args.next().context(
-        "usage: snapshot <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only]",
+        "usage: snapshot <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only] [--ssgi-res half|quarter] [--size WxH]",
     )?;
     let view = args.next().unwrap_or_else(|| "overview".into());
     let flags = args.collect();
@@ -493,6 +526,21 @@ mod tests {
             RenderQuality::default(),
             "no flags = the default quality"
         );
+    }
+
+    #[test]
+    fn size_flag_parses_wxh() {
+        assert_eq!(image_size(Some("2880x1659")).unwrap(), (2880, 1659));
+        for bad in ["2880", "0x720", "axb", "1280x"] {
+            assert!(image_size(Some(bad)).is_err(), "{bad}");
+        }
+        assert!(image_size(None).is_err());
+        assert_eq!(ssgi_resolution(Some("half")).unwrap(), SsgiResolution::Half);
+        assert_eq!(
+            ssgi_resolution(Some("quarter")).unwrap(),
+            SsgiResolution::Quarter
+        );
+        assert!(ssgi_resolution(Some("full")).is_err());
     }
 
     #[test]

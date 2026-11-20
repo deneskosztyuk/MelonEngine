@@ -1,17 +1,22 @@
-//! GI backend: screen-space diffuse GI (SSGI) at half resolution, per view.
+//! GI backend: screen-space diffuse GI (SSGI) at half or quarter
+//! resolution (`SsgiResolution`), per view.
 //!
 //! Per frame (`Ssgi::render`, after the shared depth/normal prepass, before
-//! the 3D pass), two fullscreen passes over the view's half-resolution
+//! the 3D pass), three fullscreen passes over the view's reduced-resolution
 //! textures (ssgi.wgsl):
+//! 0. `fs_geometry`: each texel's normal and eye distance, picked from the
+//!    full-resolution prepass. The trace marches this small texture, which
+//!    keeps its scattered reads in cache.
 //! 1. `fs_trace`: a few cosine-weighted rays per pixel (rotated per pixel
-//!    and frame) march the prepass eye distances. A hit reads last frame's
+//!    and frame) march those eye distances. A hit reads last frame's
 //!    resolved HDR colour (the view's HDR target, before this frame's 3D
 //!    pass overwrites it) at the hit's position under last frame's
 //!    `view_proj`; a miss, or a hit off last frame's screen, reads the
 //!    hemisphere sky light (`sky_light`, as GI off). The mean blends into
 //!    the reprojected history (rejected on disocclusion by eye distance and
 //!    normal), ping-ponged with the pixel's normal and eye distance.
-//! 2. `fs_denoise`: a depth- and normal-aware 5x5 blur into the output the
+//! 2. `fs_denoise`: a depth- and normal-aware 5x5 (half) or 3x3 (quarter)
+//!    blur into the output the
 //!    mesh shader upsamples (gi_ssgi.wgsl) in place of the hemisphere
 //!    diffuse. A camera cut, a new view (resize) or a frame without SSGI
 //!    resets the history. See AGENTS.md.
@@ -20,9 +25,12 @@ use std::cell::Cell;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, UVec2, Vec2, Vec3};
+use melon_core::SsgiResolution;
 
 /// Texture format of the history, geometry and output textures.
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Format of the eye distances the trace marches (a quarter of the bytes).
+const MARCH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
 /// An eye jump beyond this (metres per frame) is a camera cut.
 const CUT_DISTANCE: f32 = 2.0;
 /// A view direction turn beyond this (cosine; 30 degrees) is a camera cut.
@@ -44,13 +52,15 @@ struct SsgiUniform {
     intensity: f32,
     /// 1 = the mesh shader outputs indirect diffuse only (debug).
     gi_only: u32,
-    _pad: u32,
+    /// View pixels per texel (`SsgiResolution::scale`; 0 in the stand-in).
+    scale: u32,
 }
 
-/// Size of the SSGI textures for a `width` x `height` view: half, rounded
-/// up (every full-resolution pixel has a texel; never 0).
-pub fn half_size(width: u32, height: u32) -> (u32, u32) {
-    (width.div_ceil(2).max(1), height.div_ceil(2).max(1))
+/// Size of the SSGI textures for a `width` x `height` view at `scale`
+/// pixels per texel, rounded up (every full-resolution pixel has a texel;
+/// never 0).
+pub fn ssgi_size(width: u32, height: u32, scale: u32) -> (u32, u32) {
+    (width.div_ceil(scale).max(1), height.div_ceil(scale).max(1))
 }
 
 /// Screen uv (0..1, y down) of world point `p` under `view_proj`, `None`
@@ -64,13 +74,15 @@ pub fn reproject(view_proj: Mat4, p: Vec3) -> Option<Vec2> {
     (uv.cmpge(Vec2::ZERO).all() && uv.cmplt(Vec2::ONE).all()).then_some(uv)
 }
 
-/// The half-resolution texel whose sample (full pixel 2i, centre 2i + 0.5)
-/// is nearest screen `uv` of a `full` sized view (ssgi.wgsl `fs_trace`).
-pub fn half_texel(uv: Vec2, full: (u32, u32)) -> UVec2 {
+/// The texel whose sample (full pixel `scale * i`, centre `scale * i +
+/// 0.5`) is nearest screen `uv` of a `full` sized view (ssgi.wgsl
+/// `ssgi_texel`).
+pub fn ssgi_texel(uv: Vec2, full: (u32, u32), scale: u32) -> UVec2 {
     let f = uv * Vec2::new(full.0 as f32, full.1 as f32);
-    let (w, h) = half_size(full.0, full.1);
-    (f * 0.5 + 0.25)
+    let (w, h) = ssgi_size(full.0, full.1, scale);
+    ((f - 0.5) / scale as f32 + 0.5)
         .floor()
+        .max(Vec2::ZERO)
         .as_uvec2()
         .min(UVec2::new(w - 1, h - 1))
 }
@@ -90,18 +102,22 @@ pub fn is_camera_cut(prev_view_proj: Mat4, prev_eye: Vec3, view_proj: Mat4, eye:
 /// The SSGI passes (shared by every view) and the stand-ins for views
 /// without SSGI textures.
 pub(super) struct Ssgi {
+    geometry_layout: wgpu::BindGroupLayout,
     trace_layout: wgpu::BindGroupLayout,
     denoise_layout: wgpu::BindGroupLayout,
+    geometry_pipeline: wgpu::RenderPipeline,
     trace_pipeline: wgpu::RenderPipeline,
-    denoise_pipeline: wgpu::RenderPipeline,
+    /// Per `SsgiResolution`: 5x5 at half, 3x3 at quarter.
+    denoise_pipelines: [wgpu::RenderPipeline; 2],
     /// Group 3 stand-ins: no SSGI texels (the mesh shader falls back to
     /// the hemisphere) and a zero uniform.
     no_output: wgpu::TextureView,
     no_uniform: wgpu::Buffer,
 }
 
-/// One view's SSGI textures (half resolution), uniform and history state.
+/// One view's SSGI textures (reduced resolution), uniform and history state.
 pub(crate) struct SsgiView {
+    pub(crate) resolution: SsgiResolution,
     uniform: wgpu::Buffer,
     /// History (rgb, a = frames accumulated) and geometry (normal, eye
     /// distance), written alternately: frame parity p writes [p], reads [1 - p].
@@ -111,6 +127,9 @@ pub(crate) struct SsgiView {
     /// (normal, eye distance; 0 = no surface), read by the mesh shader.
     output: wgpu::TextureView,
     output_geometry: wgpu::TextureView,
+    /// This frame's eye distances (`fs_geometry`), marched by the trace.
+    march: wgpu::TextureView,
+    geometry_group: wgpu::BindGroup,
     trace_groups: [wgpu::BindGroup; 2],
     denoise_groups: [wgpu::BindGroup; 2],
     /// Camera of this view's last SSGI frame (`None`: no history).
@@ -133,14 +152,15 @@ fn fullscreen_pipeline(
     module: &wgpu::ShaderModule,
     layouts: &[&wgpu::BindGroupLayout; 2],
     entry: &str,
-    targets: u32,
+    targets: &[wgpu::TextureFormat],
+    constants: &[(&str, f64)],
 ) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("ssgi pipeline layout"),
         bind_group_layouts: &layouts.map(Some),
         immediate_size: 0,
     });
-    let targets: Vec<_> = (0..targets).map(|_| Some(FORMAT.into())).collect();
+    let targets: Vec<_> = targets.iter().map(|&f| Some(f.into())).collect();
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(entry),
         layout: Some(&layout),
@@ -156,7 +176,10 @@ fn fullscreen_pipeline(
         fragment: Some(wgpu::FragmentState {
             module,
             entry_point: Some(entry),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants,
+                ..Default::default()
+            },
             targets: &targets,
         }),
         multiview_mask: None,
@@ -202,15 +225,20 @@ impl Ssgi {
             view_dimension: wgpu::TextureViewDimension::D2,
             multisampled: false,
         };
+        let geometry_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ssgi geometry bind group layout"),
+            entries: &[layout_entry(1, TEXTURE), layout_entry(2, UNIFORM)],
+        });
         let trace_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ssgi trace bind group layout"),
             entries: &[
                 layout_entry(0, depth),
-                layout_entry(1, TEXTURE),
                 layout_entry(2, UNIFORM),
                 layout_entry(3, TEXTURE),
                 layout_entry(4, TEXTURE),
                 layout_entry(5, TEXTURE),
+                layout_entry(8, TEXTURE),
+                layout_entry(9, TEXTURE),
             ],
         });
         let denoise_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -227,21 +255,33 @@ impl Ssgi {
                 .into(),
             ),
         });
+        let geometry_pipeline = fullscreen_pipeline(
+            device,
+            &module,
+            &[frame_layout, &geometry_layout],
+            "fs_geometry",
+            &[FORMAT, MARCH_FORMAT],
+            &[],
+        );
         let trace_pipeline = fullscreen_pipeline(
             device,
             &module,
             &[frame_layout, &trace_layout],
             "fs_trace",
-            2,
+            &[FORMAT],
+            &[],
         );
-        let denoise_pipeline = fullscreen_pipeline(
-            device,
-            &module,
-            &[frame_layout, &denoise_layout],
-            "fs_denoise",
-            2,
-        );
-        let no_output = half_texture(device, "ssgi stand-in output", (1, 1));
+        let denoise_pipelines = [2.0, 1.0].map(|radius| {
+            fullscreen_pipeline(
+                device,
+                &module,
+                &[frame_layout, &denoise_layout],
+                "fs_denoise",
+                &[FORMAT, FORMAT],
+                &[("DENOISE_RADIUS", radius)],
+            )
+        });
+        let no_output = ssgi_texture(device, "ssgi stand-in output", (1, 1));
         let no_uniform = wgpu::util::DeviceExt::create_buffer_init(
             device,
             &wgpu::util::BufferInitDescriptor {
@@ -251,10 +291,12 @@ impl Ssgi {
             },
         );
         Self {
+            geometry_layout,
             trace_layout,
             denoise_layout,
+            geometry_pipeline,
             trace_pipeline,
-            denoise_pipeline,
+            denoise_pipelines,
             no_output,
             no_uniform,
         }
@@ -265,13 +307,15 @@ impl Ssgi {
         &self,
         device: &wgpu::Device,
         size: winit::dpi::PhysicalSize<u32>,
+        resolution: SsgiResolution,
         inputs: &SsgiViewInputs,
     ) -> SsgiView {
-        let half = half_size(size.width, size.height);
-        let history = [0, 1].map(|_| half_texture(device, "ssgi history", half));
-        let geometry = [0, 1].map(|_| half_texture(device, "ssgi geometry", half));
-        let output = half_texture(device, "ssgi output", half);
-        let output_geometry = half_texture(device, "ssgi output geometry", half);
+        let texels = ssgi_size(size.width, size.height, resolution.scale());
+        let history = [0, 1].map(|_| ssgi_texture(device, "ssgi history", texels));
+        let geometry = [0, 1].map(|_| ssgi_texture(device, "ssgi geometry", texels));
+        let output = ssgi_texture(device, "ssgi output", texels);
+        let march = ssgi_texture_in(device, "ssgi march", texels, MARCH_FORMAT);
+        let output_geometry = ssgi_texture(device, "ssgi output geometry", texels);
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ssgi uniform buffer"),
             size: std::mem::size_of::<SsgiUniform>() as wgpu::BufferAddress,
@@ -282,13 +326,23 @@ impl Ssgi {
             binding,
             resource: wgpu::BindingResource::TextureView(view),
         };
+        let geometry_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ssgi geometry bind group"),
+            layout: &self.geometry_layout,
+            entries: &[
+                view(1, inputs.normal),
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        });
         let trace_groups = [0, 1].map(|p| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ssgi trace bind group"),
                 layout: &self.trace_layout,
                 entries: &[
                     view(0, inputs.depth),
-                    view(1, inputs.normal),
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: uniform.as_entire_binding(),
@@ -296,6 +350,8 @@ impl Ssgi {
                     view(3, inputs.hdr),
                     view(4, &history[1 - p]),
                     view(5, &geometry[1 - p]),
+                    view(8, &geometry[p]),
+                    view(9, &march),
                 ],
             })
         });
@@ -307,11 +363,14 @@ impl Ssgi {
             })
         });
         SsgiView {
+            resolution,
             uniform,
             history,
             geometry,
             output,
             output_geometry,
+            march,
+            geometry_group,
             trace_groups,
             denoise_groups,
             prev: Cell::new(None),
@@ -368,7 +427,7 @@ impl Ssgi {
             history_valid: u32::from(valid),
             intensity,
             gi_only: u32::from(gi_only),
-            _pad: 0,
+            scale: view.resolution.scale(),
         };
         queue.write_buffer(&view.uniform, 0, bytemuck::bytes_of(&uniform));
         if on {
@@ -377,8 +436,9 @@ impl Ssgi {
         }
     }
 
-    /// The trace + accumulate and denoise passes of `view`. `frame` is
-    /// group 0 (this view's camera). Call after `update` and the prepass.
+    /// The geometry, trace + accumulate and denoise passes of `view`.
+    /// `frame` is group 0 (this view's camera). Call after `update` and the
+    /// prepass.
     pub(super) fn render(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -387,16 +447,26 @@ impl Ssgi {
     ) {
         // `update` counted this frame: its parity picks the history it writes.
         let p = (view.frame.get().wrapping_sub(1) % 2) as usize;
+        let denoise = match view.resolution {
+            SsgiResolution::Half => &self.denoise_pipelines[0],
+            SsgiResolution::Quarter => &self.denoise_pipelines[1],
+        };
         let passes = [
+            (
+                "melon_render ssgi geometry pass",
+                &self.geometry_pipeline,
+                &view.geometry_group,
+                vec![&view.geometry[p], &view.march],
+            ),
             (
                 "melon_render ssgi trace pass",
                 &self.trace_pipeline,
                 &view.trace_groups[p],
-                vec![&view.history[p], &view.geometry[p]],
+                vec![&view.history[p]],
             ),
             (
                 "melon_render ssgi denoise pass",
-                &self.denoise_pipeline,
+                denoise,
                 &view.denoise_groups[p],
                 vec![&view.output, &view.output_geometry],
             ),
@@ -434,10 +504,16 @@ impl Ssgi {
 }
 
 /// A `FORMAT` render target sampled by the SSGI passes or the mesh shader.
-fn half_texture(
+fn ssgi_texture(device: &wgpu::Device, label: &str, size: (u32, u32)) -> wgpu::TextureView {
+    ssgi_texture_in(device, label, size, FORMAT)
+}
+
+/// A `format` render target sampled by the SSGI passes.
+fn ssgi_texture_in(
     device: &wgpu::Device,
     label: &str,
     (width, height): (u32, u32),
+    format: wgpu::TextureFormat,
 ) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
@@ -450,7 +526,7 @@ fn half_texture(
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: FORMAT,
+            format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         })
@@ -472,37 +548,48 @@ mod tests {
         assert_eq!(std::mem::size_of::<SsgiUniform>(), 96);
         assert_eq!(std::mem::offset_of!(SsgiUniform, prev_eye), 64);
         assert_eq!(std::mem::offset_of!(SsgiUniform, history_valid), 80);
+        assert_eq!(std::mem::offset_of!(SsgiUniform, scale), 92);
     }
 
     #[test]
-    fn half_size_rounds_odd_sizes_up() {
-        assert_eq!(half_size(1280, 720), (640, 360));
-        assert_eq!(half_size(1281, 721), (641, 361));
-        assert_eq!(half_size(1, 1), (1, 1));
-        assert_eq!(half_size(0, 3), (1, 2));
-        // The last full pixel's sample texel exists.
-        let (w, _) = half_size(1281, 721);
-        assert_eq!(half_texel(Vec2::new(0.9999, 0.0), (1281, 721)).x, w - 1);
+    fn ssgi_size_rounds_odd_sizes_up() {
+        assert_eq!(ssgi_size(1280, 720, 2), (640, 360));
+        assert_eq!(ssgi_size(1281, 721, 2), (641, 361));
+        assert_eq!(ssgi_size(1281, 721, 4), (321, 181));
+        assert_eq!(ssgi_size(1, 1, 4), (1, 1));
+        assert_eq!(ssgi_size(0, 3, 2), (1, 2));
+        // The last full pixel's sample texel exists; the first pixel maps
+        // to texel 0.
+        for scale in [2, 4] {
+            let (w, _) = ssgi_size(1281, 721, scale);
+            let last = ssgi_texel(Vec2::new(0.9999, 0.0), (1281, 721), scale);
+            assert_eq!(last.x, w - 1, "scale {scale}");
+            assert_eq!(ssgi_texel(Vec2::ZERO, (1281, 721), scale), UVec2::ZERO);
+        }
     }
 
     #[test]
     fn static_point_keeps_its_texel_and_follows_camera_moves() {
         let full = (1281, 721);
         let a = camera(Vec3::new(0.0, 2.0, 6.0), Vec3::ZERO);
-        // The world point behind half texel (100, 50)'s sample (full pixel
-        // (200, 100)), at some depth.
-        let texel = UVec2::new(100, 50);
-        let px = (texel * 2).as_vec2() + 0.5;
-        let ndc = Vec2::new(
-            px.x / full.0 as f32 * 2.0 - 1.0,
-            1.0 - px.y / full.1 as f32 * 2.0,
-        );
-        let p = a.inverse().project_point3(ndc.extend(0.97));
-        // Camera did not move: same texel.
-        let uv = reproject(a, p).expect("on screen");
-        assert_eq!(half_texel(uv, full), texel);
+        // Camera did not move: the world point behind texel (40, 30)'s
+        // sample (full pixel scale * (40, 30)), at some depth, maps back to
+        // that texel.
+        let texel = UVec2::new(40, 30);
+        for scale in [2, 4] {
+            let px = (texel * scale).as_vec2() + 0.5;
+            let ndc = Vec2::new(
+                px.x / full.0 as f32 * 2.0 - 1.0,
+                1.0 - px.y / full.1 as f32 * 2.0,
+            );
+            let p = a.inverse().project_point3(ndc.extend(0.97));
+            let uv = reproject(a, p).expect("on screen");
+            assert_eq!(ssgi_texel(uv, full, scale), texel, "scale {scale}");
+        }
         // Camera stepped 0.5 m right: the point moves left by
         // 0.5 * proj_x / depth in ndc (half that in uv), y unchanged.
+        let p = a.inverse().project_point3(Vec3::new(0.1, -0.2, 0.97));
+        let uv = reproject(a, p).expect("on screen");
         let b = camera(Vec3::new(0.5, 2.0, 6.0), Vec3::new(0.5, 0.0, 0.0));
         let now = reproject(b, p).expect("on screen");
         let depth = (a * p.extend(1.0)).w;

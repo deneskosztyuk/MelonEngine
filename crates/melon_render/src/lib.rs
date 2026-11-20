@@ -1005,7 +1005,10 @@ impl Renderer {
         scene.set_msaa(quality.msaa);
         scene.match_msaa(target);
         let gi_mode = gi::frame_mode(&frame.environment, quality.gi_mode);
-        scene.match_gi_view(target, gi_mode == melon_core::GiMode::Ssgi);
+        scene.match_gi_view(
+            target,
+            (gi_mode == melon_core::GiMode::Ssgi).then_some(quality.ssgi_resolution),
+        );
         let target = &*target;
         scene.update_camera(frame.view_proj, frame.eye);
         scene.update_environment(&frame.environment);
@@ -1694,17 +1697,19 @@ impl SceneRenderer {
         tracing::debug!(samples = self.msaa, "viewport msaa targets recreated");
     }
 
-    /// Creates `target`'s SSGI textures when `ssgi` is on and drops them when
-    /// it is off, rebuilding its group 3 to match.
-    fn match_gi_view(&self, target: &mut ViewportTarget, ssgi: bool) {
-        if target.lighting.gi.ssgi.is_some() == ssgi {
+    /// Creates `target`'s SSGI textures at `ssgi`'s resolution (recreated,
+    /// history and all, when it changes) and drops them when it is `None`,
+    /// rebuilding its group 3 to match.
+    fn match_gi_view(&self, target: &mut ViewportTarget, ssgi: Option<melon_core::SsgiResolution>) {
+        if target.lighting.gi.ssgi.as_ref().map(|v| v.resolution) == ssgi {
             return;
         }
         let gi = gi::GiView {
-            ssgi: ssgi.then(|| {
+            ssgi: ssgi.map(|resolution| {
                 self.gi.create_ssgi_view(
                     &self.device,
                     target.size,
+                    resolution,
                     &gi::ssgi::SsgiViewInputs {
                         depth: &target.ssao.depth_view,
                         normal: &target.ssao.normal_view,
@@ -3658,9 +3663,10 @@ impl ViewportTarget {
         self.hdr_target.sample_count()
     }
 
-    /// Whether the view holds SSGI textures (only while it runs SSGI).
-    pub fn has_ssgi_textures(&self) -> bool {
-        self.lighting.gi.ssgi.is_some()
+    /// The resolution of the view's SSGI textures; `None` = it holds none
+    /// (only while it runs SSGI).
+    pub fn ssgi_resolution(&self) -> Option<melon_core::SsgiResolution> {
+        self.lighting.gi.ssgi.as_ref().map(|v| v.resolution)
     }
 
     pub fn color_texture(&self) -> Arc<wgpu::Texture> {
@@ -4365,11 +4371,12 @@ mod tests {
     }
 
     /// What one frame of `render_qualities` left: its pixels, the target's
-    /// MSAA sample count and whether it held SSGI textures.
+    /// MSAA sample count and the resolution of its SSGI textures (`None`:
+    /// none).
     struct QualityFrame {
         pixels: Vec<u8>,
         samples: u32,
-        ssgi_textures: bool,
+        ssgi: Option<melon_core::SsgiResolution>,
     }
 
     /// One `render_scene` per quality into one target, each read back.
@@ -4404,7 +4411,7 @@ mod tests {
             frames.push(QualityFrame {
                 pixels: read_back(r.device(), r.queue(), encoder, &target.color_texture),
                 samples: target.sample_count(),
-                ssgi_textures: target.has_ssgi_textures(),
+                ssgi: target.ssgi_resolution(),
             });
         }
         match pollster::block_on(scope.pop()) {
@@ -4962,20 +4969,35 @@ mod tests {
                         ));
                     }
                 }
+                // A live resolution change recreates them (fresh history).
+                use melon_core::SsgiResolution::{Half, Quarter};
                 let ssgi = quality_in(GiMode::Ssgi);
+                let quarter = RenderQuality {
+                    ssgi_resolution: Quarter,
+                    ..ssgi
+                };
                 let frames = render_qualities(
                     renderer,
                     camera,
                     light,
                     lit,
-                    &[q, ssgi, ssgi, quality_in(GiMode::Off), q],
+                    &[q, ssgi, ssgi, quarter, ssgi, quality_in(GiMode::Off), q],
                     &models,
                     &mut server,
                 )?;
-                let held: Vec<bool> = frames.iter().map(|f| f.ssgi_textures).collect();
-                if held != [false, true, true, false, false] {
+                let held: Vec<_> = frames.iter().map(|f| f.ssgi).collect();
+                let expected = [
+                    None,
+                    Some(Half),
+                    Some(Half),
+                    Some(Quarter),
+                    Some(Half),
+                    None,
+                    None,
+                ];
+                if held != expected {
                     return Err(format!(
-                        "SSGI textures should exist only on SSGI frames (DDGI, SSGI, SSGI, Off, DDGI): {held:?}"
+                        "SSGI textures should exist only on SSGI frames, at their resolution (DDGI, SSGI half x2, quarter, half, Off, DDGI): {held:?}"
                     ));
                 }
                 Ok(())
@@ -5147,11 +5169,12 @@ mod tests {
             }),
             Box::new(|renderer| {
                 // GI sky calibration: an open floor in a pillar's shadow, far
-                // from walls, sees only the sky. With DDGI and with SSGI it
-                // must match the hemisphere ambient they replace (within
-                // 10%), not the brighter background sky.
+                // from walls, sees only the sky. With DDGI and with SSGI (at
+                // half and quarter resolution) it must match the hemisphere
+                // ambient they replace (within 10%), not the brighter
+                // background sky.
                 use glam::Vec3;
-                use melon_core::GiMode;
+                use melon_core::{GiMode, SsgiResolution};
                 let mut server = repo_server();
                 let grey = server.load("assets/models/review/grey_cube.glb");
                 let models = [
@@ -5164,12 +5187,16 @@ mod tests {
                 };
                 let camera = top_down_camera();
                 let px = screen_px(camera.view_proj(), Vec3::new(-1.0, 0.0, 0.0));
-                let mut shade = |mode| {
+                let mut shade = |mode, ssgi_resolution| {
                     let env = melon_core::Environment {
                         gi_intensity: if mode == GiMode::Off { 0.0 } else { 1.0 },
                         ..gi_environment()
                     };
-                    let settings = (env, quality_in(mode));
+                    let quality = melon_core::RenderQuality {
+                        ssgi_resolution,
+                        ..quality_in(mode)
+                    };
+                    let settings = (env, quality);
                     let pixels = render_converged_in(
                         renderer,
                         camera,
@@ -5180,9 +5207,13 @@ mod tests {
                     );
                     pixel_at(renderer, &pixels, px)
                 };
-                let (ddgi, ssgi, off) =
-                    (shade(GiMode::Ddgi), shade(GiMode::Ssgi), shade(GiMode::Off));
-                for (name, on) in [("DDGI", ddgi), ("SSGI", ssgi)] {
+                let half = SsgiResolution::Half;
+                let off = shade(GiMode::Off, half);
+                for (name, on) in [
+                    ("DDGI", shade(GiMode::Ddgi, half)),
+                    ("SSGI half", shade(GiMode::Ssgi, half)),
+                    ("SSGI quarter", shade(GiMode::Ssgi, SsgiResolution::Quarter)),
+                ] {
                     let ratio = rgb_sum(on) as f32 / rgb_sum(off).max(1) as f32;
                     if (ratio - 1.0).abs() > 0.1 {
                         return Err(format!(
@@ -5196,10 +5227,10 @@ mod tests {
                 // SSGI colour bleeding: the red-wall scene of the DDGI bleed
                 // check, seen from the wall's sunlit side so the wall is on
                 // screen (SSGI only bounces what it sees). The floor in
-                // front of the lit face turns red with SSGI, stays grey
-                // without.
+                // front of the lit face turns red with SSGI at half and at
+                // quarter resolution, stays grey without.
                 use glam::Vec3;
-                use melon_core::GiMode;
+                use melon_core::{GiMode, SsgiResolution};
                 let mut server = repo_server();
                 let grey = server.load("assets/models/review/grey_cube.glb");
                 let red = server.load("assets/models/review/red_panel.glb");
@@ -5220,14 +5251,18 @@ mod tests {
                     ground_color: Vec3::ZERO,
                     ..test_light()
                 };
-                let mut ratio = |mode| {
+                let mut ratio = |mode, ssgi_resolution| {
                     let env = melon_core::Environment {
                         zenith_color: Vec3::ZERO,
                         horizon_color: Vec3::ZERO,
                         gi_intensity: if mode == GiMode::Off { 0.0 } else { 1.0 },
                         ..gi_environment()
                     };
-                    let settings = (env, quality_in(mode));
+                    let quality = melon_core::RenderQuality {
+                        ssgi_resolution,
+                        ..quality_in(mode)
+                    };
+                    let settings = (env, quality);
                     let pixels = render_converged_in(
                         renderer,
                         camera,
@@ -5239,11 +5274,14 @@ mod tests {
                     let p = pixel_at(renderer, &pixels, px);
                     f32::from(p[0]) / f32::from(p[1]).max(1.0)
                 };
-                let (on, off) = (ratio(GiMode::Ssgi), ratio(GiMode::Off));
-                if on < off + 0.05 {
-                    return Err(format!(
-                        "SSGI should bleed red onto the floor: R/G {on:.3} with SSGI, {off:.3} without"
-                    ));
+                let off = ratio(GiMode::Off, SsgiResolution::Half);
+                for resolution in [SsgiResolution::Half, SsgiResolution::Quarter] {
+                    let on = ratio(GiMode::Ssgi, resolution);
+                    if on < off + 0.05 {
+                        return Err(format!(
+                            "SSGI at {resolution:?} should bleed red onto the floor: R/G {on:.3} with SSGI, {off:.3} without"
+                        ));
+                    }
                 }
                 Ok(())
             }),

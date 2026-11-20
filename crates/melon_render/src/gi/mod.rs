@@ -110,14 +110,15 @@ impl Gi {
         entries
     }
 
-    /// The SSGI textures of a `size` view.
+    /// The SSGI textures of a `size` view at `resolution`.
     pub(crate) fn create_ssgi_view(
         &self,
         device: &wgpu::Device,
         size: winit::dpi::PhysicalSize<u32>,
+        resolution: melon_core::SsgiResolution,
         inputs: &ssgi::SsgiViewInputs,
     ) -> ssgi::SsgiView {
-        self.ssgi.create_view(device, size, inputs)
+        self.ssgi.create_view(device, size, resolution, inputs)
     }
 
     /// Points the DDGI voxel passes at a new sun shadow map.

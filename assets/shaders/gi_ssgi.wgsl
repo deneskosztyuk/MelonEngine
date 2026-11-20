@@ -1,5 +1,5 @@
 // SSGI shading for the mesh shader (GI_MODE == GI_SSGI): the view's
-// denoised half-resolution indirect diffuse (ssgi.wgsl), upsampled with
+// denoised half- or quarter-resolution indirect diffuse (ssgi.wgsl), upsampled with
 // geometry-aware bilinear weights. Prepended to mesh.wgsl. Group 3 bindings
 // 6 to 8 (gi/ssgi.rs `layout_entries`).
 
@@ -12,6 +12,8 @@ struct SsgiUniform {
     intensity: f32,
     // 1 = the mesh shader outputs indirect diffuse only (debug).
     gi_only: u32,
+    // View pixels per texel (0 in the stand-in).
+    scale: u32,
 };
 
 // Indirect diffuse (rgb, cosine-weighted mean radiance) and the geometry
@@ -23,13 +25,13 @@ struct SsgiUniform {
 
 // Diffuse light at `p` (geometric normal `ng`, framebuffer position
 // `frag`) in place of the hemisphere `hemi`: the 4 nearest
-// half-resolution texels, bilinear, each only if it saw this surface (eye
+// reduced-resolution texels, bilinear, each only if it saw this surface (eye
 // distance within 10%, normal within about 25 degrees). None does (a
-// silhouette or crease the half-resolution pass missed): the hemisphere.
+// silhouette or crease the reduced-resolution pass missed): the hemisphere.
 fn ssgi_diffuse(p: vec3f, ng: vec3f, frag: vec2f, hemi: vec3f) -> vec3f {
     let last = vec2i(textureDimensions(ssgi_tex)) - 1;
-    // Half-resolution texel i holds full pixel 2i, centred at 2i + 0.5.
-    let h = (frag - 0.5) * 0.5;
+    // Texel i holds full pixel scale * i, centred at scale * i + 0.5.
+    let h = (frag - 0.5) / f32(max(ssgi.scale, 1u));
     let base = vec2i(floor(h));
     let f = h - floor(h);
     let dist = distance(p, camera.eye);

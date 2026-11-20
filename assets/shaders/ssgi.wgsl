@@ -1,12 +1,15 @@
 // Screen-space diffuse GI passes (gi/ssgi.rs), fullscreen triangles at half
-// resolution after the depth/normal prepass. gi_common.wgsl is prepended.
-// fs_trace: per texel (the sample of full pixel 2i), SSGI_RAYS
-// cosine-weighted rays (rotated per pixel and frame) march the prepass eye
-// distances; a hit reads last frame's HDR colour where the hit point was
-// last frame, a miss (or a hit off last frame's screen) the sky light. The
-// mean blends into the reprojected history, kept where last frame's eye
-// distance and normal match. fs_denoise: 5x5 depth- and normal-aware blur
-// into the output that gi_ssgi.wgsl upsamples, plus its geometry.
+// or quarter resolution (`ssgi.scale` view pixels per texel) after the
+// depth/normal prepass. gi_common.wgsl is prepended.
+// fs_geometry: each texel's normal and eye distance (the prepass at full
+// pixel scale * i), which the trace marches.
+// fs_trace: per texel, SSGI_RAYS cosine-weighted rays (rotated per pixel and
+// frame) march those eye distances; a hit reads last frame's HDR colour
+// where the hit point was last frame, a miss (or a hit off last frame's
+// screen) the sky light. The mean blends into the reprojected history,
+// kept where last frame's eye distance and normal match. fs_denoise:
+// depth- and normal-aware blur (DENOISE_RADIUS: 5x5 at half, 3x3 at
+// quarter) into the output that gi_ssgi.wgsl upsamples, plus its geometry.
 
 struct CameraUniform {
     view_proj: mat4x4f,
@@ -34,19 +37,23 @@ struct SsgiUniform {
     history_valid: u32,
     intensity: f32,
     gi_only: u32,
+    scale: u32,
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 @group(0) @binding(1) var<uniform> light: LightUniform;
-// fs_trace: full-resolution prepass depth and normal (xyz) + eye distance
-// (w, 0 where nothing was drawn), last frame's resolved HDR colour, and
-// last frame's history and geometry (half resolution).
-@group(1) @binding(0) var depth_tex: texture_depth_2d;
+// fs_geometry: full-resolution prepass normal (xyz) + eye distance (w, 0
+// where nothing was drawn).
 @group(1) @binding(1) var normal_tex: texture_2d<f32>;
 @group(1) @binding(2) var<uniform> ssgi: SsgiUniform;
+// fs_trace: full-resolution prepass depth, last frame's resolved HDR colour,
+// last frame's history and geometry, and this frame's geometry.
+@group(1) @binding(0) var depth_tex: texture_depth_2d;
 @group(1) @binding(3) var prev_hdr: texture_2d<f32>;
 @group(1) @binding(4) var history_prev: texture_2d<f32>;
 @group(1) @binding(5) var geometry_prev: texture_2d<f32>;
+@group(1) @binding(8) var geometry_cur: texture_2d<f32>;
+@group(1) @binding(9) var march_tex: texture_2d<f32>;
 // fs_denoise: this frame's history and geometry.
 @group(1) @binding(6) var history_tex: texture_2d<f32>;
 @group(1) @binding(7) var geometry_tex: texture_2d<f32>;
@@ -61,6 +68,8 @@ const MAX_DISTANCE: f32 = 4.0;
 const THICKNESS: f32 = 0.5;
 // The history blends at least 1 / MAX_HISTORY of each new frame in.
 const MAX_HISTORY: f32 = 32.0;
+// Denoise kernel radius in texels (gi/ssgi.rs sets 2 at half, 1 at quarter).
+override DENOISE_RADIUS: i32 = 2;
 
 @vertex
 fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
@@ -80,28 +89,62 @@ fn screen_uv(m: mat4x4f, p: vec3f) -> vec2f {
     return uv;
 }
 
+// The texel whose sample (full pixel scale * i) is nearest screen `uv` of a
+// `full` sized view, within 0..`last` (gi/ssgi.rs `ssgi_texel`).
+fn ssgi_texel(uv: vec2f, full: vec2f, last: vec2i) -> vec2i {
+    let texel = floor((uv * full - 0.5) / f32(ssgi.scale) + 0.5);
+    return clamp(vec2i(texel), vec2i(0), last);
+}
+
 // Interleaved gradient noise in [0, 1) (Jimenez 2014).
 fn noise(px: vec2f) -> f32 {
     return fract(52.9829189 * fract(dot(px, vec2f(0.06711056, 0.00583715))));
 }
 
+struct GeometryOut {
+    // World normal (xyz), eye distance (w; 0 = no surface).
+    @location(0) geometry: vec4f,
+    // Eye distance alone, for the trace's march.
+    @location(1) march: vec4f,
+};
+
+@fragment
+fn fs_geometry(@builtin(position) pos: vec4f) -> GeometryOut {
+    let full = vec2i(textureDimensions(normal_tex));
+    let g = textureLoad(normal_tex, min(vec2i(pos.xy) * i32(ssgi.scale), full - 1), 0);
+    var out: GeometryOut;
+    out.geometry = vec4f(0.0);
+    out.march = vec4f(0.0);
+    if (g.w > 0.0) {
+        out.geometry = vec4f(normalize(g.xyz), g.w);
+        out.march = vec4f(g.w);
+    }
+    return out;
+}
+
 // Radiance arriving at `o` along unit `d`: last frame's colour of the first
 // surface the ray passes behind (within THICKNESS), else the sky light.
-// `jitter` in [0, 1) shifts the steps.
-fn trace(o: vec3f, d: vec3f, jitter: f32) -> vec3f {
+// `jitter` in [0, 1) shifts the steps; `full` is the view size.
+fn trace(o: vec3f, d: vec3f, jitter: f32, full: vec2f) -> vec3f {
     if (ssgi.history_valid == 0u) {
         // No usable last frame (new view, cut, SSGI just on).
         return sky_light(d);
     }
-    let size = vec2f(textureDimensions(normal_tex));
+    let last = vec2i(textureDimensions(geometry_cur)) - 1;
+    // The ray in clip space is linear in its length t: o + d t projects
+    // to c0 + cd t (one multiply-add per step instead of a matrix).
+    let c0 = camera.view_proj * vec4f(o, 1.0);
+    let cd = camera.view_proj * vec4f(d, 0.0);
     for (var i = 0u; i < SSGI_STEPS; i++) {
         let f = (f32(i) + jitter + 0.5) / f32(SSGI_STEPS);
-        let s = o + d * (MAX_DISTANCE * f * f);
-        let uv = screen_uv(camera.view_proj, s);
-        if (uv.x < 0.0) {
+        let t = MAX_DISTANCE * f * f;
+        let clip = c0 + cd * t;
+        let uv = clip.xy / clip.w * vec2f(0.5, -0.5) + 0.5;
+        if (clip.w <= 0.0 || any(uv < vec2f(0.0)) || any(uv >= vec2f(1.0))) {
             break;
         }
-        let scene = textureLoad(normal_tex, vec2i(uv * size), 0).w;
+        let s = o + d * t;
+        let scene = textureLoad(march_tex, ssgi_texel(uv, full, last), 0).x;
         let behind = distance(s, camera.eye) - scene;
         // A small margin keeps depth quantisation from hitting the surface
         // the ray starts on.
@@ -110,36 +153,26 @@ fn trace(o: vec3f, d: vec3f, jitter: f32) -> vec3f {
             if (prev.x < 0.0) {
                 break;
             }
-            return textureLoad(prev_hdr, vec2i(prev * size), 0).rgb;
+            return textureLoad(prev_hdr, vec2i(prev * full), 0).rgb;
         }
     }
     return sky_light(d);
 }
 
-struct TraceOut {
-    // Accumulated indirect diffuse (rgb), frames accumulated (a).
-    @location(0) history: vec4f,
-    // World normal (xyz), eye distance (w; 0 = no surface).
-    @location(1) geometry: vec4f,
-};
-
 @fragment
-fn fs_trace(@builtin(position) pos: vec4f) -> TraceOut {
+fn fs_trace(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     let texel = vec2i(pos.xy);
-    let full = vec2i(textureDimensions(normal_tex));
-    let px = min(texel * 2, full - 1);
-    let g = textureLoad(normal_tex, px, 0);
-    var out: TraceOut;
-    out.history = vec4f(0.0);
-    out.geometry = vec4f(0.0);
+    let g = textureLoad(geometry_cur, texel, 0);
     if (g.w <= 0.0) {
-        return out;
+        return vec4f(0.0);
     }
+    let full = vec2i(textureDimensions(depth_tex));
+    let px = min(texel * i32(ssgi.scale), full - 1);
     let size = vec2f(full);
     let ndc = vec2f((f32(px.x) + 0.5) / size.x * 2.0 - 1.0, 1.0 - (f32(px.y) + 0.5) / size.y * 2.0);
     let clip = camera.inv_view_proj * vec4f(ndc, textureLoad(depth_tex, px, 0), 1.0);
     let p = clip.xyz / clip.w;
-    let n = normalize(g.xyz);
+    let n = g.xyz;
     let dist = g.w;
 
     // Cosine-weighted rays: stratified radius, golden-angle spin, both
@@ -157,7 +190,7 @@ fn fs_trace(@builtin(position) pos: vec4f) -> TraceOut {
         let u = (f32(k) + r1) / f32(SSGI_RAYS);
         let phi = 2.0 * PI * fract(f32(k) * 0.618034 + r2);
         let d = (cos(phi) * t + sin(phi) * b) * sqrt(u) + n * sqrt(1.0 - u);
-        sum += trace(o, d, fract(r1 + f32(k) * 0.618034));
+        sum += trace(o, d, fract(r1 + f32(k) * 0.618034), size);
     }
     let sample = sum / f32(SSGI_RAYS);
 
@@ -167,8 +200,7 @@ fn fs_trace(@builtin(position) pos: vec4f) -> TraceOut {
     var count = 0.0;
     let prev = screen_uv(ssgi.prev_view_proj, p);
     if (ssgi.history_valid != 0u && prev.x >= 0.0) {
-        let last = vec2i(textureDimensions(history_prev)) - 1;
-        let q = min(vec2i(floor(prev * size * 0.5 + 0.25)), last);
+        let q = ssgi_texel(prev, size, vec2i(textureDimensions(history_prev)) - 1);
         let pg = textureLoad(geometry_prev, q, 0);
         let expected = distance(p, ssgi.prev_eye);
         if (pg.w > 0.0 && abs(pg.w - expected) < 0.05 * expected && dot(pg.xyz, n) > 0.9) {
@@ -180,9 +212,7 @@ fn fs_trace(@builtin(position) pos: vec4f) -> TraceOut {
     let frames = min(count + 1.0, MAX_HISTORY);
     // Without a last frame the sample is sky only: count it as nothing, so
     // the next frame replaces it.
-    out.history = vec4f(mix(history, sample, 1.0 / frames), select(0.0, frames, ssgi.history_valid != 0u));
-    out.geometry = vec4f(n, dist);
-    return out;
+    return vec4f(mix(history, sample, 1.0 / frames), select(0.0, frames, ssgi.history_valid != 0u));
 }
 
 struct DenoiseOut {
@@ -205,8 +235,8 @@ fn fs_denoise(@builtin(position) pos: vec4f) -> DenoiseOut {
     }
     var sum = vec3f(0.0);
     var weight = 0.0;
-    for (var y = -2; y <= 2; y++) {
-        for (var x = -2; x <= 2; x++) {
+    for (var y = -DENOISE_RADIUS; y <= DENOISE_RADIUS; y++) {
+        for (var x = -DENOISE_RADIUS; x <= DENOISE_RADIUS; x++) {
             let q = clamp(c + vec2i(x, y), vec2i(0), last);
             let g = textureLoad(geometry_tex, q, 0);
             // Other surfaces (silhouettes, creases) are skipped.
