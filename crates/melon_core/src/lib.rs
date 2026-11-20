@@ -15,6 +15,7 @@ pub mod audio;
 pub mod components;
 pub mod hierarchy;
 pub mod input;
+pub mod pack;
 pub mod physics;
 pub mod physics_settings;
 pub mod plugin;
