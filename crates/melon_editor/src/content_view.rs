@@ -30,6 +30,8 @@ enum Action {
     RenameText(String),
     /// Leave the inline rename; `true` commits the text.
     EndRename(bool),
+    /// A model tile is on screen: it wants a thumbnail.
+    WantThumbnail(String),
 }
 
 fn kind_color(kind: AssetKind) -> Color32 {
@@ -119,6 +121,7 @@ fn drop_target(response: &egui::Response, folder: &Path, actions: &mut Vec<Actio
 impl ContentBrowser {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let mut actions = Vec::new();
+        self.thumbnails.begin_frame();
         // Mouse buttons 4 / 5: read input first, test hover outside the closure.
         let (back, forward) = ui.input(|i| {
             (
@@ -214,6 +217,7 @@ impl ContentBrowser {
                 Action::AddFavorite(dir) => self.add_favorite(dir),
                 Action::RemoveFavorite(dir) => self.remove_favorite(&dir),
                 Action::Request(request) => self.request(request),
+                Action::WantThumbnail(path) => self.thumbnails.want(path),
                 Action::StartRename(path) => {
                     self.select(Some(path.clone()));
                     self.start_rename(path);
@@ -478,11 +482,17 @@ impl ContentBrowser {
             .flatten();
         let drag = AssetDrag {
             path: entry.path.clone(),
-            model,
+            model: model.clone(),
         };
         // Not `dnd_drag_source`: its drag-only widget on top hides this
         // item's clicks (egui hit test), so the item senses both itself.
-        let response = self.draw_item(ui, entry);
+        let response = self.draw_item(ui, entry, model.as_deref());
+        if let Some(model) = &model
+            && !self.is_list()
+            && ui.is_rect_visible(response.rect)
+        {
+            actions.push(Action::WantThumbnail(model.clone()));
+        }
         if response.drag_started() {
             egui::DragAndDrop::set_payload(ui.ctx(), drag);
         }
@@ -592,7 +602,13 @@ impl ContentBrowser {
         }
     }
 
-    fn draw_item(&self, ui: &mut egui::Ui, entry: &ContentEntry) -> egui::Response {
+    /// `model`: the project-relative path of a model file (its thumbnail key).
+    fn draw_item(
+        &self,
+        ui: &mut egui::Ui,
+        entry: &ContentEntry,
+        model: Option<&str>,
+    ) -> egui::Response {
         let id = Id::new(("content_item", &entry.path));
         let selected = self.selected() == Some(entry.path.as_path());
         let folder = (!self.search().is_empty())
@@ -683,14 +699,22 @@ impl ContentBrowser {
         } else {
             let icon_rect =
                 egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), rect.width()));
-            let icon_font = egui::FontId::proportional(rect.width() * sizes::TILE_ICON_SCALE);
-            painter.text(
-                icon_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                glyph,
-                icon_font,
-                tint,
-            );
+            match model.and_then(|m| self.thumbnails.texture(m)) {
+                Some(texture) => {
+                    egui::Image::new((texture, icon_rect.size())).paint_at(ui, icon_rect);
+                }
+                None => {
+                    let icon_font =
+                        egui::FontId::proportional(rect.width() * sizes::TILE_ICON_SCALE);
+                    painter.text(
+                        icon_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        glyph,
+                        icon_font,
+                        tint,
+                    );
+                }
+            }
             painter.text(
                 egui::pos2(rect.center().x, rect.bottom() - sizes::TILE_LABEL / 2.0),
                 egui::Align2::CENTER_CENTER,
@@ -1127,6 +1151,22 @@ mod tests {
         let ctx = egui::Context::default();
         frame(&mut browser, &ctx, 0.0, Vec::new());
         assert!(browser.renaming.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tile_view_wants_thumbnails_list_view_does_not() {
+        let dir = temp_dir("thumbs_wanted");
+        std::fs::write(dir.join("a.glb"), b"x").unwrap();
+        std::fs::write(dir.join("notes.md"), b"x").unwrap();
+        let mut browser = ContentBrowser::new(dir.clone());
+        let ctx = egui::Context::default();
+        frame(&mut browser, &ctx, 0.0, Vec::new());
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(browser.thumbnails.wanted(), [format!("{name}/a.glb")]);
+        *browser.tile_size_mut() = crate::theme::sizes::TILE_MIN;
+        frame(&mut browser, &ctx, 0.1, Vec::new());
+        assert!(browser.thumbnails.wanted().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

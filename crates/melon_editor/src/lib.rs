@@ -29,6 +29,7 @@ pub mod play;
 pub mod project_settings;
 pub mod scene;
 pub mod theme;
+pub mod thumbnails;
 mod toolbar_icon;
 use toolbar_icon::ToolbarIcon;
 pub mod viewport;
@@ -707,6 +708,22 @@ impl Editor {
                 false
             }
         }
+    }
+
+    /// The next model thumbnail to render (at most one per frame; the host
+    /// calls this after `end_frame`).
+    pub fn thumbnail_request(&mut self, world: &mut World) -> Option<thumbnails::ThumbnailRequest> {
+        let mut server = world.get_resource_mut::<AssetServer>()?;
+        self.content.thumbnails.request(&mut server)
+    }
+
+    /// The host rendered (`Some`) or could not render (`None`) `request`.
+    pub fn thumbnail_done(
+        &mut self,
+        request: &thumbnails::ThumbnailRequest,
+        id: Option<egui::TextureId>,
+    ) {
+        self.content.thumbnails.finish(request, id);
     }
 
     /// Run the file operations the Content Browser asked for this frame.
@@ -1960,6 +1977,30 @@ impl EditorOverlay {
 
     /// Show `target`'s colour texture in the viewport panel. Call again after
     /// the target is recreated (resize).
+    /// Give egui a thumbnail view: updates `existing`, or registers a new
+    /// texture. Returns its id.
+    pub fn register_thumbnail(
+        &mut self,
+        device: &wgpu::Device,
+        view: &wgpu::TextureView,
+        existing: Option<egui::TextureId>,
+    ) -> egui::TextureId {
+        match existing {
+            Some(id) => {
+                self.renderer.update_egui_texture_from_wgpu_texture(
+                    device,
+                    view,
+                    wgpu::FilterMode::Linear,
+                    id,
+                );
+                id
+            }
+            None => self
+                .renderer
+                .register_native_texture(device, view, wgpu::FilterMode::Linear),
+        }
+    }
+
     pub fn set_viewport_target(
         &mut self,
         device: &wgpu::Device,

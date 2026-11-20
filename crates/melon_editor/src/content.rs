@@ -313,6 +313,8 @@ pub struct ContentBrowser {
     pub(crate) pinged: Option<(PathBuf, Option<f64>)>,
     /// Scroll the pinged item into view this frame.
     pub(crate) ping_scroll: bool,
+    /// Model tile thumbnails (rendered by the host, one per frame).
+    pub(crate) thumbnails: crate::thumbnails::Thumbnails,
 }
 
 impl ContentBrowser {
@@ -339,6 +341,7 @@ impl ContentBrowser {
             blocked: false,
             pinged: None,
             ping_scroll: false,
+            thumbnails: crate::thumbnails::Thumbnails::default(),
         };
         browser.refresh();
         browser
