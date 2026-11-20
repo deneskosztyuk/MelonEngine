@@ -100,7 +100,7 @@ impl Camera {
     }
 }
 
-#[derive(Resource, Debug, Clone, Copy)]
+#[derive(Resource, Debug, Clone, Copy, PartialEq)]
 pub struct Light {
     /// Direction the light travels (from the light into the scene).
     pub direction: Vec3,

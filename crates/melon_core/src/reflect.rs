@@ -193,6 +193,7 @@ mod tests {
                 "Mesh Materials",
                 "Point Light",
                 "Rigid Body",
+                "Scene Lighting",
                 "Spin",
                 "Spot Light",
                 "Transform"

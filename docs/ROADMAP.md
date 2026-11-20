@@ -137,7 +137,8 @@ Status marks:
 
 - 🟡 Post-processing: bloom, SSAO, ACES; no exposure control (auto or
   manual). The default look is hazy (bright horizon colour, fog 0.01,
-  ambient 0.2); worth a look-pass with exposure.
+  ambient 0.2); scenes can now set their own sun, sky and fog with
+  `SceneLighting` (the Sich demo uses a golden-hour setup).
 - 🟡 Blended materials cast no shadows and take AO from the surface behind
   them; an HDR sky feeds GI misses as a two-colour approximation.
 - 🟡 Local shadows: more than 512 casters in one shadow tile drop the rest;
@@ -159,8 +160,9 @@ Status marks:
 
 ### Tooling & Agent-friendliness
 
-- 🟡 Headless runner + screenshot capture: the render `snapshot` example and
-  the player's `--frames N` exist; no general headless run of a scene file.
+- 🟡 Headless runner + screenshot capture: the render `snapshot` example
+  renders review scenes or any scene file (`--scene`, `--eye`, `--look`),
+  and the player has `--frames N`; no simulation before the capture.
 
 ## Not done
 

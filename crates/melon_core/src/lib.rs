@@ -30,6 +30,7 @@ pub mod reflect;
 pub mod resources;
 mod ron_file;
 pub mod scene;
+pub mod scene_lighting;
 pub mod stages;
 
 pub use actions::{
@@ -74,6 +75,7 @@ pub use reflect::{
 };
 pub use resources::{Camera, Environment, Light, NameCounter, SimulationState, Time};
 pub use scene::{KeepOnSceneLoad, SceneRequests};
+pub use scene_lighting::SceneLighting;
 pub use stages::{FixedPostUpdate, FixedUpdate, PhysicsStep, PostUpdate, PreUpdate, Update};
 
 /// What a game crate needs to define and register components:
@@ -198,6 +200,7 @@ impl Core {
             (
                 clear_input_frame_system,
                 hierarchy::propagate_transforms_system,
+                scene_lighting::scene_lighting_system,
             ),
         );
         core.add_systems(Update, assets::hot_reload_system);
@@ -214,7 +217,8 @@ impl Core {
             .register_component::<MeshMaterials>()
             .register_component::<PointLight>()
             .register_component::<SpotLight>()
-            .register_component::<Lod>();
+            .register_component::<Lod>()
+            .register_component::<SceneLighting>();
         core
     }
 

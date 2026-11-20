@@ -854,6 +854,14 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   underside, level with the floor, and with the bias light leaks along
   every contact seam (`no_light_leak_at_contact`). Back faces alone without
   the normal offset bring acne on lit faces (`lit_floor_has_no_acne`).
+- **Scene lighting.** `melon_core::SceneLighting` is a registered component
+  (saved in scenes, edited in the Inspector): sun elevation / azimuth in
+  degrees, sun colour, ambient split, sky / ground ambient, zenith /
+  horizon colours, fog, bloom. While an entity carries one,
+  `scene_lighting_system` (PostUpdate) writes it into `Light` and
+  `Environment` (only on change; AO, GI and the sky texture are kept);
+  when it goes, both return to their defaults. `SceneLighting::default()`
+  equals today's defaults. Scenes without one look as before.
 - **Environment.** Optional `melon_core::Environment` resource (default when
   absent, not registered in `Core::new`): procedural sky (`zenith_color`,
   `horizon_color`) and exponential distance fog (`fog_density`). The fog
@@ -864,7 +872,10 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
 - **Camera conventions.** Right-handed, DirectX depth (near = 0, far = 1).
   Screen helpers take logical points.
 - **Checking rendering.** Agents verify rendering with the snapshot example
-  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd|cornell|lights|alpha] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only] [--ssgi-res half|quarter] [--size WxH] [--no-lights]`;
+  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd|cornell|lights|alpha] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only] [--ssgi-res half|quarter] [--size WxH] [--no-lights] [--scene <file.ron> --eye x,y,z --look x,y,z] [--fog <density>]`;
+  `--scene` renders a scene file through `Core::update` and `extract` (its
+  `SceneLighting` included) from the given camera; quote a leading minus,
+  e.g. `--eye " -26,22,26"`;
   `--quality` starts from that `RenderQuality` preset (default high), the
   other flags override it; `--ao-only` saves the SSAO term as a grey
   image; `--no-ao` turns `RenderQuality::ao` off; `--no-shadow` moves scene

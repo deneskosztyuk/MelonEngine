@@ -20,6 +20,9 @@
 // --gi-only saves the indirect diffuse term of that mode alone (bloom off);
 // --ssgi-res half|quarter picks `RenderQuality::ssgi_resolution`;
 // --size WxH renders at that size (default 1280x720).
+// --scene <file.ron> renders a scene file instead of the review scene, seen
+// from --eye x,y,z toward --look x,y,z (the view name is then only a label).
+// --fog <density> overrides Environment::fog_density.
 // After the timed frames it also prints the GPU pass timings (`RenderTimings`).
 
 use std::sync::Arc;
@@ -333,6 +336,20 @@ fn ssgi_resolution(name: Option<&str>) -> Result<SsgiResolution> {
     }
 }
 
+/// A point named as `x,y,z` (for `--eye` / `--look`).
+fn vec3(text: Option<&str>) -> Result<Vec3> {
+    let parts: Vec<f32> = text
+        .unwrap_or_default()
+        .split(',')
+        .map(|p| p.trim().parse::<f32>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| anyhow::anyhow!("expected x,y,z, got {text:?}"))?;
+    match parts[..] {
+        [x, y, z] => Ok(Vec3::new(x, y, z)),
+        _ => bail!("expected x,y,z, got {text:?}"),
+    }
+}
+
 /// The image size named by `--size WxH`.
 fn image_size(text: Option<&str>) -> Result<(u32, u32)> {
     let parsed = text.and_then(|t| {
@@ -361,9 +378,16 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
     let mut preset = QualityPreset::High;
     let mut size = SIZE;
     let mut ssgi_res = None;
+    let mut scene = None;
+    let mut eye_look = (None, None);
+    let mut fog = None;
     let mut args = flags.iter();
     while let Some(flag) = args.next() {
-        const FLAGS: [&str; 12] = [
+        const FLAGS: [&str; 16] = [
+            "--fog",
+            "--scene",
+            "--eye",
+            "--look",
             "--no-lights",
             "--quality",
             "--ao-only",
@@ -383,6 +407,16 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
             "--no-gi" => gi = Some(GiMode::Off),
             "--size" => size = image_size(args.next().map(String::as_str))?,
             "--ssgi-res" => ssgi_res = Some(ssgi_resolution(args.next().map(String::as_str))?),
+            "--fog" => {
+                fog = Some(
+                    args.next()
+                        .and_then(|t| t.parse::<f32>().ok())
+                        .context("--fog needs a density, for example 0.002")?,
+                )
+            }
+            "--scene" => scene = Some(args.next().context("--scene needs a file")?.clone()),
+            "--eye" => eye_look.0 = Some(vec3(args.next().map(String::as_str))?),
+            "--look" => eye_look.1 = Some(vec3(args.next().map(String::as_str))?),
             f if FLAGS.contains(&f) => {}
             _ => bail!("unknown flag {flag:?}; expected one of {FLAGS:?}"),
         }
@@ -395,7 +429,15 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
     } else {
         Vec3::ZERO
     };
-    let mut camera = camera(view)?;
+    let mut camera = match (&scene, eye_look) {
+        (Some(_), (Some(eye), Some(center))) => Camera {
+            eye,
+            center,
+            ..Camera::default()
+        },
+        (Some(_), _) => bail!("--scene needs --eye x,y,z and --look x,y,z"),
+        (None, _) => camera(view)?,
+    };
     camera.eye += offset;
     camera.center += offset;
     camera.aspect = size.0 as f32 / size.1 as f32;
@@ -419,6 +461,7 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
             } else {
                 Environment::default().bloom_intensity
             },
+            fog_density: fog.unwrap_or(Environment::default().fog_density),
             ..Default::default()
         },
         quality,
@@ -426,6 +469,33 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
         overrides: Default::default(),
         lights: Default::default(),
     };
+    if let Some(path) = &scene {
+        // The scene's entities, lights, material overrides and SceneLighting
+        // through the engine's own update and extraction; camera and quality
+        // stay as set above, and --fog still overrides the fog.
+        let mut core = melon_core::Core::new();
+        let root = server.root().to_path_buf();
+        core.world.insert_resource(std::mem::replace(
+            &mut server,
+            AssetServer::new(root.clone()),
+        ));
+        melon_core::scene::load_scene(&mut core.world, &root.join(path))?;
+        core.update();
+        let extracted = melon_render::extract(&mut core.world);
+        frame = FrameData {
+            view_proj: frame.view_proj,
+            eye: frame.eye,
+            quality: frame.quality,
+            ..extracted
+        };
+        if let Some(fog) = fog {
+            frame.environment.fog_density = fog;
+        }
+        server = core
+            .world
+            .remove_resource::<AssetServer>()
+            .context("scene world lost its AssetServer")?;
+    }
     if view == "crowd" {
         frame.models.extend(crowd(&mut server));
     }
