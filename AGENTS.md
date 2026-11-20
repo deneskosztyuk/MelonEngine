@@ -70,7 +70,7 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   `config/quality.ron` (loaded by the host), named profiles as
   `config/quality_profiles/<name>.ron`; edited in Edit ▸ Project Settings ▸
   Quality, pending until Apply. `extract` copies it into
-  `FrameData::quality`. Live, per frame: `gi_mode`, `ao`, `bloom` (a pass
+  `FrameData::quality`. Live, per frame: `gi_mode`, `ssgi_resolution`, `ao`, `bloom` (a pass
   runs only if the quality turns it on AND its `Environment` strength is
   above 0). Rebuilt in `render_scene` before the frame that uses them:
   `shadow_map_size` (`set_shadow_map_size`: shadow texture, frame bind
@@ -84,8 +84,10 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   kept, so switching back is instant. At 1 sample the 3D pass draws
   straight into the resolved HDR texture (`HdrTarget::resolve_target`
   `None`). `present` is applied by the host (`Renderer::set_present`).
-  A view's SSGI textures exist only while it runs SSGI
-  (`match_gi_view` creates or drops them and rebuilds its group 3); DDGI
+  A view's SSGI textures exist only while it runs SSGI, at
+  `ssgi_resolution` (live; `match_gi_view` creates, recreates on a
+  resolution change, which resets the history, or drops them and
+  rebuilds its group 3); DDGI
   world resources stay allocated (bound in every group 3).
 - **GPU timings (`timings.rs`).** When the adapter has `TIMESTAMP_QUERY` +
   `TIMESTAMP_QUERY_INSIDE_ENCODERS` (requested only then), `render_scene`
@@ -123,8 +125,12 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   when you touch WGSL.
 - **Diagnosing stutter.** `$env:MELON_FRAME_STATS=1` makes the host print one
   stderr line every 2 s: FPS, average and worst frame interval, the worst
-  frame's stages (update, acquire, editor, render, submit, other = events and
-  waiting) and window/device events per frame. Off, it reads no clock.
+  frame's stages (update, acquire, editor, render, submit), its `events`
+  (time inside winit callbacks other than `RedrawRequested`), `sleep` (the
+  measured frame cap sleep, at most one period unless the OS oversleeps)
+  and `other` (the rest: outside every callback, in winit and the OS),
+  then `gpu` (the averaged `RenderTimings::total`; above the budget means
+  GPU-bound) and window/device events per frame. Off, it reads no clock.
   Redirect stderr to a file (`2> stats.txt`): a pipe filter can block it. Nothing in the engine runs on
   a 0.5 s beat except the asset poll, one `fs::metadata` per file-backed
   asset (built-ins skipped).
@@ -272,17 +278,23 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   a branch in `indirect_diffuse`. Misses read `sky_light`
   (`gi_common.wgsl`) in every backend.
 - **SSGI (`gi/ssgi.rs`, `ssgi.wgsl`, `gi_ssgi.wgsl`).** After the
-  prepass, two fullscreen passes at half resolution (`half_size`, rounded
-  up): `fs_trace` takes full pixel 2i of each texel, 6 cosine-weighted
-  rays (interleaved-gradient noise, new every frame) of 12 quadratic steps
-  up to 4 m; a sample hits when it is 1% to 0.5 m (`THICKNESS`) behind the
-  prepass eye distance there, and reads last frame's resolved HDR colour
+  prepass, three fullscreen passes at `RenderQuality::ssgi_resolution`
+  (`Half` = 2, `Quarter` = 4 pixels per texel, `ssgi_size`, rounded up;
+  `SsgiUniform::scale`): `fs_geometry` copies full pixel scale * i's
+  normal and eye distance into the texel, plus an `R16Float` eye distance
+  the trace marches (the march is bandwidth-bound: marching the
+  full-resolution `Rgba16Float` prepass cost about 2x); `fs_trace`
+  shoots 6 cosine-weighted rays (interleaved-gradient noise, new every
+  frame) of 12 quadratic steps up to 4 m, stepped in clip space; a
+  sample hits when it is 1% to 0.5 m (`THICKNESS`) behind that eye
+  distance at the nearest texel, and reads last frame's resolved HDR colour
   where the hit point was last frame (the view's HDR target, read before
   the 3D pass overwrites it, so no copy; `prev_view_proj` per view); a
   miss or a hit off last frame's screen reads `sky_light`. The mean blends
   into the reprojected history (nearest texel; kept if eye distance is
   within 5% and normal within ~25 degrees, up to 32 frames), ping-ponged
-  with the texel's normal and eye distance. `fs_denoise`: 5x5 blur over
+  with the texel's normal and eye distance. `fs_denoise`: 5x5 (half) or
+  3x3 (quarter; `DENOISE_RADIUS` override, one pipeline each) blur over
   same-surface texels into the output + its geometry. The mesh shader
   (`ssgi_diffuse`) blends the 4 nearest texels that saw its surface
   (bilinear; eye distance within 10%, geometric normal within ~25
@@ -294,9 +306,14 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   Limits: screen space only, so light from anything off screen or hidden
   disappears (a wall leaving the view stops bouncing); one frame of lag
   on moving lights; occluders are assumed 0.5 m thick (thin objects can
-  shade too much, light leaks behind thick ones); half-resolution
-  silhouettes and creases fall back to the hemisphere. About +0.5 to
-  0.9 ms on the dev GPU with AO on (prepass shared; DDGI +2.2).
+  shade too much, light leaks behind thick ones); reduced-resolution
+  silhouettes and creases fall back to the hemisphere. Cost knobs:
+  resolution (quarter is about a quarter of half), rays and steps (fewer
+  steps darkened corners measurably; 4 rays cut 30% more but are noisier
+  in motion, so both stay). At 2880x1659 on the dev GPU (Radeon 8050S,
+  min of runs): GI pass about 1.5 to 2.4 ms at half, 0.35 to 0.55 ms at
+  quarter, plus about 0.1 to 0.15 ms of mesh-side upsample in the 3D pass
+  (prepass shared with AO). Medium uses quarter, High/Max half.
 - **DDGI (`gi/ddgi.rs`, `ddgi_common.wgsl`, `ddgi_update.wgsl`,
   `gi_ddgi.wgsl`).** Per `render_scene` in mode `Ddgi`, after the shadow
   pass:
@@ -363,7 +380,7 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 - **Camera conventions.** Right-handed, DirectX depth (near = 0, far = 1).
   Screen helpers take logical points.
 - **Checking rendering.** Agents verify rendering with the snapshot example
-  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only]`;
+  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only] [--ssgi-res half|quarter] [--size WxH]`;
   `--quality` starts from that `RenderQuality` preset (default high), the
   other flags override it; `--ao-only` saves the SSAO term as a grey
   image; `--no-ao` turns `RenderQuality::ao` off; `--no-shadow` moves scene

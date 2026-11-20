@@ -16,8 +16,8 @@ Place game assets here.
   - `ddgi_common.wgsl` — DDGI declarations (`GiUniform`, constants, probe helpers) prepended to `mesh.wgsl` and `ddgi_update.wgsl`.
   - `ddgi_update.wgsl` — DDGI probe update: one compute workgroup per probe traces 64 rays through the voxel volume (3D DDA, the hemisphere sky light on a miss) and blends them into its irradiance and distance-moment atlas tiles.
   - `gi_ddgi.wgsl` — DDGI shading for `mesh.wgsl` (group 3 bindings 1 to 5): the 8 surrounding probes with trilinear, backface, Chebyshev and voxel-march visibility (`ddgi_diffuse`).
-  - `gi_ssgi.wgsl` — SSGI shading for `mesh.wgsl` (group 3 bindings 6 to 8): geometry-aware bilinear upsample of the view's half-resolution SSGI output (`ssgi_diffuse`).
-  - `ssgi.wgsl` — SSGI passes at half resolution: `fs_trace` (cosine rays marching the prepass, hits read last frame's HDR colour, temporal accumulation with reprojection) and `fs_denoise` (5x5 depth/normal-aware blur).
+  - `gi_ssgi.wgsl` — SSGI shading for `mesh.wgsl` (group 3 bindings 6 to 8): geometry-aware bilinear upsample of the view's half- or quarter-resolution SSGI output (`ssgi_diffuse`).
+  - `ssgi.wgsl` — SSGI passes at half or quarter resolution: `fs_geometry` (the texels' normal and eye distance, plus an `R16Float` distance to march), `fs_trace` (cosine rays marching those distances, hits read last frame's HDR colour, temporal accumulation with reprojection) and `fs_denoise` (5x5 or 3x3 depth/normal-aware blur, `DENOISE_RADIUS` override).
   - `prepass.wgsl` — depth/normal prepass for SSAO and SSGI: every mesh single-sample, writes the world normal and eye distance (`Rgba16Float`) plus depth.
   - `ssao.wgsl` — fullscreen SSAO (`fs_ssao`: 16 hemisphere samples, range check, 4x4 rotation pattern) and its 4x4 depth-aware blur (`fs_blur`), into `R8Unorm` AO textures read by `mesh.wgsl` group 3.
   - `shadow.wgsl` — depth-only pass that renders every mesh from the sun into the 2048x2048 shadow map.

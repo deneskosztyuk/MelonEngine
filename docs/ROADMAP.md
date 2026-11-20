@@ -156,6 +156,12 @@ Goal: an editor that looks and works like Unity / Unreal / Godot.
       ring, 1 s averages into `RenderTimings` (Quality panel cost bar).
 - [x] Frame cap sleeps at the frame start instead of `WaitUntil` (drag
       stutter with Mailbox).
+- [x] SSGI at editor size: `RenderQuality::ssgi_resolution` (Half / Quarter,
+      Medium = Quarter), geometry pass + `R16Float` march texture; at
+      2880x1659 GI 3.6-5.8 ms -> 1.5-2.4 (half), 0.35-0.55 (quarter).
+      `MELON_FRAME_STATS` splits `other` into events / sleep / rest and
+      prints the GPU total; snapshot `--size WxH`, `--ssgi-res`.
+- [ ] Find the 100-330 ms SSGI stalls from a run with the split stats.
 
 - [ ] Undo / Redo (command history), rename, duplicate.
 - [ ] Game view (game camera) next to the Scene view.
