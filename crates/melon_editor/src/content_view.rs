@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use egui::{Color32, Id, PointerButton, RichText, Sense};
 
 use crate::content::{
-    AssetDrag, AssetKind, ContentBrowser, ContentEntry, format_size, is_model_path, list_dir,
+    AssetDrag, AssetKind, BrowserRequest, ContentBrowser, ContentEntry, format_size, is_model_path,
+    list_dir,
 };
 use crate::theme::{colors, sizes};
 
@@ -24,6 +25,11 @@ enum Action {
     ToggleKind(AssetKind),
     AddFavorite(PathBuf),
     RemoveFavorite(PathBuf),
+    Request(BrowserRequest),
+    StartRename(PathBuf),
+    RenameText(String),
+    /// Leave the inline rename; `true` commits the text.
+    EndRename(bool),
 }
 
 fn kind_color(kind: AssetKind) -> Color32 {
@@ -85,6 +91,31 @@ fn id_label(
     response
 }
 
+/// New Folder / Show in Explorer for a folder (right-click on a tree row
+/// or on empty space).
+fn folder_menu(ui: &mut egui::Ui, dir: &Path, actions: &mut Vec<Action>) {
+    if ui.button("New Folder").clicked() {
+        actions.push(Action::Request(BrowserRequest::NewFolder(
+            dir.to_path_buf(),
+        )));
+    }
+    if ui.button("Show in Explorer").clicked() {
+        actions.push(Action::Request(BrowserRequest::Reveal(dir.to_path_buf())));
+    }
+}
+
+/// A browser item released over `folder` moves into it.
+fn drop_target(response: &egui::Response, folder: &Path, actions: &mut Vec<Action>) {
+    if let Some(drag) = response.dnd_release_payload::<AssetDrag>()
+        && drag.path != folder
+    {
+        actions.push(Action::Request(BrowserRequest::Move(
+            drag.path.clone(),
+            folder.to_path_buf(),
+        )));
+    }
+}
+
 impl ContentBrowser {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let mut actions = Vec::new();
@@ -103,6 +134,13 @@ impl ContentBrowser {
                 actions.push(Action::Forward);
             }
         }
+        // Focus follows the last press: inside the browser or not.
+        let (pressed, press_pos) =
+            ui.input(|i| (i.pointer.any_pressed(), i.pointer.interact_pos()));
+        if pressed {
+            self.focused = press_pos.is_some_and(|p| ui.max_rect().contains(p));
+        }
+        self.shortcut_keys(ui, &mut actions);
 
         self.toolbar(ui, &mut actions);
         ui.separator();
@@ -125,6 +163,17 @@ impl ContentBrowser {
         if resizing {
             self.tree_width = panel.response.rect.width();
         }
+        // Empty space behind the items: right-click menu, click clears the selection.
+        let background = ui.interact(
+            ui.available_rect_before_wrap(),
+            Id::new("content_items_background"),
+            Sense::click(),
+        );
+        if background.clicked() {
+            self.select(None);
+        }
+        let current = self.current().to_path_buf();
+        background.context_menu(|ui| folder_menu(ui, &current, &mut actions));
         egui::ScrollArea::vertical()
             .id_salt("content_items")
             .auto_shrink(false)
@@ -142,7 +191,64 @@ impl ContentBrowser {
                 Action::ToggleKind(kind) => self.toggle_kind(kind),
                 Action::AddFavorite(dir) => self.add_favorite(dir),
                 Action::RemoveFavorite(dir) => self.remove_favorite(&dir),
+                Action::Request(request) => self.request(request),
+                Action::StartRename(path) => {
+                    self.select(Some(path.clone()));
+                    self.start_rename(path);
+                }
+                Action::RenameText(text) => {
+                    if let Some(renaming) = &mut self.renaming {
+                        renaming.text = text;
+                        renaming.fresh = false;
+                    }
+                }
+                Action::EndRename(commit) => {
+                    if let Some(renaming) = self.renaming.take()
+                        && commit
+                        && renaming
+                            .path
+                            .file_name()
+                            .is_some_and(|n| *n != *renaming.text)
+                    {
+                        self.request(BrowserRequest::Rename(renaming.path, renaming.text));
+                    }
+                }
             }
+        }
+    }
+
+    /// F2 / Ctrl+D / Delete / Enter on the selection, only while the browser
+    /// has focus and no text field is being typed in.
+    fn shortcut_keys(&self, ui: &egui::Ui, actions: &mut Vec<Action>) {
+        if !self.focused || self.renaming.is_some() || ui.ctx().text_edit_focused() {
+            return;
+        }
+        let Some(selected) = self.selected().map(Path::to_path_buf) else {
+            return;
+        };
+        let (rename, duplicate, delete, open) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::F2),
+                i.modifiers.command && i.key_pressed(egui::Key::D),
+                i.key_pressed(egui::Key::Delete),
+                i.key_pressed(egui::Key::Enter),
+            )
+        });
+        if rename {
+            actions.push(Action::StartRename(selected.clone()));
+        }
+        if duplicate {
+            actions.push(Action::Request(BrowserRequest::Duplicate(selected.clone())));
+        }
+        if delete {
+            actions.push(Action::Request(BrowserRequest::AskDelete(selected.clone())));
+        }
+        if open {
+            actions.push(if selected.is_dir() {
+                Action::Open(selected)
+            } else {
+                Action::Request(BrowserRequest::Open(selected))
+            });
         }
     }
 
@@ -295,6 +401,7 @@ impl ContentBrowser {
             if row.clicked() {
                 actions.push(Action::Open(dir.to_path_buf()));
             }
+            drop_target(&row, dir, actions);
             let favorite = self.favorites().iter().any(|f| f == dir);
             row.context_menu(|ui| {
                 if favorite {
@@ -304,6 +411,8 @@ impl ContentBrowser {
                 } else if ui.button("Add to Favorites").clicked() {
                     actions.push(Action::AddFavorite(dir.to_path_buf()));
                 }
+                ui.separator();
+                folder_menu(ui, dir, actions);
             });
         });
         ui.data_mut(|d| d.insert_temp(open_id, open));
@@ -356,11 +465,106 @@ impl ContentBrowser {
         if response.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
         }
-        if response.clicked() {
+        if response.clicked() || response.secondary_clicked() {
             actions.push(Action::Select(entry.path.clone()));
         }
-        if response.double_clicked() && entry.is_dir {
-            actions.push(Action::Open(entry.path.clone()));
+        if response.double_clicked() {
+            actions.push(if entry.is_dir {
+                Action::Open(entry.path.clone())
+            } else {
+                Action::Request(BrowserRequest::Open(entry.path.clone()))
+            });
+        }
+        if entry.is_dir {
+            drop_target(&response, &entry.path, actions);
+        }
+        let path = &entry.path;
+        response.context_menu(|ui| {
+            if ui.button("Open").clicked() {
+                actions.push(if entry.is_dir {
+                    Action::Open(path.clone())
+                } else {
+                    Action::Request(BrowserRequest::Open(path.clone()))
+                });
+            }
+            if ui
+                .add(egui::Button::new("Rename").shortcut_text("F2"))
+                .clicked()
+            {
+                actions.push(Action::StartRename(path.clone()));
+            }
+            if ui
+                .add(egui::Button::new("Duplicate").shortcut_text("Ctrl+D"))
+                .clicked()
+            {
+                actions.push(Action::Request(BrowserRequest::Duplicate(path.clone())));
+            }
+            if ui
+                .add(egui::Button::new("Delete").shortcut_text("Del"))
+                .clicked()
+            {
+                actions.push(Action::Request(BrowserRequest::AskDelete(path.clone())));
+            }
+            ui.separator();
+            if ui.button("Show in Explorer").clicked() {
+                actions.push(Action::Request(BrowserRequest::Reveal(path.clone())));
+            }
+        });
+        self.rename_field(ui, entry, &response, actions);
+    }
+
+    /// The inline rename text field over the item's name.
+    fn rename_field(
+        &self,
+        ui: &mut egui::Ui,
+        entry: &ContentEntry,
+        item: &egui::Response,
+        actions: &mut Vec<Action>,
+    ) {
+        let Some(renaming) = self.renaming.as_ref().filter(|r| r.path == entry.path) else {
+            return;
+        };
+        let rect = if self.is_list() {
+            item.rect
+        } else {
+            egui::Rect::from_min_max(
+                egui::pos2(item.rect.left(), item.rect.bottom() - sizes::TILE_LABEL),
+                item.rect.max,
+            )
+        };
+        let id = Id::new("content_rename");
+        let mut text = renaming.text.clone();
+        let edit = ui.put(rect, egui::TextEdit::singleline(&mut text).id(id));
+        if renaming.fresh {
+            edit.request_focus();
+            // Select the name without its extension, as Explorer does.
+            let stem = Path::new(&renaming.text)
+                .file_stem()
+                .map_or(0, |s| s.to_string_lossy().chars().count());
+            let stem = if entry.is_dir {
+                text.chars().count()
+            } else {
+                stem
+            };
+            if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(0),
+                        egui::text::CCursor::new(stem),
+                    )));
+                state.store(ui.ctx(), id);
+            }
+            actions.push(Action::RenameText(text));
+            return;
+        }
+        if edit.changed() {
+            actions.push(Action::RenameText(text.clone()));
+        }
+        if edit.lost_focus() {
+            let cancelled = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            actions.push(Action::RenameText(text));
+            actions.push(Action::EndRename(!cancelled));
         }
     }
 
@@ -384,7 +588,11 @@ impl ContentBrowser {
         };
         let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
         let response = ui.interact(rect, id, Sense::click_and_drag());
-        let fill = if selected {
+        let drop_here = entry.is_dir
+            && response.contains_pointer()
+            && egui::DragAndDrop::payload::<AssetDrag>(ui.ctx())
+                .is_some_and(|drag| drag.path != entry.path);
+        let fill = if selected || drop_here {
             colors::ACCENT_SOFT
         } else if response.hovered() {
             colors::SURFACE_RAISED
@@ -465,7 +673,7 @@ impl ContentBrowser {
 
 #[cfg(test)]
 mod tests {
-    use crate::content::ContentBrowser;
+    use crate::content::{AssetDrag, BrowserRequest, ContentBrowser};
     use std::path::PathBuf;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -671,6 +879,155 @@ mod tests {
             click(pos, egui::PointerButton::Primary),
         );
         assert_eq!(browser.selected(), Some(model.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn key(key: egui::Key) -> Vec<egui::Event> {
+        let event = |pressed| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        vec![event(true), event(false)]
+    }
+
+    /// A browser on `dir` with `a.glb` selected by a click (which also
+    /// gives it focus). Returns the context and the time of the last frame.
+    fn focused_on_a(dir: &std::path::Path) -> (ContentBrowser, egui::Context, f64) {
+        std::fs::write(dir.join("a.glb"), b"x").unwrap();
+        let mut browser = ContentBrowser::new(dir.to_path_buf());
+        let ctx = egui::Context::default();
+        frame(&mut browser, &ctx, 0.0, Vec::new());
+        let pos = center(&ctx, egui::Id::new(("content_item", dir.join("a.glb"))));
+        frame(
+            &mut browser,
+            &ctx,
+            0.1,
+            click(pos, egui::PointerButton::Primary),
+        );
+        (browser, ctx, 0.1)
+    }
+
+    #[test]
+    fn f2_starts_rename_and_enter_requests_it() {
+        let dir = temp_dir("rename_keys");
+        let (mut browser, ctx, mut t) = focused_on_a(&dir);
+        let mut step = |browser: &mut ContentBrowser, events| {
+            t += 0.1;
+            frame(browser, &ctx, t, events);
+        };
+        step(&mut browser, key(egui::Key::F2));
+        step(&mut browser, Vec::new());
+        step(&mut browser, vec![egui::Event::Text("b".into())]);
+        step(&mut browser, key(egui::Key::Enter));
+        assert_eq!(
+            browser.take_requests(),
+            [BrowserRequest::Rename(dir.join("a.glb"), "b.glb".into())]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn escape_cancels_rename() {
+        let dir = temp_dir("rename_esc");
+        let (mut browser, ctx, t) = focused_on_a(&dir);
+        frame(&mut browser, &ctx, t + 0.1, key(egui::Key::F2));
+        frame(&mut browser, &ctx, t + 0.2, Vec::new());
+        frame(
+            &mut browser,
+            &ctx,
+            t + 0.3,
+            vec![egui::Event::Text("b".into())],
+        );
+        frame(&mut browser, &ctx, t + 0.4, key(egui::Key::Escape));
+        frame(&mut browser, &ctx, t + 0.5, Vec::new());
+        assert!(browser.take_requests().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_and_duplicate_keys_need_focus() {
+        let dir = temp_dir("keys_focus");
+        let (mut browser, ctx, t) = focused_on_a(&dir);
+        frame(&mut browser, &ctx, t + 0.1, key(egui::Key::Delete));
+        assert_eq!(
+            browser.take_requests(),
+            [BrowserRequest::AskDelete(dir.join("a.glb"))]
+        );
+        // Draw the browser in the left half only, so the right half is outside it.
+        let half_frame = |browser: &mut ContentBrowser, time: f64, events| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 500.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                let half = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(450.0, 500.0));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(half), |ui| browser.ui(ui));
+            });
+        };
+        half_frame(
+            &mut browser,
+            t + 0.4,
+            click(egui::pos2(700.0, 300.0), egui::PointerButton::Primary),
+        );
+        assert!(!browser.has_focus());
+        half_frame(&mut browser, t + 0.5, key(egui::Key::Delete));
+        let mut ctrl_d = key(egui::Key::D);
+        for event in &mut ctrl_d {
+            if let egui::Event::Key { modifiers, .. } = event {
+                *modifiers = egui::Modifiers::COMMAND;
+            }
+        }
+        half_frame(&mut browser, t + 0.6, ctrl_d);
+        assert!(browser.take_requests().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dropping_an_item_on_a_folder_requests_a_move() {
+        let dir = temp_dir("drop_move");
+        std::fs::create_dir_all(dir.join("c")).unwrap();
+        std::fs::write(dir.join("x.glb"), b"x").unwrap();
+        let mut browser = ContentBrowser::new(dir.clone());
+        let ctx = egui::Context::default();
+        frame(&mut browser, &ctx, 0.0, Vec::new());
+        let pos = center(&ctx, egui::Id::new(("content_item", dir.join("c"))));
+        frame(
+            &mut browser,
+            &ctx,
+            0.1,
+            vec![egui::Event::PointerMoved(pos)],
+        );
+        egui::DragAndDrop::set_payload(
+            &ctx,
+            AssetDrag {
+                path: dir.join("x.glb"),
+                model: Some("assets/x.glb".into()),
+            },
+        );
+        let release = egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(
+            &mut browser,
+            &ctx,
+            0.2,
+            vec![egui::Event::PointerMoved(pos), release],
+        );
+        assert_eq!(
+            browser.take_requests(),
+            [BrowserRequest::Move(dir.join("x.glb"), dir.join("c"))]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

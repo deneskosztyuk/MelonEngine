@@ -100,6 +100,34 @@ pub fn list_dir(path: &Path) -> Vec<ContentEntry> {
     entries
 }
 
+/// A file operation the browser asks the editor to run (the editor owns
+/// the `AssetServer`, the confirm dialogs and the status bar).
+#[derive(Clone, Debug, PartialEq)]
+pub enum BrowserRequest {
+    /// Create "New Folder" inside this folder.
+    NewFolder(PathBuf),
+    Rename(PathBuf, String),
+    Duplicate(PathBuf),
+    /// Ask before deleting (the editor lists what uses it).
+    AskDelete(PathBuf),
+    /// Move the item into the folder.
+    Move(PathBuf, PathBuf),
+    /// Copy files from outside into the folder.
+    Import(Vec<PathBuf>, PathBuf),
+    Reveal(PathBuf),
+    /// Open a file (scene or OS default app).
+    Open(PathBuf),
+}
+
+/// An inline rename in progress.
+#[derive(Clone, Debug)]
+pub(crate) struct Renaming {
+    pub(crate) path: PathBuf,
+    pub(crate) text: String,
+    /// The text field still needs focus and its selection set.
+    pub(crate) fresh: bool,
+}
+
 /// What a Content Browser drag carries: the item, and for model files the
 /// project-relative asset path the Scene and Hierarchy spawn.
 #[derive(Clone, Debug, PartialEq)]
@@ -209,6 +237,11 @@ pub struct ContentBrowser {
     /// What the asset view shows, rebuilt only when the folder, search or
     /// filter changes.
     visible: Vec<ContentEntry>,
+    requests: Vec<BrowserRequest>,
+    /// The last click landed inside the browser: its keys (F2, Ctrl+D,
+    /// Delete, Enter) act on the selection.
+    pub(crate) focused: bool,
+    pub(crate) renaming: Option<Renaming>,
 }
 
 impl ContentBrowser {
@@ -229,9 +262,38 @@ impl ContentBrowser {
             listing: Vec::new(),
             files: None,
             visible: Vec::new(),
+            requests: Vec::new(),
+            focused: false,
+            renaming: None,
         };
         browser.refresh();
         browser
+    }
+
+    /// File operations asked for since the last call.
+    pub fn take_requests(&mut self) -> Vec<BrowserRequest> {
+        std::mem::take(&mut self.requests)
+    }
+
+    pub(crate) fn request(&mut self, request: BrowserRequest) {
+        self.requests.push(request);
+    }
+
+    /// The browser owns the keyboard shortcuts it shares with other panels.
+    pub fn has_focus(&self) -> bool {
+        self.focused
+    }
+
+    /// Show a text field in place of the item's name.
+    pub fn start_rename(&mut self, path: PathBuf) {
+        let text = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        self.renaming = Some(Renaming {
+            path,
+            text,
+            fresh: true,
+        });
     }
 
     pub fn visible_entries(&self) -> &[ContentEntry] {

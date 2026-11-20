@@ -65,6 +65,13 @@ struct GizmoDrag {
 }
 
 /// Pending scene operation for the host to execute.
+/// What the delete dialog shows.
+struct DeleteConfirm {
+    path: std::path::PathBuf,
+    /// Project-relative scene files (and "the open scene") that use it.
+    used_by: Vec<String>,
+}
+
 pub enum PendingOperation {
     Save(std::path::PathBuf),
     Load(std::path::PathBuf),
@@ -94,6 +101,8 @@ pub struct Editor {
     overlay_draws: Vec<melon_render::OverlayDraw>,
     pending_dialog: Option<DialogChannel>,
     pending_operation: Option<PendingOperation>,
+    /// A Content Browser delete waiting for Delete / Cancel.
+    delete_confirm: Option<DeleteConfirm>,
     status_message: Option<(String, StatusKind, std::time::Instant)>,
     /// egui texture showing the scene (set by `EditorOverlay`).
     viewport_texture: Option<egui::TextureId>,
@@ -144,6 +153,7 @@ impl Default for Editor {
             overlay_draws: Vec::new(),
             pending_dialog: None,
             pending_operation: None,
+            delete_confirm: None,
             status_message: None,
             viewport_texture: None,
             viewport_size: winit::dpi::PhysicalSize::new(1, 1),
@@ -295,6 +305,8 @@ impl Editor {
             match shortcut {
                 Shortcut::ReleaseGame => world.insert_resource(InputFocus::Editor),
                 Shortcut::Save => self.save(world),
+                // With the Content Browser focused, Delete is its file delete.
+                Shortcut::Delete if self.content.has_focus() => {}
                 Shortcut::Delete => self.delete_selected(world),
                 Shortcut::Move => self.gizmo_mode = GizmoMode::Move,
                 Shortcut::Rotate => self.gizmo_mode = GizmoMode::Rotate,
@@ -572,6 +584,159 @@ impl Editor {
         }
     }
 
+    /// Run the file operations the Content Browser asked for this frame.
+    pub fn apply_content_requests(&mut self, world: &mut World) {
+        for request in self.content.take_requests() {
+            if let Err(error) = self.run_content_request(world, request) {
+                tracing::warn!("{error:#}");
+                self.set_status_error(format!("{error:#}"));
+            }
+        }
+    }
+
+    fn run_content_request(
+        &mut self,
+        world: &mut World,
+        request: content::BrowserRequest,
+    ) -> anyhow::Result<()> {
+        use content::BrowserRequest as Request;
+        if !world.contains_resource::<AssetServer>() {
+            world.insert_resource(AssetServer::new(self.project_root.clone()));
+        }
+        let done = match request {
+            Request::NewFolder(parent) => {
+                let dir =
+                    asset_ops::create_folder(&mut world.resource_mut::<AssetServer>(), &parent)?;
+                self.content.refresh();
+                self.content.start_rename(dir.clone());
+                Some(dir)
+            }
+            Request::Rename(path, name) => Some(asset_ops::rename(
+                &mut world.resource_mut::<AssetServer>(),
+                &path,
+                &name,
+            )?),
+            Request::Duplicate(path) => Some(asset_ops::duplicate(
+                &mut world.resource_mut::<AssetServer>(),
+                &path,
+            )?),
+            Request::Move(path, folder) => Some(asset_ops::move_to(
+                &mut world.resource_mut::<AssetServer>(),
+                &path,
+                &folder,
+            )?),
+            Request::Import(files, folder) => {
+                let results =
+                    asset_ops::import(&mut world.resource_mut::<AssetServer>(), &files, &folder);
+                let mut last = None;
+                for result in results {
+                    match result {
+                        Ok(path) => last = Some(path),
+                        Err(error) => {
+                            tracing::warn!("import: {error:#}");
+                            self.set_status_error(format!("Import failed: {error:#}"));
+                        }
+                    }
+                }
+                last
+            }
+            Request::AskDelete(path) => {
+                let needles = asset_ops::reference_needles(world.resource::<AssetServer>(), &path);
+                let mut used_by: Vec<String> =
+                    asset_ops::scene_references(&self.project_root, &needles)
+                        .iter()
+                        .map(|f| {
+                            melon_core::assets::project_relative(&self.project_root, f)
+                                .unwrap_or_else(|| f.display().to_string())
+                        })
+                        .collect();
+                let open =
+                    world.resource_scope(|world, server: bevy_ecs::world::Mut<AssetServer>| {
+                        asset_ops::open_scene_uses(world, &server, &path)
+                    });
+                if open {
+                    used_by.push("the open scene".to_string());
+                }
+                self.delete_confirm = Some(DeleteConfirm { path, used_by });
+                None
+            }
+            Request::Reveal(path) => {
+                asset_ops::reveal(&path);
+                None
+            }
+            Request::Open(path) => {
+                if path.is_dir() {
+                    self.content.open(path);
+                } else {
+                    asset_ops::open_external(&path);
+                }
+                None
+            }
+        };
+        if let Some(path) = done {
+            self.content.refresh();
+            self.content.select(Some(path));
+        }
+        Ok(())
+    }
+
+    /// Delete / Cancel for a Content Browser delete, listing what uses it.
+    fn delete_dialog(&mut self, world: &mut World, ui: &egui::Ui) {
+        let Some(confirm) = &self.delete_confirm else {
+            return;
+        };
+        let name = confirm
+            .path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let used_by = confirm.used_by.clone();
+        let mut choice = None;
+        let modal = egui::Modal::new(egui::Id::new("content_delete")).show(ui.ctx(), |ui| {
+            ui.heading(format!("Delete {name}?"));
+            ui.label("Moves it to the Recycle Bin.");
+            if !used_by.is_empty() {
+                ui.label(egui::RichText::new("Used by:").color(theme::colors::WARNING));
+                for user in &used_by {
+                    ui.label(format!("  {user}"));
+                }
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Delete").clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(false);
+                }
+            });
+        });
+        if choice.is_none() && modal.should_close() {
+            choice = Some(false);
+        }
+        let Some(delete) = choice else {
+            return;
+        };
+        let Some(confirm) = self.delete_confirm.take() else {
+            return;
+        };
+        if !delete {
+            return;
+        }
+        if !world.contains_resource::<AssetServer>() {
+            world.insert_resource(AssetServer::new(self.project_root.clone()));
+        }
+        match asset_ops::delete(&mut world.resource_mut::<AssetServer>(), &confirm.path) {
+            Ok(()) => {
+                self.set_status(format!("Moved {name} to the Recycle Bin"));
+                self.content.select(None);
+                self.content.refresh();
+            }
+            Err(error) => {
+                tracing::warn!("delete: {error:#}");
+                self.set_status_error(format!("Delete failed: {error:#}"));
+            }
+        }
+    }
+
     /// Share the engine's log buffer with the Console panel.
     pub fn set_console(&mut self, log: console::ConsoleLog) {
         self.console = log;
@@ -648,6 +813,7 @@ impl Editor {
             .show(ui, |ui| self.status_bar(world, ui));
         self.about_window(ui);
         self.project_settings_window(world, ui);
+        self.delete_dialog(world, ui);
 
         // Dockable panels fill the rest of the window.
         self.overlay_draws.clear();
@@ -1886,7 +2052,10 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                     .auto_shrink(false)
                     .show(ui, |ui| self.editor.build_inspector(self.world, ui));
             }
-            EditorTab::ContentBrowser => self.editor.content.ui(ui),
+            EditorTab::ContentBrowser => {
+                self.editor.content.ui(ui);
+                self.editor.apply_content_requests(self.world);
+            }
             EditorTab::Console => {
                 console::console_ui(ui, &self.editor.console, &mut self.editor.console_filter)
             }
@@ -3054,5 +3223,100 @@ mod tests {
             camera.eye
         );
         assert!(camera.center.distance(game_camera.center) < 1e-3);
+    }
+
+    /// An editor on a temp project with `assets/models/x.glb` (and its
+    /// `.meta`), and a world holding that project's `AssetServer`.
+    fn browser_project(name: &str) -> (Editor, World, std::path::PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("melon_browser_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("assets/models")).unwrap();
+        std::fs::write(root.join("assets/models/x.glb"), b"x").unwrap();
+        let mut server = AssetServer::new(root.clone());
+        asset_db::reconcile(&mut server);
+        let mut world = World::new();
+        world.insert_resource(server);
+        let mut editor = Editor::new();
+        editor.set_project_root(&root);
+        (editor, world, root)
+    }
+
+    fn editor_key(editor: &mut Editor, world: &mut World, key: egui::Key) {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| editor.build_ui(world, ui));
+    }
+
+    #[test]
+    fn delete_key_goes_to_the_focused_panel() {
+        let (mut editor, mut world, root) = browser_project("delete_focus");
+        let x = root.join("assets/models/x.glb");
+        let entity = world
+            .spawn((Name("E".to_string()), Transform::default()))
+            .id();
+        editor.set_selected(Some(entity));
+        editor.content.open(root.join("assets/models"));
+        editor.content.select(Some(x.clone()));
+        editor.content.focused = true;
+        editor_key(&mut editor, &mut world, egui::Key::Delete);
+        assert!(world.get::<melon_core::PendingDelete>(entity).is_none());
+        assert_eq!(
+            editor.delete_confirm.as_ref().map(|c| c.path.clone()),
+            Some(x.clone())
+        );
+
+        editor.delete_confirm = None;
+        editor.content.focused = false;
+        editor_key(&mut editor, &mut world, egui::Key::Delete);
+        assert!(world.get::<melon_core::PendingDelete>(entity).is_some());
+        assert!(x.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn new_folder_request_creates_and_starts_rename() {
+        let (mut editor, mut world, root) = browser_project("new_folder");
+        let assets = root.join("assets");
+        editor
+            .content
+            .request(content::BrowserRequest::NewFolder(assets.clone()));
+        editor.apply_content_requests(&mut world);
+        let made = assets.join("New Folder");
+        assert!(made.is_dir());
+        assert_eq!(editor.content.selected(), Some(made.as_path()));
+        assert_eq!(
+            editor.content.renaming.as_ref().map(|r| r.path.clone()),
+            Some(made)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rename_request_failure_goes_to_the_status_bar() {
+        let (mut editor, mut world, root) = browser_project("rename_fail");
+        let x = root.join("assets/models/x.glb");
+        editor.content.request(content::BrowserRequest::Rename(
+            x.clone(),
+            "bad/name".into(),
+        ));
+        editor.apply_content_requests(&mut world);
+        assert!(x.exists());
+        let status = editor
+            .status_message
+            .as_ref()
+            .map(|(m, ..)| m.clone())
+            .unwrap_or_default();
+        assert!(status.contains("cannot contain"), "{status}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
