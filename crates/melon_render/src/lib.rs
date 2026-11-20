@@ -1365,9 +1365,11 @@ impl Renderer {
         // of a model draws its instances in one call.
         let camera = Frustum::from_view_proj(frame.view_proj);
         let shadow_box = Frustum::from_view_proj(light_view_proj);
-        let mut stats = RenderStats::default();
-        stats.lights = stats_lights.0;
-        stats.lights_dropped = stats_lights.1;
+        let mut stats = RenderStats {
+            lights: stats_lights.0,
+            lights_dropped: stats_lights.1,
+            ..Default::default()
+        };
         let (mut seen, mut casters, mut voxelized) = (Vec::new(), Vec::new(), Vec::new());
         // Entities with the same material overrides share a set id (0 = none),
         // so they batch together.
