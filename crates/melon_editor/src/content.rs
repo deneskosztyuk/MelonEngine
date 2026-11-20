@@ -144,6 +144,35 @@ fn project_relative(root: &Path, path: &Path) -> Option<String> {
     )
 }
 
+/// Where the browser's settings live, relative to the project root.
+pub fn settings_path() -> PathBuf {
+    PathBuf::from(".melon/content_browser.ron")
+}
+
+const SETTINGS_VERSION: u32 = 1;
+
+/// Saved per project. Folders are root-relative with `/` (`""` = root).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ContentSettings {
+    version: u32,
+    favorites: Vec<String>,
+    tile_size: f32,
+    last_folder: Option<String>,
+    tree_width: f32,
+}
+
+impl Default for ContentSettings {
+    fn default() -> Self {
+        Self {
+            version: SETTINGS_VERSION,
+            favorites: Vec::new(),
+            tile_size: theme::sizes::TILE_DEFAULT,
+            last_folder: None,
+            tree_width: theme::sizes::CONTENT_TREE,
+        }
+    }
+}
+
 /// Folder navigation inside a fixed root (the assets folder).
 pub struct ContentBrowser {
     root: PathBuf,
@@ -152,6 +181,10 @@ pub struct ContentBrowser {
     back: Vec<PathBuf>,
     forward: Vec<PathBuf>,
     selected: Option<PathBuf>,
+    favorites: Vec<PathBuf>,
+    tile_size: f32,
+    /// Folder tree width, written back by the view.
+    pub(crate) tree_width: f32,
     /// File kinds shown; folders are always shown outside search.
     filter: HashSet<AssetKind>,
     /// What the asset view shows, rebuilt only when the folder, search or
@@ -168,6 +201,9 @@ impl ContentBrowser {
             back: Vec::new(),
             forward: Vec::new(),
             selected: None,
+            favorites: Vec::new(),
+            tile_size: theme::sizes::TILE_DEFAULT,
+            tree_width: theme::sizes::CONTENT_TREE,
             filter: AssetKind::FILE_KINDS.into_iter().collect(),
             visible: Vec::new(),
         };
@@ -287,6 +323,128 @@ impl ContentBrowser {
             }
         }
         segments
+    }
+
+    pub fn favorites(&self) -> &[PathBuf] {
+        &self.favorites
+    }
+
+    /// Pin a folder inside the root (files and duplicates are ignored).
+    pub fn add_favorite(&mut self, dir: PathBuf) {
+        if self.inside_root(&dir) && dir.is_dir() && !self.favorites.contains(&dir) {
+            self.favorites.push(dir);
+        }
+    }
+
+    pub fn remove_favorite(&mut self, dir: &Path) {
+        self.favorites.retain(|f| f != dir);
+    }
+
+    pub fn is_list(&self) -> bool {
+        self.tile_size < theme::sizes::TILE_LIST_BELOW
+    }
+
+    pub fn tile_size_mut(&mut self) -> &mut f32 {
+        &mut self.tile_size
+    }
+
+    /// `dir` relative to the root with `/`.
+    fn to_relative(&self, dir: &Path) -> Option<String> {
+        let rel = dir.strip_prefix(&self.root).ok()?;
+        Some(
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
+    }
+
+    /// An existing folder from a saved relative path; `None` for anything
+    /// with `..`, a root or a drive, or a folder that is gone.
+    fn from_relative(&self, rel: &str) -> Option<PathBuf> {
+        let rel = Path::new(rel);
+        let plain = rel
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+        let dir = self.root.join(rel);
+        (plain && dir.is_dir()).then_some(dir)
+    }
+
+    /// Apply saved settings; a missing or broken file keeps the defaults.
+    pub fn load_settings(&mut self, file: &Path) {
+        let settings = match std::fs::read_to_string(file) {
+            Err(_) => ContentSettings::default(),
+            Ok(text) => match ron::from_str::<ContentSettings>(&text) {
+                Ok(s) if s.version == SETTINGS_VERSION => s,
+                Ok(s) => {
+                    tracing::warn!("{}: unsupported version {}", file.display(), s.version);
+                    ContentSettings::default()
+                }
+                Err(error) => {
+                    tracing::warn!("{}: {error}; using defaults", file.display());
+                    ContentSettings::default()
+                }
+            },
+        };
+        let mut favorites = Vec::new();
+        for dir in settings
+            .favorites
+            .iter()
+            .filter_map(|f| self.from_relative(f))
+        {
+            if !favorites.contains(&dir) {
+                favorites.push(dir);
+            }
+        }
+        self.favorites = favorites;
+        self.tile_size = if settings.tile_size.is_finite() {
+            settings
+                .tile_size
+                .clamp(theme::sizes::TILE_MIN, theme::sizes::TILE_MAX)
+        } else {
+            theme::sizes::TILE_DEFAULT
+        };
+        self.tree_width = if settings.tree_width.is_finite() && settings.tree_width > 0.0 {
+            settings.tree_width
+        } else {
+            theme::sizes::CONTENT_TREE
+        };
+        if let Some(dir) = settings
+            .last_folder
+            .as_deref()
+            .and_then(|f| self.from_relative(f))
+        {
+            self.current = dir;
+        }
+        self.refresh();
+    }
+
+    /// Save atomically (temp file + rename), creating the folder.
+    pub fn save_settings(&self, file: &Path) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let settings = ContentSettings {
+            version: SETTINGS_VERSION,
+            favorites: self
+                .favorites
+                .iter()
+                .filter_map(|f| self.to_relative(f))
+                .collect(),
+            tile_size: self.tile_size,
+            last_folder: self.to_relative(&self.current),
+            tree_width: self.tree_width,
+        };
+        if let Some(dir) = file.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+        }
+        let text = ron::ser::to_string_pretty(&settings, ron::ser::PrettyConfig::default())?;
+        let tmp = file.with_extension("ron.tmp");
+        std::fs::write(&tmp, text).with_context(|| format!("failed to write {}", tmp.display()))?;
+        std::fs::rename(&tmp, file)
+            .with_context(|| format!("failed to write {}", file.display()))?;
+        Ok(())
     }
 
     pub fn select(&mut self, path: Option<PathBuf>) {
@@ -671,6 +829,75 @@ mod tests {
         browser.open(dir.join("a"));
         assert_eq!(browser.search(), "");
         assert_eq!(browser.selected(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_round_trip() {
+        let dir = temp_dir("settings");
+        touch(&dir, "a/");
+        let file = dir.join("settings/content_browser.ron");
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.add_favorite(dir.join("a"));
+        *browser.tile_size_mut() = 100.0;
+        browser.tree_width = 250.0;
+        browser.open(dir.join("a"));
+        browser.save_settings(&file).unwrap();
+
+        let mut fresh = ContentBrowser::new(dir.clone());
+        fresh.load_settings(&file);
+        assert_eq!(fresh.favorites(), [dir.join("a")]);
+        assert_eq!(fresh.current(), dir.join("a"));
+        assert!(!fresh.can_go_back());
+        assert!(!fresh.is_list());
+        assert_eq!(fresh.tree_width, 250.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_broken_file_gives_defaults() {
+        let dir = temp_dir("settings_broken");
+        let file = dir.join("content_browser.ron");
+        std::fs::write(&file, "(((not ron").unwrap();
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.load_settings(&file);
+        assert!(browser.favorites().is_empty());
+        assert_eq!(browser.current(), dir);
+        assert_eq!(*browser.tile_size_mut(), theme::sizes::TILE_DEFAULT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_drop_missing_and_outside_favorites() {
+        let dir = temp_dir("settings_drop");
+        touch(&dir, "a/");
+        let file = dir.join("content_browser.ron");
+        std::fs::write(
+            &file,
+            r#"(version: 1, favorites: ["a", "gone", "../outside", "a/.."], tile_size: 20.0, last_folder: Some("gone"), tree_width: 200.0)"#,
+        )
+        .unwrap();
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.load_settings(&file);
+        assert_eq!(browser.favorites(), [dir.join("a")]);
+        assert_eq!(browser.current(), dir);
+        assert_eq!(*browser.tile_size_mut(), theme::sizes::TILE_MIN);
+        assert!(browser.is_list());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_favorite_ignores_duplicates_and_files() {
+        let dir = temp_dir("favorites");
+        touch(&dir, "a/");
+        touch(&dir, "x.glb");
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.add_favorite(dir.join("a"));
+        browser.add_favorite(dir.join("a"));
+        browser.add_favorite(dir.join("x.glb"));
+        assert_eq!(browser.favorites(), [dir.join("a")]);
+        browser.remove_favorite(&dir.join("a"));
+        assert!(browser.favorites().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

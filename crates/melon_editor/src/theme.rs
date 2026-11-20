@@ -54,6 +54,13 @@ pub mod sizes {
     pub const SETTINGS_WINDOW: egui::Vec2 = egui::vec2(720.0, 420.0);
     pub const SETTINGS_SECTIONS: f32 = 140.0;
     pub const SETTINGS_NAME: f32 = 140.0;
+    /// Content Browser folder tree width (default).
+    pub const CONTENT_TREE: f32 = 200.0;
+    /// Content Browser tile sizes; below `TILE_LIST_BELOW` the view is a list.
+    pub const TILE_MIN: f32 = 32.0;
+    pub const TILE_DEFAULT: f32 = 72.0;
+    pub const TILE_MAX: f32 = 128.0;
+    pub const TILE_LIST_BELOW: f32 = 48.0;
 }
 
 /// Apply the editor theme (dark) to every egui style.

@@ -113,6 +113,7 @@ pub struct Editor {
     /// Dockable panel arrangement (saved between runs).
     dock: egui_dock::DockState<layout::EditorTab>,
     content: content::ContentBrowser,
+    content_settings_file: std::path::PathBuf,
     /// Where the dock layout is saved (under the project root).
     layout_file: std::path::PathBuf,
     /// Project folder: asset paths are relative to it.
@@ -153,6 +154,7 @@ impl Default for Editor {
             console_filter: console::ConsoleFilter::default(),
             dock: layout::default_layout(),
             content: content::ContentBrowser::new("assets".into()),
+            content_settings_file: content::settings_path(),
             layout_file: layout::layout_path(),
             project_root: ".".into(),
             hierarchy_query: String::new(),
@@ -177,6 +179,8 @@ impl Editor {
     /// `<root>/.melon/editor_layout.ron`, whatever the working directory.
     pub fn set_project_root(&mut self, root: &std::path::Path) {
         self.content = content::ContentBrowser::new(root.join("assets"));
+        self.content_settings_file = root.join(content::settings_path());
+        self.content.load_settings(&self.content_settings_file);
         self.layout_file = root.join(layout::layout_path());
         self.project_root = root.to_path_buf();
         self.dock = layout::load_layout(&self.layout_file);
@@ -186,6 +190,9 @@ impl Editor {
     pub fn save_layout(&self) {
         if let Err(error) = layout::save_layout(&self.dock, &self.layout_file) {
             tracing::warn!(?error, "could not save the editor layout");
+        }
+        if let Err(error) = self.content.save_settings(&self.content_settings_file) {
+            tracing::warn!(?error, "could not save the content browser settings");
         }
     }
 
@@ -2546,7 +2553,13 @@ mod tests {
     fn project_root_sets_layout_file_and_assets() {
         let root = std::env::temp_dir().join(format!("melon_root_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::create_dir_all(root.join("assets/models")).unwrap();
+        std::fs::create_dir_all(root.join(".melon")).unwrap();
+        std::fs::write(
+            root.join(".melon/content_browser.ron"),
+            "(version: 1, favorites: [], tile_size: 72.0, last_folder: Some(\"models\"), tree_width: 200.0)",
+        )
+        .unwrap();
         let mut saved = layout::default_layout();
         let console = saved.find_tab(&layout::EditorTab::Console).unwrap();
         saved.remove_tab(console);
@@ -2558,7 +2571,7 @@ mod tests {
             editor.dock.find_tab(&layout::EditorTab::Console).is_none(),
             "layout loaded from the root"
         );
-        assert_eq!(editor.content.current(), root.join("assets"));
+        assert_eq!(editor.content.current(), root.join("assets/models"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
