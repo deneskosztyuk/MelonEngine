@@ -5,6 +5,7 @@ use melon_core::bevy_reflect::{
     enums::{DynamicEnum, DynamicVariant, Enum, VariantInfo},
     list::List,
     std_traits::ReflectDefault,
+    structs::DynamicStruct,
     tuple::DynamicTuple,
 };
 use std::collections::HashMap;
@@ -272,6 +273,11 @@ fn value_ui(
     {
         return unit_enum_ui(ui, id, e, info.variant_names());
     }
+    if let ReflectMut::Enum(e) = value.reflect_mut()
+        && e.get_represented_enum_info().is_some()
+    {
+        return payload_enum_ui(ui, id, e, registry);
+    }
     if matches!(
         value.reflect_ref(),
         ReflectRef::Struct(_) | ReflectRef::TupleStruct(_)
@@ -345,6 +351,123 @@ fn unit_enum_ui(ui: &mut egui::Ui, id: egui::Id, e: &mut dyn Enum, names: &[&str
             }
         });
     picked.is_some_and(|name| e.try_apply(&DynamicEnum::new(name, ())).is_ok())
+}
+
+/// Variant dropdown (the combo carries the fixed id `id.with("variant")`,
+/// options `id.with(variant)`), then only the active variant's fields, each
+/// with the id `id.with(field)`. Switching inserts the new variant with
+/// default field values.
+fn payload_enum_ui(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    e: &mut dyn Enum,
+    registry: &TypeRegistry,
+) -> bool {
+    let Some(info) = e.get_represented_enum_info() else {
+        return false;
+    };
+    let current = e.variant_name().to_string();
+    let mut picked = None;
+    ui.vertical(|ui| {
+        let combo = egui::ComboBox::from_id_salt(id.with("combo"))
+            .selected_text(&current)
+            .show_ui(ui, |ui| {
+                for name in info.variant_names() {
+                    if id_label(ui, id.with(*name), *name, *name == current).clicked()
+                        && *name != current
+                    {
+                        picked = Some(*name);
+                    }
+                }
+            });
+        ui.interact(
+            combo.response.rect,
+            id.with("variant"),
+            egui::Sense::hover(),
+        );
+    });
+    if let Some(name) = picked
+        && let Some(variant) = info.variant(name)
+    {
+        let new = DynamicEnum::new(name, default_variant(variant, registry));
+        return e.try_apply(&new).is_ok();
+    }
+    let mut changed = false;
+    let count = e.field_len();
+    if count > 0 {
+        egui::Grid::new(id.with("fields"))
+            .num_columns(2)
+            .spacing([theme::sizes::SPACING; 2])
+            .show(ui, |ui| {
+                for i in 0..count {
+                    let name = e.name_at(i).map_or_else(|| i.to_string(), str::to_string);
+                    let Some(field) = e.field_at_mut(i) else {
+                        continue;
+                    };
+                    ui.label(&name);
+                    let row = id.with(name.as_str());
+                    let editor = ui.scope(|ui| value_ui(ui, row, field, registry));
+                    ui.interact(editor.response.rect, row, egui::Sense::hover());
+                    changed |= editor.inner;
+                    ui.end_row();
+                }
+            });
+    }
+    changed
+}
+
+/// A variant's payload with every field at its type's default.
+fn default_variant(variant: &VariantInfo, registry: &TypeRegistry) -> DynamicVariant {
+    let default = |tid, path| default_value(registry, tid, path);
+    match variant {
+        VariantInfo::Unit(_) => DynamicVariant::Unit,
+        VariantInfo::Tuple(t) => {
+            let mut tuple = DynamicTuple::default();
+            for f in t.iter() {
+                if let Some(v) = default(f.type_id(), f.type_path()) {
+                    tuple.insert_boxed(v);
+                }
+            }
+            DynamicVariant::Tuple(tuple)
+        }
+        VariantInfo::Struct(s) => {
+            let mut dynamic = DynamicStruct::default();
+            for f in s.iter() {
+                if let Some(v) = default(f.type_id(), f.type_path()) {
+                    dynamic.insert_boxed(f.name(), v);
+                }
+            }
+            DynamicVariant::Struct(dynamic)
+        }
+    }
+}
+
+/// `Default::default()` of a registered type. glam vectors are not
+/// reflected themselves (remote wrappers), so they become the zero struct
+/// the wrapper reads.
+fn default_value(
+    registry: &TypeRegistry,
+    t: std::any::TypeId,
+    path: &str,
+) -> Option<Box<dyn PartialReflect>> {
+    if let Some(d) = registry.get_type_data::<ReflectDefault>(t) {
+        return Some(d.default().into_partial_reflect());
+    }
+    let name = path.rsplit("::").next().unwrap_or(path);
+    let axes: &[&str] = if name.starts_with("Vec2") {
+        &["x", "y"]
+    } else if name.starts_with("Vec3") {
+        &["x", "y", "z"]
+    } else if name.starts_with("Vec4") {
+        &["x", "y", "z", "w"]
+    } else {
+        return None;
+    };
+    let mut s = DynamicStruct::default();
+    for axis in axes {
+        s.insert(*axis, 0.0f32);
+    }
+    Some(Box::new(s))
 }
 
 /// Checkbox for Some / None, then the inner editor. Enabling inserts the
@@ -448,6 +571,18 @@ mod tests {
     struct Inner {
         weight: f32,
     }
+    #[derive(Reflect, Debug, Clone, PartialEq)]
+    enum Shape {
+        Ball {
+            radius: f32,
+        },
+        Cube {
+            side: f32,
+            #[reflect(remote = Vec3Reflect)]
+            offset: Vec3,
+        },
+        Point,
+    }
 
     #[derive(Reflect, Debug, Clone, PartialEq)]
     struct Sample {
@@ -462,6 +597,7 @@ mod tests {
         inner: Inner,
         limit: Option<f32>,
         list: Vec<f32>,
+        shape: Shape,
     }
 
     #[test]
@@ -509,8 +645,8 @@ mod tests {
         assert!(texts.contains("Speed (linear)"), "label override drawn");
     }
 
-    const FIELDS: [&str; 9] = [
-        "speed", "on", "label", "pos", "rot", "mode", "inner", "limit", "list",
+    const FIELDS: [&str; 10] = [
+        "speed", "on", "label", "pos", "rot", "mode", "inner", "limit", "list", "shape",
     ];
 
     fn sample() -> Sample {
@@ -529,6 +665,7 @@ mod tests {
             inner: Inner { weight: 1.5 },
             limit: Some(4.0),
             list: vec![1.0],
+            shape: Shape::Ball { radius: 1.0 },
         }
     }
 
@@ -668,6 +805,65 @@ mod tests {
         let mut expected = sample();
         expected.mode = Mode::Run;
         assert_eq!(value, expected);
+    }
+
+    #[test]
+    fn payload_enum_shows_only_the_active_variant_fields() {
+        let mut h = Harness::new();
+        let mut value = sample();
+        h.frame(&mut value, vec![]);
+        let shape = root().with("shape");
+        assert!(h.ctx.read_response(shape.with("radius")).is_some());
+        assert!(h.ctx.read_response(shape.with("side")).is_none());
+    }
+
+    #[test]
+    fn switching_a_payload_variant_inserts_default_fields() {
+        let mut h = Harness::new();
+        let mut value = sample();
+        h.frame(&mut value, vec![]);
+        let shape = root().with("shape");
+        h.click(&mut value, shape.with("variant"));
+        assert!(h.click(&mut value, shape.with("Cube")));
+        assert_eq!(
+            value.shape,
+            Shape::Cube {
+                side: 0.0,
+                offset: Vec3::ZERO
+            }
+        );
+        assert!(h.ctx.read_response(shape.with("side")).is_some());
+        assert!(h.ctx.read_response(shape.with("offset")).is_some());
+        assert!(h.ctx.read_response(shape.with("radius")).is_none());
+        h.click(&mut value, shape.with("variant"));
+        assert!(h.click(&mut value, shape.with("Point")));
+        assert_eq!(value.shape, Shape::Point);
+    }
+
+    #[test]
+    fn editing_a_payload_field_changes_only_it() {
+        let mut h = Harness::new();
+        let mut value = sample();
+        h.frame(&mut value, vec![]);
+        let radius = root().with("shape").with("radius");
+        let pos = h.center(radius);
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut changed = false;
+        for events in [
+            vec![egui::Event::PointerMoved(pos)],
+            vec![button(true)],
+            vec![egui::Event::PointerMoved(pos + egui::vec2(30.0, 0.0))],
+            vec![button(false)],
+        ] {
+            changed |= h.frame(&mut value, events);
+        }
+        assert!(changed);
+        assert!(matches!(value.shape, Shape::Ball { radius } if radius > 1.0));
     }
 
     #[test]
