@@ -238,8 +238,11 @@ fn egui_event(event: &WindowEvent) -> EguiEvent {
 }
 
 #[cfg(feature = "editor")]
-fn forwards_to_egui(kind: EguiEvent, gate_open: bool) -> bool {
-    !(gate_open && kind == EguiEvent::Pointer)
+fn forwards_to_egui(kind: EguiEvent, gate_open: bool, cursor_free: bool) -> bool {
+    // A locked / confined game cursor is hidden: its pointer events would click
+    // the UI blindly. A free, visible one may click the editor (Stop, panels);
+    // the Scene view ignores it while the game has focus.
+    !(gate_open && kind == EguiEvent::Pointer && !cursor_free)
 }
 
 /// Window focus lost: Windows sends key releases but no mouse releases, so
@@ -788,10 +791,17 @@ impl ApplicationHandler for App {
         let name = event_start.map(|_| event_name(&event));
         // Whether egui used an event no longer matters: the raw stream records
         // everything and the gate decides what the game gets. While the game has
-        // the mouse, egui gets no pointer input (the hidden cursor would click the UI).
+        // the mouse, egui gets no pointer input unless the game's cursor is free.
         if let Some(editor) = self.editor.as_mut()
             && let Some(window) = self.window.as_ref()
-            && forwards_to_egui(egui_event(&event), self.game_input)
+            && forwards_to_egui(
+                egui_event(&event),
+                self.game_input,
+                self.core
+                    .world
+                    .get_resource::<melon_core::Cursor>()
+                    .is_none_or(|c| c.mode == melon_core::CursorMode::Free),
+            )
         {
             editor.on_window_event(window, &event);
         }
@@ -1101,15 +1111,21 @@ mod tests {
     fn pointer_events_skip_egui_while_the_game_has_input() {
         use EguiEvent::{ButtonRelease, Other, Pointer};
         assert!(
-            !forwards_to_egui(Pointer, true),
-            "hidden cursor drives the UI"
+            !forwards_to_egui(Pointer, true, false),
+            "a locked / confined cursor must not drive the UI"
         );
-        assert!(forwards_to_egui(Pointer, false));
+        assert!(forwards_to_egui(Pointer, false, false));
         // A press egui saw before the gate opened must still end.
-        assert!(forwards_to_egui(ButtonRelease, true));
+        assert!(forwards_to_egui(ButtonRelease, true, false));
         assert!(
-            forwards_to_egui(Other, true),
+            forwards_to_egui(Other, true, false),
             "Esc / F5 / F6 reach the editor"
+        );
+        // A free, visible game cursor can click the editor (Stop, panels);
+        // the Scene view ignores it while the game has focus.
+        assert!(
+            forwards_to_egui(Pointer, true, true),
+            "free cursor must reach the toolbar"
         );
     }
 

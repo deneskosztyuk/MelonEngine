@@ -23,6 +23,8 @@
 // --scene <file.ron> renders a scene file instead of the review scene, seen
 // from --eye x,y,z toward --look x,y,z (the view name is then only a label).
 // --fog <density> overrides Environment::fog_density.
+// --pan <degrees> turns the camera that much around +Y every timed frame
+// (temporal effects such as SSGI history see a moving camera).
 // After the timed frames it also prints the GPU pass timings (`RenderTimings`).
 
 use std::sync::Arc;
@@ -381,9 +383,11 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
     let mut scene = None;
     let mut eye_look = (None, None);
     let mut fog = None;
+    let mut pan = None;
     let mut args = flags.iter();
     while let Some(flag) = args.next() {
-        const FLAGS: [&str; 16] = [
+        const FLAGS: [&str; 17] = [
+            "--pan",
             "--fog",
             "--scene",
             "--eye",
@@ -407,6 +411,13 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
             "--no-gi" => gi = Some(GiMode::Off),
             "--size" => size = image_size(args.next().map(String::as_str))?,
             "--ssgi-res" => ssgi_res = Some(ssgi_resolution(args.next().map(String::as_str))?),
+            "--pan" => {
+                pan = Some(
+                    args.next()
+                        .and_then(|t| t.parse::<f32>().ok())
+                        .context("--pan needs degrees per frame, for example 2")?,
+                )
+            }
             "--fog" => {
                 fog = Some(
                     args.next()
@@ -518,6 +529,12 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
     let mut stats = render_and_wait(&mut renderer, &frame, &mut server, &mut target)?;
     let start = std::time::Instant::now();
     for _ in 0..TIMED_FRAMES {
+        if let Some(degrees) = pan {
+            let turn = Quat::from_rotation_y(degrees.to_radians());
+            camera.center = camera.eye + turn * (camera.center - camera.eye);
+            frame.view_proj = camera.view_proj();
+            frame.eye = camera.eye;
+        }
         stats = render_and_wait(&mut renderer, &frame, &mut server, &mut target)?;
     }
     println!(

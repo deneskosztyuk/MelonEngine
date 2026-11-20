@@ -124,6 +124,9 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   live in `InputMap` (`config/input.ron`, edited in Edit ▸ Project Settings).
   The host feeds `Input` only while `GameInputGate` is true (the editor writes
   it from `InputFocus`: `Game` while playing, Esc gives it back to `Editor`).
+  While the game has focus the editor UI gets pointer events only if the
+  game's `Cursor` is `Free` (so Stop and the panels stay clickable); a
+  locked or confined cursor keeps them for the game, and Esc releases it.
   `RawPresses` sees every press whatever the focus and is cleared after the
   editor UI (rebinding capture).
 - **Render quality vs look.** `RenderQuality` (`melon_core::quality`) is
