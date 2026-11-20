@@ -244,6 +244,93 @@ fn copy_dir(from: &Path, to: &Path, skip_meta: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Asset files under `dir` (recursive), without `.meta` or dot-names.
+fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with('.') || is_meta(&path) {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            files_under(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+/// What a scene file would contain if it used `target` (a file, or any file
+/// under a folder): each file's GUID and its project-relative path.
+pub fn reference_needles(server: &AssetServer, target: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    if target.is_dir() {
+        files_under(target, &mut files);
+    } else {
+        files.push(target.to_path_buf());
+    }
+    let mut needles = Vec::new();
+    for file in files {
+        let Some(rel) = project_relative(server.root(), &file) else {
+            continue;
+        };
+        if let Some(guid) = server.guid_of(&rel) {
+            needles.push(guid.to_string());
+        }
+        needles.push(rel);
+    }
+    needles
+}
+
+/// `.ron` files under the project (not `target`, `.git`, `.melon` or other
+/// dot-folders) whose text contains any needle, sorted.
+pub fn scene_references(project_root: &Path, needles: &[String]) -> Vec<PathBuf> {
+    fn walk(dir: &Path, needles: &[String], out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            if name.starts_with('.') {
+                continue;
+            }
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                if name != "target" {
+                    walk(&path, needles, out);
+                }
+            } else if name.to_lowercase().ends_with(".ron")
+                && std::fs::read_to_string(&path)
+                    .is_ok_and(|text| needles.iter().any(|n| text.contains(n.as_str())))
+            {
+                out.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    if !needles.is_empty() {
+        walk(project_root, needles, &mut found);
+    }
+    found.sort();
+    found
+}
+
+/// Some entity in the open world draws `target` (a model file, or any model
+/// under a folder).
+pub fn open_scene_uses(
+    world: &mut bevy_ecs::world::World,
+    server: &AssetServer,
+    target: &Path,
+) -> bool {
+    let Some(rel) = project_relative(server.root(), target) else {
+        return false;
+    };
+    let inside = format!("{rel}/");
+    world
+        .query::<&melon_core::Handle<melon_core::Model>>()
+        .iter(world)
+        .any(|h| {
+            let file = melon_core::assets::split_mesh_fragment(server.path(*h)).0;
+            file == rel || file.starts_with(&inside)
+        })
+}
+
 /// A path the OS shell accepts: absolute, no `..`, no `\\?\` prefix.
 fn shell_path(path: &Path) -> PathBuf {
     let full = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -522,6 +609,63 @@ mod tests {
         assert!(a.exists());
         assert!(!root.join("assets/b.glb").exists());
         drop(lock);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scene_references_find_guid_and_path() {
+        let (root, mut server) = project("refs");
+        let (a, g) = asset(&root, &mut server, "assets/models/a.glb");
+        std::fs::create_dir_all(root.join("assets/scenes")).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(
+            root.join("assets/scenes/one.ron"),
+            format!("model_guid: Some(\"{g}\")"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("two.ron"),
+            "model: Some(\"assets/models/a.glb#mesh0\")",
+        )
+        .unwrap();
+        std::fs::write(root.join("target/x.ron"), g.to_string()).unwrap();
+        std::fs::write(root.join("three.ron"), "nothing here").unwrap();
+        let needles = reference_needles(&server, &a);
+        assert_eq!(
+            scene_references(&root, &needles),
+            [root.join("assets/scenes/one.ron"), root.join("two.ron")]
+        );
+        let folder_needles = reference_needles(&server, &root.join("assets/models"));
+        assert!(folder_needles.contains(&g.to_string()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_scene_uses_sees_fragments_and_folders() {
+        let (root, mut server) = project("uses");
+        let mut world = bevy_ecs::world::World::new();
+        let h: Handle<Model> = server.load("assets/models/sub/a.glb#mesh1");
+        world.spawn(h);
+        assert!(open_scene_uses(
+            &mut world,
+            &server,
+            &root.join("assets/models/sub/a.glb")
+        ));
+        assert!(open_scene_uses(
+            &mut world,
+            &server,
+            &root.join("assets/models/sub")
+        ));
+        assert!(!open_scene_uses(
+            &mut world,
+            &server,
+            &root.join("assets/models/other.glb")
+        ));
+        assert!(!open_scene_uses(
+            &mut world,
+            &server,
+            &root.join("assets/models/su")
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
