@@ -19,3 +19,14 @@ pub struct Update;
 /// Once per frame, after `Update`: cleanup and bookkeeping.
 #[derive(ScheduleLabel, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PostUpdate;
+
+/// Each fixed step, after `FixedUpdate`: the physics step runs here (sync,
+/// requests, characters, step, write back). Game systems in `FixedUpdate`
+/// therefore run before it, in the same fixed step.
+#[derive(ScheduleLabel, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PhysicsStep;
+
+/// Each fixed step, after `PhysicsStep`: read what the step produced
+/// (collision events, new poses, `grounded`).
+#[derive(ScheduleLabel, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FixedPostUpdate;

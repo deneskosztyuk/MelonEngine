@@ -11,8 +11,8 @@ use melon_core::hierarchy::{
     depth_first, set_parent_keep_world, set_world_transform, world_matrix,
 };
 use melon_core::{
-    Aabb, AssetServer, BodyInfo, Camera, GameInputGate, Handle, InputFocus, Model, Name,
-    SimulationState, Transform,
+    Aabb, AssetServer, Camera, GameInputGate, Handle, InputFocus, Model, Name, SimulationState,
+    Transform,
 };
 use melon_render::LineVertex;
 use tracing::instrument;
@@ -31,6 +31,7 @@ pub mod gizmo;
 pub mod history;
 pub mod inspect;
 pub mod layout;
+pub mod physics_settings;
 pub mod play;
 pub mod project_settings;
 pub mod quality_settings;
@@ -794,6 +795,11 @@ impl Editor {
         self.project_settings.set_quality_broken(broken);
     }
 
+    /// The host loaded a broken `config/physics.ron`: the first Apply backs it up.
+    pub fn set_physics_broken(&mut self, broken: bool) {
+        self.project_settings.set_physics_broken(broken);
+    }
+
     /// The host loaded a broken `config/audio.ron`: the first Apply backs it up.
     pub fn set_audio_broken(&mut self, broken: bool) {
         self.project_settings.set_audio_broken(broken);
@@ -832,6 +838,21 @@ impl Editor {
                     kind: WidgetKind::Slider { min: 0.0, max: 1.0 },
                 },
             );
+        }
+        if type_path == melon_core::Collider::type_path() {
+            let names = world
+                .get_resource::<melon_core::PhysicsSettings>()
+                .map(|s| s.layer_names.clone())
+                .unwrap_or_default();
+            for (field, label) in [("membership", "Layer"), ("filter", "Collides with")] {
+                widgets.insert(
+                    field,
+                    FieldWidget {
+                        label: Some(label),
+                        kind: WidgetKind::Layers(names.clone()),
+                    },
+                );
+            }
         }
         widgets
     }
@@ -1508,6 +1529,8 @@ impl Editor {
                     world_matrix(world, e),
                     viewport::model_bounds(world, e),
                 ));
+            self.world_line_vertices
+                .extend(viewport::collider_lines(world, e));
         }
 
         let painter = ui.painter_at(rect);
@@ -2020,7 +2043,7 @@ impl Editor {
 
         // Every other registered component, by display name. The registry is
         // an Arc cloned out of the world, so the world can change meanwhile.
-        let mut body_changed = false;
+        let mut components_changed = false;
         if let Some(registry) = world.get_resource::<AppTypeRegistry>().cloned() {
             let infos = melon_core::registered_components(world);
             let registry = registry.read();
@@ -2053,14 +2076,18 @@ impl Editor {
                 } else if changed {
                     reflect.apply(world.entity_mut(entity), copy.as_ref());
                 }
-                body_changed |= (changed || remove) && info.type_path == BodyInfo::type_path();
+                components_changed |= changed || remove;
             }
-            if let Some(added) = self.add_component_ui(ui, world, entity, &registry) {
-                body_changed |= added == BodyInfo::type_path();
+            if self
+                .add_component_ui(ui, world, entity, &registry)
+                .is_some()
+            {
+                components_changed = true;
             }
         }
-        if body_changed {
-            rebuild_body(world, entity);
+        if components_changed {
+            // Rapier follows the edit now, not at the next frame.
+            melon_physics::sync_components_system(world);
         }
 
         if transform_edited {
@@ -2132,6 +2159,9 @@ impl Editor {
             default.as_partial_reflect(),
             registry,
         );
+        if path == <melon_core::Collider as melon_core::bevy_reflect::TypePath>::type_path() {
+            fit_collider_to_model(world, entity);
+        }
         Some(path)
     }
 
@@ -2623,21 +2653,19 @@ fn add_component_choices(
         .collect()
 }
 
-/// Rebuild `entity`'s rapier body from its `BodyInfo`, or remove it when
-/// the entity has none.
-fn rebuild_body(world: &mut World, entity: Entity) {
-    world.try_resource_scope(
-        |world, mut physics: bevy_ecs::world::Mut<melon_physics::PhysicsWorld>| {
-            let mut e = world.entity_mut(entity);
-            if let Some(old) = e.take::<melon_physics::RigidBodyComponent>() {
-                physics.remove_body(old.body_handle);
-            }
-            e.remove::<melon_physics::ColliderComponent>();
-            if let Some(info) = e.get::<BodyInfo>().copied() {
-                scene::spawn_body(world, &mut physics, entity, info);
-            }
-        },
-    );
+/// A new `Collider` on an entity with a measured model: its box takes the
+/// model's half size (the bounds' centre is ignored), else it keeps 0.5.
+fn fit_collider_to_model(world: &mut World, entity: Entity) {
+    let bounds = world
+        .get::<Handle<Model>>(entity)
+        .zip(world.get_resource::<AssetServer>())
+        .and_then(|(h, server)| server.bounds(*h));
+    if let (Some((min, max)), Some(mut c)) = (bounds, world.get_mut::<melon_core::Collider>(entity))
+    {
+        c.shape = melon_core::ColliderShape::Box {
+            half_extents: (max - min) * 0.5,
+        };
+    }
 }
 
 fn card_frame(fill: egui::Color32) -> egui::Frame {
@@ -3316,31 +3344,48 @@ mod tests {
         );
     }
 
+    /// An entity with a unit box body of `kind` at `translation`, and rapier
+    /// made to match. The world gets its `PhysicsWorld` if it has none.
+    fn spawn_body_entity(
+        world: &mut World,
+        translation: glam::Vec3,
+        kind: melon_core::RigidBodyKind,
+    ) -> (Entity, melon_physics::rapier3d::dynamics::RigidBodyHandle) {
+        if !world.contains_resource::<melon_physics::PhysicsWorld>() {
+            world.insert_resource(melon_physics::PhysicsWorld::new());
+        }
+        let e = world
+            .spawn((
+                Transform::from_translation(translation),
+                melon_core::RigidBody {
+                    kind,
+                    ..Default::default()
+                },
+                melon_core::Collider::default(),
+            ))
+            .id();
+        melon_physics::sync_components_system(world);
+        let handle = world
+            .get::<melon_physics::RigidBodyComponent>(e)
+            .unwrap()
+            .body_handle;
+        (e, handle)
+    }
+
     #[test]
     fn hierarchy_drop_moves_fixed_body_to_world_pose() {
         let mut world = World::new();
-        let mut physics = melon_physics::PhysicsWorld::new();
-        let (body, _) = physics.spawn_fixed_cuboid(
+        let (dragged, body) = spawn_body_entity(
+            &mut world,
             glam::Vec3::new(2.0, 0.0, 0.0),
-            glam::Quat::IDENTITY,
-            glam::Vec3::splat(0.5),
+            melon_core::RigidBodyKind::Fixed,
         );
-        world.insert_resource(physics);
         let target = world
             .spawn(Transform {
                 translation: glam::Vec3::new(5.0, 0.0, 0.0),
                 rotation: glam::Quat::from_rotation_y(1.0),
                 ..Default::default()
             })
-            .id();
-        let dragged = world
-            .spawn((
-                Transform::from_translation(glam::Vec3::new(2.0, 0.0, 0.0)),
-                melon_physics::RigidBodyComponent {
-                    body_handle: body,
-                    body_type: melon_physics::RigidBodyType::Fixed,
-                },
-            ))
             .id();
         // Move the dragged entity first so the body is stale, then drop.
         world.get_mut::<Transform>(dragged).unwrap().translation = glam::Vec3::new(4.0, 0.0, 0.0);
@@ -3682,23 +3727,12 @@ mod tests {
     #[test]
     fn gizmo_physics_write_works_while_paused() {
         let mut world = World::new();
-        let mut physics = melon_physics::PhysicsWorld::new();
-        let (body, _) = physics.spawn_dynamic_cuboid(
+        let (e, body) = spawn_body_entity(
+            &mut world,
             glam::Vec3::ZERO,
-            glam::Quat::IDENTITY,
-            glam::Vec3::splat(0.5),
+            melon_core::RigidBodyKind::Dynamic,
         );
-        world.insert_resource(physics);
         world.insert_resource(SimulationState::Paused);
-        let e = world
-            .spawn((
-                Transform::default(),
-                melon_physics::RigidBodyComponent {
-                    body_handle: body,
-                    body_type: melon_physics::RigidBodyType::Dynamic,
-                },
-            ))
-            .id();
         Editor::new().write_to_physics_body(
             &mut world,
             e,
@@ -3716,24 +3750,16 @@ mod tests {
     #[test]
     fn inspector_edit_while_paused_reaches_physics_and_prev() {
         let mut world = World::new();
-        let mut physics = melon_physics::PhysicsWorld::new();
-        let (body, _) = physics.spawn_dynamic_cuboid(
+        let (e, body) = spawn_body_entity(
+            &mut world,
             glam::Vec3::ZERO,
-            glam::Quat::IDENTITY,
-            glam::Vec3::splat(0.5),
+            melon_core::RigidBodyKind::Dynamic,
         );
-        world.insert_resource(physics);
         world.insert_resource(SimulationState::Paused);
-        let e = world
-            .spawn((
-                Transform::from_translation(glam::Vec3::new(4.0, 0.0, 0.0)),
-                melon_core::PreviousTransform(Transform::default()),
-                melon_physics::RigidBodyComponent {
-                    body_handle: body,
-                    body_type: melon_physics::RigidBodyType::Dynamic,
-                },
-            ))
-            .id();
+        world.entity_mut(e).insert((
+            Transform::from_translation(glam::Vec3::new(4.0, 0.0, 0.0)),
+            melon_core::PreviousTransform(Transform::default()),
+        ));
         Editor::new().after_transform_edit(&mut world, e);
         let x = world
             .resource::<melon_physics::PhysicsWorld>()
@@ -5287,7 +5313,7 @@ mod tests {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(400.0, 900.0),
+                    egui::vec2(700.0, 900.0),
                 )),
                 time: Some(self.time),
                 events,
@@ -5340,31 +5366,23 @@ mod tests {
         InspectorHarness::new(world, e)
     }
 
-    /// An entity with a fixed rapier body built from its `BodyInfo`.
+    /// An entity with a fixed `RigidBody` and a unit box `Collider`, and
+    /// rapier made to match.
     fn fixed_body_entity() -> InspectorHarness {
         let mut world = melon_core::Core::new().world;
-        let mut physics = melon_physics::PhysicsWorld::new();
-        let half = glam::Vec3::splat(0.5);
-        let (body, collider) =
-            physics.spawn_fixed_cuboid(glam::Vec3::ZERO, glam::Quat::IDENTITY, half);
-        world.insert_resource(physics);
+        world.insert_resource(melon_physics::PhysicsWorld::new());
         let e = world
             .spawn((
                 Name("Body".to_string()),
                 Transform::default(),
-                BodyInfo {
-                    body_type: melon_core::BodyKind::Fixed,
-                    half_extents: half,
+                melon_core::RigidBody {
+                    kind: melon_core::RigidBodyKind::Fixed,
+                    ..Default::default()
                 },
-                melon_physics::RigidBodyComponent {
-                    body_handle: body,
-                    body_type: melon_physics::RigidBodyType::Fixed,
-                },
-                melon_physics::ColliderComponent {
-                    collider_handle: collider,
-                },
+                melon_core::Collider::default(),
             ))
             .id();
+        melon_physics::sync_components_system(&mut world);
         InspectorHarness::new(world, e)
     }
 
@@ -5404,10 +5422,63 @@ mod tests {
         let mut h = entity_with(Spin);
         h.open_add_component();
         assert!(h.has(add_row_id::<melon_core::Bob>()));
-        assert!(h.has(add_row_id::<BodyInfo>()));
+        assert!(h.has(add_row_id::<melon_core::RigidBody>()));
         assert!(h.has(add_row_id::<Aabb>()));
         assert!(!h.has(add_row_id::<Spin>()));
         assert!(!h.has(add_row_id::<Transform>()));
+    }
+
+    #[test]
+    fn adding_a_collider_fits_its_box_to_the_model_bounds() {
+        let mut world = melon_core::Core::new().world;
+        let handle: Handle<Model> = world.resource_mut::<AssetServer>().load("builtin:cube");
+        world.resource_mut::<AssetServer>().set_bounds(
+            handle,
+            glam::Vec3::new(-1.0, -2.0, -3.0),
+            glam::Vec3::new(1.0, 2.0, 3.0),
+        );
+        let with_model = world
+            .spawn((Name("M".to_string()), Transform::default(), handle))
+            .id();
+        let mut h = InspectorHarness::new(world, with_model);
+        h.open_add_component();
+        h.click(add_row_id::<melon_core::Collider>());
+        let c = h.world.get::<melon_core::Collider>(h.entity).unwrap();
+        assert_eq!(
+            c.shape,
+            melon_core::ColliderShape::Box {
+                half_extents: glam::Vec3::new(1.0, 2.0, 3.0)
+            }
+        );
+        // Without a model the default 0.5 box stays.
+        let mut h = entity_with(Spin);
+        h.open_add_component();
+        h.click(add_row_id::<melon_core::Collider>());
+        let c = h.world.get::<melon_core::Collider>(h.entity).unwrap();
+        assert_eq!(c.shape, melon_core::ColliderShape::default());
+    }
+
+    #[test]
+    fn collider_layer_fields_use_the_named_layer_widget() {
+        let mut world = melon_core::Core::new().world;
+        world
+            .resource_mut::<melon_core::PhysicsSettings>()
+            .layer_names[4] = "Enemies".into();
+        let widgets = Editor::new().field_widgets(
+            &world,
+            <melon_core::Collider as melon_core::bevy_reflect::TypePath>::type_path(),
+        );
+        for field in ["membership", "filter"] {
+            let widget = widgets
+                .get(field)
+                .unwrap_or_else(|| panic!("no widget for {field}"));
+            let inspect::WidgetKind::Layers(names) = &widget.kind else {
+                panic!("{field} is not a layer widget");
+            };
+            assert_eq!(names[0], "Default");
+            assert_eq!(names[4], "Enemies");
+        }
+        assert!(widgets["membership"].label.is_some());
     }
 
     #[test]
@@ -5438,41 +5509,56 @@ mod tests {
     }
 
     #[test]
-    fn editing_body_info_rebuilds_the_body() {
+    fn editing_the_body_kind_updates_the_rapier_body() {
         let mut h = fixed_body_entity();
-        let body_type = card_id::<BodyInfo>().with("body_type");
-        h.click(body_type);
-        h.click(body_type.with("Dynamic"));
-        let info = h.world.get::<BodyInfo>(h.entity).unwrap();
-        assert_eq!(info.body_type, melon_core::BodyKind::Dynamic);
-        let rb = *h
+        let kind = card_id::<melon_core::RigidBody>().with("kind");
+        h.click(kind);
+        h.click(kind.with("Dynamic"));
+        let rb = h.world.get::<melon_core::RigidBody>(h.entity).unwrap();
+        assert_eq!(rb.kind, melon_core::RigidBodyKind::Dynamic);
+        let handle = h
             .world
             .get::<melon_physics::RigidBodyComponent>(h.entity)
             .unwrap();
-        assert_eq!(rb.body_type, melon_physics::RigidBodyType::Dynamic);
+        assert_eq!(handle.body_type, melon_physics::RigidBodyType::Dynamic);
         let physics = h.world.resource::<melon_physics::PhysicsWorld>();
-        assert!(physics.bodies.get(rb.body_handle).unwrap().is_dynamic());
-        assert_eq!(physics.bodies.len(), 1, "the old body is removed");
+        assert!(physics.bodies.get(handle.body_handle).unwrap().is_dynamic());
+        assert_eq!(physics.bodies.len(), 1, "the body is updated in place");
     }
 
     #[test]
-    fn removing_body_info_removes_the_body() {
+    fn editing_the_collider_shape_rebuilds_the_collider() {
         let mut h = fixed_body_entity();
-        h.click(card_id::<BodyInfo>().with("remove"));
-        assert!(h.world.get::<BodyInfo>(h.entity).is_none());
+        let shape = card_id::<melon_core::Collider>().with("shape");
+        h.click(shape.with("variant"));
+        h.click(shape.with("Sphere"));
+        let handle = h
+            .world
+            .get::<melon_physics::ColliderComponent>(h.entity)
+            .unwrap()
+            .collider_handle
+            .unwrap();
+        let physics = h.world.resource::<melon_physics::PhysicsWorld>();
+        let colliders = physics.colliders();
+        let co = colliders.get(handle).unwrap();
+        assert!(co.shared_shape().as_ball().is_some());
+        assert_eq!(physics.colliders().len(), 1);
+    }
+
+    #[test]
+    fn removing_the_rigid_body_removes_the_rapier_body() {
+        let mut h = fixed_body_entity();
+        h.click(card_id::<melon_core::RigidBody>().with("remove"));
+        assert!(h.world.get::<melon_core::RigidBody>(h.entity).is_none());
         assert!(
             h.world
                 .get::<melon_physics::RigidBodyComponent>(h.entity)
                 .is_none()
         );
-        assert!(
-            h.world
-                .get::<melon_physics::ColliderComponent>(h.entity)
-                .is_none()
-        );
         let physics = h.world.resource::<melon_physics::PhysicsWorld>();
         assert_eq!(physics.bodies.len(), 0);
-        assert_eq!(physics.colliders.len(), 0);
+        // The collider stays, as a static one.
+        assert_eq!(physics.colliders().len(), 1);
     }
 
     /// A moving, selected entity must not make egui run extra passes (each

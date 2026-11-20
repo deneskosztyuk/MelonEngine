@@ -208,8 +208,8 @@ fn apply(world: &mut World, targets: &[(Uuid, Option<&Snap>)]) {
             snap.index,
         );
     }
+    melon_physics::sync_components_system(world);
     for (e, _) in &written {
-        crate::rebuild_body(world, *e);
         crate::snap_previous_transform(world, *e);
     }
 }
@@ -673,7 +673,7 @@ mod tests {
     use super::*;
     use bevy_ecs::schedule::Schedule;
     use melon_core::glam::Vec3;
-    use melon_core::{BodyInfo, BodyKind, Spin};
+    use melon_core::{Collider, RigidBody, RigidBodyKind, Spin};
     use melon_physics::PhysicsWorld;
 
     fn world() -> World {
@@ -832,14 +832,16 @@ mod tests {
         let k1 = child(world, "K1", root);
         child(world, "K2", root);
         child(world, "G", k1);
-        world.entity_mut(k1).insert(BodyInfo {
-            body_type: BodyKind::Fixed,
-            half_extents: Vec3::splat(0.5),
-        });
-        world.entity_mut(root).insert(BodyInfo {
-            body_type: BodyKind::Dynamic,
-            half_extents: Vec3::splat(0.5),
-        });
+        world.entity_mut(k1).insert((
+            RigidBody {
+                kind: RigidBodyKind::Fixed,
+                ..Default::default()
+            },
+            Collider::default(),
+        ));
+        world
+            .entity_mut(root)
+            .insert((RigidBody::default(), Collider::default()));
         root
     }
 
@@ -852,9 +854,7 @@ mod tests {
         let mut world = world();
         let mut h = History::default();
         let root = family(&mut world);
-        crate::rebuild_body(&mut world, root);
-        let k1 = find(&mut world, "K1").unwrap();
-        crate::rebuild_body(&mut world, k1);
+        melon_physics::sync_components_system(&mut world);
         ensure_ids(&mut world);
         let ids: Vec<Uuid> = ["Root", "K1", "K2", "G"]
             .iter()
@@ -975,11 +975,10 @@ mod tests {
         let mut world = world();
         let mut h = History::default();
         let a = spawn(&mut world, "A", 0.0);
-        world.entity_mut(a).insert(BodyInfo {
-            body_type: BodyKind::Dynamic,
-            half_extents: Vec3::splat(0.5),
-        });
-        crate::rebuild_body(&mut world, a);
+        world
+            .entity_mut(a)
+            .insert((RigidBody::default(), Collider::default()));
+        melon_physics::sync_components_system(&mut world);
         assert_eq!(body_count(&world), 1);
         h.duplicate(&mut world, a, None).unwrap();
         assert_eq!(body_count(&world), 2);
@@ -1158,11 +1157,8 @@ mod tests {
         world
     }
 
-    fn dynamic() -> BodyInfo {
-        BodyInfo {
-            body_type: BodyKind::Dynamic,
-            half_extents: Vec3::splat(0.5),
-        }
+    fn dynamic() -> RigidBody {
+        RigidBody::default()
     }
 
     #[test]
@@ -1173,17 +1169,78 @@ mod tests {
         h.track(&mut world, Some(a), false, None);
         // What the Inspector's Add Component does for a physics component.
         world.entity_mut(a).insert(dynamic());
-        crate::rebuild_body(&mut world, a);
+        melon_physics::sync_components_system(&mut world);
         h.track(&mut world, Some(a), false, None);
-        assert_eq!(h.undo_label(), Some("Add Body Info"));
+        assert_eq!(h.undo_label(), Some("Add Rigid Body"));
         assert_eq!(body_count(&world), 1);
         h.undo(&mut world).unwrap();
         assert_eq!(body_count(&world), 0, "rapier body removed");
-        assert!(world.get::<BodyInfo>(a).is_none());
+        assert!(world.get::<RigidBody>(a).is_none());
         assert!(world.get::<melon_physics::RigidBodyComponent>(a).is_none());
         h.redo(&mut world).unwrap();
         assert_eq!(body_count(&world), 1);
         assert!(world.get::<melon_physics::RigidBodyComponent>(a).is_some());
+    }
+
+    #[test]
+    fn undo_of_deleting_a_jointed_chain_restores_bodies_and_joints() {
+        use melon_core::{Joint, JointKind};
+        let mut world = world();
+        let mut h = History::default();
+        let root = spawn(&mut world, "Root", 0.0);
+        let k1 = child(&mut world, "K1", root);
+        let g = child(&mut world, "G", k1);
+        world.entity_mut(root).insert((
+            RigidBody {
+                kind: RigidBodyKind::Fixed,
+                ..Default::default()
+            },
+            Collider::default(),
+        ));
+        let hinge = JointKind::Hinge {
+            axis: melon_core::glam::Vec3::Z,
+            limited: true,
+            min: -0.5,
+            max: 0.5,
+        };
+        for e in [k1, g] {
+            world.entity_mut(e).insert((
+                RigidBody::default(),
+                Collider::default(),
+                Joint {
+                    kind: hinge,
+                    anchor: melon_core::glam::Vec3::new(0.0, 1.0, 0.0),
+                    ..Default::default()
+                },
+            ));
+        }
+        melon_physics::sync_components_system(&mut world);
+        ensure_ids(&mut world);
+        let joints = |w: &World| w.resource::<PhysicsWorld>().impulse_joints.len();
+        assert_eq!((body_count(&world), joints(&world)), (3, 2));
+
+        h.delete(&mut world, root, Some(root));
+        cleanup(&mut world);
+        assert_eq!((body_count(&world), joints(&world)), (0, 0));
+
+        for _ in 0..2 {
+            h.undo(&mut world).unwrap();
+            assert_eq!(
+                (body_count(&world), joints(&world)),
+                (3, 2),
+                "chain is back"
+            );
+            let g = find(&mut world, "G").unwrap();
+            assert_eq!(world.get::<Joint>(g).unwrap().kind, hinge);
+            assert!(world.get::<melon_physics::JointComponent>(g).is_some());
+            // It still simulates.
+            for _ in 0..10 {
+                world.resource_mut::<PhysicsWorld>().step();
+            }
+            h.redo(&mut world).unwrap();
+            cleanup(&mut world);
+            assert_eq!((body_count(&world), joints(&world)), (0, 0));
+        }
     }
 
     #[test]
@@ -1265,7 +1322,7 @@ mod tests {
         let mut h = History::default();
         let a = spawn(&mut world, "A", 0.0);
         world.entity_mut(a).insert(dynamic());
-        crate::rebuild_body(&mut world, a);
+        melon_physics::sync_components_system(&mut world);
         let copy = h.duplicate(&mut world, a, None).unwrap();
         let handle = |w: &World, e| {
             w.get::<melon_physics::RigidBodyComponent>(e)
@@ -1313,7 +1370,7 @@ mod tests {
         let a = spawn(&mut world, "A", 0.0);
         let _b = spawn(&mut world, "B", 0.0);
         world.entity_mut(a).insert(dynamic());
-        crate::rebuild_body(&mut world, a);
+        melon_physics::sync_components_system(&mut world);
         h.rename(&mut world, a, "A2", Some(a)).unwrap();
         h.track(&mut world, Some(a), false, None);
         crate::play::play(&mut world).unwrap();
@@ -1347,7 +1404,7 @@ mod tests {
         let mut h = History::default();
         let a = spawn(&mut world, "A", 0.0);
         world.entity_mut(a).insert(dynamic());
-        crate::rebuild_body(&mut world, a);
+        melon_physics::sync_components_system(&mut world);
         for _ in 0..5 {
             h.track(&mut world, Some(a), false, None);
         }
@@ -1370,7 +1427,7 @@ mod tests {
             melon_core::Bob,
             melon_core::PreviousTransform(Transform::default()),
         ));
-        crate::rebuild_body(&mut world, a);
+        melon_physics::sync_components_system(&mut world);
         h.track(&mut world, Some(a), false, None);
         let n = 2000;
         let start = std::time::Instant::now();

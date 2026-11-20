@@ -8,6 +8,7 @@ license.workspace = true
 melon_core.workspace = true
 bevy_ecs.workspace = true
 rapier3d.workspace = true
+gltf.workspace = true
 glam.workspace = true
 tracing.workspace = true
 

@@ -2398,6 +2398,7 @@ version = "0.1.0"
 dependencies = [
  "bevy_ecs",
  "glam 0.33.2",
+ "gltf",
  "melon_core",
  "rapier3d",
  "tracing",

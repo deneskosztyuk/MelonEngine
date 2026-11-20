@@ -31,6 +31,9 @@ pub mod colors {
     pub const ERROR: Color32 = Color32::from_rgb(0xe0, 0x56, 0x56);
     pub const INFO: Color32 = Color32::from_rgb(0x6c, 0xb2, 0xe6);
     /// Axis labels in the inspector (X red, Y green, Z blue).
+    /// Collider outlines in the Scene view (green, like Unity and Godot) and trigger outlines.
+    pub const COLLIDER: Color32 = Color32::from_rgb(0x33, 0xe6, 0x4d);
+    pub const COLLIDER_SENSOR: Color32 = Color32::from_rgb(0x33, 0xc8, 0xe6);
     pub const AXIS_X: Color32 = ERROR;
     pub const AXIS_Y: Color32 = SUCCESS;
     pub const AXIS_Z: Color32 = ACCENT_HOVER;

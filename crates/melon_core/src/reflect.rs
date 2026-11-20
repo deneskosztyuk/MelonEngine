@@ -49,6 +49,36 @@ pub struct QuatReflect {
     pub w: f32,
 }
 
+/// An enum that knows usable payloads for its variants. The Inspector asks
+/// for one when the user switches variant (a plain default would give a
+/// sphere of radius 0). Register with `#[reflect(VariantDefaults)]`.
+pub trait VariantDefaults: Sized {
+    /// The enum set to variant `name` with useful field values.
+    fn variant_default(name: &str) -> Option<Self>;
+}
+
+/// Type data of `VariantDefaults`.
+#[derive(Clone)]
+pub struct ReflectVariantDefaults {
+    variant_default: fn(&str) -> Option<Box<dyn Reflect>>,
+}
+
+impl ReflectVariantDefaults {
+    pub fn variant_default(&self, name: &str) -> Option<Box<dyn Reflect>> {
+        (self.variant_default)(name)
+    }
+}
+
+impl<T: Reflect + VariantDefaults> FromType<T> for ReflectVariantDefaults {
+    fn from_type() -> Self {
+        Self {
+            variant_default: |name| {
+                T::variant_default(name).map(|v| Box::new(v) as Box<dyn Reflect>)
+            },
+        }
+    }
+}
+
 /// Bumped on every component registration, so views built from the
 /// registry (Add Component list) know to rebuild.
 #[derive(Resource, Default)]
@@ -156,7 +186,10 @@ mod tests {
                 "Audio Listener",
                 "Audio Source",
                 "Bob",
-                "Body Info",
+                "Character Controller",
+                "Collider",
+                "Joint",
+                "Rigid Body",
                 "Spin",
                 "Transform"
             ]

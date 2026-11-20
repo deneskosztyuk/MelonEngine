@@ -9,13 +9,14 @@ use bevy_ecs::reflect::{AppTypeRegistry, ReflectComponent};
 use bevy_ecs::world::World;
 use melon_core::assets::split_mesh_fragment;
 use melon_core::bevy_reflect::serde::{TypedReflectDeserializer, TypedReflectSerializer};
-use melon_core::bevy_reflect::{PartialReflect, ReflectFromReflect, TypeRegistry};
+use melon_core::bevy_reflect::{FromReflect, PartialReflect, ReflectFromReflect, TypeRegistry};
+use melon_core::glam::Vec3;
 use melon_core::hierarchy::{depth_first, world_matrix};
 use melon_core::{
-    Aabb, AssetGuid, AssetServer, Bob, BodyInfo, BodyKind, ChildOf, Handle, Model, Name,
-    NameCounter, Spin, Transform,
+    Aabb, AssetGuid, AssetServer, Bob, BodyInfo, BodyKind, ChildOf, Collider, ColliderShape,
+    Handle, Model, Name, NameCounter, RigidBody, RigidBodyKind, Spin, Transform,
 };
-use melon_physics::{ColliderComponent, PhysicsWorld, RigidBodyComponent, RigidBodyType};
+use melon_physics::PhysicsWorld;
 use ron::value::RawValue;
 use serde::de::DeserializeSeed;
 use serde::{Deserialize, Serialize};
@@ -24,7 +25,8 @@ use serde::{Deserialize, Serialize};
 /// 3: entities store a `parent` index; `transform` is local to the parent.
 /// 4: entities also store `model_guid`; it wins over `model` when it resolves.
 /// 5: components are a map from type path to RON, through the registry.
-const SCENE_VERSION: u32 = 5;
+/// 6: bodies are `RigidBody` + `Collider` components; version 1-5 `BodyInfo` is converted on load.
+const SCENE_VERSION: u32 = 6;
 
 /// Version 1 `mesh_ref` values, read so old scenes still load.
 #[derive(Deserialize, Clone, Copy)]
@@ -132,6 +134,62 @@ fn decode(
     Ok(Some(value))
 }
 
+/// Type path version 5 saved `BodyInfo` under.
+const BODY_INFO_PATH: &str = "melon_core::components::BodyInfo";
+
+/// Read a version 5 `BodyInfo` (no longer a registered component).
+fn read_body_info(raw: &RawValue) -> Result<BodyInfo> {
+    let mut registry = TypeRegistry::default();
+    registry.register::<BodyInfo>();
+    let registration = registry
+        .get(std::any::TypeId::of::<BodyInfo>())
+        .context("BodyInfo registration")?;
+    let mut de = ron::Deserializer::from_str(raw.get_ron())?;
+    let value = TypedReflectDeserializer::new(registration, &registry).deserialize(&mut de)?;
+    de.end()?;
+    BodyInfo::from_reflect(value.as_ref()).context("`BodyInfo` data does not match the type")
+}
+
+/// A version 1-5 body as `RigidBody` + `Collider` (a box), saved like any
+/// other component. `scale` is the entity scale. A body of kind `None` was no body at all.
+fn convert_body_info(
+    info: BodyInfo,
+    entity: &SceneEntity,
+    registry: &TypeRegistry,
+    saved: &mut BTreeMap<String, Box<RawValue>>,
+) -> Result<Option<Vec3>> {
+    let he = info.half_extents;
+    if he.x <= 0.0 || he.y <= 0.0 || he.z <= 0.0 {
+        bail!(
+            "entity '{}' has non-positive half-extents: {he:?}",
+            entity.name
+        );
+    }
+    let kind = match info.body_type {
+        BodyKind::None => return Ok(None),
+        BodyKind::Dynamic => RigidBodyKind::Dynamic,
+        BodyKind::Fixed => RigidBodyKind::Fixed,
+    };
+    let body = RigidBody {
+        kind,
+        ..Default::default()
+    };
+    let collider = Collider {
+        // World units for now: `apply_scene` divides by the world scale once
+        // the parents are in place.
+        shape: ColliderShape::Box { half_extents: he },
+        ..Default::default()
+    };
+    for value in [&body as &dyn PartialReflect, &collider] {
+        if let std::collections::btree_map::Entry::Vacant(slot) =
+            saved.entry(value.reflect_type_path().to_string())
+        {
+            slot.insert(component_ron(value, registry)?);
+        }
+    }
+    Ok(Some(he))
+}
+
 /// Insert a value `decode` returned.
 fn insert(world: &mut World, registry: &TypeRegistry, id: Entity, value: &dyn PartialReflect) {
     let type_id = value
@@ -146,6 +204,8 @@ fn insert(world: &mut World, registry: &TypeRegistry, id: Entity, value: &dyn Pa
 
 /// One entity's components, read and ready to insert.
 struct Decoded {
+    /// World-unit half extents of a converted `BodyInfo` box.
+    legacy_half: Option<Vec3>,
     components: Vec<Box<dyn PartialReflect>>,
     kept: BTreeMap<String, Box<RawValue>>,
 }
@@ -177,17 +237,25 @@ fn decode_entity(
     if let Some(a) = entity.aabb {
         legacy(&a)?;
     }
-    if let Some(b) = entity.body_info {
-        legacy(&b)?;
-    }
     if let Some(s) = entity.spin {
         legacy(&s)?;
     }
     if let Some(b) = entity.bob {
         legacy(&b)?;
     }
+    // Versions 1-4 stored `body_info` as a field, version 5 as a component.
+    let body_info = match (entity.body_info, saved.remove(BODY_INFO_PATH)) {
+        (Some(info), _) => Some(info),
+        (None, Some(raw)) => Some(read_body_info(&raw.trim_boxed())?),
+        (None, None) => None,
+    };
+    let mut legacy_half = None;
+    if let Some(info) = body_info {
+        legacy_half = convert_body_info(info, entity, registry, &mut saved)?;
+    }
 
     let mut decoded = Decoded {
+        legacy_half,
         components: Vec::new(),
         kept: BTreeMap::new(),
     };
@@ -357,6 +425,7 @@ pub fn apply_scene(world: &mut World, physics: &mut PhysicsWorld, data: &SceneDa
 
     // Spawn everything, attach parents, then create bodies from world poses
     // (which need the parents in place).
+    let legacy_half: Vec<Option<Vec3>> = decoded.iter().map(|d| d.legacy_half).collect();
     let ids: Vec<Entity> = data
         .entities
         .iter()
@@ -366,6 +435,18 @@ pub fn apply_scene(world: &mut World, physics: &mut PhysicsWorld, data: &SceneDa
     for (entity, &id) in data.entities.iter().zip(&ids) {
         if let Some(p) = entity.parent {
             world.entity_mut(id).insert(ChildOf(ids[p as usize]));
+        }
+    }
+    // Converted `BodyInfo` boxes: world-unit extents become local ones under
+    // the entity's world scale (its parents' included).
+    for (&id, half) in ids.iter().zip(&legacy_half) {
+        if let Some(half) = half {
+            let scale = world_matrix(world, id).to_scale_rotation_translation().0;
+            if let Some(mut c) = world.get_mut::<Collider>(id) {
+                c.shape = ColliderShape::Box {
+                    half_extents: *half / scale.abs().max(Vec3::splat(1e-6)),
+                };
+            }
         }
     }
     // A hand-copied block can repeat a uid; steps would find the wrong entity.
@@ -391,11 +472,7 @@ pub fn apply_scene(world: &mut World, physics: &mut PhysicsWorld, data: &SceneDa
         .map(|(_, &id)| id)
         .collect();
     world.insert_resource(melon_core::hierarchy::RootOrder(roots));
-    for &id in &ids {
-        if let Some(body_info) = world.get::<BodyInfo>(id).copied() {
-            spawn_body(world, physics, id, body_info);
-        }
-    }
+    melon_physics::sync_components(world, physics);
     Ok(())
 }
 
@@ -516,18 +593,10 @@ fn validate_entity(entity: &SceneEntity, decoded: &Decoded, index: usize) -> Res
         bail!("entity '{name}' (index {index}) has non-finite transform values");
     }
 
-    // Validate body info
-    if let Some(body_info) = decoded.get::<BodyInfo>() {
-        let he = body_info.half_extents;
-        if he.x <= 0.0 || he.y <= 0.0 || he.z <= 0.0 {
-            bail!("entity '{name}' (index {index}) has non-positive half-extents: {he:?}");
-        }
-    }
-
     Ok(())
 }
 
-/// Spawn one entity without its physics body (see `spawn_body`). Every scene
+/// Spawn one entity without its physics objects (`sync_components` makes them). Every scene
 /// entity gets a `Transform` (default if the file has none it can read).
 fn spawn_scene_entity(
     world: &mut World,
@@ -612,46 +681,13 @@ pub(crate) fn restore_entity(
     Ok(id)
 }
 
-/// Create the rapier body for `id` at its world pose.
-pub(crate) fn spawn_body(
-    world: &mut World,
-    physics: &mut PhysicsWorld,
-    id: Entity,
-    body_info: BodyInfo,
-) {
-    let pose = Transform::from_mat4(world_matrix(world, id));
-    let (kind, (body_h, collider_h)) = match body_info.body_type {
-        BodyKind::Dynamic => (
-            RigidBodyType::Dynamic,
-            physics.spawn_dynamic_cuboid(pose.translation, pose.rotation, body_info.half_extents),
-        ),
-        BodyKind::Fixed => (
-            RigidBodyType::Fixed,
-            physics.spawn_fixed_cuboid(pose.translation, pose.rotation, body_info.half_extents),
-        ),
-        BodyKind::None => {
-            world.entity_mut(id).insert(body_info);
-            return;
-        }
-    };
-    world.entity_mut(id).insert((
-        RigidBodyComponent {
-            body_handle: body_h,
-            body_type: kind,
-        },
-        ColliderComponent {
-            collider_handle: collider_h,
-        },
-        body_info,
-    ));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use bevy_ecs::world::World;
     use melon_core::bevy_reflect::{self, Reflect, std_traits::ReflectDefault};
     use melon_core::glam::{Quat, Vec3};
+    use melon_physics::RigidBodyComponent;
 
     fn world_with_entities() -> World {
         let mut world = reg_world();
@@ -1173,7 +1209,7 @@ mod tests {
         load_scene(&mut world, &mut physics, &tmp).unwrap();
 
         assert_eq!(physics.bodies.len(), 1, "should have 1 physics body");
-        assert_eq!(physics.colliders.len(), 1, "should have 1 collider");
+        assert_eq!(physics.colliders().len(), 1, "should have 1 collider");
 
         let has_rb = world.query::<&RigidBodyComponent>().iter(&world).count();
         assert_eq!(has_rb, 1, "entity should have RigidBodyComponent");
@@ -1419,7 +1455,7 @@ mod tests {
     const TEST_HEALTH: &str = "melon_editor::scene::tests::TestHealth";
 
     #[test]
-    fn v5_round_trips_every_engine_component() {
+    fn v6_round_trips_every_engine_component() {
         let mut world = reg_world();
         let cube: Handle<Model> = world.resource_mut::<AssetServer>().load("builtin:cube");
         let rotation = Quat::from_rotation_y(0.5);
@@ -1435,10 +1471,11 @@ mod tests {
                 Aabb {
                     half_extents: Vec3::new(0.5, 0.25, 1.0),
                 },
-                BodyInfo {
-                    body_type: BodyKind::Fixed,
-                    half_extents: Vec3::splat(0.5),
+                RigidBody {
+                    kind: RigidBodyKind::Fixed,
+                    ..Default::default()
                 },
+                Collider::default(),
                 Spin,
                 Bob,
             ))
@@ -1450,7 +1487,7 @@ mod tests {
         ));
         let mut physics = PhysicsWorld::new();
         let text = round_trip(&mut world, &mut physics);
-        assert!(text.contains("version: 5"), "{text}");
+        assert!(text.contains("version: 6"), "{text}");
 
         let root = named(&mut world, "Root");
         let t = world.get::<Transform>(root).unwrap();
@@ -1461,9 +1498,16 @@ mod tests {
             world.get::<Aabb>(root).unwrap().half_extents,
             Vec3::new(0.5, 0.25, 1.0)
         );
-        let body = world.get::<BodyInfo>(root).unwrap();
-        assert_eq!(body.body_type, BodyKind::Fixed);
-        assert_eq!(body.half_extents, Vec3::splat(0.5));
+        assert_eq!(
+            world.get::<RigidBody>(root).unwrap().kind,
+            RigidBodyKind::Fixed
+        );
+        assert_eq!(
+            world.get::<Collider>(root).unwrap().shape,
+            ColliderShape::Box {
+                half_extents: Vec3::splat(0.5)
+            }
+        );
         assert!(world.get::<Spin>(root).is_some() && world.get::<Bob>(root).is_some());
         assert!(world.get::<RigidBodyComponent>(root).is_some());
         assert_eq!(physics.bodies.len(), 1);
@@ -1502,7 +1546,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_file_has_no_runtime_components() {
+    fn v6_file_has_no_runtime_components() {
         let mut world = reg_world();
         let root = world
             .spawn((
@@ -1510,10 +1554,8 @@ mod tests {
                 Transform::default(),
                 melon_core::PreviousTransform(Transform::default()),
                 melon_core::GlobalTransform(melon_core::glam::Mat4::IDENTITY),
-                BodyInfo {
-                    body_type: BodyKind::Dynamic,
-                    half_extents: Vec3::splat(0.5),
-                },
+                RigidBody::default(),
+                Collider::default(),
             ))
             .id();
         world.spawn((Name("Kid".to_string()), Transform::default(), ChildOf(root)));
@@ -1526,14 +1568,15 @@ mod tests {
             "GlobalTransform",
             "ChildOf",
             "Children",
-            "RigidBody",
-            "Collider",
+            "RigidBodyComponent",
+            "ColliderComponent",
             "Name\"",
             "Handle",
         ] {
             assert!(!text.contains(runtime), "{runtime} saved:\n{text}");
         }
-        assert!(text.contains("melon_core::components::BodyInfo"), "{text}");
+        assert!(text.contains("melon_core::physics::RigidBody"), "{text}");
+        assert!(!text.contains("BodyInfo"), "{text}");
     }
 
     #[test]
@@ -1677,8 +1720,14 @@ mod tests {
                 Vec3::new(10.0, 0.5, 10.0)
             );
             assert_eq!(
-                world.get::<BodyInfo>(floor).unwrap().body_type,
-                BodyKind::Fixed
+                world.get::<RigidBody>(floor).unwrap().kind,
+                RigidBodyKind::Fixed
+            );
+            assert_eq!(
+                world.get::<Collider>(floor).unwrap().shape,
+                ColliderShape::Box {
+                    half_extents: Vec3::new(10.0, 0.5, 10.0)
+                }
             );
             assert_eq!(physics.bodies.len(), 1);
             let cube = named(&mut world, "Cube");
@@ -1690,10 +1739,225 @@ mod tests {
             assert!(world.get::<Spin>(cube).is_some() && world.get::<Bob>(cube).is_some());
             assert!(world.get::<Aabb>(cube).is_none());
             assert_eq!(model_path_of(&mut world, "Cube"), "assets/models/cube.glb");
-            // Saved again as v5.
+            // Saved again as v6.
             let text = round_trip(&mut world, &mut physics);
-            assert!(text.contains("version: 5"), "{text}");
+            assert!(text.contains("version: 6"), "{text}");
         }
+    }
+
+    #[test]
+    fn v5_body_info_loads_as_a_v6_body_and_saves_as_v6() {
+        let mut local = TypeRegistry::default();
+        local.register::<BodyInfo>();
+        let info = BodyInfo {
+            body_type: BodyKind::Dynamic,
+            half_extents: Vec3::new(1.0, 2.0, 3.0),
+        };
+        let mut old = entity("Old", None);
+        old.components.insert(
+            BODY_INFO_PATH.to_string(),
+            component_ron(&info, &local).unwrap(),
+        );
+        old.transform = Some(Transform {
+            scale: Vec3::splat(2.0),
+            ..Default::default()
+        });
+        let data = SceneData {
+            version: 5,
+            entities: vec![old],
+            name_counter: 0,
+        };
+        let mut world = reg_world();
+        let mut physics = PhysicsWorld::new();
+        apply_scene(&mut world, &mut physics, &data).unwrap();
+        let e = named(&mut world, "Old");
+        assert_eq!(
+            world.get::<RigidBody>(e).unwrap().kind,
+            RigidBodyKind::Dynamic
+        );
+        // World-unit half extents become local ones under the entity scale.
+        assert_eq!(
+            world.get::<Collider>(e).unwrap().shape,
+            ColliderShape::Box {
+                half_extents: Vec3::new(0.5, 1.0, 1.5)
+            }
+        );
+        assert_eq!((physics.bodies.len(), physics.colliders().len()), (1, 1));
+        assert!(world.get::<RigidBodyComponent>(e).is_some());
+        let text = round_trip(&mut world, &mut physics);
+        assert!(text.contains("version: 6"), "{text}");
+        assert!(!text.contains("BodyInfo"), "{text}");
+        let e = named(&mut world, "Old");
+        assert_eq!(
+            world.get::<RigidBody>(e).unwrap().kind,
+            RigidBodyKind::Dynamic
+        );
+        assert_eq!((physics.bodies.len(), physics.colliders().len()), (1, 1));
+    }
+
+    #[test]
+    fn v5_scaled_entity_keeps_its_world_size_in_rapier() {
+        let mut local = TypeRegistry::default();
+        local.register::<BodyInfo>();
+        let info = BodyInfo {
+            body_type: BodyKind::Fixed,
+            half_extents: Vec3::new(1.0, 2.0, 3.0),
+        };
+        let mut old = entity("Old", None);
+        old.components.insert(
+            BODY_INFO_PATH.to_string(),
+            component_ron(&info, &local).unwrap(),
+        );
+        old.transform = Some(Transform {
+            scale: Vec3::new(2.0, 0.5, 4.0),
+            ..Default::default()
+        });
+        let data = SceneData {
+            version: 5,
+            entities: vec![old],
+            name_counter: 0,
+        };
+        let mut world = reg_world();
+        let mut physics = PhysicsWorld::new();
+        apply_scene(&mut world, &mut physics, &data).unwrap();
+        let e = named(&mut world, "Old");
+        let handle = world
+            .get::<melon_physics::ColliderComponent>(e)
+            .unwrap()
+            .collider_handle
+            .unwrap();
+        let half = physics
+            .colliders()
+            .get(handle)
+            .unwrap()
+            .shape()
+            .as_cuboid()
+            .unwrap()
+            .half_extents;
+        assert!(
+            (half - Vec3::new(1.0, 2.0, 3.0)).length() < 1e-5,
+            "world half extents {half}"
+        );
+        // Saved and loaded as v6: still the same world size.
+        let text = round_trip(&mut world, &mut physics);
+        assert!(text.contains("version: 6"), "{text}");
+        let e = named(&mut world, "Old");
+        let handle = world
+            .get::<melon_physics::ColliderComponent>(e)
+            .unwrap()
+            .collider_handle
+            .unwrap();
+        let half = physics
+            .colliders()
+            .get(handle)
+            .unwrap()
+            .shape()
+            .as_cuboid()
+            .unwrap()
+            .half_extents;
+        assert!((half - Vec3::new(1.0, 2.0, 3.0)).length() < 1e-5, "{half}");
+    }
+
+    #[test]
+    fn v5_body_info_keeps_its_world_size_under_a_scaled_parent() {
+        let mut local = TypeRegistry::default();
+        local.register::<BodyInfo>();
+        let info = BodyInfo {
+            body_type: BodyKind::Fixed,
+            half_extents: Vec3::new(1.0, 2.0, 3.0),
+        };
+        let mut parent = entity("Parent", None);
+        parent.transform = Some(Transform {
+            scale: Vec3::splat(2.0),
+            ..Default::default()
+        });
+        let mut child = entity("Child", Some(0));
+        child.transform = Some(Transform {
+            scale: Vec3::new(1.0, 0.5, 1.0),
+            ..Default::default()
+        });
+        child.components.insert(
+            BODY_INFO_PATH.to_string(),
+            component_ron(&info, &local).unwrap(),
+        );
+        let data = SceneData {
+            version: 5,
+            entities: vec![parent, child],
+            name_counter: 0,
+        };
+        let mut world = reg_world();
+        let mut physics = PhysicsWorld::new();
+        apply_scene(&mut world, &mut physics, &data).unwrap();
+        let e = named(&mut world, "Child");
+        // World scale (2, 1, 2): local half = world half / scale.
+        let ColliderShape::Box { half_extents } = world.get::<Collider>(e).unwrap().shape else {
+            panic!("a box");
+        };
+        assert!(
+            (half_extents - Vec3::new(0.5, 2.0, 1.5)).length() < 1e-5,
+            "{half_extents}"
+        );
+    }
+
+    #[test]
+    fn body_info_of_kind_none_is_no_body() {
+        let mut local = TypeRegistry::default();
+        local.register::<BodyInfo>();
+        let info = BodyInfo {
+            body_type: BodyKind::None,
+            half_extents: Vec3::splat(0.5),
+        };
+        let mut old = entity("Old", None);
+        old.components.insert(
+            BODY_INFO_PATH.to_string(),
+            component_ron(&info, &local).unwrap(),
+        );
+        let data = SceneData {
+            version: 5,
+            entities: vec![old],
+            name_counter: 0,
+        };
+        let mut world = reg_world();
+        let mut physics = PhysicsWorld::new();
+        apply_scene(&mut world, &mut physics, &data).unwrap();
+        assert_eq!(physics.bodies.len(), 0);
+        let e = named(&mut world, "Old");
+        assert!(world.get::<RigidBody>(e).is_none());
+    }
+
+    #[test]
+    fn payload_enums_of_physics_components_round_trip() {
+        use melon_core::{Joint, JointKind};
+        let mut world = reg_world();
+        let collider = Collider {
+            shape: ColliderShape::Capsule {
+                half_height: 0.7,
+                radius: 0.2,
+            },
+            ..Default::default()
+        };
+        let joint = Joint {
+            kind: JointKind::Hinge {
+                axis: Vec3::Z,
+                limited: true,
+                min: -1.0,
+                max: 2.0,
+            },
+            anchor: Vec3::X,
+            ..Default::default()
+        };
+        world.spawn((
+            Name("P".to_string()),
+            Transform::default(),
+            RigidBody::default(),
+            collider.clone(),
+            joint.clone(),
+        ));
+        let text = round_trip(&mut world, &mut PhysicsWorld::new());
+        assert!(text.contains("version: 6"), "{text}");
+        let e = named(&mut world, "P");
+        assert_eq!(world.get::<Collider>(e), Some(&collider));
+        assert_eq!(world.get::<Joint>(e), Some(&joint));
     }
 
     #[test]
