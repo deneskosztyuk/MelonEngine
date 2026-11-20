@@ -183,6 +183,7 @@ impl GpuTimer {
             bloom,
             total,
             budget_ms: None,
+            msaa: None,
         }
     }
 }

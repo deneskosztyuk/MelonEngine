@@ -192,6 +192,9 @@ pub struct RenderTimings {
     pub bloom: Option<f32>,
     pub total: Option<f32>,
     pub budget_ms: Option<f32>,
+    /// Sample count the 3D pass runs at: `RenderQuality::msaa`, or the
+    /// nearest lower count the adapter supports.
+    pub msaa: Option<u32>,
 }
 
 /// Profile names become file names: letters, digits, spaces, `-` and `_`,

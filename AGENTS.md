@@ -172,7 +172,7 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 - **Viewport.** `melon_editor/src/viewport.rs` holds the UI-library-independent
   viewport logic (`EditorCamera`, `pick`, grid/selection lines). UI glue only
   fills a `ViewportInput` and shows the `ViewportTarget` image; the scene
-  always renders into `ViewportTarget` (MSAA 4x HDR, then tonemap). egui must
+  always renders into `ViewportTarget` (HDR at `RenderQuality::msaa` samples, then tonemap). egui must
   sample it through `ViewportTarget::ui_view()` (non-sRGB), or it darkens.
 - **Edit mode.** The engine starts in `SimulationState::Editing`: no fixed
   steps, no game systems. Play / Pause / Stop live in `melon_editor::play`

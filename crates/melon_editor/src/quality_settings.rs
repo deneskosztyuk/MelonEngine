@@ -353,7 +353,7 @@ fn setting_row(
                     let mut index = selected(shown, setting);
                     egui::ComboBox::from_id_salt(("quality_setting", setting_id(setting)))
                         .width(theme::sizes::QUALITY_DROPDOWN)
-                        .selected_text(options(setting)[index])
+                        .selected_text(selected_text(shown, timings, setting, index))
                         .show_ui(ui, |ui| {
                             for (j, label) in options(setting).iter().enumerate() {
                                 ui.selectable_value(&mut index, j, *label);
@@ -488,6 +488,27 @@ fn pass_color(setting: QualitySetting) -> Option<egui::Color32> {
         QualitySetting::Msaa => Some(PASS_AA),
         QualitySetting::Bloom => Some(PASS_BLOOM),
         QualitySetting::Present => None,
+    }
+}
+
+/// The dropdown's text: the option, plus the sample count the renderer
+/// runs at when the adapter lacks the requested MSAA ("MSAA 2x (runs Off)").
+fn selected_text(
+    q: &RenderQuality,
+    t: &RenderTimings,
+    setting: QualitySetting,
+    index: usize,
+) -> String {
+    let label = options(setting)[index];
+    match t.msaa {
+        Some(runs) if setting == QualitySetting::Msaa && runs != q.msaa => {
+            let runs = quality::MSAA_SAMPLES.iter().position(|&s| s == runs);
+            format!(
+                "{label} (runs {})",
+                runs.map_or("?", |i| options(setting)[i])
+            )
+        }
+        _ => label.into(),
     }
 }
 
@@ -659,6 +680,29 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cost_caption(&t), "4.6 ms of 8.3 ms budget (120 Hz)");
+    }
+
+    #[test]
+    fn msaa_dropdown_shows_the_effective_count_when_it_differs() {
+        let q = RenderQuality::default();
+        let row = QualitySetting::Msaa;
+        let index = selected(&q, row);
+        let runs = |msaa| RenderTimings {
+            msaa,
+            ..Default::default()
+        };
+        assert_eq!(selected_text(&q, &runs(None), row, index), "MSAA 4x");
+        assert_eq!(selected_text(&q, &runs(Some(4)), row, index), "MSAA 4x");
+        assert_eq!(
+            selected_text(&q, &runs(Some(1)), row, index),
+            "MSAA 4x (runs Off)"
+        );
+        let bloom = QualitySetting::Bloom;
+        let on = selected(&q, bloom);
+        assert_eq!(
+            selected_text(&q, &runs(Some(1)), bloom, on),
+            options(bloom)[on]
+        );
     }
 
     #[test]

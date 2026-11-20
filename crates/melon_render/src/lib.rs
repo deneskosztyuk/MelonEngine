@@ -796,6 +796,8 @@ pub struct Renderer {
     present_mode: wgpu::PresentMode,
     /// Present modes the surface offers.
     present_modes: Vec<wgpu::PresentMode>,
+    /// `MELON_PRESENT`, read once at startup.
+    present_env: Option<String>,
     /// The adapter's backend (`backend_order`).
     backend: wgpu::Backend,
     scene: SceneRenderer,
@@ -980,10 +982,11 @@ impl Renderer {
             .first()
             .copied()
             .context("surface reported no usable formats")?;
+        let present_env = std::env::var("MELON_PRESENT").ok();
         let present_mode = choose_present_mode(
             melon_core::RenderQuality::default().present,
             &caps.present_modes,
-            std::env::var("MELON_PRESENT").ok().as_deref(),
+            present_env.as_deref(),
         );
 
         let timer = timings::GpuTimer::new(&device, &queue);
@@ -1004,6 +1007,7 @@ impl Renderer {
             window,
             present_mode,
             present_modes: caps.present_modes,
+            present_env,
             backend,
             scene,
             model_cache,
@@ -1032,11 +1036,8 @@ impl Renderer {
     /// `choose_present_mode`), reconfiguring the surface; true when it
     /// changed (the host then switches its frame cap). Call between frames.
     pub fn set_present(&mut self, preference: melon_core::PresentPreference) -> bool {
-        let mode = choose_present_mode(
-            preference,
-            &self.present_modes,
-            std::env::var("MELON_PRESENT").ok().as_deref(),
-        );
+        let mode =
+            choose_present_mode(preference, &self.present_modes, self.present_env.as_deref());
         if mode == self.present_mode {
             return false;
         }
@@ -1050,10 +1051,14 @@ impl Renderer {
     /// measured (no timestamp support, pass off). `budget_ms` is left to
     /// the host (monitor refresh).
     pub fn timings(&self) -> melon_core::RenderTimings {
-        self.timer
-            .as_ref()
-            .map(timings::GpuTimer::timings)
-            .unwrap_or_default()
+        melon_core::RenderTimings {
+            msaa: Some(self.scene.msaa()),
+            ..self
+                .timer
+                .as_ref()
+                .map(timings::GpuTimer::timings)
+                .unwrap_or_default()
+        }
     }
 
     /// Load `handle` through the model cache (as `render_scene` does) and
