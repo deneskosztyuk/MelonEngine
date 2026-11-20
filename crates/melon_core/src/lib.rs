@@ -12,7 +12,9 @@ pub mod components;
 pub mod hierarchy;
 pub mod input;
 pub mod plugin;
+pub mod quality;
 pub mod resources;
+mod ron_file;
 pub mod stages;
 
 pub use actions::{
@@ -29,7 +31,10 @@ pub use glam;
 pub use hierarchy::{ChildOf, Children, GlobalTransform};
 pub use input::{GameInputGate, Input, InputButton, InputFocus, KeyCode, MouseButton, RawPresses};
 pub use plugin::{App, Plugin, abi_fingerprint};
-pub use resources::{Camera, Environment, GiMode, Light, NameCounter, SimulationState, Time};
+pub use quality::{
+    GiMode, PresentPreference, QualityPreset, QualitySetting, RenderQuality, RenderTimings,
+};
+pub use resources::{Camera, Environment, Light, NameCounter, SimulationState, Time};
 pub use stages::{FixedUpdate, PostUpdate, PreUpdate, Update};
 
 pub fn version() -> &'static str {
@@ -105,6 +110,7 @@ impl Core {
         world.init_resource::<RawPresses>();
         world.init_resource::<InputMap>();
         world.init_resource::<Actions>();
+        world.init_resource::<RenderQuality>();
 
         let mut core = Self {
             world,

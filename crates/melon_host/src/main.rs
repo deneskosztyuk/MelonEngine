@@ -263,6 +263,8 @@ struct App {
     game_input: bool,
     /// `config/input.ron` failed to load: the editor backs it up before its first save.
     input_map_broken: bool,
+    /// `config/quality.ron` failed to load: the editor backs it up before its first Apply.
+    quality_broken: bool,
     last_frame: Option<Instant>,
     /// Frame cap, set when the present mode does not wait for vblank.
     pacer: Option<pacing::FrameDeadline>,
@@ -340,6 +342,10 @@ impl App {
             }
         };
         core.world.insert_resource(input_map);
+        let quality_path = melon_editor::quality_settings::quality_path(PROJECT_ROOT.as_ref());
+        let (quality, outcome) = melon_core::RenderQuality::load(&quality_path);
+        let quality_broken = outcome.log(&quality_path, "quality settings");
+        core.world.insert_resource(quality);
         let mut physics = PhysicsWorld::new();
         spawn_default_scene(&mut core.world, &mut physics);
         core.world.insert_resource(physics);
@@ -362,6 +368,7 @@ impl App {
             core,
             game_input: false,
             input_map_broken,
+            quality_broken,
             last_frame: None,
             pacer: None,
             stats: pacing::FrameStats::from_env(),
@@ -437,6 +444,7 @@ impl ApplicationHandler for App {
         // ship builds need a real project path (CLI argument or project file).
         editor_ui.set_project_root(std::path::Path::new(PROJECT_ROOT));
         editor_ui.set_input_map_broken(self.input_map_broken);
+        editor_ui.set_quality_broken(self.quality_broken);
 
         let size = renderer.size();
         let aspect = size.width as f32 / size.height.max(1) as f32;

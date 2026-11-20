@@ -23,6 +23,7 @@ pub mod gizmo;
 pub mod layout;
 pub mod play;
 pub mod project_settings;
+pub mod quality_settings;
 pub mod scene;
 pub mod theme;
 mod toolbar_icon;
@@ -482,6 +483,11 @@ impl Editor {
     /// The host loaded a broken `config/input.ron`: the first mapping save backs it up.
     pub fn set_input_map_broken(&mut self, broken: bool) {
         self.project_settings.set_broken_on_load(broken);
+    }
+
+    /// The host loaded a broken `config/quality.ron`: the first Apply backs it up.
+    pub fn set_quality_broken(&mut self, broken: bool) {
+        self.project_settings.set_quality_broken(broken);
     }
 
     pub fn selected_entity(&self) -> Option<Entity> {

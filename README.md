@@ -80,6 +80,7 @@ Editor:
   axis: positive, then negative) waits for the next key; **Esc** cancels.
   Changes apply live and save to `config/input.ron`; a broken file falls
   back to the defaults and is kept as `config/input.ron.broken` on the first save.
+- **Edit ▸ Project Settings ▸ Quality** — preset, per-setting render quality and named profiles; edits wait for **Apply** (saved to `config/quality.ron`).
 - Panels (Hierarchy, Scene, Inspector, Content Browser, Console) dock and tab
   by dragging their tabs; the arrangement is saved to `.melon/editor_layout.ron`.
   **Window** reopens closed panels; **Window ▸ Reset Layout** restores the default.

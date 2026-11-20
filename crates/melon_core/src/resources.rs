@@ -2,7 +2,8 @@ use bevy_ecs::resource::Resource;
 use glam::camera::rh::proj::directx;
 use glam::camera::rh::view;
 use glam::{Mat4, Vec2, Vec3, Vec4};
-use serde::{Deserialize, Serialize};
+
+pub use crate::quality::GiMode;
 
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct Camera {
@@ -204,19 +205,6 @@ pub struct Environment {
     /// Strength of the indirect diffuse light that replaces the hemisphere
     /// ambient (`gi_mode`); 0 = off, like `GiMode::Off` (no GI passes).
     pub gi_intensity: f32,
-}
-
-/// Diffuse global illumination technique (`Environment::gi_mode`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum GiMode {
-    /// Hemisphere ambient only.
-    Off,
-    /// Screen-space GI at half resolution: cheaper, but only what is on
-    /// screen bounces light.
-    Ssgi,
-    /// DDGI probes over a voxel scene: world-space, costlier.
-    #[default]
-    Ddgi,
 }
 
 impl Default for Environment {
