@@ -272,7 +272,7 @@ impl Editor {
                 egui::Key::Escape,
             ]
             .into_iter()
-            .filter(|key| i.key_pressed(*key))
+            .filter(|key| fresh_press(i, *key))
             .filter_map(|key| shortcut_for(key, i.modifiers.command, typing, self.flying))
             .collect()
         });
@@ -788,14 +788,14 @@ impl Editor {
         // Shortcuts are ignored while typing in a text field or capturing a binding.
         if !ui.ctx().text_edit_focused() && !self.keys_captured {
             ui.input(|i| {
-                if i.key_pressed(egui::Key::F5) {
+                if fresh_press(i, egui::Key::F5) {
                     if i.modifiers.shift {
                         want_stop = true;
                     } else {
                         want_play = true;
                     }
                 }
-                want_pause |= i.key_pressed(egui::Key::F6);
+                want_pause |= fresh_press(i, egui::Key::F6);
             });
         }
         let can_play = state != SimulationState::Playing;
@@ -1792,6 +1792,14 @@ pub enum Shortcut {
     Scale,
     /// Esc: input focus back to the editor (the game keeps running).
     ReleaseGame,
+}
+
+/// `key` went down this frame. Key repeat does not count, so a key held since
+/// a binding capture never fires its shortcut.
+fn fresh_press(i: &egui::InputState, key: egui::Key) -> bool {
+    i.events.iter().any(
+        |e| matches!(e, egui::Event::Key { key: k, pressed: true, repeat: false, .. } if *k == key),
+    )
 }
 
 /// Map a pressed key to a shortcut. Nothing fires while typing in a text

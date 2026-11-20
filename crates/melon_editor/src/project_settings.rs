@@ -433,14 +433,35 @@ mod tests {
         modifiers: egui::Modifiers,
     ) {
         let ctx = egui::Context::default();
+        editor_frame(
+            &ctx,
+            editor,
+            world,
+            key_event(key, true, modifiers),
+            modifiers,
+        );
+    }
+
+    fn key_event(key: egui::Key, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// One full editor frame on `ctx` (which remembers held keys) with `event`.
+    fn editor_frame(
+        ctx: &egui::Context,
+        editor: &mut crate::Editor,
+        world: &mut World,
+        event: egui::Event,
+        modifiers: egui::Modifiers,
+    ) {
         let input = egui::RawInput {
-            events: vec![egui::Event::Key {
-                key,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers,
-            }],
+            events: vec![event],
             modifiers,
             ..Default::default()
         };
@@ -516,6 +537,66 @@ mod tests {
             SimulationState::Playing
         );
         assert_eq!(*world.resource::<InputFocus>(), InputFocus::Game);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn held_captured_key_does_not_trigger_on_repeat() {
+        use melon_core::{InputFocus, PendingDelete, SimulationState};
+        let root = temp_root("repeat");
+        let mut world = world_with(vec![InputButton::Key(KeyCode::Delete)]);
+        world.insert_resource(SimulationState::Paused);
+        world.insert_resource(InputFocus::Editor);
+        let entity = world.spawn(Transform::default()).id();
+        let mut editor = crate::Editor::new();
+        editor.project_root = root.clone();
+        editor.set_selected(Some(entity));
+        editor.project_settings.open = true;
+        editor.project_settings.capture = Some(CaptureTarget::Button(jump_index(&world)));
+        // One context across frames, so egui knows the keys stay held.
+        let ctx = egui::Context::default();
+        let none = egui::Modifiers::NONE;
+        let press = |key| key_event(key, true, none);
+        editor_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            press(egui::Key::Delete),
+            none,
+        );
+        assert!(!editor.project_settings.capturing());
+
+        // Key repeat of the still-held Delete triggers nothing.
+        editor_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            press(egui::Key::Delete),
+            none,
+        );
+        assert!(world.get::<PendingDelete>(entity).is_none());
+
+        // Same for a held, just-captured F5: no Play.
+        world.insert_resource(RawPresses(vec![InputButton::Key(KeyCode::F5)]));
+        editor.project_settings.capture = Some(CaptureTarget::Button(jump_index(&world)));
+        editor_frame(&ctx, &mut editor, &mut world, press(egui::Key::F5), none);
+        editor_frame(&ctx, &mut editor, &mut world, press(egui::Key::F5), none);
+        assert_eq!(
+            *world.resource::<SimulationState>(),
+            SimulationState::Paused
+        );
+
+        // After a release, a fresh press deletes again.
+        let release = key_event(egui::Key::Delete, false, none);
+        editor_frame(&ctx, &mut editor, &mut world, release, none);
+        editor_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            press(egui::Key::Delete),
+            none,
+        );
+        assert!(world.get::<PendingDelete>(entity).is_some());
         let _ = std::fs::remove_dir_all(&root);
     }
 
