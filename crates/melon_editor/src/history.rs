@@ -581,7 +581,7 @@ impl History {
     }
 }
 
-fn name_of(world: &World, e: Entity) -> String {
+pub(crate) fn name_of(world: &World, e: Entity) -> String {
     world
         .get::<Name>(e)
         .map(|n| n.0.clone())

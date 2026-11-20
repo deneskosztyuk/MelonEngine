@@ -8,7 +8,7 @@ use egui_wgpu::ScreenDescriptor;
 use melon_core::bevy_reflect::{TypePath, TypeRegistry, std_traits::ReflectDefault};
 use melon_core::glam;
 use melon_core::hierarchy::{
-    depth_first, mark_for_delete, set_parent_keep_world, set_world_transform, world_matrix,
+    depth_first, set_parent_keep_world, set_world_transform, world_matrix,
 };
 use melon_core::{
     Aabb, AssetServer, BodyInfo, Camera, GameInputGate, Handle, InputFocus, Model, Name,
@@ -193,6 +193,18 @@ pub struct Editor {
     /// A rebinding capture was waiting when this frame began: its keys are not shortcuts.
     keys_captured: bool,
     logo: Option<egui::TextureHandle>,
+    /// Undo / redo steps (edit mode only).
+    history: history::History,
+    /// Hierarchy row being renamed inline.
+    renaming: Option<Renaming>,
+}
+
+/// An inline rename in the Hierarchy.
+struct Renaming {
+    entity: Entity,
+    text: String,
+    /// First frame: take keyboard focus and select the text.
+    fresh: bool,
 }
 
 impl Default for Editor {
@@ -240,6 +252,8 @@ impl Default for Editor {
             project_settings: project_settings::ProjectSettings::default(),
             keys_captured: false,
             logo: None,
+            history: history::History::default(),
+            renaming: None,
         }
     }
 }
@@ -286,9 +300,85 @@ impl Editor {
     /// Mark the selected entity for deletion and clear the selection.
     pub fn delete_selected(&mut self, world: &mut World) {
         if let Some(entity) = self.selected {
-            mark_for_delete(world, entity);
+            self.history.delete(world, entity, self.selected);
         }
         self.clear_selection();
+    }
+
+    /// Spawn a cube and record it as a step.
+    fn create_cube_step(&mut self, world: &mut World) {
+        let cube = create_cube(world);
+        let label = format!("Create {}", history::name_of(world, cube));
+        self.history
+            .record_created(world, cube, label, self.selected);
+        self.selected = Some(cube);
+    }
+
+    /// Spawn a model (see `spawn_model`), select it and record it as a step.
+    fn spawn_model_step(
+        &mut self,
+        world: &mut World,
+        path: &str,
+        at: glam::Vec3,
+        parent: Option<Entity>,
+    ) {
+        let root = spawn_model(world, &self.project_root, path, at, parent);
+        let label = format!("Create {}", history::name_of(world, root));
+        self.history
+            .record_created(world, root, label, self.selected);
+        self.selected = Some(root);
+    }
+
+    /// Show what an undo / redo / jump selected.
+    fn adopt_history_selection(&mut self, selection: Option<Option<Entity>>) {
+        if let Some(selection) = selection {
+            self.clear_selection();
+            self.selected = selection;
+            self.renaming = None;
+        }
+    }
+
+    fn undo(&mut self, world: &mut World) {
+        let selection = self.history.undo(world);
+        self.adopt_history_selection(selection);
+    }
+
+    fn redo(&mut self, world: &mut World) {
+        let selection = self.history.redo(world);
+        self.adopt_history_selection(selection);
+    }
+
+    /// Copy the selected entity (Ctrl+D); the copy becomes the selection.
+    fn duplicate_selected(&mut self, world: &mut World) {
+        let Some(entity) = self.selected else { return };
+        if let Some(copy) = self.history.duplicate(world, entity, self.selected) {
+            self.clear_selection();
+            self.selected = Some(copy);
+        }
+    }
+
+    /// Record this frame's edits to the selected entity (Inspector, gizmo).
+    fn track_history(&mut self, world: &mut World, ui: &egui::Ui) {
+        let ctx = ui.ctx();
+        let active =
+            self.gizmo_drag.is_some() || ctx.dragged_id().is_some() || ctx.text_edit_focused();
+        let hint = self.gizmo_drag.map(|d| match d.mode {
+            GizmoMode::Move => "Move",
+            GizmoMode::Rotate => "Rotate",
+            GizmoMode::Scale => "Scale",
+        });
+        self.history.track(world, self.selected, active, hint);
+    }
+
+    /// Open the inline rename on the selected Hierarchy row (F2).
+    fn start_rename(&mut self, world: &World) {
+        if let Some(entity) = self.selected {
+            self.renaming = Some(Renaming {
+                entity,
+                text: history::name_of(world, entity),
+                fresh: true,
+            });
+        }
     }
 
     fn open_dialog(&mut self, save: bool) {
@@ -360,6 +450,7 @@ impl Editor {
 
     fn handle_shortcuts(&mut self, world: &mut World, ui: &egui::Ui) {
         let typing = ui.ctx().text_edit_focused();
+        let dragging = self.gizmo_drag.is_some() || ui.ctx().dragged_id().is_some();
         let pressed: Vec<Shortcut> = ui.input(|i| {
             [
                 egui::Key::S,
@@ -369,10 +460,22 @@ impl Editor {
                 egui::Key::R,
                 egui::Key::Escape,
                 egui::Key::Space,
+                egui::Key::Z,
+                egui::Key::Y,
+                egui::Key::D,
+                egui::Key::F2,
             ]
             .into_iter()
             .filter(|key| fresh_press(i, *key))
-            .filter_map(|key| shortcut_for(key, i.modifiers.command, typing, self.flying))
+            .filter_map(|key| {
+                shortcut_for(
+                    key,
+                    i.modifiers.command,
+                    i.modifiers.shift,
+                    typing,
+                    self.flying,
+                )
+            })
             .collect()
         });
         let game_focus = input_focus(world) == InputFocus::Game;
@@ -391,6 +494,14 @@ impl Editor {
                 Shortcut::Rotate => self.gizmo_mode = GizmoMode::Rotate,
                 Shortcut::Scale => self.gizmo_mode = GizmoMode::Scale,
                 Shortcut::ToggleDrawer => self.toggle_drawer(),
+                // Not mid-gesture: the step is still being recorded.
+                Shortcut::Undo | Shortcut::Redo if dragging => {}
+                Shortcut::Undo => self.undo(world),
+                Shortcut::Redo => self.redo(world),
+                // With the Content Browser focused, Ctrl+D and F2 are its own.
+                Shortcut::Duplicate | Shortcut::Rename if self.content.has_focus() => {}
+                Shortcut::Duplicate => self.duplicate_selected(world),
+                Shortcut::Rename => self.start_rename(world),
             }
         }
     }
@@ -441,6 +552,50 @@ impl Editor {
                 }
             });
             ui.menu_button("Edit", |ui| {
+                let step = |verb: &str, label: Option<&str>| match label {
+                    Some(label) => format!("{verb} {label}"),
+                    None => verb.to_string(),
+                };
+                let undo_text = step("Undo", self.history.undo_label());
+                if ui
+                    .add_enabled(
+                        editing && self.history.can_undo(),
+                        egui::Button::new(undo_text).shortcut_text("Ctrl+Z"),
+                    )
+                    .clicked()
+                {
+                    self.undo(world);
+                }
+                let redo_text = step("Redo", self.history.redo_label());
+                if ui
+                    .add_enabled(
+                        editing && self.history.can_redo(),
+                        egui::Button::new(redo_text).shortcut_text("Ctrl+Y"),
+                    )
+                    .clicked()
+                {
+                    self.redo(world);
+                }
+                ui.separator();
+                let has_selection = editing && self.selected.is_some();
+                if ui
+                    .add_enabled(
+                        has_selection,
+                        egui::Button::new("Duplicate").shortcut_text("Ctrl+D"),
+                    )
+                    .clicked()
+                {
+                    self.duplicate_selected(world);
+                }
+                if ui
+                    .add_enabled(
+                        has_selection,
+                        egui::Button::new("Rename").shortcut_text("F2"),
+                    )
+                    .clicked()
+                {
+                    self.start_rename(world);
+                }
                 if ui
                     .add_enabled(
                         self.selected.is_some(),
@@ -457,7 +612,7 @@ impl Editor {
             });
             ui.menu_button("GameObject", |ui| {
                 if ui.button("Create Cube").clicked() {
-                    self.selected = Some(create_cube(world));
+                    self.create_cube_step(world);
                 }
             });
             ui.menu_button("Window", |ui| {
@@ -666,6 +821,8 @@ impl Editor {
                 match result {
                     Ok(()) => {
                         self.clear_selection();
+                        self.history.clear();
+                        self.renaming = None;
                         self.set_status(format!("Loaded from {}", path.display()));
                         self.set_current_scene(path);
                     }
@@ -1151,6 +1308,7 @@ impl Editor {
                     );
             });
         self.dock = dock;
+        self.track_history(world, ui);
         self.drawer_ui(world, ui);
         if std::mem::take(&mut self.focus_content_tab) {
             layout::reopen(&mut self.dock, layout::EditorTab::ContentBrowser);
@@ -1192,7 +1350,7 @@ impl Editor {
                 (vp.pointer, world.get_resource::<Camera>().copied())
         {
             let at = viewport::drop_point(&camera, pointer, vp.size);
-            self.selected = Some(spawn_model(world, &self.project_root, &path, at, None));
+            self.spawn_model_step(world, &path, at, None);
             self.gizmo_drag = None;
         }
         self.flying = vp.right_down;
@@ -1339,7 +1497,7 @@ impl Editor {
         });
 
         if add {
-            self.selected = Some(create_cube(world));
+            self.create_cube_step(world);
         }
 
         ui.separator();
@@ -1349,6 +1507,8 @@ impl Editor {
         let mut to_delete: Option<Entity> = None;
         let mut reparent: Option<(Entity, Option<Entity>)> = None;
         let mut model_drop: Option<(String, Option<Entity>)> = None;
+        // Inline rename finished this frame: the new text, or `None` for Esc.
+        let mut rename_done: Option<(Entity, Option<String>)> = None;
         let searching = !self.hierarchy_query.trim().is_empty();
         let rows: Vec<(Entity, usize, String, bool)> = depth_first(world)
             .into_iter()
@@ -1428,11 +1588,19 @@ impl Editor {
                 if response.secondary_clicked() {
                     to_delete = Some(entity);
                 }
+                if !searching && response.double_clicked() && !on_arrow {
+                    self.selected = Some(entity);
+                    self.renaming = Some(Renaming {
+                        entity,
+                        text: name.clone(),
+                        fresh: true,
+                    });
+                }
                 if !searching && response.drag_started() {
                     egui::DragAndDrop::set_payload(ui.ctx(), entity);
                 }
 
-                let painter = ui.painter();
+                let painter = ui.painter().clone();
                 let fill = if is_selected {
                     theme::colors::ACCENT_SOFT
                 } else if response.hovered() {
@@ -1468,13 +1636,49 @@ impl Editor {
                 } else {
                     arrow_rect.right()
                 };
-                painter.text(
-                    egui::pos2(text_x, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    &name,
-                    egui::TextStyle::Body.resolve(ui.style()),
-                    theme::colors::TEXT,
-                );
+                let renaming_here = self.renaming.as_ref().is_some_and(|r| r.entity == entity);
+                if renaming_here && let Some(r) = self.renaming.as_mut() {
+                    let edit_rect = egui::Rect::from_min_max(
+                        egui::pos2(text_x, rect.top()),
+                        rect.right_bottom(),
+                    );
+                    let id = egui::Id::new("hierarchy_rename");
+                    let edit = ui.put(
+                        edit_rect,
+                        egui::TextEdit::singleline(&mut r.text)
+                            .id(id)
+                            .desired_width(edit_rect.width()),
+                    );
+                    if std::mem::take(&mut r.fresh) {
+                        edit.request_focus();
+                        if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
+                            let end = egui::text::CCursor::new(r.text.chars().count());
+                            state
+                                .cursor
+                                .set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(0),
+                                    end,
+                                )));
+                            state.store(ui.ctx(), id);
+                        }
+                    } else {
+                        // Esc cancels; Enter or clicking away commits.
+                        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                        if escape {
+                            rename_done = Some((entity, None));
+                        } else if edit.lost_focus() {
+                            rename_done = Some((entity, Some(r.text.clone())));
+                        }
+                    }
+                } else {
+                    painter.text(
+                        egui::pos2(text_x, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        &name,
+                        egui::TextStyle::Body.resolve(ui.style()),
+                        theme::colors::TEXT,
+                    );
+                }
 
                 if !searching && carrying && response.contains_pointer() {
                     painter.rect_stroke(
@@ -1500,29 +1704,59 @@ impl Editor {
             }
         }
 
+        if let Some((entity, new_name)) = rename_done {
+            self.renaming = None;
+            if let Some(text) = new_name
+                && let Err(message) = self.history.rename(world, entity, &text, self.selected)
+            {
+                self.set_status_warning(message);
+            }
+        }
+
         if let Some((dragged, target)) = reparent
             && target != Some(dragged)
-            && let Err(message) = hierarchy_drop(world, dragged, target)
+            && let Err(message) = self.history.reparent(world, dragged, target, self.selected)
         {
             self.set_status_warning(message);
         }
         if let Some((path, parent)) = model_drop
             && content::is_model_path(&path)
         {
-            self.selected = Some(spawn_model(
-                world,
-                &self.project_root,
-                &path,
-                glam::Vec3::ZERO,
-                parent,
-            ));
+            self.spawn_model_step(world, &path, glam::Vec3::ZERO, parent);
         }
 
         if let Some(entity) = to_delete {
-            mark_for_delete(world, entity);
+            self.history.delete(world, entity, self.selected);
             if self.selected == Some(entity) {
                 self.clear_selection();
             }
+        }
+    }
+
+    /// The History panel: every step, the applied ones solid; a click goes there.
+    fn build_history(&mut self, world: &mut World, ui: &mut egui::Ui) {
+        let cursor = self.history.cursor();
+        let mut jump = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                if ui.selectable_label(cursor == 0, "Initial state").clicked() {
+                    jump = Some(0);
+                }
+                for (i, label) in self.history.labels().enumerate() {
+                    let text = if i < cursor {
+                        egui::RichText::new(label)
+                    } else {
+                        egui::RichText::new(label).weak()
+                    };
+                    if ui.selectable_label(i + 1 == cursor, text).clicked() {
+                        jump = Some(i + 1);
+                    }
+                }
+            });
+        if let Some(target) = jump {
+            let selection = self.history.jump_to(world, target);
+            self.adopt_history_selection(selection);
         }
     }
 
@@ -2606,6 +2840,14 @@ pub enum Shortcut {
     ReleaseGame,
     /// Ctrl+Space: show or hide the Content Drawer.
     ToggleDrawer,
+    /// Ctrl+Z.
+    Undo,
+    /// Ctrl+Y or Ctrl+Shift+Z.
+    Redo,
+    /// Ctrl+D.
+    Duplicate,
+    /// F2: rename in the Hierarchy.
+    Rename,
 }
 
 /// `key` went down this frame. Key repeat does not count, so a key held since
@@ -2618,7 +2860,13 @@ fn fresh_press(i: &egui::InputState, key: egui::Key) -> bool {
 
 /// Map a pressed key to a shortcut. Nothing fires while typing in a text
 /// field; W/E/R are fly keys while the right mouse button flies the camera.
-pub fn shortcut_for(key: egui::Key, ctrl: bool, typing: bool, flying: bool) -> Option<Shortcut> {
+pub fn shortcut_for(
+    key: egui::Key,
+    ctrl: bool,
+    shift: bool,
+    typing: bool,
+    flying: bool,
+) -> Option<Shortcut> {
     if typing {
         return None;
     }
@@ -2630,6 +2878,11 @@ pub fn shortcut_for(key: egui::Key, ctrl: bool, typing: bool, flying: bool) -> O
         egui::Key::R if !flying && !ctrl => Some(Shortcut::Scale),
         egui::Key::Escape => Some(Shortcut::ReleaseGame),
         egui::Key::Space if ctrl => Some(Shortcut::ToggleDrawer),
+        egui::Key::Z if ctrl && shift => Some(Shortcut::Redo),
+        egui::Key::Z if ctrl => Some(Shortcut::Undo),
+        egui::Key::Y if ctrl => Some(Shortcut::Redo),
+        egui::Key::D if ctrl => Some(Shortcut::Duplicate),
+        egui::Key::F2 => Some(Shortcut::Rename),
         _ => None,
     }
 }
@@ -2697,6 +2950,7 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                 self.editor.content.ui(ui);
                 self.editor.apply_content_requests(self.world);
             }
+            EditorTab::History => self.editor.build_history(self.world, ui),
             EditorTab::Console => {
                 console::console_ui(ui, &self.editor.console, &mut self.editor.console_filter)
             }
@@ -3461,10 +3715,10 @@ mod tests {
     #[test]
     fn ctrl_s_saves() {
         assert_eq!(
-            shortcut_for(egui::Key::S, true, false, false),
+            shortcut_for(egui::Key::S, true, false, false, false),
             Some(Shortcut::Save)
         );
-        assert_eq!(shortcut_for(egui::Key::S, false, false, false), None);
+        assert_eq!(shortcut_for(egui::Key::S, false, false, false, false), None);
     }
 
     #[test]
@@ -3474,27 +3728,27 @@ mod tests {
             (egui::Key::Delete, false),
             (egui::Key::S, true),
         ] {
-            assert_eq!(shortcut_for(key, ctrl, true, false), None, "{key:?}");
+            assert_eq!(shortcut_for(key, ctrl, false, true, false), None, "{key:?}");
         }
     }
 
     #[test]
     fn tool_keys_ignored_while_flying() {
-        assert_eq!(shortcut_for(egui::Key::W, false, false, true), None);
+        assert_eq!(shortcut_for(egui::Key::W, false, false, false, true), None);
         assert_eq!(
-            shortcut_for(egui::Key::W, false, false, false),
+            shortcut_for(egui::Key::W, false, false, false, false),
             Some(Shortcut::Move)
         );
         assert_eq!(
-            shortcut_for(egui::Key::E, false, false, false),
+            shortcut_for(egui::Key::E, false, false, false, false),
             Some(Shortcut::Rotate)
         );
         assert_eq!(
-            shortcut_for(egui::Key::R, false, false, false),
+            shortcut_for(egui::Key::R, false, false, false, false),
             Some(Shortcut::Scale)
         );
         assert_eq!(
-            shortcut_for(egui::Key::Delete, false, false, false),
+            shortcut_for(egui::Key::Delete, false, false, false, false),
             Some(Shortcut::Delete)
         );
     }
@@ -3717,7 +3971,7 @@ mod tests {
     #[test]
     fn escape_returns_focus_to_editor_while_playing() {
         assert_eq!(
-            shortcut_for(egui::Key::Escape, false, false, false),
+            shortcut_for(egui::Key::Escape, false, false, false, false),
             Some(Shortcut::ReleaseGame)
         );
         let mut world = World::new();
@@ -5122,5 +5376,188 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&root);
         assert!(reasons.is_empty(), "extra passes: {reasons:#?}");
+    }
+
+    fn history_world() -> World {
+        let mut world = melon_core::Core::new().world;
+        world.insert_resource(melon_physics::PhysicsWorld::new());
+        world
+    }
+
+    fn live_names(world: &mut World) -> Vec<String> {
+        let mut names: Vec<String> = world
+            .query_filtered::<&Name, bevy_ecs::query::Without<melon_core::PendingDelete>>()
+            .iter(world)
+            .map(|n| n.0.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn press(editor: &mut Editor, world: &mut World, key: egui::Key, shift: bool) {
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            shift,
+            ..Default::default()
+        };
+        let input = egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        let _ = egui::Context::default().run_ui(input, |ui| editor.handle_shortcuts(world, ui));
+    }
+
+    #[test]
+    fn undo_redo_duplicate_shortcuts_map() {
+        let s = |key, ctrl, shift, typing| shortcut_for(key, ctrl, shift, typing, false);
+        assert_eq!(s(egui::Key::Z, true, false, false), Some(Shortcut::Undo));
+        assert_eq!(s(egui::Key::Z, true, true, false), Some(Shortcut::Redo));
+        assert_eq!(s(egui::Key::Y, true, false, false), Some(Shortcut::Redo));
+        assert_eq!(
+            s(egui::Key::D, true, false, false),
+            Some(Shortcut::Duplicate)
+        );
+        assert_eq!(
+            s(egui::Key::F2, false, false, false),
+            Some(Shortcut::Rename)
+        );
+        assert_eq!(s(egui::Key::Z, false, false, false), None);
+        for key in [egui::Key::Z, egui::Key::Y, egui::Key::D] {
+            assert_eq!(
+                s(key, true, false, true),
+                None,
+                "typing keeps egui's own undo"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_z_and_ctrl_y_walk_a_delete_and_restore_the_selection() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        editor.create_cube_step(&mut world);
+        let cube = editor.selected.unwrap();
+        editor.delete_selected(&mut world);
+        assert_eq!(editor.selected, None);
+        // What the physics PostUpdate does with marked entities.
+        let mut cleanup = bevy_ecs::schedule::Schedule::default();
+        cleanup.add_systems(melon_physics::cleanup_deleted_system);
+        cleanup.run(&mut world);
+        assert!(live_names(&mut world).is_empty());
+
+        press(&mut editor, &mut world, egui::Key::Z, false);
+        assert_eq!(live_names(&mut world), ["Cube 0"]);
+        assert!(
+            editor.selected.is_some(),
+            "the deleted entity is selected again"
+        );
+        let _ = cube;
+        press(&mut editor, &mut world, egui::Key::Z, true); // redo
+        assert!(live_names(&mut world).is_empty());
+        assert_eq!(editor.selected, None);
+        press(&mut editor, &mut world, egui::Key::Z, false);
+        press(&mut editor, &mut world, egui::Key::Z, false); // undoes the create
+        assert!(live_names(&mut world).is_empty());
+    }
+
+    #[test]
+    fn ctrl_d_duplicates_and_selects_the_copy() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        editor.create_cube_step(&mut world);
+        let original = editor.selected.unwrap();
+        press(&mut editor, &mut world, egui::Key::D, false);
+        assert_ne!(editor.selected, Some(original));
+        assert_eq!(live_names(&mut world), ["Cube 0", "Cube 0 (1)"]);
+        assert_eq!(
+            editor.history.undo_label(),
+            Some("Duplicate Cube 0"),
+            "one step"
+        );
+    }
+
+    #[test]
+    fn create_while_playing_records_nothing() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        world.insert_resource(SimulationState::Playing);
+        editor.create_cube_step(&mut world);
+        assert!(!editor.history.can_undo());
+    }
+
+    #[test]
+    fn f2_renames_inline_on_enter_and_esc_cancels() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        editor.create_cube_step(&mut world);
+        let cube = editor.selected.unwrap();
+        let ctx = egui::Context::default();
+        let frame = |editor: &mut Editor, world: &mut World, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| editor.build_hierarchy(world, ui));
+        };
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        editor.start_rename(&world);
+        frame(&mut editor, &mut world, vec![]);
+        frame(&mut editor, &mut world, vec![]);
+        frame(
+            &mut editor,
+            &mut world,
+            vec![egui::Event::Text("Hero".into())],
+        );
+        frame(&mut editor, &mut world, vec![key(egui::Key::Enter)]);
+        frame(&mut editor, &mut world, vec![]);
+        assert_eq!(world.get::<Name>(cube).unwrap().0, "Hero");
+        assert!(editor.renaming.is_none());
+        assert_eq!(editor.history.undo_label(), Some("Rename Cube 0"));
+
+        editor.start_rename(&world);
+        frame(&mut editor, &mut world, vec![]);
+        frame(
+            &mut editor,
+            &mut world,
+            vec![egui::Event::Text("Nope".into())],
+        );
+        frame(&mut editor, &mut world, vec![key(egui::Key::Escape)]);
+        frame(&mut editor, &mut world, vec![]);
+        assert_eq!(world.get::<Name>(cube).unwrap().0, "Hero");
+        assert!(editor.renaming.is_none());
+    }
+
+    #[test]
+    fn loading_a_scene_clears_the_history() {
+        let dir = pending_dir("history_clear");
+        let path = dir.join("scene.ron");
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        editor.create_cube_step(&mut world);
+        editor.pending_operation = Some(PendingOperation::Save(path.clone()));
+        editor.run_pending_operation(&mut world);
+        assert!(editor.history.can_undo(), "saving keeps the history");
+        editor.pending_operation = Some(PendingOperation::Load(path));
+        editor.run_pending_operation(&mut world);
+        assert!(!editor.history.can_undo() && !editor.history.can_redo());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

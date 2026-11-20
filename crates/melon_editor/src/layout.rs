@@ -17,15 +17,17 @@ pub enum EditorTab {
     Inspector,
     ContentBrowser,
     Console,
+    History,
 }
 
 impl EditorTab {
-    pub const ALL: [EditorTab; 5] = [
+    pub const ALL: [EditorTab; 6] = [
         EditorTab::Hierarchy,
         EditorTab::Scene,
         EditorTab::Inspector,
         EditorTab::ContentBrowser,
         EditorTab::Console,
+        EditorTab::History,
     ];
 
     pub fn title(self) -> &'static str {
@@ -35,6 +37,7 @@ impl EditorTab {
             EditorTab::Inspector => "Inspector",
             EditorTab::ContentBrowser => "Content Browser",
             EditorTab::Console => "Console",
+            EditorTab::History => "History",
         }
     }
 }
@@ -53,7 +56,11 @@ pub fn default_layout() -> DockState<EditorTab> {
     let [top, _bottom] = tree.split_below(
         NodeIndex::root(),
         1.0 - sizes::BOTTOM_PANE / REFERENCE_HEIGHT,
-        vec![EditorTab::ContentBrowser, EditorTab::Console],
+        vec![
+            EditorTab::ContentBrowser,
+            EditorTab::Console,
+            EditorTab::History,
+        ],
     );
     let [scene, _left] = tree.split_left(
         top,
@@ -233,7 +240,8 @@ mod tests {
     fn editor_layout_fixture_loads() {
         let text = include_str!("../fixtures/editor_layout.ron");
         let state: DockState<EditorTab> = ron::from_str(text).unwrap();
-        assert_eq!(open_tabs(&state), EditorTab::ALL.to_vec());
+        // Saved before the History panel existed (Window menu reopens it).
+        assert_eq!(open_tabs(&state), EditorTab::ALL[..5].to_vec());
         let leaves: Vec<Vec<EditorTab>> = state
             .iter_leaves()
             .map(|(_, leaf)| leaf.tabs.clone())
