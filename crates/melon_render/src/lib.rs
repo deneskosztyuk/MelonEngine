@@ -4,6 +4,7 @@ mod extract;
 pub mod gi;
 mod models;
 mod overlay;
+mod packed_gltf;
 mod present;
 mod timings;
 
@@ -3405,14 +3406,14 @@ impl SceneRenderer {
         Ok(self.meshes_of(path, imported))
     }
 
-    /// `load_gltf_meshes` from memory (a packed game; embedded buffers only).
+    /// `load_gltf_meshes` from memory (a packed game; external files in `files`, see `packed_gltf`).
     pub fn load_gltf_meshes_bytes(
         &self,
         name: &str,
         bytes: &[u8],
+        files: &std::collections::HashMap<String, Vec<u8>>,
     ) -> Result<Vec<Result<LoadedModel>>> {
-        let imported = gltf::import_slice(bytes)
-            .with_context(|| format!("failed to import glTF data: {name}"))?;
+        let imported = packed_gltf::import_with(name, bytes, files)?;
         Ok(self.meshes_of(name, imported))
     }
 
@@ -3462,6 +3463,18 @@ impl SceneRenderer {
     pub fn load_gltf_bytes(&self, bytes: &[u8]) -> Result<LoadedModel> {
         let (document, buffers, images) =
             gltf::import_slice(bytes).context("failed to import glTF data")?;
+        self.build_model(&document, &buffers, &images)
+    }
+
+    /// Load a glTF from the pack: `name` is its pack path, `files` its external
+    /// buffers and images (`packed_gltf::external_files`).
+    pub fn load_gltf_packed(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        files: &std::collections::HashMap<String, Vec<u8>>,
+    ) -> Result<LoadedModel> {
+        let (document, buffers, images) = packed_gltf::import_with(name, bytes, files)?;
         self.build_model(&document, &buffers, &images)
     }
 
@@ -7102,6 +7115,35 @@ mod tests {
                 }
                 Ok(())
             }),
+            Box::new(|renderer| {
+                // A packed `.gltf` whose buffer is a separate `.bin` loads
+                // through the AssetServer (`packed_gltf`), not a placeholder cube.
+                use melon_core::{AssetServer, Handle, Model};
+                let root = temp_project("packed_external");
+                let gltf = TWO_NODE_GLTF.replace(
+                    r#""uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAA""#,
+                    r#""uri": "m.bin""#,
+                );
+                assert!(gltf.contains("m.bin"));
+                std::fs::write(root.join("assets/models/m.gltf"), gltf).unwrap();
+                let mut bin = vec![0u8; 36];
+                bin[12..16].copy_from_slice(&1.0f32.to_le_bytes()); // (1, 0, 0)
+                bin[28..32].copy_from_slice(&1.0f32.to_le_bytes()); // (0, 1, 0)
+                std::fs::write(root.join("assets/models/m.bin"), bin).unwrap();
+                let pak = root.join("game.pak");
+                melon_core::pack::build_pack(&root, &[], &pak).unwrap();
+                let mut server = AssetServer::new(root.clone());
+                server.set_pack(Arc::new(melon_core::pack::Pack::open(&pak).unwrap()));
+                let h: Handle<Model> = server.load("assets/models/m.gltf");
+                let mut cache = ModelCache::new(renderer.scene());
+                let bounds = cache.get(renderer.scene(), &mut server, h).bounds;
+                let _ = std::fs::remove_dir_all(&root);
+                if bounds.1.x >= 3.0 {
+                    Ok(())
+                } else {
+                    Err(format!("placeholder cube instead of the model: {bounds:?}"))
+                }
+            }),
         ];
 
         #[cfg(target_os = "windows")]
@@ -7128,60 +7170,6 @@ mod tests {
             !runner.results.is_empty(),
             "GPU tests did not run (renderer init may have failed)"
         );
-    }
-
-    /// KNOWN GAP: a packed `.gltf` whose buffer is a separate `.bin` cannot
-    /// load, because packed models are imported from memory
-    /// (`gltf::import_slice`, embedded buffers only). Run with `--ignored`.
-    #[test]
-    #[ignore = "known gap: packed .gltf with an external .bin / textures does not load (only .glb)"]
-    fn packed_gltf_with_external_bin_loads_from_the_pack() {
-        use melon_core::{AssetServer, Handle, Model};
-        let root = temp_project("packed_external");
-        let gltf = TWO_NODE_GLTF.replace(
-            r#""uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAA""#,
-            r#""uri": "m.bin""#,
-        );
-        assert!(gltf.contains("m.bin"));
-        std::fs::write(root.join("assets/models/m.gltf"), gltf).unwrap();
-        let mut bin = vec![0u8; 36];
-        bin[12..16].copy_from_slice(&1.0f32.to_le_bytes()); // (1, 0, 0)
-        bin[28..32].copy_from_slice(&1.0f32.to_le_bytes()); // (0, 1, 0)
-        std::fs::write(root.join("assets/models/m.bin"), bin).unwrap();
-        let pak = root.join("game.pak");
-        melon_core::pack::build_pack(&root, &[], &pak).unwrap();
-        let assertion: GpuAssertion = Box::new(move |renderer| {
-            let mut server = AssetServer::new(root.clone());
-            server.set_pack(Arc::new(melon_core::pack::Pack::open(&pak).unwrap()));
-            let h: Handle<Model> = server.load("assets/models/m.gltf");
-            let mut cache = ModelCache::new(renderer.scene());
-            let bounds = cache.get(renderer.scene(), &mut server, h).bounds;
-            let _ = std::fs::remove_dir_all(&root);
-            if bounds.1.x >= 3.0 {
-                Ok(())
-            } else {
-                Err(format!("placeholder cube instead of the model: {bounds:?}"))
-            }
-        });
-
-        #[cfg(target_os = "windows")]
-        let event_loop = {
-            use winit::platform::windows::EventLoopBuilderExtWindows;
-            let mut builder = EventLoop::builder();
-            builder.with_any_thread(true);
-            builder.build().expect("failed to create event loop")
-        };
-        #[cfg(not(target_os = "windows"))]
-        let event_loop = EventLoop::new().expect("failed to create event loop");
-        event_loop.set_control_flow(ControlFlow::Poll);
-        let mut runner = GpuTestRunner::new(vec![assertion]);
-        let _ = event_loop.run_app(&mut runner);
-        assert!(!runner.results.is_empty(), "GPU test did not run");
-        for result in &runner.results {
-            if let Err(msg) = result {
-                panic!("{msg}");
-            }
-        }
     }
 
     #[test]

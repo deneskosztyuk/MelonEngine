@@ -17,7 +17,12 @@ struct CachedModel {
 /// external buffers and textures resolve) or memory (the pack).
 enum Source {
     File(std::path::PathBuf),
-    Packed { name: String, bytes: Vec<u8> },
+    Packed {
+        name: String,
+        bytes: Vec<u8>,
+        /// External buffers and images of a `.gltf`, by pack path.
+        files: HashMap<String, Vec<u8>>,
+    },
 }
 
 impl Source {
@@ -27,7 +32,8 @@ impl Source {
             let bytes = server
                 .read(&name)
                 .map_err(|e| anyhow::anyhow!("{name} is not in the pack: {e}"))?;
-            return Ok(Self::Packed { name, bytes });
+            let files = crate::packed_gltf::external_files(&name, &bytes, &|p| server.read(p))?;
+            return Ok(Self::Packed { name, bytes, files });
         }
         server.full_path(handle).map(Self::File).ok_or_else(|| {
             anyhow::anyhow!("unknown built-in asset (expected {BUILTIN_PREFIX}cube)")
@@ -37,8 +43,8 @@ impl Source {
     fn model(&self, scene: &SceneRenderer, path: &str) -> anyhow::Result<LoadedModel> {
         match self {
             Self::File(file) => scene.load_gltf(&file.to_string_lossy()),
-            Self::Packed { bytes, .. } => scene
-                .load_gltf_bytes(bytes)
+            Self::Packed { name, bytes, files } => scene
+                .load_gltf_packed(name, bytes, files)
                 .map_err(|e| e.context(format!("packed model {path}"))),
         }
     }
@@ -46,7 +52,7 @@ impl Source {
     fn meshes(&self, scene: &SceneRenderer) -> anyhow::Result<Vec<anyhow::Result<LoadedModel>>> {
         match self {
             Self::File(file) => scene.load_gltf_meshes(&file.to_string_lossy()),
-            Self::Packed { name, bytes } => scene.load_gltf_meshes_bytes(name, bytes),
+            Self::Packed { name, bytes, files } => scene.load_gltf_meshes_bytes(name, bytes, files),
         }
     }
 }
