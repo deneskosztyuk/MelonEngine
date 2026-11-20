@@ -10,7 +10,7 @@ Current state and planned work: `docs/ROADMAP.md`.
 | `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera. No GPU or window code. |
 | `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache`) records sun shadow pass, depth/normal prepass, SSAO passes, the GI mode's passes (`gi/`: DDGI voxel and probe passes or SSGI), 3D pass into HDR target, bloom passes, tonemap pass; `ui_pass` for the editor. |
 | `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource) and ECS sync systems. |
-| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), Content Drawer (`drawer.rs`), asset `.meta` files (`asset_db.rs`), file operations (`asset_ops.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), Project Settings window (`project_settings.rs`). |
+| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), Content Drawer (`drawer.rs`), asset `.meta` files (`asset_db.rs`), file operations (`asset_ops.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), undo history (`history.rs`), Project Settings window (`project_settings.rs`). |
 | `crates/melon_game` | Game logic as an `rlib` + `dylib`, hot-reloaded in dev builds. |
 | `crates/melon_host` | Binary: winit event loop, input mapping, frame order (core update, editor, extract, render_scene, ui pass). No render pass code. |
 | `assets/models` | glTF models. `cube.glb` loads at startup. `review/` holds the snapshot scene's material test models (`grey_cube`, `material_spheres`, `normal_panel`, `emissive_cube`, `red_panel`, `green_panel`), written by `cargo run -p melon_render --example gen_review_assets` from the repo root; commit them when regenerated. |
@@ -255,6 +255,27 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   Auxiliary views (thumbnails) go in their own submission after the
   frame's. A second main view (a Game view next to the Scene view) needs
   per-view uniform and instance buffers first.
+- **Undo / redo (`history.rs`).** A step stores the scene-file form
+  (`scene::capture_entity`) of the entities it touched, before and after;
+  undo writes "before" back, redo "after" (`restore_entity` overwrites an
+  entity in place or spawns it; then parents, sibling order, bodies via
+  `rebuild_body`). Steps name entities by `EditorId` (uuid component, added
+  lazily, saved as `SceneEntity::uid` so ids survive Play / Stop and saves),
+  never by `Entity`. Edits to the selected entity (Inspector, Add / Remove
+  Component, mesh, gizmo) are found by `History::track` once per frame
+  (`Editor::track_history`): it diffs a snapshot taken at rest and records
+  one step when the gesture ends (no dragged widget, no focused text field,
+  no gizmo drag). Create, delete, reparent, rename, duplicate are explicit
+  (`record_created`, `delete`, `reparent`, `rename`, `duplicate`): never
+  `mark_for_delete` or `hierarchy_drop` straight from editor UI. Nothing is
+  recorded or undone unless `SimulationState::Editing`; cap `MAX_STEPS` =
+  200; opening a scene clears it. Shortcuts: Ctrl+Z, Ctrl+Y / Ctrl+Shift+Z,
+  Ctrl+D, F2 (not while typing or with the Content Browser focused, which
+  owns F2 / Ctrl+D). A new editable thing that is not a registered
+  component, `Name`, `Handle<Model>` or the hierarchy is invisible to
+  history. Root entities have no stored order (they follow query order), so
+  a duplicate of a root is not guaranteed to sit right after it; children
+  keep their position.
 - **Scene format.** RON, `SCENE_VERSION = 5` in `melon_editor/src/scene.rs`:
   each entity has `name`, `parent` (index into `entities`), `model` (path,
   `#mesh<N>` included), `model_guid` (wins when it resolves, so a scene
