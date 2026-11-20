@@ -37,11 +37,11 @@ snapshot view="overview":
 # Run the engine in release mode (game plugin linked statically, no live reload).
 # Runs the gate first; only launches if gate passes.
 run: gate
-    cargo run -p melon_host --release --no-default-features
+    cargo run -p melon_host --release --no-default-features --features editor
 
 # Fast run — skip the gate, release build (use during active dev).
 fast-run:
-    cargo run -p melon_host --release --no-default-features
+    cargo run -p melon_host --release --no-default-features --features editor
 
 # Debug run — with live reload of the melon_game plugin. Use for game logic dev.
 dev-run: gate
@@ -57,8 +57,14 @@ game:
 
 # Ship build — release, live reload disabled (statically links melon_game).
 ship:
-    cargo build -p melon_host --release --no-default-features
+    cargo build -p melon_host --release --no-default-features --features editor
 
 # Run the ship build.
 ship-run:
-    cargo run -p melon_host --release --no-default-features
+    cargo run -p melon_host --release --no-default-features --features editor
+
+# Package the game: build the player (release, no editor, static C runtime) and
+# write <out>/<GameName>/ with the executable and game.pak. The folder runs on a
+# PC without Rust or the Windows SDK. Same as the editor's File > Build.
+package out:
+    cargo run -p melon_host --no-default-features --bin melon_package -- {{out}}

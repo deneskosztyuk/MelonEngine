@@ -72,7 +72,7 @@ Core features all three share, and where MelonEngine stands (✅ done,
 | Editor | Game view | ❌ |
 | Editor | Console / log | ✅ |
 | Editor | Profiler | 🟡 GPU pass timings only |
-| Shipping | Release build, asset packaging | 🟡 release build, no packaging |
+| Shipping | Release build, asset packaging | ✅ player mode, `game.pak`, File > Build, `just package` |
 
 ## Missing, in priority order
 
@@ -97,7 +97,10 @@ one; 10 comes after.
 7. - [ ] **In-game UI and text**, plus a debug-draw API.
 8. - [ ] **Cameras as components**, several cameras, and a Game view next to
       the Scene view.
-9. - [ ] **Asset packaging** for ship builds.
+9. - [x] **Asset packaging** for ship builds: scenes in `melon_core`, player mode
+      (`--no-default-features`), `config/player.ron`, `game.pak`, File > Build
+      and `just package`, `--frames N` smoke run (spec
+      `docs/superpowers/specs/2026-11-20-packaging-design.md`).
 10. - [ ] **Later:** particles, navigation mesh, profiler integration
       (tracing spans exist), shader hot reload, exposure, gizmo local/world toggle, networking.
 
