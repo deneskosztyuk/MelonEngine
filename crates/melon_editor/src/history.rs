@@ -1183,6 +1183,67 @@ mod tests {
     }
 
     #[test]
+    fn undo_of_deleting_a_jointed_chain_restores_bodies_and_joints() {
+        use melon_core::{Joint, JointKind};
+        let mut world = world();
+        let mut h = History::default();
+        let root = spawn(&mut world, "Root", 0.0);
+        let k1 = child(&mut world, "K1", root);
+        let g = child(&mut world, "G", k1);
+        world.entity_mut(root).insert((
+            RigidBody {
+                kind: RigidBodyKind::Fixed,
+                ..Default::default()
+            },
+            Collider::default(),
+        ));
+        let hinge = JointKind::Hinge {
+            axis: melon_core::glam::Vec3::Z,
+            limited: true,
+            min: -0.5,
+            max: 0.5,
+        };
+        for e in [k1, g] {
+            world.entity_mut(e).insert((
+                RigidBody::default(),
+                Collider::default(),
+                Joint {
+                    kind: hinge,
+                    anchor: melon_core::glam::Vec3::new(0.0, 1.0, 0.0),
+                    ..Default::default()
+                },
+            ));
+        }
+        melon_physics::sync_components_system(&mut world);
+        ensure_ids(&mut world);
+        let joints = |w: &World| w.resource::<PhysicsWorld>().impulse_joints.len();
+        assert_eq!((body_count(&world), joints(&world)), (3, 2));
+
+        h.delete(&mut world, root, Some(root));
+        cleanup(&mut world);
+        assert_eq!((body_count(&world), joints(&world)), (0, 0));
+
+        for _ in 0..2 {
+            h.undo(&mut world).unwrap();
+            assert_eq!(
+                (body_count(&world), joints(&world)),
+                (3, 2),
+                "chain is back"
+            );
+            let g = find(&mut world, "G").unwrap();
+            assert_eq!(world.get::<Joint>(g).unwrap().kind, hinge);
+            assert!(world.get::<melon_physics::JointComponent>(g).is_some());
+            // It still simulates.
+            for _ in 0..10 {
+                world.resource_mut::<PhysicsWorld>().step();
+            }
+            h.redo(&mut world).unwrap();
+            cleanup(&mut world);
+            assert_eq!((body_count(&world), joints(&world)), (0, 0));
+        }
+    }
+
+    #[test]
     fn undo_of_delete_keeps_unknown_components() {
         let mut world = world();
         let mut h = History::default();

@@ -168,6 +168,33 @@ mod tests {
     }
 
     #[test]
+    fn stop_puts_the_rapier_bodies_back_at_their_edit_poses() {
+        let mut world = edit_world();
+        play(&mut world).unwrap();
+        for _ in 0..60 {
+            world.resource_mut::<PhysicsWorld>().step();
+        }
+        let e = find(&mut world, "Box");
+        let handle = world.get::<RigidBodyComponent>(e).unwrap().body_handle;
+        let fallen = world
+            .resource::<PhysicsWorld>()
+            .body_translation(handle)
+            .unwrap()
+            .y;
+        assert!(fallen < 2.5, "the body fell while playing: {fallen}");
+        stop(&mut world).unwrap();
+        let e = find(&mut world, "Box");
+        let handle = world.get::<RigidBodyComponent>(e).unwrap().body_handle;
+        let pw = world.resource::<PhysicsWorld>();
+        assert!((pw.body_translation(handle).unwrap().y - 3.0).abs() < 1e-6);
+        assert!(
+            pw.bodies.get(handle).unwrap().linvel().length() < 1e-6,
+            "velocity reset"
+        );
+        assert_eq!((pw.bodies.len(), pw.colliders.len()), (2, 2));
+    }
+
+    #[test]
     fn stop_removes_spawned_and_restores_despawned() {
         let mut world = edit_world();
         play(&mut world).unwrap();

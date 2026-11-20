@@ -1791,6 +1791,69 @@ mod tests {
     }
 
     #[test]
+    fn v5_scaled_entity_keeps_its_world_size_in_rapier() {
+        let mut local = TypeRegistry::default();
+        local.register::<BodyInfo>();
+        let info = BodyInfo {
+            body_type: BodyKind::Fixed,
+            half_extents: Vec3::new(1.0, 2.0, 3.0),
+        };
+        let mut old = entity("Old", None);
+        old.components.insert(
+            BODY_INFO_PATH.to_string(),
+            component_ron(&info, &local).unwrap(),
+        );
+        old.transform = Some(Transform {
+            scale: Vec3::new(2.0, 0.5, 4.0),
+            ..Default::default()
+        });
+        let data = SceneData {
+            version: 5,
+            entities: vec![old],
+            name_counter: 0,
+        };
+        let mut world = reg_world();
+        let mut physics = PhysicsWorld::new();
+        apply_scene(&mut world, &mut physics, &data).unwrap();
+        let e = named(&mut world, "Old");
+        let handle = world
+            .get::<melon_physics::ColliderComponent>(e)
+            .unwrap()
+            .collider_handle
+            .unwrap();
+        let half = physics
+            .colliders
+            .get(handle)
+            .unwrap()
+            .shape()
+            .as_cuboid()
+            .unwrap()
+            .half_extents;
+        assert!(
+            (half - Vec3::new(1.0, 2.0, 3.0)).length() < 1e-5,
+            "world half extents {half}"
+        );
+        // Saved and loaded as v6: still the same world size.
+        let text = round_trip(&mut world, &mut physics);
+        assert!(text.contains("version: 6"), "{text}");
+        let e = named(&mut world, "Old");
+        let handle = world
+            .get::<melon_physics::ColliderComponent>(e)
+            .unwrap()
+            .collider_handle
+            .unwrap();
+        let half = physics
+            .colliders
+            .get(handle)
+            .unwrap()
+            .shape()
+            .as_cuboid()
+            .unwrap()
+            .half_extents;
+        assert!((half - Vec3::new(1.0, 2.0, 3.0)).length() < 1e-5, "{half}");
+    }
+
+    #[test]
     fn body_info_of_kind_none_is_no_body() {
         let mut local = TypeRegistry::default();
         local.register::<BodyInfo>();
