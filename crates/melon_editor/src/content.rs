@@ -349,7 +349,7 @@ impl ContentBrowser {
     }
 
     /// `dir` relative to the root with `/`.
-    fn to_relative(&self, dir: &Path) -> Option<String> {
+    fn relative(&self, dir: &Path) -> Option<String> {
         let rel = dir.strip_prefix(&self.root).ok()?;
         Some(
             rel.components()
@@ -361,7 +361,7 @@ impl ContentBrowser {
 
     /// An existing folder from a saved relative path; `None` for anything
     /// with `..`, a root or a drive, or a folder that is gone.
-    fn from_relative(&self, rel: &str) -> Option<PathBuf> {
+    fn saved_folder(&self, rel: &str) -> Option<PathBuf> {
         let rel = Path::new(rel);
         let plain = rel
             .components()
@@ -390,7 +390,7 @@ impl ContentBrowser {
         for dir in settings
             .favorites
             .iter()
-            .filter_map(|f| self.from_relative(f))
+            .filter_map(|f| self.saved_folder(f))
         {
             if !favorites.contains(&dir) {
                 favorites.push(dir);
@@ -412,7 +412,7 @@ impl ContentBrowser {
         if let Some(dir) = settings
             .last_folder
             .as_deref()
-            .and_then(|f| self.from_relative(f))
+            .and_then(|f| self.saved_folder(f))
         {
             self.current = dir;
         }
@@ -427,10 +427,10 @@ impl ContentBrowser {
             favorites: self
                 .favorites
                 .iter()
-                .filter_map(|f| self.to_relative(f))
+                .filter_map(|f| self.relative(f))
                 .collect(),
             tile_size: self.tile_size,
-            last_folder: self.to_relative(&self.current),
+            last_folder: self.relative(&self.current),
             tree_width: self.tree_width,
         };
         if let Some(dir) = file.parent()
