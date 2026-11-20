@@ -165,9 +165,11 @@ mod tests {
     fn build_entry_spins_while_playing_and_rebuilds() {
         let mut core = Core::new();
         let log = tracing::Dispatch::none();
-        core.rebuild_plugins(|app| melon_game_build(app, &log));
+        core.rebuild_plugins(|app| melon_game_build(app, &log))
+            .unwrap();
         // A second build (a reload) replaces the first without panicking.
-        core.rebuild_plugins(|app| melon_game_build(app, &log));
+        core.rebuild_plugins(|app| melon_game_build(app, &log))
+            .unwrap();
         let e = core.world.spawn((Transform::default(), Spin)).id();
         core.world.insert_resource(SimulationState::Playing);
         core.world.resource_mut::<Time>().update(0.2);
