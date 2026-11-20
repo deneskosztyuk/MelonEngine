@@ -1,6 +1,8 @@
 // Renders the fixed review scene offscreen and saves it as a PNG.
-// Run: cargo run -p melon_render --example snapshot -- <out.png> [view]
-// Views: overview (default), low, sun, materials.
+// Run: cargo run -p melon_render --example snapshot -- <out.png> [view] [flag]
+// Views: overview (default), low, sun, materials, corner.
+// Debug flags: --ao-only saves the SSAO term (grey, white = open) instead of
+// the image; --no-ao renders with `ao_strength` 0.
 
 use std::sync::Arc;
 
@@ -97,7 +99,9 @@ fn camera(view: &str) -> Result<Camera> {
         }
         // From the sun's side onto the sphere rows and the panel.
         "materials" => (Vec3::new(0.0, 2.4, 0.0), Vec3::new(1.0, 0.9, 6.5)),
-        _ => bail!("unknown view {view:?}; expected overview, low, sun or materials"),
+        // Close over the cubes at the origin toward the two-wall corner.
+        "corner" => (Vec3::new(-2.5, 3.0, 4.0), Vec3::new(3.0, 0.2, -3.0)),
+        _ => bail!("unknown view {view:?}; expected overview, low, sun, materials or corner"),
     };
     Ok(Camera {
         eye,
@@ -115,7 +119,12 @@ fn unpad_rows(data: &[u8], padded: usize, row: usize) -> Vec<u8> {
         .collect()
 }
 
-fn render(window: Arc<Window>, out: &str, view: &str) -> Result<()> {
+fn render(window: Arc<Window>, out: &str, view: &str, flag: Option<&str>) -> Result<()> {
+    let ao_only = match flag {
+        None | Some("--no-ao") => false,
+        Some("--ao-only") => true,
+        Some(other) => bail!("unknown flag {other:?}; expected --ao-only or --no-ao"),
+    };
     let camera = camera(view)?;
     let mut renderer = pollster::block_on(Renderer::new(window))?;
     let target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(WIDTH, HEIGHT));
@@ -124,7 +133,10 @@ fn render(window: Arc<Window>, out: &str, view: &str) -> Result<()> {
         view_proj: camera.view_proj(),
         eye: camera.eye,
         light: Light::default(),
-        environment: Environment::default(),
+        environment: Environment {
+            ao_strength: if flag == Some("--no-ao") { 0.0 } else { 1.0 },
+            ..Default::default()
+        },
         models: review_scene(&mut server),
     };
 
@@ -135,8 +147,12 @@ fn render(window: Arc<Window>, out: &str, view: &str) -> Result<()> {
     });
     renderer.render_scene(&mut encoder, &frame, &mut server, &target, &[], &[]);
 
-    let texture = target.color_texture();
-    let row = WIDTH * 4;
+    let texture = if ao_only {
+        target.ao_texture().clone()
+    } else {
+        target.color_texture_handle()
+    };
+    let row = WIDTH * texture.format().block_copy_size(None).unwrap_or(4);
     let padded = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("snapshot readback"),
@@ -168,15 +184,19 @@ fn render(window: Arc<Window>, out: &str, view: &str) -> Result<()> {
     let mut pixels = unpad_rows(&buffer.get_mapped_range(..), padded as usize, row as usize);
 
     // The display image is the sRGB surface format: RGBA or BGRA.
-    match texture.format() {
-        wgpu::TextureFormat::Rgba8UnormSrgb => {}
-        wgpu::TextureFormat::Bgra8UnormSrgb => pixels.chunks_mut(4).for_each(|p| p.swap(0, 2)),
+    let color_type = match texture.format() {
+        wgpu::TextureFormat::Rgba8UnormSrgb => image::ColorType::Rgba8,
+        wgpu::TextureFormat::Bgra8UnormSrgb => {
+            pixels.chunks_mut(4).for_each(|p| p.swap(0, 2));
+            image::ColorType::Rgba8
+        }
+        wgpu::TextureFormat::R8Unorm => image::ColorType::L8,
         other => bail!("unsupported viewport format {other:?}"),
-    }
+    };
     if let Some(dir) = std::path::Path::new(out).parent() {
         std::fs::create_dir_all(dir)?;
     }
-    image::save_buffer(out, &pixels, WIDTH, HEIGHT, image::ColorType::Rgba8)
+    image::save_buffer(out, &pixels, WIDTH, HEIGHT, color_type)
         .with_context(|| format!("failed to write {out}"))?;
     Ok(())
 }
@@ -184,6 +204,7 @@ fn render(window: Arc<Window>, out: &str, view: &str) -> Result<()> {
 struct App {
     out: String,
     view: String,
+    flag: Option<String>,
     result: Option<Result<()>>,
 }
 
@@ -197,7 +218,7 @@ impl ApplicationHandler for App {
                 event_loop
                     .create_window(attrs)
                     .context("failed to create hidden window")
-                    .and_then(|w| render(Arc::new(w), &self.out, &self.view)),
+                    .and_then(|w| render(Arc::new(w), &self.out, &self.view, self.flag.as_deref())),
             );
         }
         event_loop.exit();
@@ -208,10 +229,11 @@ impl ApplicationHandler for App {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let out = args
-        .next()
-        .context("usage: snapshot <out.png> [overview|low|sun|materials]")?;
+    let out = args.next().context(
+        "usage: snapshot <out.png> [overview|low|sun|materials|corner] [--ao-only|--no-ao]",
+    )?;
     let view = args.next().unwrap_or_else(|| "overview".into());
+    let flag = args.next();
 
     #[cfg(target_os = "windows")]
     let event_loop = {
@@ -224,6 +246,7 @@ fn main() -> Result<()> {
     let mut app = App {
         out: out.clone(),
         view,
+        flag,
         result: None,
     };
     event_loop.run_app(&mut app)?;
@@ -245,7 +268,7 @@ mod tests {
     #[test]
     fn unknown_view_is_an_error() {
         assert!(camera("sideways").is_err());
-        for view in ["overview", "low", "sun", "materials"] {
+        for view in ["overview", "low", "sun", "materials", "corner"] {
             assert!(camera(view).is_ok(), "{view}");
         }
     }

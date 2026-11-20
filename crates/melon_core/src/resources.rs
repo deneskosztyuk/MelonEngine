@@ -190,6 +190,11 @@ pub struct Environment {
     pub horizon_color: Vec3,
     /// Exponential fog density per metre; 0 turns fog off.
     pub fog_density: f32,
+    /// Screen-space ambient occlusion on ambient light: 1 = full, 0 = off
+    /// (the SSAO passes are skipped).
+    pub ao_strength: f32,
+    /// SSAO sampling radius in metres.
+    pub ao_radius: f32,
 }
 
 impl Default for Environment {
@@ -199,6 +204,8 @@ impl Default for Environment {
             zenith_color: Vec3::new(0.15, 0.3, 0.75),
             horizon_color: Vec3::new(0.7, 0.8, 0.95),
             fog_density: 0.01,
+            ao_strength: 1.0,
+            ao_radius: 0.5,
         }
     }
 }
@@ -219,6 +226,12 @@ pub struct NameCounter(pub u32);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_ao_defaults() {
+        let env = Environment::default();
+        assert_eq!((env.ao_strength, env.ao_radius), (1.0, 0.5));
+    }
 
     #[test]
     fn camera_default_looks_at_negz() {

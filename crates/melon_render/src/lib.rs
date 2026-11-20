@@ -91,6 +91,45 @@ struct EnvironmentUniform {
     _pad: f32,
 }
 
+/// Hemisphere samples per pixel in the SSAO pass.
+const SSAO_SAMPLES: usize = 16;
+
+/// SSAO kernel and settings (group 1, binding 2 of the SSAO passes).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SsaoUniform {
+    /// Offsets in the unit +Z hemisphere (xyz; w unused).
+    kernel: [[f32; 4]; SSAO_SAMPLES],
+    /// Metres.
+    radius: f32,
+    strength: f32,
+    _pad: [f32; 2],
+}
+
+/// The SSAO sample offsets: cosine-weighted directions on a golden-angle
+/// spiral over the +Z hemisphere, lengths 0.1 to ~0.95 growing
+/// quadratically (more samples near the surface), shuffled against the
+/// direction order. Fixed, so frames are deterministic.
+fn ssao_kernel() -> [[f32; 4]; SSAO_SAMPLES] {
+    let golden_angle = std::f32::consts::PI * (3.0 - 5f32.sqrt());
+    std::array::from_fn(|i| {
+        let t = (i as f32 + 0.5) / SSAO_SAMPLES as f32;
+        let (r, z) = (t.sqrt(), (1.0 - t).sqrt());
+        let phi = i as f32 * golden_angle;
+        // 7 is coprime to 16: a permutation of the length steps.
+        let s = (((i * 7) % SSAO_SAMPLES) as f32 + 0.5) / SSAO_SAMPLES as f32;
+        let len = 0.1 + 0.9 * s * s;
+        [r * phi.cos() * len, r * phi.sin() * len, z * len, 0.0]
+    })
+}
+
+/// Format of the SSAO textures (1 = unoccluded).
+const AO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+
+/// Format of the prepass normal target: world normal (xyz), distance to the
+/// eye (w).
+const PREPASS_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ModelUniform {
@@ -476,6 +515,18 @@ pub struct SceneRenderer {
     checker_material: wgpu::BindGroup,
     /// Fullscreen sky behind the meshes (3D pass).
     sky_pipeline: wgpu::RenderPipeline,
+    /// SSAO: depth/normal prepass, AO and blur pipelines, their group 1
+    /// layouts and the shared kernel/settings uniform.
+    prepass_pipeline: wgpu::RenderPipeline,
+    ssao_pipeline: wgpu::RenderPipeline,
+    ssao_blur_pipeline: wgpu::RenderPipeline,
+    ssao_layout: wgpu::BindGroupLayout,
+    ssao_blur_layout: wgpu::BindGroupLayout,
+    ssao_buffer: wgpu::Buffer,
+    /// Group 3 of the mesh pipeline: per-view lighting inputs.
+    lighting_layout: wgpu::BindGroupLayout,
+    /// Group 3 with a 1x1 white AO texture: no occlusion (AO off).
+    unoccluded_lighting: wgpu::BindGroup,
     /// Depth-tested lines inside the 3D pass (grid, axes, selection box).
     world_line_pipeline: wgpu::RenderPipeline,
     world_lines: LineBuffer,
@@ -611,6 +662,7 @@ impl Renderer {
         let scene = &mut self.scene;
         scene.update_camera(frame.view_proj, frame.eye);
         scene.update_environment(&frame.environment);
+        scene.update_ssao(&frame.environment);
         scene.update_light(
             &frame.light,
             directional_light_view_proj(frame.light.to_light(), SHADOW_CENTER, SHADOW_RADIUS),
@@ -635,6 +687,14 @@ impl Renderer {
         let shadow_draw_calls: Vec<(usize, &Mesh)> =
             draw_calls.iter().map(|(i, mesh, _)| (*i, *mesh)).collect();
         scene.render_shadow_pass(encoder, &shadow_draw_calls);
+        // AO off: skip the SSAO passes and bind white, so the image matches
+        // the renderer without SSAO.
+        let lighting = if frame.environment.ao_strength > 0.0 {
+            scene.render_ssao(encoder, &shadow_draw_calls, &target.ssao);
+            &target.ssao.lighting_bind_group
+        } else {
+            &scene.unoccluded_lighting
+        };
 
         let hdr = target.hdr_target();
         {
@@ -661,7 +721,7 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            scene.draw_meshes_textured(&mut pass, &draw_calls);
+            scene.draw_meshes_textured(&mut pass, &draw_calls, lighting);
             scene.draw_sky(&mut pass);
             scene.draw_world_lines(&mut pass, world_lines, frame.view_proj);
         }
@@ -725,8 +785,8 @@ impl SceneRenderer {
             },
             count: None,
         };
-        // Group 0 holds everything that changes once per frame, so group 3
-        // stays free for GI data.
+        // Group 0 holds everything that changes once per frame; group 3
+        // holds per-view lighting inputs (SSAO, later GI).
         let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame bind group layout"),
             entries: &[
@@ -787,8 +847,68 @@ impl SceneRenderer {
             ],
         });
 
-        let mesh_pipeline =
-            Renderer::build_mesh_pipeline(&device, &frame_layout, &model_layout, &material_layout);
+        // Group 3: per-view lighting inputs (SSAO now; GI data later).
+        let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("lighting bind group layout"),
+            entries: &[texture_entry(0)], // AO (R, 1 = unoccluded)
+        });
+        let mesh_pipeline = Renderer::build_mesh_pipeline(
+            &device,
+            &[
+                &frame_layout,
+                &model_layout,
+                &material_layout,
+                &lighting_layout,
+            ],
+        );
+
+        let unfilterable_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let ssao_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ssao bind group layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                unfilterable_entry(1),
+                uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+            ],
+        });
+        let ssao_blur_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ssao blur bind group layout"),
+            entries: &[
+                unfilterable_entry(1),
+                uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+                unfilterable_entry(3),
+            ],
+        });
+        let prepass_pipeline =
+            Renderer::build_prepass_pipeline(&device, &frame_layout, &model_layout);
+        let ssao_pipeline =
+            Renderer::build_ssao_pipeline(&device, &frame_layout, &ssao_layout, "fs_ssao");
+        let ssao_blur_pipeline =
+            Renderer::build_ssao_pipeline(&device, &frame_layout, &ssao_blur_layout, "fs_blur");
+        let ssao_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ssao uniform buffer"),
+            size: std::mem::size_of::<SsaoUniform>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let tonemap_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tonemap bind group layout"),
@@ -941,6 +1061,15 @@ impl SceneRenderer {
             [Some(&checker), None, None, None],
         );
 
+        let unoccluded_lighting = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("unoccluded lighting bind group"),
+            layout: &lighting_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&default_textures.white),
+            }],
+        });
+
         let world_line_pipeline = Renderer::build_world_line_pipeline(&device, &frame_layout);
         let sky_pipeline = Renderer::build_sky_pipeline(&device, &frame_layout);
 
@@ -992,6 +1121,14 @@ impl SceneRenderer {
             shadow_view,
             checker_material,
             sky_pipeline,
+            prepass_pipeline,
+            ssao_pipeline,
+            ssao_blur_pipeline,
+            ssao_layout,
+            ssao_blur_layout,
+            ssao_buffer,
+            lighting_layout,
+            unoccluded_lighting,
             world_line_pipeline,
             world_lines: LineBuffer::default(),
             model_uniform_buffer,
@@ -1003,18 +1140,17 @@ impl SceneRenderer {
 }
 
 impl Renderer {
+    /// `layouts`: frame, model, material, lighting (groups 0 to 3).
     fn build_mesh_pipeline(
         device: &wgpu::Device,
-        frame_layout: &wgpu::BindGroupLayout,
-        model_layout: &wgpu::BindGroupLayout,
-        texture_layout: &wgpu::BindGroupLayout,
+        layouts: &[&wgpu::BindGroupLayout; 4],
     ) -> wgpu::RenderPipeline {
         let shader =
             device.create_shader_module(wgpu::include_wgsl!("../../../assets/shaders/mesh.wgsl"));
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh pipeline layout"),
-            bind_group_layouts: &[Some(frame_layout), Some(model_layout), Some(texture_layout)],
+            bind_group_layouts: &layouts.map(Some),
             immediate_size: 0,
         });
 
@@ -1060,6 +1196,93 @@ impl Renderer {
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
+    }
+
+    /// SSAO depth/normal prepass: single-sample, depth-writing, back faces
+    /// culled like the mesh pipeline.
+    fn build_prepass_pipeline(
+        device: &wgpu::Device,
+        frame_layout: &wgpu::BindGroupLayout,
+        model_layout: &wgpu::BindGroupLayout,
+    ) -> wgpu::RenderPipeline {
+        let shader = device
+            .create_shader_module(wgpu::include_wgsl!("../../../assets/shaders/prepass.wgsl"));
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("prepass pipeline layout"),
+            bind_group_layouts: &[Some(frame_layout), Some(model_layout)],
+            immediate_size: 0,
+        });
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("melon_render prepass pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                }],
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(PREPASS_NORMAL_FORMAT.into())],
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
+    }
+
+    /// A fullscreen SSAO pass (`entry` in ssao.wgsl) writing `AO_FORMAT`.
+    fn build_ssao_pipeline(
+        device: &wgpu::Device,
+        frame_layout: &wgpu::BindGroupLayout,
+        layout: &wgpu::BindGroupLayout,
+        entry: &str,
+    ) -> wgpu::RenderPipeline {
+        let shader =
+            device.create_shader_module(wgpu::include_wgsl!("../../../assets/shaders/ssao.wgsl"));
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ssao pipeline layout"),
+            bind_group_layouts: &[Some(frame_layout), Some(layout)],
+            immediate_size: 0,
+        });
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(entry),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                targets: &[Some(AO_FORMAT.into())],
             }),
             multiview_mask: None,
             cache: None,
@@ -1571,7 +1794,79 @@ impl SceneRenderer {
             self.surface_format.add_srgb_suffix(),
             size,
             self.create_hdr_target(size),
+            self.create_ssao_targets(size),
         )
+    }
+
+    /// The prepass and AO textures of one view and their bind groups.
+    fn create_ssao_targets(&self, size: winit::dpi::PhysicalSize<u32>) -> SsaoTargets {
+        let texture = |label, format, extra_usage| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: size.width.max(1),
+                    height: size.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | extra_usage,
+                view_formats: &[],
+            })
+        };
+        let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
+        let none = wgpu::TextureUsages::empty();
+        let depth_view = view(&texture(
+            "prepass depth",
+            wgpu::TextureFormat::Depth32Float,
+            none,
+        ));
+        let normal_view = view(&texture("prepass normal", PREPASS_NORMAL_FORMAT, none));
+        let raw_view = view(&texture("raw ao", AO_FORMAT, none));
+        // COPY_SRC: debug readback (snapshot example).
+        let ao_texture = texture("ao", AO_FORMAT, wgpu::TextureUsages::COPY_SRC);
+        let ao_view = view(&ao_texture);
+        let entry = |binding, view| wgpu::BindGroupEntry {
+            binding,
+            resource: wgpu::BindingResource::TextureView(view),
+        };
+        let uniform = wgpu::BindGroupEntry {
+            binding: 2,
+            resource: self.ssao_buffer.as_entire_binding(),
+        };
+        let ssao_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ssao bind group"),
+            layout: &self.ssao_layout,
+            entries: &[
+                entry(0, &depth_view),
+                entry(1, &normal_view),
+                uniform.clone(),
+            ],
+        });
+        let blur_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ssao blur bind group"),
+            layout: &self.ssao_blur_layout,
+            entries: &[entry(1, &normal_view), uniform, entry(3, &raw_view)],
+        });
+        let lighting_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lighting bind group"),
+            layout: &self.lighting_layout,
+            entries: &[entry(0, &ao_view)],
+        });
+        SsaoTargets {
+            depth_view,
+            normal_view,
+            raw_view,
+            ao_texture,
+            ao_view,
+            ssao_bind_group,
+            blur_bind_group,
+            lighting_bind_group,
+        }
     }
 
     /// Creates an HDR scene colour target. Zero sizes clamp to 1x1.
@@ -1739,6 +2034,99 @@ impl SceneRenderer {
             0,
             bytemuck::cast_slice(&[shadow_camera]),
         );
+    }
+
+    /// SSAO kernel, radius and strength for the SSAO passes.
+    pub fn update_ssao(&self, environment: &melon_core::Environment) {
+        let uniform = SsaoUniform {
+            kernel: ssao_kernel(),
+            radius: environment.ao_radius,
+            strength: environment.ao_strength,
+            _pad: [0.0; 2],
+        };
+        self.queue
+            .write_buffer(&self.ssao_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    /// Depth/normal prepass of every mesh, then the SSAO and blur passes into
+    /// `ssao`'s AO texture. Call after `update_camera`, `update_ssao` and
+    /// `update_model_uniforms`, before the 3D pass.
+    fn render_ssao(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        draw_calls: &[(usize, &Mesh)],
+        ssao: &SsaoTargets,
+    ) {
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("melon_render ssao prepass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &ssao.normal_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &ssao.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.prepass_pipeline);
+            pass.set_bind_group(0, &self.frame_bind_group, &[]);
+            for (entity_index, mesh) in draw_calls {
+                let offset = self.model_uniform_offset(*entity_index);
+                pass.set_bind_group(1, &self.model_bind_group, &[offset]);
+                pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+        }
+        for (label, view, pipeline, bind_group) in [
+            (
+                "melon_render ssao pass",
+                &ssao.raw_view,
+                &self.ssao_pipeline,
+                &ssao.ssao_bind_group,
+            ),
+            (
+                "melon_render ssao blur pass",
+                &ssao.ao_view,
+                &self.ssao_blur_pipeline,
+                &ssao.blur_bind_group,
+            ),
+        ] {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // The fullscreen triangle overwrites every pixel.
+                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.frame_bind_group, &[]);
+            pass.set_bind_group(1, bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
     }
 
     /// Renders every mesh into the sun's shadow map. Call before the 3D pass,
@@ -2157,11 +2545,12 @@ impl SceneRenderer {
     /// Draw 3D meshes into an existing render pass.
     /// Each draw call is `(entity_index, mesh)` where `entity_index` is the index
     /// into the model uniform buffer (see `update_model_uniforms`). Every
-    /// mesh gets the checkerboard material.
+    /// mesh gets the checkerboard material, without ambient occlusion.
     pub fn draw_meshes(&self, pass: &mut wgpu::RenderPass<'_>, draw_calls: &[(usize, &Mesh)]) {
         pass.set_pipeline(&self.mesh_pipeline);
         pass.set_bind_group(0, &self.frame_bind_group, &[]);
         pass.set_bind_group(2, &self.checker_material, &[]);
+        pass.set_bind_group(3, &self.unoccluded_lighting, &[]);
         for (entity_index, mesh) in draw_calls {
             let offset = self.model_uniform_offset(*entity_index);
             pass.set_bind_group(1, &self.model_bind_group, &[offset]);
@@ -2172,14 +2561,17 @@ impl SceneRenderer {
     }
 
     /// Draw 3D meshes with per-draw-call materials.
-    /// Each draw call is `(entity_index, mesh, material_bind_group)`.
+    /// Each draw call is `(entity_index, mesh, material_bind_group)`;
+    /// `lighting` is the view's group 3 (per-view lighting inputs).
     pub fn draw_meshes_textured(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
         draw_calls: &[(usize, &Mesh, &wgpu::BindGroup)],
+        lighting: &wgpu::BindGroup,
     ) {
         pass.set_pipeline(&self.mesh_pipeline);
         pass.set_bind_group(0, &self.frame_bind_group, &[]);
+        pass.set_bind_group(3, lighting, &[]);
         for (entity_index, mesh, material) in draw_calls {
             let offset = self.model_uniform_offset(*entity_index);
             pass.set_bind_group(1, &self.model_bind_group, &[offset]);
@@ -2251,8 +2643,23 @@ pub struct ViewportTarget {
     _depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
     hdr_target: HdrTarget,
+    ssao: SsaoTargets,
     overlay: overlay::OverlayTargets,
     size: winit::dpi::PhysicalSize<u32>,
+}
+
+/// One view's SSAO targets: the single-sample depth/normal prepass, the raw
+/// and blurred AO (full resolution), and the bind groups reading them.
+struct SsaoTargets {
+    depth_view: wgpu::TextureView,
+    normal_view: wgpu::TextureView,
+    raw_view: wgpu::TextureView,
+    ao_texture: wgpu::Texture,
+    ao_view: wgpu::TextureView,
+    ssao_bind_group: wgpu::BindGroup,
+    blur_bind_group: wgpu::BindGroup,
+    /// Group 3 of the mesh pipeline, with `ao_view`.
+    lighting_bind_group: wgpu::BindGroup,
 }
 
 impl ViewportTarget {
@@ -2261,6 +2668,7 @@ impl ViewportTarget {
         format: wgpu::TextureFormat,
         size: winit::dpi::PhysicalSize<u32>,
         hdr_target: HdrTarget,
+        ssao: SsaoTargets,
     ) -> Self {
         let size = winit::dpi::PhysicalSize::new(size.width.max(1), size.height.max(1));
         let color_texture = Arc::new(device.create_texture(&wgpu::TextureDescriptor {
@@ -2298,9 +2706,16 @@ impl ViewportTarget {
             _depth_texture: depth_texture,
             depth_view,
             hdr_target,
+            ssao,
             overlay,
             size,
         }
+    }
+
+    /// The blurred SSAO term (`R8Unorm`, 1 = unoccluded) of the last
+    /// `render_scene`; not written while `Environment::ao_strength` is 0.
+    pub fn ao_texture(&self) -> &wgpu::Texture {
+        &self.ssao.ao_texture
     }
 
     /// Scene colour target the 3D pass renders into before tonemapping.
@@ -2502,6 +2917,21 @@ mod tests {
         assert_eq!(std::mem::size_of::<LightUniform>(), 128);
     }
 
+    #[test]
+    fn ssao_uniform_size_is_272() {
+        assert_eq!(std::mem::size_of::<SsaoUniform>(), 272);
+    }
+
+    #[test]
+    fn ssao_kernel_lies_in_unit_hemisphere_and_is_deterministic() {
+        let kernel = ssao_kernel();
+        for k in kernel {
+            let v = glam::Vec3::new(k[0], k[1], k[2]);
+            assert!(v.z > 0.0 && v.length() < 1.0 && v.length() > 0.05, "{v}");
+        }
+        assert_eq!(kernel, ssao_kernel());
+    }
+
     fn clip(m: glam::Mat4, p: glam::Vec3) -> glam::Vec3 {
         let c = m * p.extend(1.0);
         c.truncate() / c.w
@@ -2649,6 +3079,7 @@ mod tests {
                     (0, &cube, floor.unwrap_or(&white_bg)),
                     (1, &cube, &white_bg),
                 ],
+                &r.unoccluded_lighting,
             );
         }
         r.tonemap_pass(&mut encoder, &hdr, &color_view);
@@ -2710,6 +3141,63 @@ mod tests {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         r.render_scene(&mut encoder, &frame, server, &target, &[], &[]);
         read_back(r.device(), r.queue(), encoder, &target.color_texture)
+    }
+
+    /// Pixel of a TEST_SIZE target that world point `p` projects to.
+    fn screen_px(view_proj: glam::Mat4, p: glam::Vec3) -> (u32, u32) {
+        let ndc = view_proj.project_point3(p);
+        let size = TEST_SIZE as f32;
+        (
+            ((ndc.x * 0.5 + 0.5) * size) as u32,
+            ((0.5 - ndc.y * 0.5) * size) as u32,
+        )
+    }
+
+    /// A 1 m `builtin:cube` on a floor, seen from (3, 2.5, 3), lit by the
+    /// white hemisphere only (no sun), so the image is all ambient. Returns
+    /// the RGB sums at the floor next to the cube's +X face and at an open
+    /// floor point behind the cube's silhouette, more than 2 * `ao_radius`
+    /// from it (sample rays there cross the cube).
+    fn ao_scene_pixels(r: &mut Renderer, ao_strength: f32) -> (u32, u32) {
+        use glam::{Mat4, Quat, Vec3};
+        use melon_core::{AssetServer, Handle, Model};
+        let mut server = AssetServer::new(".".into());
+        let cube: Handle<Model> = server.load("builtin:cube");
+        let floor = Mat4::from_scale_rotation_translation(
+            Vec3::new(8.0, 0.2, 8.0),
+            Quat::IDENTITY,
+            Vec3::new(0.0, -0.1, 0.0),
+        );
+        let camera = melon_core::Camera {
+            eye: Vec3::new(3.0, 2.5, 3.0),
+            center: Vec3::ZERO,
+            aspect: 1.0,
+            ..Default::default()
+        };
+        // Grey sky and ground keep the floor in the tonemap's steep midtones.
+        let light = melon_core::Light {
+            ambient: 1.0,
+            sky_color: glam::Vec3::splat(0.35),
+            ground_color: glam::Vec3::splat(0.35),
+            ..test_light()
+        };
+        let env = melon_core::Environment {
+            fog_density: 0.0,
+            ao_strength,
+            ..Default::default()
+        };
+        let models = vec![(floor, cube), (Mat4::from_translation(Vec3::Y * 0.5), cube)];
+        let px = render_frame(r, camera, light, env, models, &mut server);
+        let rgb = |p: Vec3| {
+            pixel_at(r, &px, screen_px(camera.view_proj(), p))[..3]
+                .iter()
+                .map(|&c| u32::from(c))
+                .sum()
+        };
+        (
+            rgb(Vec3::new(0.55, 0.0, 0.0)),
+            rgb(Vec3::new(-1.8, 0.0, -1.8)),
+        )
     }
 
     /// Clears an HDR target to `value` (all channels), tonemaps it to sRGB8
@@ -2919,7 +3407,10 @@ mod tests {
             view_proj: camera.view_proj(),
             eye: camera.eye,
             light: melon_core::Light::default(),
-            environment: melon_core::Environment::default(),
+            environment: melon_core::Environment {
+                ao_strength: 0.0,
+                ..Default::default()
+            },
             models: if cube {
                 vec![(glam::Mat4::IDENTITY, h)]
             } else {
@@ -3045,6 +3536,17 @@ mod tests {
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
+            Box::new(|renderer| {
+                let (contact_on, open_on) = ao_scene_pixels(renderer, 1.0);
+                let (contact_off, open_off) = ao_scene_pixels(renderer, 0.0);
+                if contact_on + 30 < contact_off && open_on.abs_diff(open_off) <= 3 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "ssao_darkens_contact_only: contact {contact_on} (AO) vs {contact_off} (off), want 30+ darker (RGB sum); open floor {open_on} vs {open_off}, want within 3"
+                    ))
+                }
+            }),
             Box::new(|renderer| {
                 // Grey dielectric floor mirroring the sun into the camera.
                 let floor = |roughness| MaterialUniform {
@@ -3317,7 +3819,10 @@ mod tests {
                         view_proj: melon_core::Camera::default().view_proj(),
                         eye: melon_core::Camera::default().eye,
                         light: melon_core::Light::default(),
-                        environment: melon_core::Environment::default(),
+                        environment: melon_core::Environment {
+                            ao_strength: 0.0,
+                            ..Default::default()
+                        },
                         models,
                     };
                     let mut encoder = renderer
@@ -3348,6 +3853,8 @@ mod tests {
                     zenith_color: glam::Vec3::Z,
                     horizon_color: glam::Vec3::X,
                     fog_density: 0.0,
+                    ao_strength: 0.0,
+                    ..Default::default()
                 };
                 let light = melon_core::Light {
                     direction: glam::Vec3::new(0.0, -1.0, -1.0).normalize(),
@@ -3384,6 +3891,8 @@ mod tests {
                     zenith_color: glam::Vec3::Z,
                     horizon_color: glam::Vec3::splat(0.5),
                     fog_density: 0.0,
+                    ao_strength: 0.0,
+                    ..Default::default()
                 };
                 let light = melon_core::Light {
                     direction: glam::Vec3::new(0.0, -1.0, -1.0).normalize(),
@@ -3411,6 +3920,8 @@ mod tests {
                     zenith_color: glam::Vec3::splat(0.02),
                     horizon_color: glam::Vec3::splat(0.02),
                     fog_density: 0.0,
+                    ao_strength: 0.0,
+                    ..Default::default()
                 };
                 let light = melon_core::Light::default();
                 let camera = melon_core::Camera {
@@ -3449,6 +3960,7 @@ mod tests {
                     let env = melon_core::Environment {
                         horizon_color: glam::Vec3::Z,
                         fog_density,
+                        ao_strength: 0.0,
                         ..Default::default()
                     };
                     let light = melon_core::Light::default();

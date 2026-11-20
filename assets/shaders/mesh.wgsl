@@ -2,8 +2,10 @@
 // uv + tangent. Group 0: camera, light (sun + sky/ground hemisphere + shadow
 // matrix), shadow map, environment. Group 2: the material (base colour,
 // metallic-roughness, normal and emissive textures, one sampler, factors).
+// Group 3: per-view lighting inputs (the SSAO texture).
 // Sun: Cook-Torrance (GGX, height-correlated Smith, Schlick Fresnel), shadowed.
-// Ambient: hemisphere diffuse plus a sky-gradient specular. Emissive is added,
+// Ambient: hemisphere diffuse plus a sky-gradient specular, both occluded by
+// SSAO (never the sun). Emissive is added,
 // then exponential distance fog fades toward the horizon colour. Output is
 // linear HDR; the tonemap pass maps it to the display.
 
@@ -79,6 +81,8 @@ struct VsOut {
 @group(2) @binding(3) var normal_tex: texture_2d<f32>;
 @group(2) @binding(4) var emissive_tex: texture_2d<f32>;
 @group(2) @binding(5) var<uniform> material: MaterialUniform;
+// Ambient occlusion per screen pixel (R, 1 = open); 1x1 white when off.
+@group(3) @binding(0) var ao_tex: texture_2d<f32>;
 
 const PI: f32 = 3.14159265;
 
@@ -154,6 +158,17 @@ fn visibility_smith_ggx(ndv: f32, ndl: f32, alpha: f32) -> f32 {
     return 0.5 / max(gv + gl, 1e-5);
 }
 
+// SSAO at framebuffer position `frag`; clamped so the 1x1 white fallback works.
+fn ambient_occlusion(frag: vec2f) -> f32 {
+    let px = min(vec2u(frag), textureDimensions(ao_tex) - 1u);
+    return textureLoad(ao_tex, px, 0).r;
+}
+
+// Specular occlusion from AO (Lagarde 2014): exactly 1 when ao is 1.
+fn specular_occlusion(ndv: f32, ao: f32, roughness: f32) -> f32 {
+    return clamp(pow(ndv + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao, 0.0, 1.0);
+}
+
 // World normal: the vertex normal bent by the tangent-space normal map.
 fn surface_normal(in: VsOut) -> vec3f {
     let n = normalize(in.world_normal);
@@ -194,11 +209,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
 
     // Ambient. Diffuse: the sky/ground hemisphere. Specular: the sky in the
     // mirror direction, fading toward the hemisphere around the normal as
-    // roughness blurs the reflection.
+    // roughness blurs the reflection. SSAO occludes both.
+    let ao = ambient_occlusion(in.clip_pos.xy);
     let hemi = light.ambient * mix(light.ground_color, light.sky_color, n.y * 0.5 + 0.5);
     let f_amb = fresnel_schlick_roughness(ndv, f0, roughness);
     let reflected = mix(sky_radiance(reflect(-v, n)), hemi, roughness);
-    let ambient = (1.0 - f_amb) * (1.0 - metallic) * base * hemi + f_amb * reflected;
+    let ambient = (1.0 - f_amb) * (1.0 - metallic) * base * hemi * ao
+        + f_amb * reflected * specular_occlusion(ndv, ao, roughness);
 
     let emissive = (textureSample(emissive_tex, material_sampler, in.uv).rgb * material.emissive);
     let color = sun + ambient + emissive;
