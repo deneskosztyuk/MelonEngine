@@ -132,6 +132,12 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   `melon_core` only reads them (`AssetServer::scan_metas`). Editor file
   operations go through `melon_editor::asset_ops` (moves the `.meta`, keeps
   the `AssetServer` paths, then `reconcile`). Scenes live in `assets/scenes`.
+- **Thumbnails.** `Renderer::render_thumbnail` records and submits its own
+  command buffer; the host calls it only after `end_frame`. Shared uniforms
+  are written with `queue.write_buffer`, which applies at the next submit, so
+  a thumbnail recorded into the frame's encoder would give the Scene view
+  the thumbnail's camera. One per frame, driven by
+  `Editor::thumbnail_request` / `thumbnail_done`.
 - **Scene format.** RON, `SCENE_VERSION = 4` in `melon_editor/src/scene.rs`:
   `parent` is an index into `entities`, `transform` is local (versions 1 and 2
   still load, all roots). `model` is the path (`#mesh<N>` included) and

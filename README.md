@@ -90,7 +90,8 @@ Editor:
 - **Content Browser:** folder tree (right-click a folder to add it to
   Favorites), clickable path, Back / Forward (also mouse buttons 4 / 5),
   search (this folder and below), type filter chips, and a size slider whose
-  far left switches tiles to a list. Click selects; double-click (or Enter)
+  far left switches tiles to a list. Model tiles show a rendered thumbnail
+  (one per frame, refreshed when the file changes). Click selects; double-click (or Enter)
   opens a folder, asks Save / Don't Save / Cancel and loads a scene (`.ron`
   in `assets/`), or opens any other file in its default app. Right-click:
   New Folder, Rename (**F2**), Duplicate (**Ctrl+D**), Delete (**Del**, to the

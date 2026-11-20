@@ -259,6 +259,8 @@ struct App {
     editor_ui: Option<Editor>,
     /// Offscreen image the scene renders into; the editor shows it in its viewport panel.
     viewport_target: Option<melon_render::ViewportTarget>,
+    /// Shared target for Content Browser thumbnails (`THUMBNAIL_SIZE` square).
+    thumbnail_target: Option<melon_render::ViewportTarget>,
     core: melon_core::Core,
     /// Last `GameInputGate` value applied (input routing and cursor grab).
     game_input: bool,
@@ -363,6 +365,7 @@ impl App {
             editor: None,
             editor_ui: None,
             viewport_target: None,
+            thumbnail_target: None,
             core,
             game_input: false,
             input_map_broken,
@@ -432,6 +435,10 @@ impl ApplicationHandler for App {
         };
 
         let viewport_target = renderer.create_viewport_target(renderer.size());
+        let thumbnail_target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(
+            melon_render::THUMBNAIL_SIZE,
+            melon_render::THUMBNAIL_SIZE,
+        ));
 
         let mut editor = EditorOverlay::new(&window, renderer.device(), renderer.surface_format());
         editor.set_viewport_target(renderer.device(), &viewport_target);
@@ -466,6 +473,7 @@ impl ApplicationHandler for App {
             self.editor_ui = Some(editor_ui);
         }
         self.viewport_target = Some(viewport_target);
+        self.thumbnail_target = Some(thumbnail_target);
         window.focus_window();
         window.request_redraw();
     }
@@ -623,6 +631,22 @@ impl ApplicationHandler for App {
                     editor.render(&mut pass);
                 }
                 renderer.end_frame(frame);
+
+                // One Content Browser thumbnail per frame, in its own
+                // submission after this frame's (shared uniforms are written
+                // with `queue.write_buffer`, applied at the next submit).
+                if let Some(target) = self.thumbnail_target.as_ref()
+                    && let Some(request) = editor_ui.thumbnail_request(&mut self.core.world)
+                {
+                    let view = {
+                        let mut server = self.core.world.resource_mut::<melon_core::AssetServer>();
+                        renderer.render_thumbnail(&mut server, request.handle, target)
+                    };
+                    let id = view.map(|view| {
+                        editor.register_thumbnail(renderer.device(), &view, request.existing)
+                    });
+                    editor_ui.thumbnail_done(&request, id);
+                }
 
                 window.request_redraw();
             }
