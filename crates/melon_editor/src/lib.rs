@@ -120,6 +120,12 @@ pub struct Editor {
     /// Follows changes under `assets/` made outside the editor; `None` if
     /// it could not start (Refresh still works).
     watcher: Option<asset_watch::AssetWatcher>,
+    /// glTF mesh counts for the Inspector's Asset card, by file and its
+    /// modified time (re-read only when the file changes).
+    mesh_counts: std::collections::HashMap<
+        std::path::PathBuf,
+        (Option<std::time::SystemTime>, Result<usize, String>),
+    >,
     status_message: Option<(String, StatusKind, std::time::Instant)>,
     /// egui texture showing the scene (set by `EditorOverlay`).
     viewport_texture: Option<egui::TextureId>,
@@ -174,6 +180,7 @@ impl Default for Editor {
             confirm_open: None,
             content_shown: false,
             watcher: None,
+            mesh_counts: std::collections::HashMap::new(),
             status_message: None,
             viewport_texture: None,
             viewport_size: winit::dpi::PhysicalSize::new(1, 1),
@@ -1393,8 +1400,24 @@ impl Editor {
     }
 
     fn build_inspector(&mut self, world: &mut World, ui: &mut egui::Ui) {
+        let asset = self.content.selected().and_then(|path| {
+            world
+                .get_resource::<AssetServer>()
+                .and_then(|server| content::asset_details(server, path))
+                .map(|details| (path.to_path_buf(), details))
+        });
+        if let Some((path, details)) = &asset {
+            self.asset_card(world, ui, path, details);
+        }
         let Some(entity) = self.selected else {
-            ui.weak("Nothing selected");
+            if asset.is_none() {
+                let label = ui.weak("Nothing selected");
+                ui.interact(
+                    label.rect,
+                    egui::Id::new("inspector_nothing"),
+                    egui::Sense::hover(),
+                );
+            }
             return;
         };
         // Read before borrowing the entity mutably (the server is a world resource).
@@ -1965,6 +1988,102 @@ fn inspector_card(
                 });
         });
     fills.swap(0, 1);
+}
+
+impl Editor {
+    /// The Content Browser's selected file or folder, read-only.
+    fn asset_card(
+        &mut self,
+        world: &mut World,
+        ui: &mut egui::Ui,
+        path: &std::path::Path,
+        details: &content::AssetDetails,
+    ) {
+        let model = details.kind == content::AssetKind::Model;
+        let meshes = model.then(|| {
+            let entry = self
+                .mesh_counts
+                .entry(path.to_path_buf())
+                .or_insert((None, Ok(0)));
+            if entry.0 != details.modified || entry.0.is_none() {
+                let count = melon_render::gltf_nodes(path)
+                    .map(|nodes| {
+                        nodes
+                            .iter()
+                            .filter_map(|n| n.mesh)
+                            .collect::<std::collections::HashSet<_>>()
+                            .len()
+                    })
+                    .map_err(|e| format!("{e:#}"));
+                *entry = (details.modified, count);
+            }
+            match &entry.1 {
+                Ok(count) => count.to_string(),
+                Err(error) => error.clone(),
+            }
+        });
+        let bounds = model.then(|| {
+            let mut server = world.resource_mut::<AssetServer>();
+            let handle: Handle<Model> = server.load(&details.path);
+            server.bounds(handle).map_or_else(
+                || "not loaded yet".to_string(),
+                |(min, max)| {
+                    format!(
+                        "({:.2}, {:.2}, {:.2}) \u{2026} ({:.2}, {:.2}, {:.2})",
+                        min.x, min.y, min.z, max.x, max.y, max.z
+                    )
+                },
+            )
+        });
+        let mut fills = theme::colors::INSPECTOR_CARDS;
+        inspector_card(ui, &mut fills, "Asset", |ui| {
+            let name = ui.label("Name");
+            ui.interact(
+                name.rect,
+                egui::Id::new("inspector_asset_card"),
+                egui::Sense::hover(),
+            );
+            inspector_value(ui, &details.name);
+            ui.end_row();
+            ui.label("Path");
+            inspector_value(ui, &details.path);
+            ui.end_row();
+            ui.label("Type");
+            inspector_value(ui, details.kind.label());
+            ui.end_row();
+            if details.kind != content::AssetKind::Folder {
+                ui.label("Size");
+                inspector_value(ui, content::format_size(details.size));
+                ui.end_row();
+            }
+            ui.label("Modified");
+            inspector_value(
+                ui,
+                details
+                    .modified
+                    .map_or_else(|| "unknown".to_string(), content::format_modified),
+            );
+            ui.end_row();
+            ui.label("GUID");
+            inspector_value(
+                ui,
+                details
+                    .guid
+                    .map_or_else(|| "none".to_string(), |g| g.to_string()),
+            );
+            ui.end_row();
+            if let Some(meshes) = &meshes {
+                ui.label("Meshes");
+                inspector_value(ui, meshes);
+                ui.end_row();
+            }
+            if let Some(bounds) = &bounds {
+                ui.label("Bounds");
+                inspector_value(ui, bounds);
+                ui.end_row();
+            }
+        });
+    }
 }
 
 /// Fill the value column so read-only rows get the same band width as editable rows.
@@ -3752,6 +3871,35 @@ mod tests {
             Some(guid)
         );
         assert!(melon_core::meta_path(&y).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inspector_shows_asset_card_for_browser_selection() {
+        let (mut editor, mut world, root) = browser_project("asset_card");
+        editor
+            .content
+            .select(Some(root.join("assets/models/x.glb")));
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            editor.build_inspector(&mut world, ui)
+        });
+        assert!(
+            ctx.read_response(egui::Id::new("inspector_asset_card"))
+                .is_some()
+        );
+        assert!(
+            ctx.read_response(egui::Id::new("inspector_nothing"))
+                .is_none()
+        );
+        editor.content.select(None);
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            editor.build_inspector(&mut world, ui)
+        });
+        assert!(
+            ctx.read_response(egui::Id::new("inspector_nothing"))
+                .is_some()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

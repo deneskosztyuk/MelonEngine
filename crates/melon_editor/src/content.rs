@@ -136,6 +136,62 @@ pub struct AssetDrag {
     pub model: Option<String>,
 }
 
+/// What the Inspector shows for a file or folder picked in the browser.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AssetDetails {
+    pub name: String,
+    /// Project-relative, forward slashes.
+    pub path: String,
+    pub kind: AssetKind,
+    pub size: u64,
+    pub modified: Option<std::time::SystemTime>,
+    pub guid: Option<melon_core::AssetGuid>,
+}
+
+/// Details of `path`; `None` if it is gone or outside the project.
+pub fn asset_details(server: &melon_core::AssetServer, path: &Path) -> Option<AssetDetails> {
+    let meta = std::fs::metadata(path).ok()?;
+    let rel = melon_core::assets::project_relative(server.root(), path)?;
+    let is_dir = meta.is_dir();
+    Some(AssetDetails {
+        name: path.file_name()?.to_string_lossy().into_owned(),
+        kind: asset_kind(path, is_dir),
+        size: if is_dir { 0 } else { meta.len() },
+        modified: meta.modified().ok(),
+        guid: server.guid_of(&rel),
+        path: rel,
+    })
+}
+
+/// `YYYY-MM-DD HH:MM UTC` (no date crate: civil date from days since 1970).
+pub fn format_modified(time: std::time::SystemTime) -> String {
+    let secs = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let (year, month, day) = civil_from_days((secs / 86_400) as i64);
+    let rest = secs % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        rest / 3600,
+        rest % 3600 / 60
+    )
+}
+
+/// Days since 1970-01-01 to (year, month, day), proleptic Gregorian
+/// (Howard Hinnant's `civil_from_days`).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
 /// A scene file: `.ron` (any case) under `<project_root>/assets`.
 pub fn is_scene_path(project_root: &Path, path: &Path) -> bool {
     path.starts_with(project_root.join("assets"))
@@ -1052,5 +1108,47 @@ mod tests {
         browser.refresh();
         assert_eq!(browser.selected(), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn asset_details_for_a_model() {
+        let root = temp_dir("details");
+        touch(&root, "assets/models/x.glb");
+        let mut server = melon_core::AssetServer::new(root.clone());
+        crate::asset_db::reconcile(&mut server);
+        let g = server.guid_of("assets/models/x.glb");
+        let x = root.join("assets/models/x.glb");
+        let d = asset_details(&server, &x).unwrap();
+        assert_eq!(
+            (d.name.as_str(), d.path.as_str(), d.kind),
+            ("x.glb", "assets/models/x.glb", AssetKind::Model)
+        );
+        assert_eq!(d.guid, g);
+        assert!(d.guid.is_some());
+        assert_eq!(d.size, 1);
+        assert!(d.modified.is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn asset_details_none_for_missing_or_outside() {
+        let root = temp_dir("details_none");
+        let server = melon_core::AssetServer::new(root.clone());
+        assert!(asset_details(&server, &root.join("assets/gone.glb")).is_none());
+        let outside =
+            std::env::temp_dir().join(format!("melon_outside_{}.glb", std::process::id()));
+        std::fs::write(&outside, "x").unwrap();
+        assert!(asset_details(&server, &outside).is_none());
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn format_modified_is_utc_civil_time() {
+        // 2025-11-20 12:00:00 UTC
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_763_640_000);
+        assert_eq!(format_modified(t), "2025-11-20 12:00 UTC");
+        let leap = std::time::UNIX_EPOCH + std::time::Duration::from_secs(951_782_400); // 2000-02-29
+        assert_eq!(format_modified(leap), "2000-02-29 00:00 UTC");
     }
 }
