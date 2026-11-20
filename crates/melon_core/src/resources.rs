@@ -2,6 +2,7 @@ use bevy_ecs::resource::Resource;
 use glam::camera::rh::proj::directx;
 use glam::camera::rh::view;
 use glam::{Mat4, Vec2, Vec3, Vec4};
+use serde::{Deserialize, Serialize};
 
 #[derive(Resource, Debug, Clone, Copy)]
 pub struct Camera {
@@ -198,10 +199,21 @@ pub struct Environment {
     /// Bloom: how much of the blurred HDR image is mixed into the scene
     /// colour before tonemapping; 0 = off (the bloom passes are skipped).
     pub bloom_intensity: f32,
-    /// Dynamic diffuse GI (DDGI probes over a voxel scene): scales the
-    /// probe irradiance that replaces the hemisphere ambient inside the GI
-    /// volume; 0 = off (the voxel and probe passes are skipped).
+    /// Diffuse GI technique; `gi_intensity` scales whichever runs.
+    pub gi_mode: GiMode,
+    /// Strength of the indirect diffuse light that replaces the hemisphere
+    /// ambient (`gi_mode`); 0 = off, like `GiMode::Off` (no GI passes).
     pub gi_intensity: f32,
+}
+
+/// Diffuse global illumination technique (`Environment::gi_mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum GiMode {
+    /// Hemisphere ambient only.
+    Off,
+    /// DDGI probes over a voxel scene: world-space, costlier.
+    #[default]
+    Ddgi,
 }
 
 impl Default for Environment {
@@ -214,6 +226,7 @@ impl Default for Environment {
             ao_strength: 1.0,
             ao_radius: 0.5,
             bloom_intensity: 0.08,
+            gi_mode: GiMode::Ddgi,
             gi_intensity: 1.0,
         }
     }
@@ -245,6 +258,16 @@ mod tests {
     #[test]
     fn environment_gi_default_is_on() {
         assert_eq!(Environment::default().gi_intensity, 1.0);
+    }
+
+    #[test]
+    fn gi_mode_defaults_to_ddgi_and_round_trips() {
+        assert_eq!(Environment::default().gi_mode, GiMode::Ddgi);
+        for mode in [GiMode::Off, GiMode::Ddgi] {
+            let text = ron::to_string(&mode).unwrap();
+            assert_eq!(ron::from_str::<GiMode>(&text).unwrap(), mode);
+        }
+        assert_eq!(ron::to_string(&GiMode::Ddgi).unwrap(), "Ddgi");
     }
 
     #[test]

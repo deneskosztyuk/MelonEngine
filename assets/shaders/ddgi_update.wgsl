@@ -1,8 +1,8 @@
-// DDGI probe update (compute), after the voxel passes. gi_common.wgsl is
-// prepended. One workgroup per probe: each invocation traces one of the
-// GI_RAYS rays through the voxel radiance volume (3D DDA, early exit on the
-// first occupied voxel; a miss reads the sky light) into workgroup memory, then
-// the workgroup blends them into every texel of the probe's irradiance and
+// DDGI probe update (compute), after the voxel passes. gi_common.wgsl and
+// ddgi_common.wgsl are prepended. One workgroup per probe: each invocation
+// traces one of the GI_RAYS rays through the voxel radiance volume (3D DDA,
+// early exit on the first occupied voxel; a miss reads `sky_light`) into
+// workgroup memory, then the workgroup blends them into every texel of the probe's irradiance and
 // depth tiles with hysteresis. Border texels compute the interior texel
 // they mirror, so the octahedral border needs no extra pass.
 
@@ -48,17 +48,6 @@ fn ray_direction(i: u32) -> vec3f {
     return normalize((gi.ray_rotation * vec4f(d, 0.0)).xyz);
 }
 
-// Sky light along a ray that leaves the volume: the hemisphere ambient's
-// colours, `light.ambient * sky_color` above the horizon, `ground_color`
-// below. Cosine-weighted over a normal's hemisphere this is exactly the
-// GI-off ambient `ambient * mix(ground, sky, n.y * 0.5 + 0.5)` (an open
-// plane tilted by t sees (1 + cos t) / 2 of the sky), so an unoccluded
-// surface keeps the GI-off brightness. The drawn sky (sky.wgsl) is the
-// background, several times brighter, and would wash the scene out.
-fn sky(dir: vec3f) -> vec3f {
-    return light.ambient * select(light.ground_color, light.sky_color, dir.y >= 0.0);
-}
-
 // 3D DDA from `o` along unit `d` through the voxel grid: the first occupied
 // voxel's radiance and the distance to it, or the sky light and MISS_DISTANCE.
 fn trace(o: vec3f, d: vec3f) -> vec4f {
@@ -94,7 +83,7 @@ fn trace(o: vec3f, d: vec3f) -> vec4f {
             t_max.z += t_delta.z;
         }
     }
-    return vec4f(sky(d), MISS_DISTANCE);
+    return vec4f(sky_light(d), MISS_DISTANCE);
 }
 
 // Probe index -> grid cell (x fastest, then y, then z).

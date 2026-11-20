@@ -1,17 +1,19 @@
-//! Dynamic diffuse global illumination (DDGI) with software voxel tracing.
+//! GI backend: dynamic diffuse global illumination (DDGI) with software
+//! voxel tracing. World data, shared by every view.
 //!
-//! Per frame (`render_gi`, after the sun shadow pass): clear the voxel
+//! Per frame (`Ddgi::render`, after the sun shadow pass): clear the voxel
 //! volume, voxelise every instance in the GI volume (three orthographic
 //! passes, X, Y and Z, writing radiance from the fragment stage), then the
 //! probe update (one compute workgroup per probe: trace rays through the
 //! voxels, blend irradiance and distance moments into the atlases with
 //! hysteresis), then copy the new atlases over the sampled ones. The
-//! mesh shader reads the atlases from group 3. See AGENTS.md.
+//! mesh shader reads the atlases from group 3 (gi_ddgi.wgsl). See AGENTS.md.
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, UVec3, Vec2, Vec3};
 
-use crate::{Mesh, SceneRenderer};
+use super::GiInputs;
+use crate::Mesh;
 
 // ponytail: fixed volume around the origin (the sun shadow box's footprint);
 // it should follow the camera (with probe scrolling) once scenes outgrow it.
@@ -43,7 +45,7 @@ pub fn volume_size() -> Vec3 {
     PROBE_COUNTS.as_vec3() * PROBE_SPACING
 }
 
-/// The GI settings as the shaders see them (gi_common.wgsl `GiUniform`).
+/// The DDGI settings as the shaders see them (ddgi_common.wgsl `GiUniform`).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(crate) struct GiUniform {
@@ -61,7 +63,7 @@ pub(crate) struct GiUniform {
 }
 
 /// Ray `i` of `n` on the unit sphere, spherical Fibonacci (mirrors
-/// gi.wgsl `ray_direction` before the rotation).
+/// ddgi_update.wgsl `ray_direction` before the rotation).
 pub fn spherical_fibonacci(i: u32, n: u32) -> Vec3 {
     let golden_ratio = (1.0 + 5f32.sqrt()) / 2.0;
     let phi = std::f32::consts::TAU * (i as f32 / golden_ratio).fract();
@@ -162,9 +164,9 @@ fn ray_rotation(frame: u32) -> Mat4 {
     )
 }
 
-/// Group 3 layout entries 1 to 5 (irradiance atlas, depth atlas, sampler,
-/// `GiUniform`, voxel buffer); entry 0 is the AO texture.
-pub(crate) fn lighting_layout_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
+/// This backend's group 3 layout entries, 1 to 5 (irradiance atlas, depth
+/// atlas, sampler, `GiUniform`, voxel buffer).
+pub(super) fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
     let atlas = |binding| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -208,16 +210,6 @@ pub(crate) fn lighting_layout_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
     ]
 }
 
-/// Frame resources the GI passes read (from `SceneRenderer::new`).
-pub(crate) struct GiInputs<'a> {
-    pub light: &'a wgpu::Buffer,
-    pub shadow_view: &'a wgpu::TextureView,
-    pub shadow_sampler: &'a wgpu::Sampler,
-    pub model_layout: &'a wgpu::BindGroupLayout,
-    pub material_layout: &'a wgpu::BindGroupLayout,
-    pub lighting_layout: &'a wgpu::BindGroupLayout,
-}
-
 /// One probe atlas: the texture the mesh shader samples and the storage
 /// texture the update writes, copied over it after each update.
 struct Atlas {
@@ -255,8 +247,8 @@ impl Atlas {
     }
 }
 
-/// The GI world data and passes, shared by every view.
-pub(crate) struct Gi {
+/// The DDGI world data and passes, shared by every view.
+pub(super) struct Ddgi {
     uniform: wgpu::Buffer,
     irradiance: Atlas,
     depth: Atlas,
@@ -273,15 +265,12 @@ pub(crate) struct Gi {
     /// One workgroup per probe: trace its rays, blend both atlas tiles.
     update_pipeline: wgpu::ComputePipeline,
     update_group: wgpu::BindGroup,
-    /// Probe updates since GI was last off (hysteresis and ray rotation).
+    /// Probe updates since DDGI was last off (hysteresis and ray rotation).
     updates: u32,
-    /// GI was on in the last `update_gi`: the mesh draws use the GI pipeline.
-    pub(crate) on: bool,
-    gi_only: bool,
 }
 
-impl Gi {
-    pub(crate) fn new(device: &wgpu::Device, inputs: &GiInputs) -> Self {
+impl Ddgi {
+    pub(super) fn new(device: &wgpu::Device, inputs: &GiInputs) -> Self {
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gi uniform buffer"),
             size: std::mem::size_of::<GiUniform>() as wgpu::BufferAddress,
@@ -475,11 +464,12 @@ impl Gi {
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("gi.wgsl"),
+            label: Some("ddgi_update.wgsl"),
             source: wgpu::ShaderSource::Wgsl(
                 concat!(
-                    include_str!("../../../assets/shaders/gi_common.wgsl"),
-                    include_str!("../../../assets/shaders/gi.wgsl")
+                    include_str!("../../../../assets/shaders/gi_common.wgsl"),
+                    include_str!("../../../../assets/shaders/ddgi_common.wgsl"),
+                    include_str!("../../../../assets/shaders/ddgi_update.wgsl")
                 )
                 .into(),
             ),
@@ -510,15 +500,13 @@ impl Gi {
             voxel_target,
             update_group,
             updates: 0,
-            on: false,
-            gi_only: false,
         }
     }
 
     /// Group 3 entries 1 to 5 for a lighting bind group. `voxels`: bind the
     /// voxel volume for probe visibility; false (the voxel passes, which
     /// write it) binds a dummy the shader never reads there.
-    pub(crate) fn lighting_entries(&self, voxels: bool) -> [wgpu::BindGroupEntry<'_>; 5] {
+    pub(super) fn entries(&self, voxels: bool) -> [wgpu::BindGroupEntry<'_>; 5] {
         [
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -599,59 +587,53 @@ fn build_voxel_pipeline(
     })
 }
 
-impl SceneRenderer {
-    /// Debug: the mesh shader outputs only the indirect diffuse term.
-    pub fn set_gi_only(&mut self, gi_only: bool) {
-        self.gi.gi_only = gi_only;
-    }
-
-    /// Writes the GI uniform for this frame. `intensity` 0 turns GI off and
-    /// restarts convergence for the next frame it is on.
-    pub(crate) fn update_gi(&mut self, intensity: f32) {
-        let gi = &mut self.gi;
+impl Ddgi {
+    /// Writes the DDGI uniform for this frame. `intensity` 0 turns DDGI off
+    /// and restarts convergence for the next frame it is on.
+    pub(super) fn update(&mut self, queue: &wgpu::Queue, intensity: f32, gi_only: bool) {
         let on = intensity > 0.0;
-        gi.on = on;
         if !on {
-            gi.updates = 0;
+            self.updates = 0;
         }
         let uniform = GiUniform {
             origin: GI_ORIGIN.to_array(),
             intensity: if on { intensity } else { 0.0 },
             probe_counts: PROBE_COUNTS.to_array(),
-            gi_only: u32::from(gi.gi_only),
+            gi_only: u32::from(gi_only),
             voxel_counts: VOXEL_COUNTS.to_array(),
             voxel_size: VOXEL_SIZE,
             spacing: PROBE_SPACING,
-            hysteresis: hysteresis(gi.updates),
+            hysteresis: hysteresis(self.updates),
             max_depth: 1.5 * PROBE_SPACING * 3f32.sqrt(),
             _pad: 0.0,
-            ray_rotation: ray_rotation(gi.updates).to_cols_array_2d(),
+            ray_rotation: ray_rotation(self.updates).to_cols_array_2d(),
         };
-        self.queue
-            .write_buffer(&gi.uniform, 0, bytemuck::bytes_of(&uniform));
+        queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
         if on {
-            gi.updates += 1;
+            self.updates += 1;
         }
     }
 
-    /// Voxelises `draw_calls` (the instances in the GI volume) and updates
-    /// the probes. Call after `update_gi`, `update_instances` and the
-    /// shadow pass, before the 3D pass.
-    pub(crate) fn render_gi(
+    /// Voxelises `draw_calls` (the instances in the GI volume, see
+    /// [`in_volume`]) and updates the probes. `instances` is group 1,
+    /// `voxel_lighting` the group 3 without the voxel volume. Call after
+    /// `update`, `update_instances` and the shadow pass, before the 3D pass.
+    pub(super) fn render(
         &self,
         encoder: &mut wgpu::CommandEncoder,
+        instances: &wgpu::BindGroup,
+        voxel_lighting: &wgpu::BindGroup,
         draw_calls: &[(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)],
     ) {
-        let gi = &self.gi;
-        encoder.clear_buffer(&gi.voxels, 0, None);
+        encoder.clear_buffer(&self.voxels, 0, None);
         // Viewport (one pixel per voxel) of the projections along X, Y, Z.
         let c = VOXEL_COUNTS;
         let viewports = [(c.z, c.y), (c.x, c.z), (c.x, c.y)];
-        for (group, (width, height)) in gi.voxel_groups.iter().zip(viewports) {
+        for (group, (width, height)) in self.voxel_groups.iter().zip(viewports) {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("melon_render gi voxel pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &gi.voxel_target,
+                    view: &self.voxel_target,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -665,10 +647,10 @@ impl SceneRenderer {
                 multiview_mask: None,
             });
             pass.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
-            pass.set_pipeline(&gi.voxel_pipeline);
+            pass.set_pipeline(&self.voxel_pipeline);
             pass.set_bind_group(0, group, &[]);
-            pass.set_bind_group(1, &self.instance_bind_group, &[]);
-            pass.set_bind_group(3, &self.voxel_pass_lighting, &[]);
+            pass.set_bind_group(1, instances, &[]);
+            pass.set_bind_group(3, voxel_lighting, &[]);
             for (mesh, material, instances) in draw_calls {
                 pass.set_bind_group(2, *material, &[]);
                 pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
@@ -681,11 +663,11 @@ impl SceneRenderer {
                 label: Some("melon_render gi probe update"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&gi.update_pipeline);
-            pass.set_bind_group(0, &gi.update_group, &[]);
+            pass.set_pipeline(&self.update_pipeline);
+            pass.set_bind_group(0, &self.update_group, &[]);
             pass.dispatch_workgroups(PROBE_COUNTS.x * PROBE_COUNTS.y * PROBE_COUNTS.z, 1, 1);
         }
-        for atlas in [&gi.irradiance, &gi.depth] {
+        for atlas in [&self.irradiance, &self.depth] {
             encoder.copy_texture_to_texture(
                 atlas.scratch.as_image_copy(),
                 atlas.texture.as_image_copy(),
@@ -693,6 +675,11 @@ impl SceneRenderer {
             );
         }
     }
+}
+
+/// Whether a world AABB touches the GI volume (its instance is voxelised).
+pub(crate) fn in_volume(min: Vec3, max: Vec3) -> bool {
+    min.cmple(GI_ORIGIN + volume_size()).all() && max.cmpge(GI_ORIGIN).all()
 }
 
 #[cfg(test)]

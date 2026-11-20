@@ -482,10 +482,12 @@ fn image_from_gltf_data(data: &gltf::image::Data) -> image::DynamicImage {
     }
 }
 
-/// mesh.wgsl with the shared DDGI declarations prepended (mesh and voxel
-/// pipelines).
+/// mesh.wgsl with the GI helpers and every GI backend's shading prepended
+/// (mesh and voxel pipelines).
 const MESH_WGSL: &str = concat!(
     include_str!("../../../assets/shaders/gi_common.wgsl"),
+    include_str!("../../../assets/shaders/ddgi_common.wgsl"),
+    include_str!("../../../assets/shaders/gi_ddgi.wgsl"),
     include_str!("../../../assets/shaders/mesh.wgsl")
 );
 
@@ -602,9 +604,9 @@ pub struct SceneRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface_format: wgpu::TextureFormat,
-    /// The mesh pipeline without and with DDGI (`GI_ENABLED` override).
+    /// The mesh pipeline per GI mode (`GI_MODE` override): off, DDGI.
     mesh_pipeline: wgpu::RenderPipeline,
-    mesh_gi_pipeline: wgpu::RenderPipeline,
+    mesh_ddgi_pipeline: wgpu::RenderPipeline,
     tonemap_pipeline: wgpu::RenderPipeline,
     tonemap_bind_group_layout: wgpu::BindGroupLayout,
     /// Bloom: one source texture + sampler per pass, the first (Karis)
@@ -654,7 +656,7 @@ pub struct SceneRenderer {
     /// Group 3 of the GI voxel passes: `unoccluded_lighting` without the
     /// voxel volume they write.
     voxel_pass_lighting: wgpu::BindGroup,
-    /// DDGI world data (voxels, probe atlases) and its passes.
+    /// The GI backends (resources, passes) and the last frame's mode.
     gi: gi::Gi,
     /// Depth-tested lines inside the 3D pass (grid, axes, selection box).
     world_line_pipeline: wgpu::RenderPipeline,
@@ -835,8 +837,7 @@ impl Renderer {
         scene.update_camera(frame.view_proj, frame.eye);
         scene.update_environment(&frame.environment);
         scene.update_ssao(&frame.environment);
-        let gi_on = frame.environment.gi_intensity > 0.0;
-        scene.update_gi(frame.environment.gi_intensity);
+        let gi_mode = scene.gi.update(&scene.queue, &frame.environment);
         let light_view_proj =
             directional_light_view_proj(frame.light.to_light(), SHADOW_CENTER, SHADOW_RADIUS);
         scene.update_light(&frame.light, light_view_proj);
@@ -851,10 +852,9 @@ impl Renderer {
         let shadow_box = Frustum::from_view_proj(light_view_proj);
         let mut stats = RenderStats::default();
         let (mut seen, mut casters, mut voxelized) = (Vec::new(), Vec::new(), Vec::new());
-        let (gi_min, gi_max) = (gi::GI_ORIGIN, gi::GI_ORIGIN + gi::volume_size());
         for (matrix, handle) in &frame.models {
             let (min, max) = world_aabb(*matrix, self.model_cache.model(server, *handle).bounds);
-            if gi_on && min.cmple(gi_max).all() && max.cmpge(gi_min).all() {
+            if gi_mode == melon_core::GiMode::Ddgi && gi::ddgi::in_volume(min, max) {
                 voxelized.push((*handle, *matrix));
             }
             if camera.intersects_aabb(min, max) {
@@ -901,11 +901,16 @@ impl Renderer {
         // The draw lists borrow the model cache; the scene is a separate field.
         let scene = &mut self.scene;
         scene.render_shadow_pass(encoder, &shadow_draw_calls);
-        // GI off: no voxel or probe passes; the mesh shader keeps the
-        // hemisphere ambient, so the image matches the renderer without GI.
-        if gi_on {
-            scene.render_gi(encoder, &voxel_draw_calls);
-        }
+        // GI off: no GI passes; the mesh shader keeps the hemisphere
+        // ambient, so the image matches the renderer without GI.
+        scene.gi.render(
+            encoder,
+            &gi::GiPasses {
+                instances: &scene.instance_bind_group,
+                voxel_lighting: &scene.voxel_pass_lighting,
+                voxel_draws: &voxel_draw_calls,
+            },
+        );
         // AO off: skip the SSAO passes and bind white, so the image matches
         // the renderer without SSAO.
         let lighting = if frame.environment.ao_strength > 0.0 {
@@ -1081,11 +1086,12 @@ impl SceneRenderer {
         });
 
         // Group 3: per-view lighting inputs: AO (R, 1 = unoccluded), then
-        // the DDGI atlases, sampler and settings (shared by every view).
-        let [gi_1, gi_2, gi_3, gi_4, gi_5] = gi::lighting_layout_entries();
+        // every GI backend's bindings (gi/mod.rs).
+        let mut lighting_entries = vec![texture_entry(0)];
+        lighting_entries.extend(gi::Gi::layout_entries());
         let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("lighting bind group layout"),
-            entries: &[texture_entry(0), gi_1, gi_2, gi_3, gi_4, gi_5],
+            entries: &lighting_entries,
         });
         let mesh_layouts = [
             &frame_layout,
@@ -1093,8 +1099,9 @@ impl SceneRenderer {
             &material_layout,
             &lighting_layout,
         ];
-        let mesh_pipeline = Renderer::build_mesh_pipeline(&device, &mesh_layouts, false);
-        let mesh_gi_pipeline = Renderer::build_mesh_pipeline(&device, &mesh_layouts, true);
+        let build_mesh = |mode| Renderer::build_mesh_pipeline(&device, &mesh_layouts, mode);
+        let mesh_pipeline = build_mesh(melon_core::GiMode::Off);
+        let mesh_ddgi_pipeline = build_mesh(melon_core::GiMode::Ddgi);
 
         let unfilterable_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,
@@ -1346,11 +1353,12 @@ impl SceneRenderer {
             resource: wgpu::BindingResource::TextureView(&default_textures.white),
         };
         let lighting = |label, voxels| {
-            let [gi_1, gi_2, gi_3, gi_4, gi_5] = gi.lighting_entries(voxels);
+            let mut entries = vec![white_ao.clone()];
+            entries.extend(gi.entries(voxels));
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
                 layout: &lighting_layout,
-                entries: &[white_ao.clone(), gi_1, gi_2, gi_3, gi_4, gi_5],
+                entries: &entries,
             })
         };
         let unoccluded_lighting = lighting("unoccluded lighting bind group", true);
@@ -1367,7 +1375,7 @@ impl SceneRenderer {
             queue,
             surface_format,
             mesh_pipeline,
-            mesh_gi_pipeline,
+            mesh_ddgi_pipeline,
             tonemap_pipeline,
             tonemap_bind_group_layout: tonemap_layout,
             bloom_layout,
@@ -1413,13 +1421,13 @@ impl SceneRenderer {
 
 impl Renderer {
     /// `layouts`: frame, model, material, lighting (groups 0 to 3). `gi`:
-    /// diffuse ambient from the DDGI probes instead of the hemisphere.
+    /// where the diffuse ambient comes from (`Off`: the hemisphere).
     fn build_mesh_pipeline(
         device: &wgpu::Device,
         layouts: &[&wgpu::BindGroupLayout; 4],
-        gi: bool,
+        gi: melon_core::GiMode,
     ) -> wgpu::RenderPipeline {
-        let constants = [("GI_ENABLED", if gi { 1.0 } else { 0.0 })];
+        let constants = [("GI_MODE", gi::shader_mode(gi))];
         let compilation_options = wgpu::PipelineCompilationOptions {
             constants: &constants,
             ..Default::default()
@@ -2179,11 +2187,12 @@ impl SceneRenderer {
             layout: &self.ssao_blur_layout,
             entries: &[entry(1, &normal_view), uniform, entry(3, &raw_view)],
         });
-        let [gi_1, gi_2, gi_3, gi_4, gi_5] = self.gi.lighting_entries(true);
+        let mut lighting_entries = vec![entry(0, &ao_view)];
+        lighting_entries.extend(self.gi.entries(true));
         let lighting_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lighting bind group"),
             layout: &self.lighting_layout,
-            entries: &[entry(0, &ao_view), gi_1, gi_2, gi_3, gi_4, gi_5],
+            entries: &lighting_entries,
         });
         SsaoTargets {
             depth_view,
@@ -3050,18 +3059,16 @@ impl SceneRenderer {
     /// Draw 3D meshes with per-draw-call materials.
     /// Each draw call is `(mesh, material_bind_group, instance range)`;
     /// `lighting` is the view's group 3 (per-view lighting inputs). Diffuse
-    /// ambient comes from the GI probes when the last `render_scene` had
-    /// `gi_intensity` above 0.
+    /// ambient comes from the GI mode of the last `render_scene`.
     pub fn draw_meshes_textured(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
         draw_calls: &[(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)],
         lighting: &wgpu::BindGroup,
     ) {
-        pass.set_pipeline(if self.gi.on {
-            &self.mesh_gi_pipeline
-        } else {
-            &self.mesh_pipeline
+        pass.set_pipeline(match self.gi.mode {
+            melon_core::GiMode::Off => &self.mesh_pipeline,
+            melon_core::GiMode::Ddgi => &self.mesh_ddgi_pipeline,
         });
         pass.set_bind_group(0, &self.frame_bind_group, &[]);
         pass.set_bind_group(1, &self.instance_bind_group, &[]);
