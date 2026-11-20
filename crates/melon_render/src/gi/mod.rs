@@ -23,7 +23,10 @@ use crate::Mesh;
 pub(crate) struct GiInputs<'a> {
     pub frame_layout: &'a wgpu::BindGroupLayout,
     pub light: &'a wgpu::Buffer,
-    pub shadow_view: &'a wgpu::TextureView,
+    /// The voxel passes' own sun: a light uniform with one cascade fitted to
+    /// the GI volume, and the shadow map rendered for it.
+    pub gi_light: &'a wgpu::Buffer,
+    pub gi_shadow_view: &'a wgpu::TextureView,
     pub shadow_sampler: &'a wgpu::Sampler,
     /// The point / spot shadow atlas and its view records (group 0
     /// bindings 11 and 12 of the voxel passes).

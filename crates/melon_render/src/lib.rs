@@ -633,6 +633,8 @@ pub const MSAA_SAMPLES: u32 = 4;
 /// Default width and height of the sun's shadow map, in texels;
 /// `RenderQuality::shadow_map_size` sets it per frame.
 pub const SHADOW_MAP_SIZE: u32 = 2048;
+/// Edge of the fixed shadow map the DDGI voxel passes inject the sun with.
+const GI_SHADOW_SIZE: u32 = 2048;
 
 /// Sample counts the pipeline cache has a slot for (1, 2, 4).
 const MSAA_SLOTS: usize = 3;
@@ -708,6 +710,13 @@ pub fn bloom_mip_sizes(width: u32, height: u32) -> Vec<(u32, u32)> {
     .take_while(|&(w, h)| w >= 1 && h >= 1)
     .take(BLOOM_LEVELS)
     .collect()
+}
+
+/// World -> shadow clip space of the sun for the DDGI volume: an orthographic
+/// box around the volume's bounding sphere, so it never depends on the camera.
+fn gi_shadow_matrix(to_light: glam::Vec3) -> glam::Mat4 {
+    let (min, max) = gi::ddgi::volume_bounds();
+    directional_light_view_proj(to_light, (min + max) * 0.5, (max - min).length() * 0.5)
 }
 
 /// World -> shadow clip space for a directional light. An orthographic box of
@@ -891,6 +900,14 @@ pub struct SceneRenderer {
     shadow_view: wgpu::TextureView,
     shadow_layers: Vec<wgpu::TextureView>,
     shadow_sampler: wgpu::Sampler,
+    /// The DDGI voxel passes' sun shadow: one fixed cascade fitted to the GI
+    /// volume (not to the camera), so injection does not depend on where
+    /// the camera looks. Its light uniform, map, and camera.
+    gi_light_buffer: wgpu::Buffer,
+    _gi_shadow_texture: wgpu::Texture,
+    gi_shadow_view: wgpu::TextureView,
+    gi_shadow_layer: wgpu::TextureView,
+    gi_shadow_camera: (wgpu::Buffer, wgpu::BindGroup),
     /// `builtin:cube`'s material: the checkerboard as base colour.
     checker_material: wgpu::BindGroup,
 
@@ -1592,6 +1609,11 @@ impl Renderer {
             scene.shadow_map_size(),
         );
         scene.update_light_cascades(&frame.light, &cascade_set);
+        let gi_shadow = (gi_mode == melon_core::GiMode::Ddgi).then(|| {
+            let matrix = gi_shadow_matrix(frame.light.to_light());
+            scene.update_gi_light(&frame.light, matrix);
+            Frustum::from_view_proj(matrix)
+        });
         for (_, handle) in &frame.models {
             self.model_cache.prepare(&self.scene, server, *handle);
         }
@@ -1617,7 +1639,7 @@ impl Renderer {
             light_index_overflow: cluster_data.overflow as u32,
             ..Default::default()
         };
-        let (mut seen, mut voxelized) = (Vec::new(), Vec::new());
+        let (mut seen, mut voxelized, mut gi_casters) = (Vec::new(), Vec::new(), Vec::new());
         let mut casters: Vec<Vec<_>> = vec![Vec::new(); shadow_boxes.len()];
         let local_boxes: Vec<Frustum> = local_views
             .iter()
@@ -1646,6 +1668,12 @@ impl Renderer {
             } else {
                 stats.culled += 1;
             }
+            if gi_shadow
+                .as_ref()
+                .is_some_and(|gi_box| gi_box.intersects_aabb(min, max))
+            {
+                gi_casters.push((key, *matrix));
+            }
             let mut cast = false;
             for (list, shadow_box) in casters.iter_mut().zip(&shadow_boxes) {
                 if shadow_box.intersects_aabb(min, max) {
@@ -1673,6 +1701,7 @@ impl Renderer {
             .map(|list| batch(list, &mut matrices))
             .collect();
         let voxelized = batch(voxelized, &mut matrices);
+        let gi_casters = batch(gi_casters, &mut matrices);
         self.scene.update_instances(&matrices);
 
         let (cache, materials, assets) = (&self.model_cache, &self.materials, &*server);
@@ -1752,6 +1781,7 @@ impl Renderer {
         };
         let shadow_calls: Vec<ShadowDraws> = casters.iter().map(casters_of).collect();
         let local_calls: Vec<ShadowDraws> = local_casters.iter().map(casters_of).collect();
+        let gi_calls = casters_of(&gi_casters);
         let all_draws = [draw_calls, &calls.two_sided, &blend_calls];
         stats.draw_calls = all_draws.iter().map(|c| c.len() as u32).sum();
         stats.instances_drawn = all_draws
@@ -1788,6 +1818,9 @@ impl Renderer {
         }
         if !local_views.is_empty() {
             scene.render_local_shadows(encoder, &local_views, local_layout, &local_calls);
+        }
+        if gi_shadow.is_some() {
+            scene.render_gi_shadow(encoder, &gi_calls.0, &gi_calls.1);
         }
         mark(encoder, timer, timings::Mark::Shadows);
         // The depth/normal prepass feeds SSAO and SSGI. AO off (quality or
@@ -2237,6 +2270,28 @@ impl SceneRenderer {
             })
             .collect();
 
+        let (gi_shadow_texture, gi_shadow_view, mut gi_shadow_layers) =
+            create_shadow_map(&device, GI_SHADOW_SIZE, 1);
+        let gi_light_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gi light uniform buffer"),
+            size: std::mem::size_of::<LightUniform>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let gi_camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gi shadow camera uniform buffer"),
+            size: std::mem::size_of::<CameraUniform>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let gi_camera_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gi shadow camera bind group"),
+            layout: &shadow_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: gi_camera_buffer.as_entire_binding(),
+            }],
+        });
         let (local_atlas, local_atlas_view) = create_local_atlas(&device, 4);
         let local_views_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("local shadow views"),
@@ -2309,7 +2364,8 @@ impl SceneRenderer {
             &gi::GiInputs {
                 frame_layout: &frame_layout,
                 light: &light_buffer,
-                shadow_view: &shadow_view,
+                gi_light: &gi_light_buffer,
+                gi_shadow_view: &gi_shadow_view,
                 shadow_sampler: &shadow_sampler,
                 local_atlas: &local_atlas_view,
                 local_views: &local_views_buffer,
@@ -2365,6 +2421,11 @@ impl SceneRenderer {
             default_textures,
             camera_buffer,
             light_buffer,
+            gi_light_buffer,
+            _gi_shadow_texture: gi_shadow_texture,
+            gi_shadow_view,
+            gi_shadow_layer: gi_shadow_layers.remove(0),
+            gi_shadow_camera: (gi_camera_buffer, gi_camera_group),
             environment_buffer,
             frame_bind_group,
             ibl,
@@ -2489,7 +2550,8 @@ impl SceneRenderer {
             &gi::GiInputs {
                 frame_layout: &self.frame_layout,
                 light: &self.light_buffer,
-                shadow_view: &self.shadow_view,
+                gi_light: &self.gi_light_buffer,
+                gi_shadow_view: &self.gi_shadow_view,
                 shadow_sampler: &self.shadow_sampler,
                 local_atlas: &self.local_atlas_view,
                 local_views: &self.local_views_buffer,
@@ -4006,6 +4068,22 @@ impl SceneRenderer {
             self.ibl_sky.ground_color = light.ground_color;
         }
         self.refresh_ibl();
+        let uniform = self.light_uniform(light, set);
+        self.queue
+            .write_buffer(&self.light_buffer, 0, bytemuck::cast_slice(&[uniform]));
+        // The shadow shader reads only `view_proj`.
+        for (buffer, m) in self.shadow_camera_buffers.iter().zip(&set.view_proj) {
+            let shadow_camera = CameraUniform {
+                view_proj: m.to_cols_array_2d(),
+                ..Zeroable::zeroed()
+            };
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(&[shadow_camera]));
+        }
+    }
+
+    /// The light uniform for `light` with the shadow cascades `set`.
+    fn light_uniform(&self, light: &melon_core::Light, set: &cascades::CascadeSet) -> LightUniform {
         // With an HDR sky the hemisphere colours (read by GI misses and the
         // GI-off fallbacks) follow the mean radiance of the image above and
         // below the horizon.
@@ -4015,7 +4093,7 @@ impl SceneRenderer {
         } else {
             (light.sky_color, light.ground_color)
         };
-        let uniform = LightUniform {
+        LightUniform {
             direction: light.to_light().to_array(),
             ambient: light.ambient,
             color: light.color.to_array(),
@@ -4034,18 +4112,21 @@ impl SceneRenderer {
             cascade_far: set.far,
             cascade_info: [set.view_proj.len() as f32, set.distance, 0.0, 0.0],
             cascade_forward: set.forward.extend(0.0).to_array(),
+        }
+    }
+
+    /// The sun for the DDGI voxel passes: one cascade fitted to the GI
+    /// volume (`gi_shadow_matrix`), whatever the camera sees.
+    fn update_gi_light(&self, light: &melon_core::Light, view_proj: glam::Mat4) {
+        let uniform = self.light_uniform(light, &cascades::CascadeSet::single(view_proj));
+        self.queue
+            .write_buffer(&self.gi_light_buffer, 0, bytemuck::cast_slice(&[uniform]));
+        let camera = CameraUniform {
+            view_proj: view_proj.to_cols_array_2d(),
+            ..Zeroable::zeroed()
         };
         self.queue
-            .write_buffer(&self.light_buffer, 0, bytemuck::cast_slice(&[uniform]));
-        // The shadow shader reads only `view_proj`.
-        for (buffer, m) in self.shadow_camera_buffers.iter().zip(&set.view_proj) {
-            let shadow_camera = CameraUniform {
-                view_proj: m.to_cols_array_2d(),
-                ..Zeroable::zeroed()
-            };
-            self.queue
-                .write_buffer(buffer, 0, bytemuck::cast_slice(&[shadow_camera]));
-        }
+            .write_buffer(&self.gi_shadow_camera.0, 0, bytemuck::cast_slice(&[camera]));
     }
 
     /// SSAO kernel, radius and strength for the SSAO passes.
@@ -4183,11 +4264,44 @@ impl SceneRenderer {
         draw_calls: &[(&Mesh, std::ops::Range<u32>)],
         masked: &[(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)],
     ) {
+        self.render_shadow_into(
+            encoder,
+            &self.shadow_layers[layer],
+            &self.shadow_bind_groups[layer],
+            draw_calls,
+            masked,
+        );
+    }
+
+    /// The casters of the DDGI sun shadow map.
+    fn render_gi_shadow(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        draw_calls: &[(&Mesh, std::ops::Range<u32>)],
+        masked: &[(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)],
+    ) {
+        self.render_shadow_into(
+            encoder,
+            &self.gi_shadow_layer,
+            &self.gi_shadow_camera.1,
+            draw_calls,
+            masked,
+        );
+    }
+
+    fn render_shadow_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        camera: &wgpu::BindGroup,
+        draw_calls: &[(&Mesh, std::ops::Range<u32>)],
+        masked: &[(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)],
+    ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("melon_render shadow pass"),
             color_attachments: &[],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &self.shadow_layers[layer],
+                view: target,
                 depth_ops: Some(wgpu::Operations {
                     load: wgpu::LoadOp::Clear(1.0),
                     store: wgpu::StoreOp::Store,
@@ -4199,7 +4313,7 @@ impl SceneRenderer {
             multiview_mask: None,
         });
         pass.set_pipeline(&self.shadow_pipeline);
-        pass.set_bind_group(0, &self.shadow_bind_groups[layer], &[]);
+        pass.set_bind_group(0, camera, &[]);
         pass.set_bind_group(1, &self.instance_bind_group, &[]);
         for (mesh, instances) in draw_calls {
             pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
@@ -7398,6 +7512,97 @@ mod tests {
         Ok(())
     }
 
+    /// The camera decides which sun cascades exist, but the GI volume is
+    /// fixed: an open-fronted box with a roof stands far from the camera;
+    /// converging GI while looking away from it (no cascade covers the box)
+    /// must give the same indirect light as converging while looking at it.
+    fn check_gi_sun_injection_ignores_the_camera(r: &mut Renderer) -> Result<(), String> {
+        use glam::Vec3;
+        let mut server = repo_server();
+        let grey = server.load("assets/models/review/grey_cube.glb");
+        let models = vec![
+            slab(grey, Vec3::new(6.0, 0.4, 6.0), Vec3::new(0.0, -0.2, 10.0)),
+            slab(grey, Vec3::new(5.2, 4.0, 0.4), Vec3::new(0.0, 2.0, 12.8)),
+            slab(grey, Vec3::new(0.4, 4.0, 5.6), Vec3::new(2.8, 2.0, 9.8)),
+            slab(grey, Vec3::new(0.4, 4.0, 5.6), Vec3::new(-2.8, 2.0, 9.8)),
+            slab(grey, Vec3::new(6.0, 0.4, 6.0), Vec3::new(0.0, 4.2, 10.0)),
+        ];
+        let toward = melon_core::Camera {
+            eye: Vec3::new(0.0, 2.0, 3.0),
+            center: Vec3::new(0.0, 1.5, 10.0),
+            aspect: 1.0,
+            ..Default::default()
+        };
+        let away = melon_core::Camera {
+            center: Vec3::new(0.0, 2.0, -30.0),
+            ..toward
+        };
+        let light = melon_core::Light {
+            direction: Vec3::new(0.15, -1.0, 0.1).normalize(),
+            sky_color: Vec3::splat(0.05),
+            ground_color: Vec3::splat(0.05),
+            ..Default::default()
+        };
+        let quality = melon_core::RenderQuality::default();
+        let mut run = |cameras: &[melon_core::Camera]| {
+            r.model_cache = ModelCache::new(&r.scene);
+            let mut target =
+                r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+            for (i, camera) in cameras.iter().enumerate() {
+                // A GI-off frame first restarts DDGI's convergence.
+                let environment = if i == 0 {
+                    plain_environment()
+                } else {
+                    gi_environment()
+                };
+                let frame = FrameData {
+                    view_proj: camera.view_proj(),
+                    eye: camera.eye,
+                    light,
+                    environment,
+                    quality,
+                    models: models.clone(),
+                    overrides: Default::default(),
+                    lights: Default::default(),
+                };
+                let mut encoder = r
+                    .device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                r.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
+                if i + 1 == cameras.len() {
+                    return read_back(r.device(), r.queue(), encoder, &target.color_texture);
+                }
+                r.queue().submit([encoder.finish()]);
+            }
+            unreachable!()
+        };
+        let steady = run(&[toward; GI_FRAMES as usize + 1]);
+        let mut looked_away = vec![away; GI_FRAMES as usize];
+        looked_away.push(toward);
+        let after_away = run(&looked_away);
+        // End on a GI-off frame, like the other GI checks.
+        render_frame(
+            r,
+            toward,
+            light,
+            plain_environment(),
+            models.clone(),
+            &mut server,
+        );
+        let diff: u32 = steady
+            .iter()
+            .zip(&after_away)
+            .map(|(a, b)| u32::from(a.abs_diff(*b)))
+            .sum();
+        let mean = diff as f32 / steady.len() as f32;
+        if mean > 0.1 {
+            return Err(format!(
+                "GI follows the camera: mean difference {mean:.2} per channel between looking at the box and looking away first"
+            ));
+        }
+        Ok(())
+    }
+
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
@@ -9214,6 +9419,7 @@ mod tests {
             Box::new(check_blend_material_thumbnail),
             Box::new(check_material_bad_texture_refs),
             Box::new(check_ibl_updates_in_place),
+            Box::new(check_gi_sun_injection_ignores_the_camera),
         ];
 
         #[cfg(target_os = "windows")]

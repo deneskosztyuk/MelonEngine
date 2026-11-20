@@ -530,7 +530,7 @@ impl Ddgi {
     }
 }
 
-/// Voxel pass group 0 per axis: the light, the sun shadow map, the voxel
+/// Voxel pass group 0 per axis: the GI sun light, its volume-fitted shadow map, the voxel
 /// buffer and the axis.
 fn voxel_groups(
     device: &wgpu::Device,
@@ -546,11 +546,11 @@ fn voxel_groups(
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: inputs.light.as_entire_binding(),
+                    resource: inputs.gi_light.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(inputs.shadow_view),
+                    resource: wgpu::BindingResource::TextureView(inputs.gi_shadow_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -629,7 +629,7 @@ fn build_voxel_pipeline(
 }
 
 impl Ddgi {
-    /// Rebinds the voxel passes to `inputs.shadow_view` (a new shadow map size).
+    /// Rebinds the voxel passes (a new local shadow atlas).
     pub(super) fn set_shadow_map(&mut self, device: &wgpu::Device, inputs: &GiInputs) {
         self.voxel_groups = voxel_groups(
             device,
