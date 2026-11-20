@@ -9,8 +9,11 @@ Place game assets here.
     - `material_spheres.glb` — two rows of five UV spheres, roughness 0.05 to 1; top row red dielectric, bottom row gold metal; one node and material each.
     - `normal_panel.glb` — 2x2 m panel with a tiled-bump normal map and no `TANGENT` attribute (the loader generates tangents).
     - `emissive_cube.glb` — unit cube, dark base, emissive (12, 1.2, 0.14) HDR (a lamp: hot core, orange glow) via `KHR_materials_emissive_strength`; the bloom test emitter.
+    - `red_panel.glb`, `green_panel.glb` — unit cubes like `grey_cube` in Cornell red (0.63, 0.065, 0.05) and green (0.14, 0.45, 0.091), scaled into the coloured walls of the GI review room (`cornell` view) and the GI tests.
 - `shaders/` — WGSL shader source files, included via `wgpu::include_wgsl!`.
-  - `mesh.wgsl` — glTF metallic-roughness PBR: Cook-Torrance sun (GGX, height-correlated Smith, Schlick Fresnel) with 3x3 PCF shadows, hemisphere diffuse ambient plus sky-gradient specular ambient, tangent-space normal maps, emissive, exponential distance fog. SSAO (group 3) occludes the ambient terms only. Group 2 is the material (see `AGENTS.md`). Writes linear HDR colour (`Rgba16Float`).
+  - `mesh.wgsl` — glTF metallic-roughness PBR: Cook-Torrance sun (GGX, height-correlated Smith, Schlick Fresnel) with 3x3 PCF shadows, diffuse ambient from the DDGI probes (hemisphere outside the GI volume or with GI off) plus sky-gradient specular ambient, tangent-space normal maps, emissive, exponential distance fog. SSAO (group 3) occludes the ambient terms only. Group 2 is the material, group 3 the AO and GI inputs (see `AGENTS.md`). Writes linear HDR colour (`Rgba16Float`). Also holds the GI voxel passes (`vs_voxel`, `fs_voxel`).
+  - `gi_common.wgsl` — DDGI declarations (`GiUniform`, constants, octahedral encode/decode, probe helpers) prepended to `mesh.wgsl` and `gi.wgsl`.
+  - `gi.wgsl` — DDGI probe update: one compute workgroup per probe traces 64 rays through the voxel volume (3D DDA, sky on a miss) and blends them into its irradiance and distance-moment atlas tiles.
   - `prepass.wgsl` — SSAO depth/normal prepass: every mesh single-sample, writes the world normal and eye distance (`Rgba16Float`) plus depth.
   - `ssao.wgsl` — fullscreen SSAO (`fs_ssao`: 16 hemisphere samples, range check, 4x4 rotation pattern) and its 4x4 depth-aware blur (`fs_blur`), into `R8Unorm` AO textures read by `mesh.wgsl` group 3.
   - `shadow.wgsl` — depth-only pass that renders every mesh from the sun into the 2048x2048 shadow map.

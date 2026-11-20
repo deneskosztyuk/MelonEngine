@@ -80,6 +80,16 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
       `Environment::bloom_intensity` (default 0.08, 0 skips the passes).
       glTF emissive strength (`KHR_materials_emissive_strength`).
 - [x] MSAA 4x.
+- [x] DDGI (dynamic diffuse GI), software voxel tracing: 128x64x128 voxel
+      radiance volume (0.3125 m) voxelised each frame in three orthographic
+      passes, 16x8x16 probes (2.5 m) tracing 64 rays each per frame (3D
+      DDA), octahedral irradiance (8x8) and distance moments (16x16) with
+      hysteresis 0.97, Chebyshev visibility, multi-bounce through the
+      voxels. Replaces the hemisphere diffuse inside the volume.
+      `Environment::gi_intensity` (default 1, 0 skips the passes). Limits:
+      fixed 40 x 20 x 40 m volume at the origin; walls under 0.35 m leak;
+      light leaks a little at room corners (probe resolution); about
+      +1.5 to 1.9 ms on the dev GPU.
 - [x] SSAO: single-sample depth/normal prepass, 16-sample hemisphere AO
       with range check, 4x4 depth-aware blur, full resolution; occludes
       ambient diffuse and specular only. `Environment::ao_strength` /
