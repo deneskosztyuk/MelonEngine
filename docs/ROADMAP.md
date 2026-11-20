@@ -91,6 +91,15 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
       `Environment::gi_intensity` (default 1, 0 skips the passes). Limits:
       fixed 40 x 20 x 40 m volume at the origin; walls under 0.35 m leak;
       hard edges where one probe dominates; about +2.2 to 2.4 ms on the dev GPU.
+- [x] GI modes: `Environment::gi_mode` (`Off`, `Ssgi`, `Ddgi`, default
+      `Ddgi`), switchable frame to frame; `gi/` front with one module per
+      backend and one mesh pipeline variant per mode.
+- [x] SSGI: half-resolution screen-space diffuse GI, 6 cosine rays per
+      pixel marching the prepass, hits read last frame's HDR colour
+      (reprojected), misses the hemisphere sky light; reprojected history
+      with disocclusion rejection, 5x5 depth/normal-aware denoise. About
+      +0.5 to 0.9 ms on the dev GPU. Limits: only what is on screen
+      bounces; one frame of lag.
 - [x] SSAO: single-sample depth/normal prepass, 16-sample hemisphere AO
       with range check, 4x4 depth-aware blur, full resolution; occludes
       ambient diffuse and specular only. `Environment::ao_strength` /

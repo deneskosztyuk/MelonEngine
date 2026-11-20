@@ -8,13 +8,13 @@ Current state and planned work: `docs/ROADMAP.md`.
 | Path | Role |
 |---|---|
 | `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera. No GPU or window code. |
-| `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache`) records sun shadow pass, GI voxel and probe passes (`gi.rs`), SSAO passes, 3D pass into HDR target, bloom passes, tonemap pass; `ui_pass` for the editor. |
+| `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache`) records sun shadow pass, depth/normal prepass, SSAO passes, the GI mode's passes (`gi/`: DDGI voxel and probe passes or SSGI), 3D pass into HDR target, bloom passes, tonemap pass; `ui_pass` for the editor. |
 | `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource) and ECS sync systems. |
 | `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), Project Settings window (`project_settings.rs`). |
 | `crates/melon_game` | Game logic as an `rlib` + `dylib`, hot-reloaded in dev builds. |
 | `crates/melon_host` | Binary: winit event loop, input mapping, frame order (core update, editor, extract, render_scene, ui pass). No render pass code. |
 | `assets/models` | glTF models. `cube.glb` loads at startup. `review/` holds the snapshot scene's material test models (`grey_cube`, `material_spheres`, `normal_panel`, `emissive_cube`, `red_panel`, `green_panel`), written by `cargo run -p melon_render --example gen_review_assets` from the repo root; commit them when regenerated. |
-| `assets/shaders` | WGSL shaders, compiled in with `wgpu::include_wgsl!` (no runtime reload). `mesh.wgsl` and `gi.wgsl` are built as `gi_common.wgsl` + the file (`concat!(include_str!(..))`, WGSL has no include). |
+| `assets/shaders` | WGSL shaders, compiled in with `wgpu::include_wgsl!` (no runtime reload). Shared pieces are prepended with `concat!(include_str!(..))` (WGSL has no include): `mesh.wgsl` = `gi_common` + `ddgi_common` + `gi_ddgi` + `gi_ssgi` + `mesh`; `ddgi_update.wgsl` = `gi_common` + `ddgi_common` + it; `ssgi.wgsl` = `gi_common` + it. |
 
 Dependency direction: `core` <- `render`, `physics` <- `editor` <- `host`.
 `melon_game` depends only on `melon_core`. Keep it that way.
@@ -163,15 +163,19 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 - **Per-view lighting (group 3).** Group 3 of the mesh pipeline holds
   per-view lighting inputs, created per `ViewportTarget` (rebuilt with it on
   resize): binding 0 = SSAO texture (`R8Unorm`, 1 = open, read with
-  `textureLoad` at the fragment position); bindings 1 to 4 = the DDGI
-  irradiance atlas, depth-moment atlas, linear clamp sampler,
-  `GiUniform` and the voxel buffer (world data: every view's group
-  references the same ones, `Gi::lighting_entries`). `draw_meshes_textured` takes the group; AO off
-  binds a 1x1 white AO one (`unoccluded_lighting`, also used by the voxel
-  passes).
+  `textureLoad` at the fragment position); then every GI backend's
+  bindings whatever the mode (`gi::Gi::layout_entries` / `entries`):
+  1 to 5 DDGI (irradiance atlas, depth-moment atlas, linear clamp
+  sampler, `GiUniform`, voxel buffer; world data shared by every view),
+  6 to 8 SSGI (the view's output, `SsgiUniform`, output geometry). Each
+  view (`ViewLighting`) has the group with its AO and with white AO (AO
+  off); `draw_meshes_textured` takes it. `unoccluded_lighting` (white AO,
+  SSGI stand-ins) serves `draw_meshes` and tests, `voxel_pass_lighting`
+  the voxel passes.
 - **SSAO.** Before the 3D pass `render_scene` draws the camera's batches once,
   single-sample, into the view's prepass targets (`Depth32Float` depth,
-  `Rgba16Float` world normal + eye distance), then `ssao.wgsl` `fs_ssao`
+  `Rgba16Float` world normal + eye distance; `render_prepass`, also run
+  for SSGI with AO off), then `ssao.wgsl` `fs_ssao`
   (16 hemisphere samples, range check, 4x4 Bayer rotation) and `fs_blur`
   (4x4 depth-aware box, applies the strength). AO multiplies ambient
   diffuse and specular only, never the sun. `Environment::ao_strength`
@@ -197,8 +201,54 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   k, for more glow: lights want emissive strength well above 1 (the review
   cube is 12, about 10x a sunlit floor). GPU tests that
   are not about bloom set `bloom_intensity: 0.0`.
-- **DDGI (`gi.rs`, `gi_common.wgsl`, `gi.wgsl`).** Per `render_scene`
-  with `Environment::gi_intensity` above 0, after the shadow pass:
+- **GI modes (`gi/`).** `Environment::gi_mode` (`Off`, `Ssgi`, `Ddgi`,
+  default `Ddgi`) picks the technique per frame; `gi_intensity` scales it
+  and 0 means `Off` (`gi::frame_mode`). Switching works frame to frame.
+  `gi/mod.rs` is the front: mode dispatch (`Gi::update`, `Gi::render`,
+  a `match` per mode), the group 3 entries of every backend, per-view
+  resources (`GiView`, in `ViewportTarget`). Each backend owns its
+  resources and passes behind the same few calls: `layout_entries`,
+  `entries`, `create_view` (SSGI only), `update`, `render`. Shader side,
+  mesh.wgsl `indirect_diffuse` / `gi_only` branch on the `GI_MODE`
+  override; the mesh pipeline is built once per mode (`mesh_pipeline`,
+  `mesh_ssgi_pipeline`, `mesh_ddgi_pipeline`, `gi::shader_mode`), so each
+  compiles only its own path and Off (`GI_OFF`, every GI pass skipped)
+  matches the renderer without GI exactly. Each backend's uniform holds
+  its own `intensity` and `gi_only`. A third backend: `gi/<name>.rs`, a
+  `GiMode` variant, its bindings after 8, arms in `Gi::update` /
+  `Gi::render` / `shader_mode` / `draw_meshes_textured`, its pipeline
+  variant, its shading in `gi_<name>.wgsl` (prepended in `MESH_WGSL`) and
+  a branch in `indirect_diffuse`. Misses read `sky_light`
+  (`gi_common.wgsl`) in every backend.
+- **SSGI (`gi/ssgi.rs`, `ssgi.wgsl`, `gi_ssgi.wgsl`).** After the
+  prepass, two fullscreen passes at half resolution (`half_size`, rounded
+  up): `fs_trace` takes full pixel 2i of each texel, 6 cosine-weighted
+  rays (interleaved-gradient noise, new every frame) of 12 quadratic steps
+  up to 4 m; a sample hits when it is 1% to 0.5 m (`THICKNESS`) behind the
+  prepass eye distance there, and reads last frame's resolved HDR colour
+  where the hit point was last frame (the view's HDR target, read before
+  the 3D pass overwrites it, so no copy; `prev_view_proj` per view); a
+  miss or a hit off last frame's screen reads `sky_light`. The mean blends
+  into the reprojected history (nearest texel; kept if eye distance is
+  within 5% and normal within ~25 degrees, up to 32 frames), ping-ponged
+  with the texel's normal and eye distance. `fs_denoise`: 5x5 blur over
+  same-surface texels into the output + its geometry. The mesh shader
+  (`ssgi_diffuse`) blends the 4 nearest texels that saw its surface
+  (bilinear; eye distance within 10%, geometric normal within ~25
+  degrees), else the hemisphere, times intensity, AO and
+  `1 - metallic`. History resets on a new view (resize), a camera cut
+  (`is_camera_cut`: eye jump over 2 m or a turn over 30 degrees) and any
+  frame without SSGI on that view; the first frame after a reset is sky
+  only; 100 frames are converged (300 differ by at most 2 sRGB steps).
+  Limits: screen space only, so light from anything off screen or hidden
+  disappears (a wall leaving the view stops bouncing); one frame of lag
+  on moving lights; occluders are assumed 0.5 m thick (thin objects can
+  shade too much, light leaks behind thick ones); half-resolution
+  silhouettes and creases fall back to the hemisphere. About +0.5 to
+  0.9 ms on the dev GPU with AO on (prepass shared; DDGI +2.2).
+- **DDGI (`gi/ddgi.rs`, `ddgi_common.wgsl`, `ddgi_update.wgsl`,
+  `gi_ddgi.wgsl`).** Per `render_scene` in mode `Ddgi`, after the shadow
+  pass:
   (1) voxelise: clear the voxel buffer (3 u32 per voxel, 128x64x128 over
   `GI_ORIGIN` + 40 x 20 x 40 m, 0.3125 m), then draw every instance whose
   AABB touches the volume three times (mesh.wgsl `vs_voxel`/`fs_voxel`,
@@ -227,10 +277,8 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   blocked the unmarched weights are used) and replaces the hemisphere
   diffuse (times AO and
   `1 - metallic`), fading back to it within one probe spacing outside the
-  volume. Ambient specular stays sky-based. GI off uses the mesh pipeline
-  built with the `GI_ENABLED` override false (a runtime branch alone moved
-  a few pixels by one step) and skips every GI pass, so the image matches
-  the renderer without GI exactly. Turning GI on restarts convergence;
+  volume. Ambient specular stays sky-based. Turning DDGI on restarts
+  convergence;
   about 30 frames converge. Limits: the volume is fixed at the origin
   (`ponytail` note: follow the camera); its corners stick out of the
   sun's shadow box (no sun shadows there, as for direct light); **walls
@@ -243,7 +291,7 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   (read-only, for the visibility march); the voxel passes bind
   `voxel_pass_lighting` with a dummy there, since they write the voxels.
   Debug with the snapshot's `--gi-only` (the indirect diffuse term alone,
-  `set_gi_only`) and `--no-gi`.
+  `set_gi_only`, either mode) and `--gi off`.
 - **No overlapping slabs.** Boxes that overlap share face planes, which
   z-fight into stripes at oblique views (the first cornell room's wall
   tops inside the ceiling). Let walls end where the next slab starts.
@@ -264,19 +312,22 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 - **Camera conventions.** Right-handed, DirectX depth (near = 0, far = 1).
   Screen helpers take logical points.
 - **Checking rendering.** Agents verify rendering with the snapshot example
-  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--no-gi] [--gi-only]`;
+  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only]`;
   `--ao-only` saves the SSAO term as a grey image; `--no-shadow` moves scene
   and camera outside the shadow box (no sun shadows, debug only); `--no-bloom`
   sets `bloom_intensity` 0, `--bloom-only` sets it to 1 (the image is the
-  bloom alone); `--no-gi` sets `gi_intensity` 0, `--gi-only` saves the
-  indirect diffuse term alone; `crowd` adds about
+  bloom alone); `--gi` picks `gi_mode` (default ddgi; `--no-gi` is
+  `--gi off`), `--gi-only` saves that mode's indirect diffuse term alone; `crowd` adds about
   10,000 instances; `cornell` adds an open-front red/green room at
   (-13, 0, -13) seen through its opening; the 100 timed frames run
-  before the capture, so GI has converged; it prints the mean frame time
+  before the capture, so GI has converged (SSGI too: 300 frames differ
+  by at most 2 sRGB steps); it prints the mean frame time
   and `RenderStats`),
   never by opening the editor or game window.
 - **GPU tests** open a window, so they need a display and adapter. Tests
   that are not about GI set `gi_intensity: 0.0` (and end GI tests on a
   GI-off frame: the mesh pipeline follows the last `render_scene`). GI
   tests render 60 frames (`render_converged`, which also drops cached
-  models: handle ids restart with every `AssetServer`).
+  models: handle ids restart with every `AssetServer`); `render_sequence`
+  renders one frame per environment into one target (mode switching).
+  SSGI tests need the bouncing surface on screen.
