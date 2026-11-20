@@ -101,6 +101,8 @@ struct DeleteConfirm {
 pub enum PendingOperation {
     Save(std::path::PathBuf),
     Load(std::path::PathBuf),
+    /// File > New Scene: an empty scene holding one World Environment.
+    NewScene,
     /// File > Exit: the host saves the layout and closes the window.
     Exit,
 }
@@ -134,6 +136,8 @@ pub struct Editor {
     /// A scene opened from the Content Browser, waiting for Save / Don't
     /// Save / Cancel.
     confirm_open: Option<std::path::PathBuf>,
+    /// File > New Scene is waiting for Save / Don't Save / Cancel.
+    confirm_new: bool,
     /// The Content Browser tab was drawn last frame (it takes OS file drops).
     content_shown: bool,
     /// The Content Browser tab (not the drawer) was drawn last frame;
@@ -255,6 +259,7 @@ impl Default for Editor {
             pending_operation: None,
             delete_confirm: None,
             confirm_open: None,
+            confirm_new: false,
             content_shown: false,
             content_tab_shown: false,
             drawer: drawer::DrawerState::default(),
@@ -423,6 +428,19 @@ impl Editor {
         self.history
             .record_created(world, light, label, self.selected);
         self.selected = Some(light);
+    }
+
+    /// Spawn a World Environment, select it and record it as a step.
+    fn create_world_environment_step(&mut self, world: &mut World) {
+        match create_world_environment(world, &self.project_root) {
+            Ok(entity) => {
+                let label = format!("Create {}", history::name_of(world, entity));
+                self.history
+                    .record_created(world, entity, label, self.selected);
+                self.selected = Some(entity);
+            }
+            Err(error) => self.set_status_error(format!("World Environment failed: {error:#}")),
+        }
     }
 
     /// Spawn a model (see `spawn_model`), select it and record it as a step.
@@ -647,6 +665,16 @@ impl Editor {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui
+                    .add_enabled(
+                        editing && !dialog_open && !self.confirm_new,
+                        egui::Button::new("New Scene"),
+                    )
+                    .clicked()
+                {
+                    self.confirm_new = true;
+                    ui.close();
+                }
+                if ui
                     .add_enabled(editing && !dialog_open, egui::Button::new("Open…"))
                     .clicked()
                 {
@@ -737,6 +765,10 @@ impl Editor {
             ui.menu_button("GameObject", |ui| {
                 if ui.button("Create Cube").clicked() {
                     self.create_cube_step(world);
+                }
+                if ui.button("World Environment").clicked() {
+                    self.create_world_environment_step(world);
+                    ui.close();
                 }
                 ui.menu_button("Light", |ui| {
                     if ui.button("Point Light").clicked() {
@@ -1072,6 +1104,10 @@ impl Editor {
                 }
                 false
             }
+            Some(PendingOperation::NewScene) => {
+                self.new_scene(world);
+                false
+            }
             Some(PendingOperation::Load(path)) => {
                 if !world.contains_resource::<melon_physics::PhysicsWorld>() {
                     world.insert_resource(melon_physics::PhysicsWorld::new());
@@ -1093,6 +1129,68 @@ impl Editor {
                 }
                 false
             }
+        }
+    }
+
+    /// Replace the scene with one World Environment on the default `.env`.
+    fn new_scene(&mut self, world: &mut World) {
+        if !world.contains_resource::<melon_physics::PhysicsWorld>() {
+            world.insert_resource(melon_physics::PhysicsWorld::new());
+        }
+        let empty = melon_core::scene::SceneData {
+            version: melon_core::scene::SCENE_VERSION,
+            entities: Vec::new(),
+            name_counter: 0,
+        };
+        let applied = world.resource_scope(
+            |world, mut physics: bevy_ecs::world::Mut<melon_physics::PhysicsWorld>| {
+                scene::apply_scene(world, &mut physics, &empty)
+            },
+        );
+        if let Err(error) = applied {
+            self.set_status_error(format!("New scene failed: {error:#}"));
+            return;
+        }
+        self.clear_selection();
+        self.history.clear();
+        self.renaming = None;
+        self.current_scene = None;
+        world.insert_resource(melon_core::EnvironmentPreview(None));
+        if let Err(error) = create_world_environment(world, &self.project_root) {
+            self.set_status_error(format!("World Environment failed: {error:#}"));
+            return;
+        }
+        self.set_status("New scene".to_string());
+    }
+
+    /// Act on the answer to "New scene?": Save writes the current scene
+    /// first; both Save and Don't Save then start the new scene.
+    pub fn resolve_new(&mut self, world: &mut World, choice: OpenChoice) {
+        if !std::mem::take(&mut self.confirm_new) {
+            return;
+        }
+        match choice {
+            OpenChoice::Cancel => return,
+            OpenChoice::Save => {
+                if sim_state(world) != SimulationState::Editing {
+                    self.set_status_error("Stop playing to start a new scene".into());
+                    return;
+                }
+                let Some(current) = self.current_scene.clone() else {
+                    self.set_status_error("Use File \u{25b8} Save As first".into());
+                    return;
+                };
+                if let Err(e) = scene::save_scene(world, &current) {
+                    self.set_status_error(format!("Save failed: {e}"));
+                    return;
+                }
+            }
+            OpenChoice::DontSave => {}
+        }
+        if sim_state(world) == SimulationState::Editing {
+            self.pending_operation = Some(PendingOperation::NewScene);
+        } else {
+            self.set_status_error("Stop playing to start a new scene".into());
         }
     }
 
@@ -1397,32 +1495,25 @@ impl Editor {
         let name = path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        let can_save = self.open_scene_can_save();
-        let mut choice = None;
-        let modal = egui::Modal::new(egui::Id::new("content_open_scene")).show(ui.ctx(), |ui| {
-            ui.heading(format!("Open {name}?"));
-            ui.label("Unsaved changes in the current scene are lost.");
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(can_save, egui::Button::new("Save"))
-                    .on_disabled_hover_text("Use File \u{25b8} Save As first")
-                    .clicked()
-                {
-                    choice = Some(OpenChoice::Save);
-                }
-                if ui.button("Don't Save").clicked() {
-                    choice = Some(OpenChoice::DontSave);
-                }
-                if ui.button("Cancel").clicked() {
-                    choice = Some(OpenChoice::Cancel);
-                }
-            });
-        });
-        if choice.is_none() && modal.should_close() {
-            choice = Some(OpenChoice::Cancel);
-        }
+        let choice = save_choice_modal(
+            ui,
+            "content_open_scene",
+            &format!("Open {name}?"),
+            self.open_scene_can_save(),
+        );
         if let Some(choice) = choice {
             self.resolve_open(world, choice);
+        }
+    }
+
+    /// Save / Don't Save / Cancel before File > New Scene.
+    fn new_scene_dialog(&mut self, world: &mut World, ui: &egui::Ui) {
+        if !self.confirm_new {
+            return;
+        }
+        let choice = save_choice_modal(ui, "new_scene", "New scene?", self.open_scene_can_save());
+        if let Some(choice) = choice {
+            self.resolve_new(world, choice);
         }
     }
 
@@ -1607,6 +1698,7 @@ impl Editor {
         self.follow_asset_changes(world, ui, std::time::Instant::now());
         self.delete_dialog(world, ui);
         self.open_scene_dialog(world, ui);
+        self.new_scene_dialog(world, ui);
         self.take_dropped_files(ui);
         self.content_tab_shown = false;
 
@@ -2913,6 +3005,55 @@ fn create_light(world: &mut World, kind: LightKind) -> Entity {
     entity.id()
 }
 
+/// Spawn "World Environment" pointing at the default `.env` (written first
+/// when missing).
+fn create_world_environment(world: &mut World, root: &std::path::Path) -> anyhow::Result<Entity> {
+    asset_ops::ensure_default_environment(&mut world.resource_mut::<AssetServer>(), root)?;
+    let reference = melon_core::AssetRef::for_path(
+        world.resource::<AssetServer>(),
+        asset_ops::DEFAULT_ENVIRONMENT,
+    );
+    let name = history::unused_name(world, None, "World Environment", true);
+    Ok(world
+        .spawn((
+            Name(name),
+            Transform::default(),
+            melon_core::WorldEnvironment {
+                environment: reference,
+            },
+        ))
+        .id())
+}
+
+/// The shared Save / Don't Save / Cancel modal of the scene-replacing
+/// actions; Cancel also on Esc or a click outside.
+fn save_choice_modal(ui: &egui::Ui, id: &str, heading: &str, can_save: bool) -> Option<OpenChoice> {
+    let mut choice = None;
+    let modal = egui::Modal::new(egui::Id::new(id)).show(ui.ctx(), |ui| {
+        ui.heading(heading);
+        ui.label("Unsaved changes in the current scene are lost.");
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(can_save, egui::Button::new("Save"))
+                .on_disabled_hover_text("Use File \u{25b8} Save As first")
+                .clicked()
+            {
+                choice = Some(OpenChoice::Save);
+            }
+            if ui.button("Don't Save").clicked() {
+                choice = Some(OpenChoice::DontSave);
+            }
+            if ui.button("Cancel").clicked() {
+                choice = Some(OpenChoice::Cancel);
+            }
+        });
+    });
+    if choice.is_none() && modal.should_close() {
+        choice = Some(OpenChoice::Cancel);
+    }
+    choice
+}
+
 /// Registered components Add Component offers for `entity`: addable, not on
 /// it yet, display name containing `search` (any case).
 fn add_component_choices(
@@ -3394,8 +3535,9 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
             EditorTab::ContentBrowser => {
                 self.editor.content_shown = true;
                 self.editor.content_tab_shown = true;
-                self.editor.content.blocked =
-                    self.editor.delete_confirm.is_some() || self.editor.confirm_open.is_some();
+                self.editor.content.blocked = self.editor.delete_confirm.is_some()
+                    || self.editor.confirm_open.is_some()
+                    || self.editor.confirm_new;
                 let playing = self
                     .world
                     .get_resource::<melon_core::AudioPreview>()
@@ -4433,6 +4575,86 @@ mod tests {
         let t = world.get::<melon_core::Transform>(spot).unwrap();
         let axis = t.rotation * glam::Vec3::NEG_Z;
         assert!((axis - glam::Vec3::NEG_Y).length() < 1e-5, "{axis}");
+    }
+
+    fn world_environments(world: &mut World) -> Vec<melon_core::WorldEnvironment> {
+        world
+            .query_filtered::<&melon_core::WorldEnvironment, bevy_ecs::query::Without<melon_core::PendingDelete>>()
+            .iter(world)
+            .cloned()
+            .collect()
+    }
+
+    fn transform_count(world: &mut World) -> usize {
+        world.query::<&Transform>().iter(world).count()
+    }
+
+    #[test]
+    fn new_scene_leaves_one_world_environment() {
+        let (mut editor, mut world, root) = browser_project("new_scene");
+        create_cube(&mut world);
+        editor.create_cube_step(&mut world);
+        editor.set_current_scene(root.join("assets/scenes/current.ron"));
+        assert!(editor.history.can_undo());
+        editor.pending_operation = Some(PendingOperation::NewScene);
+        assert!(!editor.run_pending_operation(&mut world));
+        assert_eq!(transform_count(&mut world), 1);
+        let environments = world_environments(&mut world);
+        assert_eq!(environments.len(), 1);
+        assert_eq!(
+            environments[0].environment.path,
+            asset_ops::DEFAULT_ENVIRONMENT
+        );
+        assert!(editor.current_scene.is_none());
+        assert!(!editor.history.can_undo());
+        assert!(editor.selected_entity().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn new_scene_writes_the_default_environment_when_missing() {
+        let (mut editor, mut world, root) = browser_project("new_scene_default");
+        let file = root.join(asset_ops::DEFAULT_ENVIRONMENT);
+        assert!(!file.exists());
+        editor.pending_operation = Some(PendingOperation::NewScene);
+        editor.run_pending_operation(&mut world);
+        assert_eq!(
+            melon_core::EnvironmentAsset::read(&file).unwrap(),
+            melon_core::EnvironmentAsset::default()
+        );
+        assert!(melon_core::meta_path(&file).is_file());
+        let environments = world_environments(&mut world);
+        assert!(
+            !environments[0].environment.guid.is_empty(),
+            "GUID from the .meta"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_world_environment_undoes() {
+        let (mut editor, mut world, root) = browser_project("world_env_undo");
+        editor.create_world_environment_step(&mut world);
+        let created = world_environments(&mut world);
+        assert_eq!(created.len(), 1);
+        editor.undo(&mut world);
+        assert!(world_environments(&mut world).is_empty(), "undone");
+        editor.redo(&mut world);
+        assert_eq!(world_environments(&mut world), created, "back with its ref");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn new_scene_cancel_changes_nothing() {
+        let (mut editor, mut world, root) = browser_project("new_scene_cancel");
+        create_cube(&mut world);
+        editor.confirm_new = true;
+        editor.resolve_new(&mut world, OpenChoice::Cancel);
+        assert!(!editor.confirm_new);
+        assert!(editor.pending_operation.is_none());
+        assert_eq!(transform_count(&mut world), 1);
+        assert!(world_environments(&mut world).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

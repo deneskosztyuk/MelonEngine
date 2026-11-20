@@ -86,6 +86,25 @@ pub fn create_environment(server: &mut AssetServer, parent: &Path) -> anyhow::Re
     Ok(file)
 }
 
+/// The environment a new scene's World Environment points at.
+pub const DEFAULT_ENVIRONMENT: &str = "assets/environments/default.env";
+
+/// Write `DEFAULT_ENVIRONMENT` (and its `.meta`) under `root` when it is missing.
+pub fn ensure_default_environment(server: &mut AssetServer, root: &Path) -> anyhow::Result<()> {
+    let file = root.join(DEFAULT_ENVIRONMENT);
+    if file.is_file() {
+        return Ok(());
+    }
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("could not create {}", dir.display()))?;
+    }
+    std::fs::write(&file, melon_core::EnvironmentAsset::default().to_ron())
+        .with_context(|| format!("could not create {}", file.display()))?;
+    reconcile(server);
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) const ONE_MATERIAL_GLTF: &str = r#"{
     "asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}],
