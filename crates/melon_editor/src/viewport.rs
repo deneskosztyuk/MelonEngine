@@ -375,18 +375,21 @@ pub fn collider_lines(world: &World, entity: Entity) -> Vec<LineVertex> {
         let m = Mat4::from_rotation_translation(rotation, translation);
         let s = scale.abs();
         match c.shape {
-            ColliderShape::Box => {
-                vertices.extend(box_lines(m, -c.half_extents * s, c.half_extents * s))
+            ColliderShape::Box { half_extents } => {
+                vertices.extend(box_lines(m, -half_extents * s, half_extents * s))
             }
-            ColliderShape::Sphere => {
-                let r = c.radius * s.max_element();
+            ColliderShape::Sphere { radius } => {
+                let r = radius * s.max_element();
                 for (a, b) in [(Vec3::X, Vec3::Y), (Vec3::X, Vec3::Z), (Vec3::Y, Vec3::Z)] {
                     vertices.extend(arc(m, Vec3::ZERO, a * r, b * r, 0.0, std::f32::consts::TAU));
                 }
             }
-            ColliderShape::Capsule => {
-                let r = c.radius * s.x.max(s.z);
-                let h = Vec3::Y * c.half_height * s.y;
+            ColliderShape::Capsule {
+                half_height,
+                radius,
+            } => {
+                let r = radius * s.x.max(s.z);
+                let h = Vec3::Y * half_height * s.y;
                 // Rings where the cylinder meets the caps, the side lines, the cap arcs.
                 for end in [h, -h] {
                     vertices.extend(arc(
@@ -807,7 +810,9 @@ mod tests {
     fn box_collider_outline_is_a_green_wire_box_at_the_scaled_size() {
         let (world, e) = collider_world(
             Collider {
-                half_extents: Vec3::new(1.0, 2.0, 3.0),
+                shape: ColliderShape::Box {
+                    half_extents: Vec3::new(1.0, 2.0, 3.0),
+                },
                 ..Default::default()
             },
             Transform {
@@ -828,8 +833,7 @@ mod tests {
     fn sphere_and_capsule_outlines_stay_on_their_surface() {
         let (world, e) = collider_world(
             Collider {
-                shape: ColliderShape::Sphere,
-                radius: 2.0,
+                shape: ColliderShape::Sphere { radius: 2.0 },
                 ..Default::default()
             },
             Transform::default(),
@@ -843,9 +847,10 @@ mod tests {
         );
         let (world, e) = collider_world(
             Collider {
-                shape: ColliderShape::Capsule,
-                radius: 0.5,
-                half_height: 1.0,
+                shape: ColliderShape::Capsule {
+                    half_height: 1.0,
+                    radius: 0.5,
+                },
                 ..Default::default()
             },
             Transform::default(),
@@ -861,7 +866,7 @@ mod tests {
     fn collider_outline_follows_an_edit_and_includes_children() {
         let (mut world, e) = collider_world(Collider::default(), Transform::default());
         let before = collider_lines(&world, e).len();
-        world.get_mut::<Collider>(e).unwrap().shape = ColliderShape::Sphere;
+        world.get_mut::<Collider>(e).unwrap().shape = ColliderShape::Sphere { radius: 0.5 };
         let sphere = collider_lines(&world, e).len();
         assert_ne!(sphere, before);
         world.spawn((

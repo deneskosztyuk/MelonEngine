@@ -270,15 +270,16 @@ fn build_collider(
     let s = scale.abs().max(Vec3::splat(1e-3));
     let min = |v: f32| v.max(1e-3);
     let builder = match c.shape {
-        ColliderShape::Box => ColliderBuilder::cuboid(
-            min(c.half_extents.x * s.x),
-            min(c.half_extents.y * s.y),
-            min(c.half_extents.z * s.z),
+        ColliderShape::Box { half_extents } => ColliderBuilder::cuboid(
+            min(half_extents.x * s.x),
+            min(half_extents.y * s.y),
+            min(half_extents.z * s.z),
         ),
-        ColliderShape::Sphere => ColliderBuilder::ball(min(c.radius * s.max_element())),
-        ColliderShape::Capsule => {
-            ColliderBuilder::capsule_y(min(c.half_height * s.y), min(c.radius * s.x.max(s.z)))
-        }
+        ColliderShape::Sphere { radius } => ColliderBuilder::ball(min(radius * s.max_element())),
+        ColliderShape::Capsule {
+            half_height,
+            radius,
+        } => ColliderBuilder::capsule_y(min(half_height * s.y), min(radius * s.x.max(s.z))),
         ColliderShape::Mesh => {
             let (vertices, indices) = mesh::triangles(world, e)?;
             let vertices = vertices.into_iter().map(|v| v * s).collect();
@@ -421,8 +422,6 @@ fn sync_joints(world: &mut World, physics: &mut PhysicsWorld) {
             }
             physics.remove_joint(existing.handle);
         }
-        let axis = joint.axis.try_normalize().unwrap_or(Vec3::Y);
-        let limits = [joint.limit_min, joint.limit_max];
         let generic: rapier3d::dynamics::GenericJoint = match joint.kind {
             JointKind::Fixed => {
                 let rot = |h: RigidBodyHandle| {
@@ -438,31 +437,44 @@ fn sync_joints(world: &mut World, physics: &mut PhysicsWorld) {
                     .build()
                     .into()
             }
-            JointKind::Hinge => {
-                let mut b = RevoluteJointBuilder::new(axis)
+            JointKind::Hinge {
+                axis,
+                limited,
+                min,
+                max,
+            } => {
+                let mut b = RevoluteJointBuilder::new(axis.try_normalize().unwrap_or(Vec3::Y))
                     .local_anchor1(joint.parent_anchor)
                     .local_anchor2(joint.anchor);
-                if joint.use_limits {
-                    b = b.limits(limits);
+                if limited {
+                    b = b.limits([min, max]);
                 }
                 b.build().into()
             }
-            JointKind::Slider => {
-                let mut b = PrismaticJointBuilder::new(axis)
+            JointKind::Slider {
+                axis,
+                limited,
+                min,
+                max,
+            } => {
+                let mut b = PrismaticJointBuilder::new(axis.try_normalize().unwrap_or(Vec3::Y))
                     .local_anchor1(joint.parent_anchor)
                     .local_anchor2(joint.anchor);
-                if joint.use_limits {
-                    b = b.limits(limits);
+                if limited {
+                    b = b.limits([min, max]);
                 }
                 b.build().into()
             }
-            JointKind::Ball => {
+            JointKind::Ball {
+                limited,
+                cone_limit,
+            } => {
                 let mut b = SphericalJointBuilder::new()
                     .local_anchor1(joint.parent_anchor)
                     .local_anchor2(joint.anchor);
-                if joint.cone_limit < std::f32::consts::PI {
+                if limited {
                     // Swing about the Y and Z axes bounded; twist about X free.
-                    let cone = [-joint.cone_limit, joint.cone_limit];
+                    let cone = [-cone_limit, cone_limit];
                     b = b
                         .limits(JointAxis::AngY, cone)
                         .limits(JointAxis::AngZ, cone);

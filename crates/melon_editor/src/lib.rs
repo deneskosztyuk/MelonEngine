@@ -5274,7 +5274,7 @@ mod tests {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(400.0, 900.0),
+                    egui::vec2(700.0, 900.0),
                 )),
                 time: Some(self.time),
                 events,
@@ -5438,7 +5438,7 @@ mod tests {
     fn editing_the_collider_shape_rebuilds_the_collider() {
         let mut h = fixed_body_entity();
         let shape = card_id::<melon_core::Collider>().with("shape");
-        h.click(shape);
+        h.click(shape.with("variant"));
         h.click(shape.with("Sphere"));
         let handle = h
             .world

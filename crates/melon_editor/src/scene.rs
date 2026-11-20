@@ -13,8 +13,8 @@ use melon_core::bevy_reflect::{FromReflect, PartialReflect, ReflectFromReflect, 
 use melon_core::glam::Vec3;
 use melon_core::hierarchy::depth_first;
 use melon_core::{
-    Aabb, AssetGuid, AssetServer, Bob, BodyInfo, BodyKind, ChildOf, Collider, Handle, Model, Name,
-    NameCounter, RigidBody, RigidBodyKind, Spin, Transform,
+    Aabb, AssetGuid, AssetServer, Bob, BodyInfo, BodyKind, ChildOf, Collider, ColliderShape,
+    Handle, Model, Name, NameCounter, RigidBody, RigidBodyKind, Spin, Transform,
 };
 use melon_physics::PhysicsWorld;
 use ron::value::RawValue;
@@ -177,7 +177,9 @@ fn convert_body_info(
     };
     let collider = Collider {
         // `BodyInfo` was in world units; the collider follows the entity scale.
-        half_extents: he / scale.abs().max(Vec3::splat(1e-6)),
+        shape: ColliderShape::Box {
+            half_extents: he / scale.abs().max(Vec3::splat(1e-6)),
+        },
         ..Default::default()
     };
     for value in [&body as &dyn PartialReflect, &collider] {
@@ -1496,8 +1498,10 @@ mod tests {
             RigidBodyKind::Fixed
         );
         assert_eq!(
-            world.get::<Collider>(root).unwrap().half_extents,
-            Vec3::splat(0.5)
+            world.get::<Collider>(root).unwrap().shape,
+            ColliderShape::Box {
+                half_extents: Vec3::splat(0.5)
+            }
         );
         assert!(world.get::<Spin>(root).is_some() && world.get::<Bob>(root).is_some());
         assert!(world.get::<RigidBodyComponent>(root).is_some());
@@ -1715,8 +1719,10 @@ mod tests {
                 RigidBodyKind::Fixed
             );
             assert_eq!(
-                world.get::<Collider>(floor).unwrap().half_extents,
-                Vec3::new(10.0, 0.5, 10.0)
+                world.get::<Collider>(floor).unwrap().shape,
+                ColliderShape::Box {
+                    half_extents: Vec3::new(10.0, 0.5, 10.0)
+                }
             );
             assert_eq!(physics.bodies.len(), 1);
             let cube = named(&mut world, "Cube");
@@ -1766,8 +1772,10 @@ mod tests {
         );
         // World-unit half extents become local ones under the entity scale.
         assert_eq!(
-            world.get::<Collider>(e).unwrap().half_extents,
-            Vec3::new(0.5, 1.0, 1.5)
+            world.get::<Collider>(e).unwrap().shape,
+            ColliderShape::Box {
+                half_extents: Vec3::new(0.5, 1.0, 1.5)
+            }
         );
         assert_eq!((physics.bodies.len(), physics.colliders.len()), (1, 1));
         assert!(world.get::<RigidBodyComponent>(e).is_some());
@@ -1806,6 +1814,41 @@ mod tests {
         assert_eq!(physics.bodies.len(), 0);
         let e = named(&mut world, "Old");
         assert!(world.get::<RigidBody>(e).is_none());
+    }
+
+    #[test]
+    fn payload_enums_of_physics_components_round_trip() {
+        use melon_core::{Joint, JointKind};
+        let mut world = reg_world();
+        let collider = Collider {
+            shape: ColliderShape::Capsule {
+                half_height: 0.7,
+                radius: 0.2,
+            },
+            ..Default::default()
+        };
+        let joint = Joint {
+            kind: JointKind::Hinge {
+                axis: Vec3::Z,
+                limited: true,
+                min: -1.0,
+                max: 2.0,
+            },
+            anchor: Vec3::X,
+            ..Default::default()
+        };
+        world.spawn((
+            Name("P".to_string()),
+            Transform::default(),
+            RigidBody::default(),
+            collider.clone(),
+            joint.clone(),
+        ));
+        let text = round_trip(&mut world, &mut PhysicsWorld::new());
+        assert!(text.contains("version: 6"), "{text}");
+        let e = named(&mut world, "P");
+        assert_eq!(world.get::<Collider>(e), Some(&collider));
+        assert_eq!(world.get::<Joint>(e), Some(&joint));
     }
 
     #[test]

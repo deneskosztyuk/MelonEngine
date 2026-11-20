@@ -213,6 +213,14 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   scene, despawn its entities (`load_scene` despawns entities with a
   `Transform`). Never call `World::clear_entities()`: in bevy 0.19 resources
   are entities, so it deletes them too.
+- **Inspector enum editing (`inspect.rs`, `reflect_ui`).** A unit enum is a
+  combo (`id.with("combo")`, options `id.with(variant)`). An enum with payload
+  variants gets a variant combo (click id `id.with("variant")`, options
+  `id.with(variant)`) and then only the active variant's fields, each
+  `id.with(field)`; picking another variant builds it from default field
+  values (`ReflectDefault` of each field type, zero for glam vectors; a
+  field type without a default makes the switch fail). `Option` keeps its
+  checkbox editor. Any new reflected enum with payloads needs no editor code.
 - **Editor panels.** A new panel is a variant of `layout::EditorTab` (title,
   `ALL`) plus a match arm in `EditorTabs::ui`. Colours and sizes come from
   `theme::colors` / `theme::sizes`, not literals. Log with `tracing`; INFO and
@@ -254,11 +262,13 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   records the undo step); `mark_for_delete` stays for game and engine code.
 - **Physics (`melon_physics`).** Game data is in `melon_core::physics`
   (usable from `melon_game`): `RigidBody` (kind, mass, damping, gravity
-  scale, per-axis rotation lock, ccd), `Collider` (shape `Box` /
-  `Sphere` / `Capsule` / `Mesh`, flat fields `half_extents`, `radius`,
-  `half_height` because the Inspector edits unit enums only; friction,
+  scale, per-axis rotation lock, ccd), `Collider` (`shape`: `Box {
+  half_extents }` / `Sphere { radius }` / `Capsule { half_height, radius }` /
+  `Mesh`; friction,
   restitution, `sensor`, `membership` / `filter` bit masks),
-  `CharacterController`, `Joint`; all registered, so scenes and the
+  `CharacterController`, `Joint` (`kind`: `Fixed` / `Hinge { axis, limited,
+  min, max }` / `Ball { limited, cone_limit }` / `Slider { axis, limited, min,
+  max }`, plus `anchor`, `parent_anchor`); all registered, so scenes and the
   Inspector need no special code. A collider without a body is static; a
   collider on a child attaches to the nearest ancestor body (a body's mass
   is shared by its solid colliders). Shapes follow the entity's world
@@ -293,7 +303,7 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   to its nearest ancestor body, or a fixed world body (then `parent_anchor`
   is a world position); the bodies are assumed aligned at creation (hinge /
   slider axes are the same vector on both bodies; `Fixed` keeps the
-  relative rotation). Ball `cone_limit` bounds the Y and Z swing, twist is
+  relative rotation). Ball `cone_limit` (when `limited`) bounds the Y and Z swing, twist is
   free. The Scene view draws green outlines of the selected entity's
   colliders (and its descendants'; a mesh collider as its model bounds).
 - **Hierarchy.** Parents use bevy's `ChildOf` / `Children`. `Transform` is

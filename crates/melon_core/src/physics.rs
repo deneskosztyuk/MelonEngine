@@ -1,8 +1,6 @@
 //! Physics data and the game-facing API: components the Inspector and scene
 //! files edit, ray / shape queries and collision events. `melon_physics`
 //! turns the components into rapier objects and fills `PhysicsQueries`.
-//! The fields are flat (a shape enum plus its numbers) because the Inspector
-//! edits unit enums, not enums with payloads.
 
 use std::sync::Arc;
 
@@ -61,18 +59,32 @@ impl Default for RigidBody {
     }
 }
 
-#[derive(Reflect, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Reflect, Debug, Clone, Copy, PartialEq)]
 #[reflect(Default)]
 pub enum ColliderShape {
-    /// `half_extents`, scaled by the entity's world scale.
-    #[default]
-    Box,
-    /// `radius`.
-    Sphere,
-    /// `half_height` of the straight part along Y, and `radius`.
-    Capsule,
+    /// Scaled by the entity's world scale.
+    Box {
+        #[reflect(remote = Vec3Reflect)]
+        half_extents: Vec3,
+    },
+    Sphere {
+        radius: f32,
+    },
+    /// `half_height` of the straight part along Y.
+    Capsule {
+        half_height: f32,
+        radius: f32,
+    },
     /// Triangle mesh of the entity's model (`x.glb#meshN` included).
     Mesh,
+}
+
+impl Default for ColliderShape {
+    fn default() -> Self {
+        Self::Box {
+            half_extents: Vec3::splat(0.5),
+        }
+    }
 }
 
 /// A collider on the entity. With a `RigidBody` on the entity or on its
@@ -81,10 +93,6 @@ pub enum ColliderShape {
 #[reflect(Component, Default)]
 pub struct Collider {
     pub shape: ColliderShape,
-    #[reflect(remote = Vec3Reflect)]
-    pub half_extents: Vec3,
-    pub radius: f32,
-    pub half_height: f32,
     pub friction: f32,
     pub restitution: f32,
     /// A trigger: reports overlaps, never pushes.
@@ -98,10 +106,7 @@ pub struct Collider {
 impl Default for Collider {
     fn default() -> Self {
         Self {
-            shape: ColliderShape::Box,
-            half_extents: Vec3::splat(0.5),
-            radius: 0.5,
-            half_height: 0.5,
+            shape: ColliderShape::default(),
             friction: 0.5,
             restitution: 0.0,
             sensor: false,
@@ -168,23 +173,38 @@ impl CharacterController {
     }
 }
 
-#[derive(Reflect, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Reflect, Debug, Clone, Copy, PartialEq, Default)]
 #[reflect(Default)]
 pub enum JointKind {
     /// No relative motion.
     #[default]
     Fixed,
-    /// Rotates about `axis`.
-    Hinge,
-    /// Rotates freely about the anchor; `cone_limit` bounds the swing.
-    Ball,
-    /// Slides along `axis`.
-    Slider,
+    /// Rotates about `axis` (local to this body); with `limited`, the angle
+    /// stays within `min..max` radians.
+    Hinge {
+        #[reflect(remote = Vec3Reflect)]
+        axis: Vec3,
+        limited: bool,
+        min: f32,
+        max: f32,
+    },
+    /// Rotates freely about the anchor; with `limited`, the Y and Z swing
+    /// stays within `cone_limit` radians.
+    Ball { limited: bool, cone_limit: f32 },
+    /// Slides along `axis` (local to this body); with `limited`, the offset
+    /// stays within `min..max` metres.
+    Slider {
+        #[reflect(remote = Vec3Reflect)]
+        axis: Vec3,
+        limited: bool,
+        min: f32,
+        max: f32,
+    },
 }
 
 /// Connects this entity's body to its nearest ancestor body (or the world
 /// when it has none). Anchors are local to each body.
-#[derive(Component, Reflect, Debug, Clone, PartialEq)]
+#[derive(Component, Reflect, Debug, Clone, PartialEq, Default)]
 #[reflect(Component, Default)]
 pub struct Joint {
     pub kind: JointKind,
@@ -193,30 +213,6 @@ pub struct Joint {
     /// Anchor in the ancestor body's space (world space with no ancestor body).
     #[reflect(remote = Vec3Reflect)]
     pub parent_anchor: Vec3,
-    /// Hinge / Slider axis, local to this body.
-    #[reflect(remote = Vec3Reflect)]
-    pub axis: Vec3,
-    pub use_limits: bool,
-    /// Hinge angle (radians) or slider distance (metres).
-    pub limit_min: f32,
-    pub limit_max: f32,
-    /// Ball: largest swing angle in radians (pi = free).
-    pub cone_limit: f32,
-}
-
-impl Default for Joint {
-    fn default() -> Self {
-        Self {
-            kind: JointKind::Fixed,
-            anchor: Vec3::ZERO,
-            parent_anchor: Vec3::ZERO,
-            axis: Vec3::Y,
-            use_limits: false,
-            limit_min: 0.0,
-            limit_max: 0.0,
-            cone_limit: std::f32::consts::PI,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

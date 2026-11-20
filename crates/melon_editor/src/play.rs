@@ -118,7 +118,9 @@ mod tests {
                 ..Default::default()
             },
             melon_core::Collider {
-                half_extents: Vec3::new(5.0, 0.5, 5.0),
+                shape: melon_core::ColliderShape::Box {
+                    half_extents: Vec3::new(5.0, 0.5, 5.0),
+                },
                 ..Default::default()
             },
         ));

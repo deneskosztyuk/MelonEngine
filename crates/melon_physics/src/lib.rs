@@ -500,7 +500,9 @@ mod tests {
 
     fn cube() -> Collider {
         Collider {
-            half_extents: Vec3::splat(0.5),
+            shape: ColliderShape::Box {
+                half_extents: Vec3::splat(0.5),
+            },
             ..Default::default()
         }
     }
@@ -515,7 +517,9 @@ mod tests {
             .spawn((
                 at(0.0, 0.0, 0.0),
                 Collider {
-                    half_extents: Vec3::new(20.0, 0.5, 20.0),
+                    shape: ColliderShape::Box {
+                        half_extents: Vec3::new(20.0, 0.5, 20.0),
+                    },
                     ..Default::default()
                 },
             ))
@@ -588,8 +592,7 @@ mod tests {
             &mut c,
             at(0.0, 3.0, 0.0),
             Collider {
-                shape: ColliderShape::Sphere,
-                radius: 0.5,
+                shape: ColliderShape::Sphere { radius: 0.5 },
                 ..Default::default()
             },
         );
@@ -597,9 +600,10 @@ mod tests {
             &mut c,
             at(4.0, 3.0, 0.0),
             Collider {
-                shape: ColliderShape::Capsule,
-                half_height: 0.5,
-                radius: 0.25,
+                shape: ColliderShape::Capsule {
+                    half_height: 0.5,
+                    radius: 0.25,
+                },
                 ..Default::default()
             },
         );
@@ -672,13 +676,14 @@ mod tests {
                 .clone()
         };
         assert_eq!(shape_of(&c).as_cuboid().unwrap().half_extents.x, 0.5);
-        c.world.get_mut::<Collider>(e).unwrap().half_extents = Vec3::new(2.0, 0.5, 0.5);
+        c.world.get_mut::<Collider>(e).unwrap().shape = ColliderShape::Box {
+            half_extents: Vec3::new(2.0, 0.5, 0.5),
+        };
         frames(&mut c, 1);
         assert_eq!(shape_of(&c).as_cuboid().unwrap().half_extents.x, 2.0);
         {
             let mut col = c.world.get_mut::<Collider>(e).unwrap();
-            col.shape = ColliderShape::Sphere;
-            col.radius = 0.75;
+            col.shape = ColliderShape::Sphere { radius: 0.75 };
         }
         frames(&mut c, 1);
         assert_eq!(shape_of(&c).as_ball().unwrap().radius, 0.75);
@@ -1130,7 +1135,9 @@ mod tests {
             .spawn((
                 at(0.0, 0.0, 0.0),
                 Collider {
-                    half_extents: Vec3::splat(1.0),
+                    shape: ColliderShape::Box {
+                        half_extents: Vec3::splat(1.0),
+                    },
                     sensor: true,
                     ..Default::default()
                 },
@@ -1155,9 +1162,10 @@ mod tests {
             .spawn((
                 at(0.0, y, 0.0),
                 Collider {
-                    shape: ColliderShape::Capsule,
-                    half_height: 0.5,
-                    radius: 0.3,
+                    shape: ColliderShape::Capsule {
+                        half_height: 0.5,
+                        radius: 0.3,
+                    },
                     ..Default::default()
                 },
                 CharacterController::default(),
@@ -1209,7 +1217,9 @@ mod tests {
         c.world.spawn((
             at(3.0, 0.6, 0.0),
             Collider {
-                half_extents: Vec3::new(1.0, 0.1, 5.0),
+                shape: ColliderShape::Box {
+                    half_extents: Vec3::new(1.0, 0.1, 5.0),
+                },
                 ..Default::default()
             },
         ));
@@ -1231,7 +1241,9 @@ mod tests {
         c.world.spawn((
             at(3.0, 1.0, 0.0),
             Collider {
-                half_extents: Vec3::new(1.0, 0.5, 5.0),
+                shape: ColliderShape::Box {
+                    half_extents: Vec3::new(1.0, 0.5, 5.0),
+                },
                 ..Default::default()
             },
         ));
@@ -1251,7 +1263,9 @@ mod tests {
         c.world.spawn((
             ramp,
             Collider {
-                half_extents: Vec3::new(3.0, 0.1, 5.0),
+                shape: ColliderShape::Box {
+                    half_extents: Vec3::new(3.0, 0.1, 5.0),
+                },
                 ..Default::default()
             },
         ));
@@ -1285,9 +1299,13 @@ mod tests {
                 RigidBody::default(),
                 cube(),
                 Joint {
-                    kind: JointKind::Hinge,
+                    kind: JointKind::Hinge {
+                        axis: Vec3::Z,
+                        limited: false,
+                        min: 0.0,
+                        max: 0.0,
+                    },
                     anchor: Vec3::new(-2.0, 0.0, 0.0),
-                    axis: Vec3::Z,
                     ..Default::default()
                 },
                 ChildOf(parent),
@@ -1357,8 +1375,7 @@ mod tests {
             &mut c,
             at(0.0, 3.0, 0.0),
             Collider {
-                shape: ColliderShape::Sphere,
-                radius: 0.25,
+                shape: ColliderShape::Sphere { radius: 0.25 },
                 ..Default::default()
             },
         );
