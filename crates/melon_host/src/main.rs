@@ -235,6 +235,14 @@ fn forwards_to_egui(kind: EguiEvent, gate_open: bool) -> bool {
     !(gate_open && kind == EguiEvent::Pointer)
 }
 
+/// Window focus lost: Windows sends key releases but no mouse releases, so
+/// release every held game button (focus stays as it is).
+fn release_game_input(world: &mut World) {
+    if let Some(mut input) = world.get_resource_mut::<Input>() {
+        input.release_all();
+    }
+}
+
 /// End of the host frame, after the editor UI read this frame's presses.
 fn clear_raw_presses(world: &mut World) {
     if let Some(mut raw) = world.get_resource_mut::<RawPresses>() {
@@ -492,6 +500,7 @@ impl ApplicationHandler for App {
                 }
                 event_loop.exit();
             }
+            WindowEvent::Focused(false) => release_game_input(&mut self.core.world),
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size);
@@ -885,5 +894,24 @@ mod tests {
         assert!(apply_gate(&mut input, &mut applied, false));
         assert!(!input.pressed(W));
         assert!(input.just_released(W));
+    }
+
+    #[test]
+    fn focus_loss_releases_held_mouse_buttons() {
+        let mut world = World::new();
+        let mut input = Input::default();
+        let lmb = InputButton::Mouse(EngineMouse::Left);
+        input.press(lmb);
+        input.press(W);
+        world.insert_resource(input);
+        world.insert_resource(melon_core::InputFocus::Game);
+        release_game_input(&mut world);
+        let input = world.resource::<Input>();
+        assert!(!input.pressed(lmb) && !input.pressed(W));
+        assert!(input.just_released(lmb));
+        assert_eq!(
+            *world.resource::<melon_core::InputFocus>(),
+            melon_core::InputFocus::Game
+        );
     }
 }
