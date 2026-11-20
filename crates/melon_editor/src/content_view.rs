@@ -40,6 +40,7 @@ fn kind_color(kind: AssetKind) -> Color32 {
         AssetKind::Model => colors::ACCENT_HOVER,
         AssetKind::Texture => colors::SUCCESS,
         AssetKind::Material => colors::ACCENT,
+        AssetKind::Environment => colors::ENVIRONMENT,
         AssetKind::Shader => colors::ERROR,
         AssetKind::Scene => colors::INFO,
         AssetKind::Audio => colors::ACCENT,
@@ -105,6 +106,11 @@ fn folder_menu(ui: &mut egui::Ui, dir: &Path, actions: &mut Vec<Action>) {
     }
     if ui.button("New Material").clicked() {
         actions.push(Action::Request(BrowserRequest::NewMaterial(
+            dir.to_path_buf(),
+        )));
+    }
+    if ui.button("New Environment").clicked() {
+        actions.push(Action::Request(BrowserRequest::NewEnvironment(
             dir.to_path_buf(),
         )));
     }

@@ -25,7 +25,7 @@ const FLOAT_SPEED: f64 = 0.01;
 /// editor (by field name). The caller builds these per component type.
 pub struct FieldWidget {
     /// Row label; the field name when `None`.
-    pub label: Option<&'static str>,
+    pub label: Option<std::borrow::Cow<'static, str>>,
     pub kind: WidgetKind,
 }
 
@@ -50,6 +50,25 @@ pub enum WidgetKind {
     Degrees { min: f32, max: f32 },
     /// A linear `Vec3` colour edited with a colour picker.
     Color,
+    /// An `f32` drag value with a range, speed, unit suffix and decimals
+    /// (from `melon_core::EditHint`).
+    Drag {
+        min: f32,
+        max: f32,
+        speed: f32,
+        suffix: &'static str,
+        decimals: usize,
+    },
+    /// A linear `Vec3` colour that may exceed 1: a colour button on the
+    /// colour divided by its largest channel plus an intensity drag value
+    /// (that channel).
+    HdrColor,
+    /// A `melon_core::AssetRef`: `Asset`'s picker and drop target on its
+    /// path; a change also sets the GUID from the file's `.meta`.
+    AssetRef {
+        root: PathBuf,
+        extensions: &'static [&'static str],
+    },
 }
 
 /// An angle stored in radians as a drag value in degrees. The stored value
@@ -68,6 +87,42 @@ pub(crate) fn degrees_field(ui: &mut egui::Ui, radians: &mut f32, min: f32, max:
     if changed {
         *radians = degrees.to_radians();
     }
+    changed
+}
+
+/// An HDR colour as (colour with largest channel 1, intensity); black is
+/// white at intensity 0.
+fn hdr_split(v: Vec3) -> (Vec3, f32) {
+    let max = v.max_element();
+    if max > 0.0 {
+        (v / max, max)
+    } else {
+        (Vec3::ONE, 0.0)
+    }
+}
+
+/// Colour button + intensity drag for a linear `Vec3` of any brightness.
+/// Only an edit rewrites the value, so drawing never drifts it.
+fn hdr_color_field(ui: &mut egui::Ui, v: &mut Vec3) -> bool {
+    let (colour, mut intensity) = hdr_split(*v);
+    let mut rgb = colour.to_array();
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        if ui.color_edit_button_rgb(&mut rgb).changed() {
+            // Picking a colour on black brings it to intensity 1.
+            let k = if intensity > 0.0 { intensity } else { 1.0 };
+            *v = Vec3::from_array(rgb) * k;
+            changed = true;
+        }
+        let drag = egui::DragValue::new(&mut intensity)
+            .speed(0.01)
+            .range(0.0..=100.0)
+            .prefix("\u{d7} ");
+        if ui.add(drag).on_hover_text("Intensity").changed() {
+            *v = colour * intensity;
+            changed = true;
+        }
+    });
     changed
 }
 
@@ -283,9 +338,38 @@ fn widget_ui(
             let v = value.try_downcast_mut::<String>()?;
             Some(asset_field(ui, id, v, root, extensions))
         }
+        WidgetKind::AssetRef { root, extensions } => {
+            let v = value.try_downcast_mut::<melon_core::AssetRef>()?;
+            let mut path = v.path.clone();
+            let changed = asset_field(ui, id, &mut path, root, extensions);
+            if changed {
+                let guid = crate::material_assign::slot_for(root, &path).guid;
+                *v = melon_core::AssetRef { guid, path };
+            }
+            Some(changed)
+        }
         WidgetKind::Degrees { min, max } => {
             let v = value.try_downcast_mut::<f32>()?;
             Some(degrees_field(ui, v, *min, *max))
+        }
+        WidgetKind::Drag {
+            min,
+            max,
+            speed,
+            suffix,
+            decimals,
+        } => {
+            let v = value.try_downcast_mut::<f32>()?;
+            let drag = egui::DragValue::new(v)
+                .range(*min..=*max)
+                .speed(*speed)
+                .suffix(*suffix)
+                .max_decimals(*decimals);
+            Some(ui.add(drag).changed())
+        }
+        WidgetKind::HdrColor => {
+            let v = value.try_downcast_mut::<Vec3>()?;
+            Some(hdr_color_field(ui, v))
         }
         WidgetKind::Color => {
             let v = value.try_downcast_mut::<Vec3>()?;
@@ -358,7 +442,7 @@ fn fields_ui(
                 };
                 let Some(field) = field else { continue };
                 let widget = widgets.get(name.as_str());
-                ui.label(widget.and_then(|w| w.label).unwrap_or(&name));
+                ui.label(widget.and_then(|w| w.label.as_deref()).unwrap_or(&name));
                 let row = id.with(name.as_str());
                 let editor = ui.scope(|ui| {
                     widget
@@ -879,13 +963,67 @@ mod tests {
     }
 
     #[test]
+    fn asset_ref_widget_fills_path_and_guid_on_a_drop() {
+        let root = std::env::temp_dir().join(format!("melon_assetref_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let mut server = melon_core::AssetServer::new(root.clone());
+        let file = root.join("assets/a.env");
+        std::fs::write(&file, melon_core::EnvironmentAsset::default().to_ron()).unwrap();
+        crate::asset_db::reconcile(&mut server);
+        let guid = server.guid_of("assets/a.env").unwrap().to_string();
+        let widget = WidgetKind::AssetRef {
+            root: root.clone(),
+            extensions: &["env"],
+        };
+        let ctx = egui::Context::default();
+        let mut value = melon_core::AssetRef::default();
+        let frame = |events: Vec<egui::Event>, value: &mut melon_core::AssetRef| {
+            let mut changed = None;
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| changed = widget_ui(ui, egui::Id::new("ref"), value, &widget),
+            );
+            changed
+        };
+        frame(vec![], &mut value);
+        let pos = ctx
+            .read_response(egui::Id::new("ref").with("drop"))
+            .expect("drop target drawn")
+            .rect
+            .center();
+        frame(vec![egui::Event::PointerMoved(pos)], &mut value);
+        egui::DragAndDrop::set_payload(
+            &ctx,
+            AssetDrag {
+                path: file,
+                model: None,
+            },
+        );
+        let release = egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let changed = frame(vec![egui::Event::PointerMoved(pos), release], &mut value);
+        assert_eq!(changed, Some(true));
+        assert_eq!(value.path, "assets/a.env");
+        assert_eq!(value.guid, guid);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn slider_widget_edits_a_float_field() {
         let h = Harness::new();
         let mut v = sample();
         let widgets = FieldWidgets::from([(
             "speed",
             FieldWidget {
-                label: Some("Speed (linear)"),
+                label: Some("Speed (linear)".into()),
                 kind: WidgetKind::Slider { min: 0.0, max: 1.0 },
             },
         )]);
@@ -947,6 +1085,55 @@ mod tests {
         assert!(changed);
         let degrees = value.speed.to_degrees();
         assert!((degrees - 85.0).abs() < 1.5, "{degrees}");
+    }
+
+    #[test]
+    fn hdr_colour_survives_drawing_and_an_intensity_edit() {
+        let mut h = Harness::new();
+        h.widgets.insert(
+            "pos",
+            FieldWidget {
+                label: None,
+                kind: WidgetKind::HdrColor,
+            },
+        );
+        let mut value = sample();
+        value.pos = Vec3::new(1.35, 0.68, 0.32);
+        for _ in 0..3 {
+            assert!(!h.frame(&mut value, vec![]));
+        }
+        assert_eq!(value.pos, Vec3::new(1.35, 0.68, 0.32), "not clamped");
+        let (colour, intensity) = hdr_split(value.pos);
+        assert_eq!(intensity, 1.35);
+        assert_eq!(colour.max_element(), 1.0);
+        let doubled = colour * 2.0 * intensity;
+        assert!(
+            (doubled - value.pos * 2.0).length() < 1e-5,
+            "all channels scale"
+        );
+        assert_eq!(hdr_split(Vec3::ZERO), (Vec3::ONE, 0.0));
+    }
+
+    #[test]
+    fn drag_widget_clamps_to_its_range() {
+        let mut h = Harness::new();
+        h.widgets.insert(
+            "speed",
+            FieldWidget {
+                label: Some("Elevation".into()),
+                kind: WidgetKind::Drag {
+                    min: -90.0,
+                    max: 90.0,
+                    speed: 0.5,
+                    suffix: "\u{b0}",
+                    decimals: 1,
+                },
+            },
+        );
+        let mut value = sample();
+        value.speed = 120.0;
+        h.frame(&mut value, vec![]);
+        assert_eq!(value.speed, 90.0);
     }
 
     #[test]

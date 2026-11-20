@@ -25,6 +25,10 @@ pub struct Texture;
 /// Asset type tag for materials (`.mat` RON files, see `material`).
 pub struct Material;
 
+/// Asset type tag for environments (`.env` RON files, see
+/// `environment_asset`).
+pub struct EnvironmentFile;
+
 /// Prefix for assets that have no file (e.g. `builtin:cube`).
 pub const BUILTIN_PREFIX: &str = "builtin:";
 
@@ -508,14 +512,26 @@ impl AssetServer {
     /// load stays in use).
     pub fn poll_changes(&mut self) {
         for i in 0..self.entries.len() {
-            let Some(modified) = self.modified_time(&self.entries[i].path) else {
-                continue;
-            };
-            let entry = &mut self.entries[i];
-            if entry.modified != Some(modified) {
-                entry.version += 1;
-                entry.modified = Some(modified);
-            }
+            self.refresh_entry(i);
+        }
+    }
+
+    /// `poll_changes` for one path (after the editor wrote the file). An
+    /// unknown path is a no-op.
+    pub fn refresh(&mut self, path: &str) {
+        if let Some(&id) = self.by_path.get(&normalise(path)) {
+            self.refresh_entry(id as usize);
+        }
+    }
+
+    fn refresh_entry(&mut self, i: usize) {
+        let Some(modified) = self.modified_time(&self.entries[i].path) else {
+            return;
+        };
+        let entry = &mut self.entries[i];
+        if entry.modified != Some(modified) {
+            entry.version += 1;
+            entry.modified = Some(modified);
         }
     }
 }

@@ -543,7 +543,7 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
         lights: Default::default(),
     };
     if let Some(path) = &scene {
-        // The scene's entities, lights, material overrides and SceneLighting
+        // The scene's entities, lights, material overrides and WorldEnvironment
         // through the engine's own update and extraction; camera and quality
         // stay as set above, and --fog still overrides the fog.
         let mut core = melon_core::Core::new();

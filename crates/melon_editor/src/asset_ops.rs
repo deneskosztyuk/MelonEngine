@@ -77,6 +77,38 @@ pub fn create_material(server: &mut AssetServer, parent: &Path) -> anyhow::Resul
     Ok(file)
 }
 
+/// Write a default `New Environment.env` into `parent` (a free name).
+pub fn create_environment(server: &mut AssetServer, parent: &Path) -> anyhow::Result<PathBuf> {
+    let file = unique_path(parent, "New Environment.env");
+    std::fs::write(&file, melon_core::EnvironmentAsset::default().to_ron())
+        .with_context(|| format!("could not create {}", file.display()))?;
+    reconcile(server);
+    Ok(file)
+}
+
+/// The environment a new scene's World Environment points at.
+pub const DEFAULT_ENVIRONMENT: &str = "assets/environments/default.env";
+
+/// Write `DEFAULT_ENVIRONMENT` (and its `.meta`) under `root` when it is missing.
+pub fn ensure_default_environment(server: &mut AssetServer, root: &Path) -> anyhow::Result<()> {
+    let file = root.join(DEFAULT_ENVIRONMENT);
+    if file.is_file() {
+        // A hand-copied file has no `.meta`; give the ref a GUID.
+        if !melon_core::meta_path(&file).is_file() {
+            reconcile(server);
+        }
+        return Ok(());
+    }
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("could not create {}", dir.display()))?;
+    }
+    std::fs::write(&file, melon_core::EnvironmentAsset::default().to_ron())
+        .with_context(|| format!("could not create {}", file.display()))?;
+    reconcile(server);
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) const ONE_MATERIAL_GLTF: &str = r#"{
     "asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}],
@@ -546,6 +578,36 @@ mod tests {
             melon_core::MaterialAsset::new_default()
         );
         assert!(melon_core::meta_path(&first).is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensure_default_environment_gives_an_existing_file_its_meta() {
+        let (root, mut server) = project("ensure_meta");
+        let file = root.join(DEFAULT_ENVIRONMENT);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, melon_core::EnvironmentAsset::default().to_ron()).unwrap();
+        assert!(!melon_core::meta_path(&file).exists());
+        ensure_default_environment(&mut server, &root).unwrap();
+        assert!(melon_core::meta_path(&file).is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_environment_writes_a_loadable_default_with_a_meta() {
+        let (root, mut server) = project("create_environment");
+        let assets = root.join("assets");
+        let first = create_environment(&mut server, &assets).unwrap();
+        let second = create_environment(&mut server, &assets).unwrap();
+        assert_eq!(first, assets.join("New Environment.env"));
+        assert_eq!(second, assets.join("New Environment 2.env"));
+        for f in [&first, &second] {
+            assert_eq!(
+                melon_core::EnvironmentAsset::read(f).unwrap(),
+                melon_core::EnvironmentAsset::default()
+            );
+            assert!(melon_core::meta_path(f).is_file());
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

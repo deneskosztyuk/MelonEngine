@@ -30,6 +30,8 @@ pub mod colors {
     pub const WARNING: Color32 = Color32::from_rgb(0xd9, 0xa4, 0x41);
     pub const ERROR: Color32 = Color32::from_rgb(0xe0, 0x56, 0x56);
     pub const INFO: Color32 = Color32::from_rgb(0x6c, 0xb2, 0xe6);
+    /// Environment (`.env`) tiles in the Content Browser.
+    pub const ENVIRONMENT: Color32 = Color32::from_rgb(0x9a, 0xc9, 0x5b);
     /// Axis labels in the inspector (X red, Y green, Z blue).
     /// Collider outlines in the Scene view (green, like Unity and Godot) and trigger outlines.
     pub const COLLIDER: Color32 = Color32::from_rgb(0x33, 0xe6, 0x4d);
