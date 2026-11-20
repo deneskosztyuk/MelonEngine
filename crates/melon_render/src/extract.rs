@@ -46,16 +46,18 @@ fn add_lod_models(
     matrices: &HashMap<melon_core::bevy_ecs::entity::Entity, Mat4>,
     view_proj: Mat4,
     models: &mut Vec<(Mat4, Handle<Model>)>,
+    slots: &mut Vec<(usize, MeshMaterials)>,
 ) {
     let mut query = world.query::<(
         melon_core::bevy_ecs::entity::Entity,
         &Lod,
         Option<&LodState>,
+        Option<&MeshMaterials>,
     )>();
     let lods: Vec<_> = query
         .iter(world)
-        .filter(|(e, lod, _)| !lod.levels.is_empty() && matrices.contains_key(e))
-        .map(|(e, lod, state)| (e, lod.clone(), state.map(|s| s.0)))
+        .filter(|(e, lod, ..)| !lod.levels.is_empty() && matrices.contains_key(e))
+        .map(|(e, lod, state, materials)| (e, lod.clone(), state.map(|s| s.0), materials.cloned()))
         .collect();
     if lods.is_empty() || !world.contains_resource::<AssetServer>() {
         return;
@@ -63,7 +65,7 @@ fn add_lod_models(
     let mut states = Vec::new();
     world.resource_scope(
         |_, mut server: melon_core::bevy_ecs::prelude::Mut<AssetServer>| {
-            for (e, lod, state) in &lods {
+            for (e, lod, state, materials) in &lods {
                 let matrix = matrices[e];
                 let handles: Vec<_> = lod.levels.iter().map(|l| l.resolve(&mut server)).collect();
                 let (min, max) = handles
@@ -87,6 +89,10 @@ fn add_lod_models(
                     melon_core::lod::select_level(&thresholds, lod.hysteresis, height, *state);
                 states.push((*e, level.unwrap_or(lod.levels.len())));
                 if let Some(handle) = level.and_then(|i| handles[i]) {
+                    // The same part slots apply to every level.
+                    if let Some(materials) = materials {
+                        slots.push((models.len(), materials.clone()));
+                    }
                     models.push((matrix, handle));
                 }
             }
@@ -142,7 +148,7 @@ pub fn extract(world: &mut World) -> FrameData {
             models.push((*m, *h));
         }
     }
-    add_lod_models(world, &matrices, view_proj, &mut models);
+    add_lod_models(world, &matrices, view_proj, &mut models, &mut slots);
     let mut overrides = HashMap::new();
     if let Some(mut server) = world.get_resource_mut::<AssetServer>() {
         for (index, materials) in slots {
@@ -297,6 +303,42 @@ mod tests {
         assert_eq!(drawn(&mut world, -7.9), ["assets/far.glb"], "held");
         assert_eq!(drawn(&mut world, -6.0), ["builtin:cube"]);
         assert_eq!(drawn(&mut world, -8.5), ["builtin:cube"], "held");
+    }
+
+    #[test]
+    fn mesh_materials_apply_to_the_chosen_lod_level() {
+        use melon_core::{Lod, LodLevel, MaterialSlot};
+        let mut world = World::new();
+        world.insert_resource(AssetServer::new(".".into()));
+        world.insert_resource(Camera {
+            eye: Vec3::ZERO,
+            center: Vec3::new(0.0, 0.0, -1.0),
+            aspect: 1.0,
+            ..Default::default()
+        });
+        let level = |path: &str| LodLevel {
+            guid: String::new(),
+            path: path.into(),
+            screen_height: 0.001,
+        };
+        world.spawn((
+            Transform::from_translation(Vec3::new(0.0, 0.0, -5.0)),
+            Lod {
+                levels: vec![level("builtin:cube")],
+                hysteresis: 0.1,
+            },
+            MeshMaterials {
+                parts: vec![MaterialSlot {
+                    guid: String::new(),
+                    path: "assets/m.mat".into(),
+                }],
+            },
+        ));
+        let frame = extract(&mut world);
+        assert_eq!(frame.models.len(), 1);
+        let parts = frame.overrides.get(&0).expect("override on the LOD model");
+        let server = world.resource::<AssetServer>();
+        assert_eq!(server.path(parts[0].unwrap()), "assets/m.mat");
     }
 
     #[test]

@@ -6463,17 +6463,6 @@ mod tests {
                 "uniform sky: floor shows {got}, expected about {want}"
             ));
         }
-        // An image sky (flat red) replaces the procedural one: the floor
-        // takes its colour, and a corner of the view shows it as the sky.
-        let (red, _) =
-            render_floor_under(r, vec![], quality, light, environment, Some([255, 0, 0]));
-        let px = pixel_at(r, &red, CENTRE_PX);
-        let sky = pixel_at(r, &red, (2, 2));
-        if px[0] < px[2].saturating_add(40) || sky[0] < sky[2].saturating_add(100) {
-            return Err(format!(
-                "red image sky: floor {px:?}, sky {sky:?} (want red)"
-            ));
-        }
         // Doubling the sky doubles the light: brighter, never darker.
         let bright = melon_core::Light {
             sky_color: glam::Vec3::splat(2.0 * l),
@@ -6727,6 +6716,43 @@ mod tests {
                 "ddgi frame: {} shadowed lights",
                 stats.shadowed_lights
             ));
+        }
+        Ok(())
+    }
+
+    fn check_hdr_sky_is_drawn(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("hdr_sky");
+        image::RgbaImage::from_pixel(8, 4, image::Rgba([255, 0, 0, 255]))
+            .save(root.join("assets/textures/sky.png"))
+            .unwrap();
+        let mut server = fresh_ids_server(root.clone(), 7500);
+        let camera = melon_core::Camera {
+            eye: glam::Vec3::ZERO,
+            center: glam::Vec3::new(0.0, 0.0, -10.0),
+            aspect: 1.0,
+            ..Default::default()
+        };
+        let frame = FrameData {
+            view_proj: camera.view_proj(),
+            eye: camera.eye,
+            light: test_light(),
+            environment: melon_core::Environment {
+                sky_texture: true.then(|| server.load("assets/textures/sky.png")),
+                ..plain_environment()
+            },
+            ..Default::default()
+        };
+        let mut target =
+            r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let mut encoder = r
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        r.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
+        let pixels = read_back(r.device(), r.queue(), encoder, &target.color_texture);
+        let _ = std::fs::remove_dir_all(&root);
+        let sky = pixel_at(r, &pixels, CENTRE_PX);
+        if sky[0] < sky[2].saturating_add(100) {
+            return Err(format!("the image sky should be drawn red: {sky:?}"));
         }
         Ok(())
     }
@@ -8508,6 +8534,7 @@ mod tests {
             Box::new(check_ibl_uniform_sky),
             Box::new(check_far_cascade_shadow),
             Box::new(check_local_light_shadows),
+            Box::new(check_hdr_sky_is_drawn),
         ];
 
         #[cfg(target_os = "windows")]

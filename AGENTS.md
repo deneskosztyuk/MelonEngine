@@ -540,8 +540,8 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   (state in `LodState`, kept by `extract`). The entity's own `Handle<Model>`
   is not drawn while `levels` is non-empty; the chosen level's model is, so
   instancing groups by it. Bounds come from the first level the
-  `AssetServer` knows (a unit cube until one has loaded). `MeshMaterials` is
-  not applied to LOD entities. Not exposed in the editor beyond the generic
+  `AssetServer` knows (a unit cube until one has loaded). `MeshMaterials` applies
+  to every level (same part indices; parts a level lacks are ignored). Not exposed in the editor beyond the generic
   component Inspector.
 - **Materials.** glTF metallic-roughness per primitive (`MaterialUniform`:
   base colour, metallic, roughness, normal scale, emissive). Group 2 of the
