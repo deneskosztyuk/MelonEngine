@@ -453,10 +453,11 @@ impl ApplicationHandler for App {
         }
 
         tracing::info!(
-            "renderer ready: {}x{} {:?} {:?}",
+            "renderer ready: {}x{} {:?} {:?} {:?}",
             size.width,
             size.height,
             renderer.surface_format(),
+            renderer.backend(),
             renderer.present_mode()
         );
         if renderer.present_mode() == wgpu::PresentMode::Mailbox {

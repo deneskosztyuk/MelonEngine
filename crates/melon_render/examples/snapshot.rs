@@ -3,7 +3,7 @@
 // Views: overview (default), low, sun, materials, corner, crowd (overview
 // plus about 10,000 grey cubes and spheres), cornell (the review scene plus
 // a red/green open-front room at (-13, 0, -13), seen through its opening).
-// Prints the mean frame time and the `RenderStats`. The timed frames run
+// Prints the backend, the mean frame time and the `RenderStats`. The timed frames run
 // before the capture, so the GI probes have converged.
 // Debug flags (any order): --ao-only saves the SSAO term (grey, white =
 // open) instead of the image; --no-ao renders with `ao_strength` 0;
@@ -314,7 +314,8 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
         stats = render_and_wait(&mut renderer, &frame, &mut server, &target)?;
     }
     println!(
-        "{view}: {} models, {:.2} ms per frame (render_scene + submit + wait, mean of {TIMED_FRAMES})",
+        "{view}: {:?}, {} models, {:.2} ms per frame (render_scene + submit + wait, mean of {TIMED_FRAMES})",
+        renderer.backend(),
         frame.models.len(),
         start.elapsed().as_secs_f64() * 1000.0 / f64::from(TIMED_FRAMES)
     );

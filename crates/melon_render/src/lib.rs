@@ -677,6 +677,8 @@ pub struct Renderer {
     window: Arc<Window>,
     /// Chosen once at init (`choose_present_mode`).
     present_mode: wgpu::PresentMode,
+    /// The adapter's backend (`backend_order`).
+    backend: wgpu::Backend,
     scene: SceneRenderer,
     /// GPU models per asset handle, used by `render_scene`.
     model_cache: ModelCache,
@@ -718,6 +720,23 @@ fn choose_present_mode(available: &[wgpu::PresentMode], forced: Option<&str>) ->
         wgpu::PresentMode::Mailbox
     } else {
         wgpu::PresentMode::Fifo
+    }
+}
+
+/// Backend sets to try in order. Windows tries DX12 first (AMD's Vulkan
+/// driver there offers no `Mailbox`), then the default set.
+/// `MELON_BACKEND=vulkan|dx12|auto` overrides it; unknown values mean auto.
+fn backend_order(windows: bool, forced: Option<&str>) -> Vec<wgpu::Backends> {
+    match forced {
+        Some("vulkan") => return vec![wgpu::Backends::VULKAN],
+        Some("dx12") => return vec![wgpu::Backends::DX12],
+        None | Some("auto") => {}
+        Some(other) => tracing::warn!("MELON_BACKEND={other:?} unknown, using auto"),
+    }
+    if windows {
+        vec![wgpu::Backends::DX12, wgpu::Backends::default()]
+    } else {
+        vec![wgpu::Backends::default()]
     }
 }
 
@@ -764,11 +783,23 @@ fn create_instance_buffer(
 impl Renderer {
     #[instrument(skip(window), level = "info")]
     pub async fn new(window: Arc<Window>) -> Result<Self> {
-        let instance = wgpu::Instance::default();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await
-            .context("no suitable wgpu adapter found")?;
+        let forced = std::env::var("MELON_BACKEND").ok();
+        let mut found = None;
+        for backends in backend_order(cfg!(windows), forced.as_deref()) {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            if let Ok(adapter) = instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+            {
+                found = Some((instance, adapter));
+                break;
+            }
+        }
+        let (instance, adapter) = found.context("no suitable wgpu adapter found")?;
+        let backend = adapter.get_info().backend;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default())
             .await
@@ -803,6 +834,7 @@ impl Renderer {
             size,
             window,
             present_mode,
+            backend,
             scene,
             model_cache,
             overlay,
@@ -818,6 +850,11 @@ impl Renderer {
     /// `Mailbox` does not wait for vblank: the host caps the frame rate then.
     pub fn present_mode(&self) -> wgpu::PresentMode {
         self.present_mode
+    }
+
+    /// The graphics API in use (DX12 first on Windows, `MELON_BACKEND`).
+    pub fn backend(&self) -> wgpu::Backend {
+        self.backend
     }
 
     /// Record one view of `frame` into `target`: shadow pass, SSAO passes, 3D
@@ -3362,6 +3399,19 @@ mod tests {
             choose_present_mode(&[Fifo, Mailbox], Some("other")),
             Mailbox
         );
+    }
+
+    #[test]
+    fn backend_order_prefers_dx12_on_windows_unless_forced() {
+        use wgpu::Backends;
+        let all = Backends::default();
+        assert_eq!(backend_order(true, None), [Backends::DX12, all]);
+        assert_eq!(backend_order(false, None), [all]);
+        assert_eq!(backend_order(true, Some("auto")), [Backends::DX12, all]);
+        assert_eq!(backend_order(true, Some("vulkan")), [Backends::VULKAN]);
+        assert_eq!(backend_order(false, Some("dx12")), [Backends::DX12]);
+        assert_eq!(backend_order(true, Some("bogus")), [Backends::DX12, all]);
+        assert_eq!(backend_order(false, Some("bogus")), [all]);
     }
 
     /// Unit quad in the XY plane facing +Z, UVs given per corner
