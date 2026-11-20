@@ -15,13 +15,15 @@ fmt:
 fmt-check:
     cargo fmt --all --check
 
-# Run clippy with warnings denied (gate).
+# Run clippy with warnings denied (gate), also on the player build (no editor).
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy -p melon_host --no-default-features -- -D warnings
 
-# Compile-check all crates (gate).
+# Compile-check all crates and the player build (gate).
 check:
     cargo check --workspace
+    cargo check -p melon_host --no-default-features
 
 # Full gate: fmt-check + clippy + check. Run before commit and before run.
 gate: fmt-check clippy check

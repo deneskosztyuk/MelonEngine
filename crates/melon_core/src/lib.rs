@@ -13,6 +13,7 @@ pub mod actions;
 pub mod assets;
 pub mod audio;
 pub mod components;
+pub mod cursor;
 pub mod hierarchy;
 pub mod input;
 pub mod pack;
@@ -43,6 +44,7 @@ pub use components::{
     Aabb, Bob, BodyInfo, BodyKind, Name, PendingDelete, PreviousTransform, Spin, Transform,
     store_previous_transforms_system,
 };
+pub use cursor::{AppExit, Cursor, CursorMode};
 pub use glam;
 pub use hierarchy::{ChildOf, Children, GlobalTransform};
 pub use input::{GameInputGate, Input, InputButton, InputFocus, KeyCode, MouseButton, RawPresses};
@@ -167,6 +169,8 @@ impl Core {
         world.init_resource::<PhysicsSettings>();
         world.init_resource::<scene::SceneRequests>();
         world.init_resource::<PlayerSettings>();
+        world.init_resource::<Cursor>();
+        world.init_resource::<AppExit>();
 
         let mut core = Self {
             world,

@@ -29,7 +29,7 @@ use winit::{
 };
 
 use crate::{
-    PROJECT_ROOT, clear_raw_presses, grab_cursor, map_key, map_mouse, pacing, record_button,
+    PROJECT_ROOT, apply_cursor, clear_raw_presses, map_key, map_mouse, pacing, record_button,
     release_game_input,
 };
 
@@ -53,6 +53,8 @@ struct Player {
     audio: melon_audio::AudioEngine,
     settings: PlayerSettings,
     last_frame: Option<Instant>,
+    /// Last cursor applied to the window (`None` = not yet, or dropped on focus loss).
+    cursor_applied: Option<melon_core::Cursor>,
     pacer: Option<pacing::FrameDeadline>,
     frame_period: std::time::Duration,
     /// Frames drawn so far, and the `--frames N` limit.
@@ -130,6 +132,7 @@ impl Player {
             audio: melon_audio::AudioEngine::new(),
             settings,
             last_frame: None,
+            cursor_applied: None,
             pacer: None,
             frame_period: pacing::frame_period(None),
             drawn: 0,
@@ -171,6 +174,17 @@ impl Player {
         self.core.update();
         self.audio.update(&mut self.core.world);
         clear_raw_presses(&mut self.core.world);
+        if self.core.world.resource_mut::<melon_core::AppExit>().take() {
+            tracing::info!("the game asked to quit");
+            event_loop.exit();
+            return;
+        }
+        if let Some(window) = self.window.as_ref() {
+            let wanted = *self.core.world.resource::<melon_core::Cursor>();
+            if let Some(cursor) = wanted.to_apply(&mut self.cursor_applied, false) {
+                apply_cursor(window, cursor);
+            }
+        }
 
         let (Some(renderer), Some(target)) = (self.renderer.as_mut(), self.target.as_mut()) else {
             return;
@@ -204,6 +218,26 @@ impl Player {
         }
     }
 
+    /// Draw from inside an event callback once a frame is a period late: a
+    /// mouse-look flood keeps winit's queue full, so `about_to_wait` alone would
+    /// hold frames back (the editor does the same).
+    fn draw_if_overdue(&mut self, event_loop: &ActiveEventLoop) {
+        if pacing::frame_overdue(self.last_frame, Instant::now(), self.frame_period) {
+            self.draw_unless_minimized(event_loop);
+        }
+    }
+
+    /// Minimized: no frames (and no game updates).
+    fn draw_unless_minimized(&mut self, event_loop: &ActiveEventLoop) {
+        if self
+            .window
+            .as_ref()
+            .is_some_and(|w| w.is_minimized() != Some(true))
+        {
+            self.draw_frame(event_loop);
+        }
+    }
+
     /// Match the render target and the camera to the window.
     fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
         let Some(renderer) = self.renderer.as_mut() else {
@@ -226,13 +260,7 @@ impl Player {
 
 impl ApplicationHandler for Player {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self
-            .window
-            .as_ref()
-            .is_some_and(|w| w.is_minimized() != Some(true))
-        {
-            self.draw_frame(event_loop);
-        }
+        self.draw_unless_minimized(event_loop);
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -296,8 +324,6 @@ impl ApplicationHandler for Player {
         self.window = Some(window.clone());
         self.renderer = Some(renderer);
         self.resize(size);
-        // The game owns the mouse, as in the editor's Play.
-        grab_cursor(&window, true);
         event_loop.listen_device_events(pacing::device_events(true));
         window.focus_window();
         window.request_redraw();
@@ -311,7 +337,13 @@ impl ApplicationHandler for Player {
             }
             WindowEvent::Focused(focused) => {
                 if let Some(window) = self.window.as_ref() {
-                    grab_cursor(window, focused);
+                    if focused {
+                        // Re-apply the game's cursor (a lost focus dropped the grab).
+                        self.cursor_applied = None;
+                    } else {
+                        apply_cursor(window, melon_core::Cursor::default());
+                        self.cursor_applied = None;
+                    }
                 }
                 if !focused {
                     release_game_input(&mut self.core.world);
@@ -344,14 +376,16 @@ impl ApplicationHandler for Player {
             WindowEvent::RedrawRequested => self.draw_frame(event_loop),
             _ => {}
         }
+        self.draw_if_overdue(event_loop);
     }
 
-    fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+    fn device_event(&mut self, event_loop: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta: (x, y) } = event
             && let Some(mut input) = self.core.world.get_resource_mut::<Input>()
         {
             input.mouse_delta += melon_core::glam::Vec2::new(x as f32, y as f32);
         }
+        self.draw_if_overdue(event_loop);
     }
 }
 

@@ -257,19 +257,22 @@ fn clear_raw_presses(world: &mut World) {
     }
 }
 
-/// Hide and confine the cursor for the game, or give it back to the editor.
-fn grab_cursor(window: &Window, grab: bool) {
-    let result = if grab {
-        window
+/// Apply the cursor the game asked for (`melon_core::Cursor`).
+fn apply_cursor(window: &Window, cursor: melon_core::Cursor) {
+    use melon_core::CursorMode;
+    let result = match cursor.mode {
+        CursorMode::Free => window.set_cursor_grab(CursorGrabMode::None),
+        CursorMode::Confined => window
             .set_cursor_grab(CursorGrabMode::Confined)
-            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked))
-    } else {
-        window.set_cursor_grab(CursorGrabMode::None)
+            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Locked)),
+        CursorMode::Locked => window
+            .set_cursor_grab(CursorGrabMode::Locked)
+            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined)),
     };
     if let Err(error) = result {
-        tracing::warn!(?error, grab, "cursor grab failed");
+        tracing::warn!(?error, ?cursor, "cursor grab failed");
     }
-    window.set_cursor_visible(!grab);
+    window.set_cursor_visible(cursor.visible);
 }
 
 #[cfg(feature = "editor")]
@@ -287,6 +290,8 @@ struct App {
     core: melon_core::Core,
     /// Last `GameInputGate` value applied (input routing and cursor grab).
     game_input: bool,
+    /// Last cursor applied to the window.
+    cursor_applied: Option<melon_core::Cursor>,
     /// `config/input.ron` failed to load: the editor backs it up before its first save.
     input_map_broken: bool,
     /// `config/quality.ron` failed to load: the editor backs it up before its first Apply.
@@ -409,6 +414,7 @@ impl App {
             thumbnail_target: None,
             core,
             game_input: false,
+            cursor_applied: None,
             input_map_broken,
             quality_broken,
             audio_broken,
@@ -490,6 +496,12 @@ impl App {
         self.game.poll(dt, &mut self.core);
 
         self.core.update();
+        // A game asking to quit stops Play; the editor stays open.
+        if self.core.world.resource_mut::<melon_core::AppExit>().take()
+            && let Err(error) = melon_editor::play::stop(&mut self.core.world)
+        {
+            tracing::error!(?error, "stop after a quit request failed");
+        }
         // Editor requests (clip preview) from the last frame play now.
         self.audio.update(&mut self.core.world);
         self.stats.lap(pacing::Stage::Update);
@@ -536,8 +548,20 @@ impl App {
         if let Some(mut input) = self.core.world.get_resource_mut::<Input>()
             && apply_gate(&mut input, &mut self.game_input, gate)
         {
-            grab_cursor(window, gate);
             event_loop.listen_device_events(pacing::device_events(gate));
+        }
+        // The game's cursor while it has input; the editor's (free) after Esc / Stop.
+        let wanted = if gate {
+            self.core
+                .world
+                .get_resource::<melon_core::Cursor>()
+                .copied()
+                .unwrap_or_default()
+        } else {
+            melon_core::Cursor::default()
+        };
+        if let Some(cursor) = wanted.to_apply(&mut self.cursor_applied, false) {
+            apply_cursor(window, cursor);
         }
         if editor_ui.run_pending_operation(&mut self.core.world) {
             event_loop.exit();
