@@ -48,8 +48,13 @@ impl GameLoader {
 
     /// Copy the dylib to a fresh name (Windows locks loaded files, cargo must
     /// overwrite the original), load it, check its fingerprint and rebuild
-    /// the plugin schedules. On failure the previous plugin stays.
+    /// the plugin schedules. On failure the previous plugin stays, except when
+    /// a resource changed its layout: then no plugin system runs.
     pub fn load(&mut self, core: &mut Core) -> Result<(), String> {
+        self.load_expecting(core, melon_core::abi_fingerprint())
+    }
+
+    fn load_expecting(&mut self, core: &mut Core, expected: u64) -> Result<(), String> {
         let source = &self.source;
         let modified = std::fs::metadata(source)
             .and_then(|meta| meta.modified())
@@ -65,12 +70,19 @@ impl GameLoader {
         std::fs::copy(source, &copy).map_err(|e| format!("copy to {}: {e}", copy.display()))?;
         // SAFETY: the library is melon_game built by this workspace; loading
         // runs only its Rust static initialisers.
-        let library = unsafe { libloading::Library::new(&copy) }
-            .map_err(|e| format!("{}: {e}", copy.display()))?;
+        let library = unsafe { libloading::Library::new(&copy) }.map_err(|e| {
+            format!(
+                "{}: {e} (start dev builds through `cargo run` / `just dev-run`                  so Rust's std dll is on PATH)",
+                copy.display()
+            )
+        })?;
+        // Its code has run (initialisers, then `melon_game_abi`): never free it.
+        self.loaded.push(library);
+        let library = &self.loaded[self.loaded.len() - 1];
         // SAFETY: the symbol is `melon_game_abi`, declared `fn() -> u64`.
         let abi = unsafe { library.get::<fn() -> u64>(b"melon_game_abi") }
             .map_err(|e| format!("melon_game_abi: {e}"))?;
-        if abi() != melon_core::abi_fingerprint() {
+        if abi() != expected {
             return Err(
                 "ABI fingerprint differs from the host; build the game with `just game`".into(),
             );
@@ -80,10 +92,7 @@ impl GameLoader {
         let build =
             *unsafe { library.get::<fn(&mut App, &tracing::Dispatch)>(b"melon_game_build") }
                 .map_err(|e| format!("melon_game_build: {e}"))?;
-        // Keep the library before its code runs, so its functions stay valid.
-        self.loaded.push(library);
-        core.rebuild_plugins(|app| build(app, &tracing::dispatcher::get_default(Clone::clone)));
-        Ok(())
+        core.rebuild_plugins(|app| build(app, &tracing::dispatcher::get_default(Clone::clone)))
     }
 
     /// Every `POLL_INTERVAL` seconds, reload the dylib if its modified time changed.
@@ -100,7 +109,7 @@ impl GameLoader {
         match self.load(core) {
             Ok(()) => tracing::info!("Game plugin reloaded"),
             Err(error) => {
-                tracing::error!("Game plugin reload failed, keeping the old one: {error}")
+                tracing::error!("Game plugin reload failed: {error}")
             }
         }
     }
@@ -186,6 +195,45 @@ mod tests {
         let rot = core.world.get::<Transform>(e).unwrap().rotation;
         // Only the second build's systems run: 0.5 rad/s * 0.2 s, once.
         assert!(rot.angle_between(melon_core::glam::Quat::from_rotation_y(0.1)) < 1e-5);
+    }
+
+    #[test]
+    fn fingerprint_mismatch_keeps_library_and_old_plugin() {
+        use melon_core::{SimulationState, Spin, Time, Transform};
+        let built = std::env::current_exe()
+            .unwrap()
+            .with_file_name(libloading::library_filename("melon_game"));
+        let dir = std::env::temp_dir().join(format!("melon_mismatch_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join(built.file_name().unwrap());
+        std::fs::copy(&built, &source).unwrap();
+        let mut core = Core::new();
+        let mut loader = GameLoader::new(source);
+        loader.load(&mut core).unwrap();
+        let error = loader
+            .load_expecting(&mut core, melon_core::abi_fingerprint() ^ 1)
+            .unwrap_err();
+        assert!(error.contains("fingerprint"), "{error}");
+        // The mismatched library ran code, so it stays loaded.
+        assert_eq!(loader.loaded.len(), 2);
+        let e = core.world.spawn((Transform::default(), Spin)).id();
+        core.world.insert_resource(SimulationState::Playing);
+        core.world.resource_mut::<Time>().update(0.2);
+        core.update();
+        let rot = core.world.get::<Transform>(e).unwrap().rotation;
+        assert!(rot.angle_between(melon_core::glam::Quat::from_rotation_y(0.1)) < 1e-5);
+    }
+
+    #[test]
+    fn unloadable_library_error_hints_at_cargo_run() {
+        let dir = std::env::temp_dir().join(format!("melon_garbage_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("melon_game.dll");
+        std::fs::write(&source, b"not a library").unwrap();
+        let mut core = Core::new();
+        let error = GameLoader::new(source).load(&mut core).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(error.contains("cargo run"), "{error}");
     }
 
     #[test]
