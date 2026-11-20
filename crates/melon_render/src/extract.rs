@@ -7,8 +7,8 @@ use glam::{Mat4, Vec3};
 use melon_core::bevy_ecs::world::World;
 use melon_core::hierarchy::render_matrices;
 use melon_core::{
-    AssetServer, Camera, Environment, Handle, Light, Material, MeshMaterials, Model, PointLight,
-    RenderQuality, SimulationState, SpotLight, Time,
+    AssetServer, Camera, Environment, Handle, Light, Lod, LodState, Material, MeshMaterials, Model,
+    PointLight, RenderQuality, SimulationState, SpotLight, Time,
 };
 
 /// Everything one view needs to draw a frame.
@@ -36,6 +36,65 @@ pub struct FrameData {
 /// paused, so the pose holds still). In edit mode draw the current pose.
 pub fn blends(state: SimulationState) -> bool {
     state != SimulationState::Editing
+}
+
+/// Draw each `Lod` entity at the level its screen height picks (the model
+/// bounds come from the `AssetServer`, a unit cube until loaded), and
+/// remember the level in `LodState` so it holds on its thresholds.
+fn add_lod_models(
+    world: &mut World,
+    matrices: &HashMap<melon_core::bevy_ecs::entity::Entity, Mat4>,
+    view_proj: Mat4,
+    models: &mut Vec<(Mat4, Handle<Model>)>,
+) {
+    let mut query = world.query::<(
+        melon_core::bevy_ecs::entity::Entity,
+        &Lod,
+        Option<&LodState>,
+    )>();
+    let lods: Vec<_> = query
+        .iter(world)
+        .filter(|(e, lod, _)| !lod.levels.is_empty() && matrices.contains_key(e))
+        .map(|(e, lod, state)| (e, lod.clone(), state.map(|s| s.0)))
+        .collect();
+    if lods.is_empty() || !world.contains_resource::<AssetServer>() {
+        return;
+    }
+    let mut states = Vec::new();
+    world.resource_scope(
+        |_, mut server: melon_core::bevy_ecs::prelude::Mut<AssetServer>| {
+            for (e, lod, state) in &lods {
+                let matrix = matrices[e];
+                let handles: Vec<_> = lod.levels.iter().map(|l| l.resolve(&mut server)).collect();
+                let (min, max) = handles
+                    .iter()
+                    .flatten()
+                    .find_map(|h| server.bounds(*h))
+                    .unwrap_or((Vec3::splat(-0.5), Vec3::splat(0.5)));
+                let scale = matrix
+                    .x_axis
+                    .length()
+                    .max(matrix.y_axis.length())
+                    .max(matrix.z_axis.length());
+                let centre = matrix.transform_point3((min + max) * 0.5);
+                let height = melon_core::lod::screen_height(
+                    view_proj,
+                    centre,
+                    (max - min).length() * 0.5 * scale,
+                );
+                let thresholds: Vec<f32> = lod.levels.iter().map(|l| l.screen_height).collect();
+                let level =
+                    melon_core::lod::select_level(&thresholds, lod.hysteresis, height, *state);
+                states.push((*e, level.unwrap_or(lod.levels.len())));
+                if let Some(handle) = level.and_then(|i| handles[i]) {
+                    models.push((matrix, handle));
+                }
+            }
+        },
+    );
+    for (e, level) in states {
+        world.entity_mut(e).insert(LodState(level));
+    }
 }
 
 /// Read the camera, the light, the environment and every model entity's world matrix
@@ -69,8 +128,13 @@ pub fn extract(world: &mut World) -> FrameData {
         melon_core::bevy_ecs::entity::Entity,
         &Handle<Model>,
         Option<&MeshMaterials>,
+        Option<&Lod>,
     )>();
-    for (e, h, materials) in query.iter(world) {
+    for (e, h, materials, lod) in query.iter(world) {
+        // An entity with LOD levels draws the chosen level instead.
+        if lod.is_some_and(|lod| !lod.levels.is_empty()) {
+            continue;
+        }
         if let Some(m) = matrices.get(&e) {
             if let Some(materials) = materials {
                 slots.push((models.len(), materials.clone()));
@@ -78,6 +142,7 @@ pub fn extract(world: &mut World) -> FrameData {
             models.push((*m, *h));
         }
     }
+    add_lod_models(world, &matrices, view_proj, &mut models);
     let mut overrides = HashMap::new();
     if let Some(mut server) = world.get_resource_mut::<AssetServer>() {
         for (index, materials) in slots {
@@ -181,6 +246,57 @@ mod tests {
         assert!(parts[0].is_none());
         let server = world.resource::<AssetServer>();
         assert_eq!(server.path(parts[1].unwrap()), "assets/m.mat");
+    }
+
+    #[test]
+    fn lod_entities_draw_the_level_their_distance_picks_with_hysteresis() {
+        use melon_core::{Lod, LodLevel, LodState};
+        let level = |path: &str, screen_height| LodLevel {
+            guid: String::new(),
+            path: path.into(),
+            screen_height,
+        };
+        let mut world = World::new();
+        world.insert_resource(AssetServer::new(".".into()));
+        let camera = Camera {
+            eye: Vec3::ZERO,
+            center: Vec3::new(0.0, 0.0, -1.0),
+            aspect: 1.0,
+            ..Default::default()
+        };
+        // The unit cube (radius 0.866) covers this share of the view at 8 m.
+        let t0 =
+            melon_core::lod::screen_height(camera.view_proj(), Vec3::new(0.0, 0.0, -8.0), 0.866);
+        world.insert_resource(camera);
+        let e = world
+            .spawn((
+                Transform::from_translation(Vec3::new(0.0, 0.0, -5.0)),
+                Lod {
+                    levels: vec![level("builtin:cube", t0), level("assets/far.glb", 0.01)],
+                    hysteresis: 0.1,
+                },
+            ))
+            .id();
+        let drawn = |world: &mut World, z: f32| {
+            world.get_mut::<Transform>(e).unwrap().translation.z = z;
+            let frame = extract(world);
+            let server = world.resource::<AssetServer>();
+            frame
+                .models
+                .iter()
+                .map(|(_, h)| server.path(*h).to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(drawn(&mut world, -5.0), ["builtin:cube"]);
+        assert_eq!(drawn(&mut world, -20.0), ["assets/far.glb"]);
+        assert!(drawn(&mut world, -400.0).is_empty(), "culled when tiny");
+        assert_eq!(world.get::<LodState>(e), Some(&LodState(2)));
+        // The level-0 threshold sits at 8 m. Coming from far, the switch
+        // back needs 10% more height; going away, 10% less.
+        let _ = drawn(&mut world, -20.0);
+        assert_eq!(drawn(&mut world, -7.9), ["assets/far.glb"], "held");
+        assert_eq!(drawn(&mut world, -6.0), ["builtin:cube"]);
+        assert_eq!(drawn(&mut world, -8.5), ["builtin:cube"], "held");
     }
 
     #[test]

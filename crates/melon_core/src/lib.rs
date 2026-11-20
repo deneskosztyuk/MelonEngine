@@ -16,6 +16,7 @@ pub mod components;
 pub mod hierarchy;
 pub mod input;
 pub mod local_lights;
+pub mod lod;
 pub mod material;
 pub mod physics;
 pub mod physics_settings;
@@ -47,6 +48,7 @@ pub use glam;
 pub use hierarchy::{ChildOf, Children, GlobalTransform};
 pub use input::{GameInputGate, Input, InputButton, InputFocus, KeyCode, MouseButton, RawPresses};
 pub use local_lights::{PointLight, SpotLight};
+pub use lod::{Lod, LodLevel, LodState};
 pub use material::{AlphaMode, MaterialAsset, MaterialSlot, MeshMaterials, TextureRef};
 pub use physics::{
     CharacterController, Collider, ColliderShape, CollisionEvent, CollisionEventKind, Joint,
@@ -193,7 +195,8 @@ impl Core {
             .register_component::<AudioListener>()
             .register_component::<MeshMaterials>()
             .register_component::<PointLight>()
-            .register_component::<SpotLight>();
+            .register_component::<SpotLight>()
+            .register_component::<Lod>();
         core
     }
 
