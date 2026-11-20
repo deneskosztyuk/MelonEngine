@@ -1239,4 +1239,27 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Fixture: a real `.melon/content_browser.ron` written by `save_settings` (ron 0.8).
+    #[test]
+    fn content_browser_ron_fixture_loads() {
+        let ron = r#"(
+    version: 1,
+    favorites: [],
+    tile_size: 80.0,
+    last_folder: Some("branding"),
+    tree_width: 200.0,
+)"#;
+        let settings: ContentSettings = ron::from_str(ron).unwrap();
+        assert_eq!(
+            settings,
+            ContentSettings {
+                version: 1,
+                favorites: Vec::new(),
+                tile_size: 80.0,
+                last_folder: Some("branding".to_string()),
+                tree_width: 200.0,
+            }
+        );
+    }
 }

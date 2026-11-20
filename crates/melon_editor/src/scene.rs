@@ -950,4 +950,130 @@ mod tests {
         assert_eq!(model_path_of(&mut world, "A"), "assets/models/a.glb");
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// Checks the two-entity scene the v3 and v4 fixtures hold.
+    fn assert_fixture_scene(data: &SceneData, version: u32) {
+        assert_eq!(data.version, version);
+        assert_eq!(data.name_counter, 3);
+        let [floor, cube] = &data.entities[..] else {
+            panic!("expected 2 entities");
+        };
+        assert_eq!(floor.name, "Floor");
+        assert_eq!(floor.transform.translation, Vec3::new(0.0, -1.0, 0.0));
+        assert_eq!(floor.transform.rotation, Quat::IDENTITY);
+        assert_eq!(floor.transform.scale, Vec3::ONE);
+        assert_eq!(floor.parent, None);
+        assert_eq!(floor.model.as_deref(), Some("builtin:cube"));
+        assert_eq!(floor.model_guid, None);
+        assert_eq!(floor.aabb.unwrap().half_extents, Vec3::new(10.0, 0.5, 10.0));
+        let body = floor.body_info.unwrap();
+        assert_eq!(body.body_type, BodyKind::Fixed);
+        assert_eq!(body.half_extents, Vec3::new(10.0, 0.5, 10.0));
+        assert!(floor.spin.is_none() && floor.bob.is_none());
+        assert_eq!(cube.name, "Cube");
+        assert_eq!(cube.transform.translation, Vec3::new(0.0, 2.0, 0.0));
+        assert_eq!(cube.parent, Some(0));
+        assert_eq!(cube.model.as_deref(), Some("assets/models/cube.glb"));
+        assert!(cube.aabb.is_none() && cube.body_info.is_none());
+        assert!(cube.spin.is_some() && cube.bob.is_some());
+    }
+
+    /// Fixture: `save_scene` output (ron 0.8 pretty) of a version 3 scene.
+    #[test]
+    fn v3_scene_fixture_loads() {
+        let ron = r#"(
+    version: 3,
+    entities: [
+        (
+            name: "Floor",
+            transform: (
+                translation: (0.0, -1.0, 0.0),
+                rotation: (0.0, 0.0, 0.0, 1.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            parent: None,
+            model: Some("builtin:cube"),
+            aabb: Some((
+                half_extents: (10.0, 0.5, 10.0),
+            )),
+            body_info: Some((
+                body_type: Fixed,
+                half_extents: (10.0, 0.5, 10.0),
+            )),
+            spin: None,
+            bob: None,
+        ),
+        (
+            name: "Cube",
+            transform: (
+                translation: (0.0, 2.0, 0.0),
+                rotation: (0.0, 0.0, 0.0, 1.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            parent: Some(0),
+            model: Some("assets/models/cube.glb"),
+            aabb: None,
+            body_info: None,
+            spin: Some(()),
+            bob: Some(()),
+        ),
+    ],
+    name_counter: 3,
+)"#;
+        let data: SceneData = ron::from_str(ron).unwrap();
+        assert_fixture_scene(&data, 3);
+        assert_eq!(data.entities[1].model_guid, None);
+    }
+
+    /// Fixture: `save_scene` output (ron 0.8 pretty) of a version 4 scene.
+    #[test]
+    fn v4_scene_fixture_loads() {
+        let ron = r#"(
+    version: 4,
+    entities: [
+        (
+            name: "Floor",
+            transform: (
+                translation: (0.0, -1.0, 0.0),
+                rotation: (0.0, 0.0, 0.0, 1.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            parent: None,
+            model: Some("builtin:cube"),
+            model_guid: None,
+            aabb: Some((
+                half_extents: (10.0, 0.5, 10.0),
+            )),
+            body_info: Some((
+                body_type: Fixed,
+                half_extents: (10.0, 0.5, 10.0),
+            )),
+            spin: None,
+            bob: None,
+        ),
+        (
+            name: "Cube",
+            transform: (
+                translation: (0.0, 2.0, 0.0),
+                rotation: (0.0, 0.0, 0.0, 1.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            parent: Some(0),
+            model: Some("assets/models/cube.glb"),
+            model_guid: Some("334087e7-ba37-4ff4-b11f-bc731349dbfa"),
+            aabb: None,
+            body_info: None,
+            spin: Some(()),
+            bob: Some(()),
+        ),
+    ],
+    name_counter: 3,
+)"#;
+        let data: SceneData = ron::from_str(ron).unwrap();
+        assert_fixture_scene(&data, 4);
+        assert_eq!(
+            data.entities[1].model_guid,
+            Some("334087e7-ba37-4ff4-b11f-bc731349dbfa".parse().unwrap())
+        );
+    }
 }

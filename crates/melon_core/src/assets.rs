@@ -697,4 +697,26 @@ mod tests {
         assert_eq!(server.guid_of("assets/models/a.glb"), None);
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// Fixture: a `.meta` file as `AssetMeta::to_ron` writes it.
+    #[test]
+    fn meta_fixture_loads() {
+        let root = temp_root("meta_fixture");
+        let path = root.join("assets/models/cube.glb.meta");
+        std::fs::write(
+            &path,
+            "(version: 1, guid: \"334087e7-ba37-4ff4-b11f-bc731349dbfa\")
+",
+        )
+        .unwrap();
+        let meta = AssetMeta::read(&path).unwrap();
+        assert_eq!(
+            meta,
+            AssetMeta {
+                version: 1,
+                guid: "334087e7-ba37-4ff4-b11f-bc731349dbfa".parse().unwrap(),
+            }
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
