@@ -630,24 +630,29 @@ impl Editor {
             Request::NewFolder(parent) => {
                 let dir =
                     asset_ops::create_folder(&mut world.resource_mut::<AssetServer>(), &parent)?;
+                // Show the folder it went into (no search), so the rename field is on screen.
+                self.content.open(parent);
+                self.content.set_search(String::new());
                 self.content.refresh();
                 self.content.start_rename(dir.clone());
                 Some(dir)
             }
-            Request::Rename(path, name) => Some(asset_ops::rename(
-                &mut world.resource_mut::<AssetServer>(),
-                &path,
-                &name,
-            )?),
+            Request::Rename(path, name) => {
+                let new =
+                    asset_ops::rename(&mut world.resource_mut::<AssetServer>(), &path, &name)?;
+                self.follow_current_scene(&path, &new);
+                Some(new)
+            }
             Request::Duplicate(path) => Some(asset_ops::duplicate(
                 &mut world.resource_mut::<AssetServer>(),
                 &path,
             )?),
-            Request::Move(path, folder) => Some(asset_ops::move_to(
-                &mut world.resource_mut::<AssetServer>(),
-                &path,
-                &folder,
-            )?),
+            Request::Move(path, folder) => {
+                let new =
+                    asset_ops::move_to(&mut world.resource_mut::<AssetServer>(), &path, &folder)?;
+                self.follow_current_scene(&path, &new);
+                Some(new)
+            }
             Request::Import(files, folder) => {
                 let results =
                     asset_ops::import(&mut world.resource_mut::<AssetServer>(), &files, &folder);
@@ -691,6 +696,10 @@ impl Editor {
                 if path.is_dir() {
                     self.content.open(path);
                 } else if content::is_scene_path(&self.project_root, &path) {
+                    // Asking "Save?" while playing would save the play state.
+                    if sim_state(world) != SimulationState::Editing {
+                        anyhow::bail!("Stop playing to open a scene");
+                    }
                     self.confirm_open = Some(path);
                 } else {
                     asset_ops::open_external(&path);
@@ -703,6 +712,20 @@ impl Editor {
             self.content.select(Some(path));
         }
         Ok(())
+    }
+
+    /// The open scene's file (or a folder holding it) moved: Ctrl+S must
+    /// write to the new place.
+    fn follow_current_scene(&mut self, old: &std::path::Path, new: &std::path::Path) {
+        if let Some(current) = &self.current_scene
+            && let Ok(rest) = current.strip_prefix(old)
+        {
+            self.current_scene = Some(if rest.as_os_str().is_empty() {
+                new.to_path_buf()
+            } else {
+                new.join(rest)
+            });
+        }
     }
 
     /// Save is offered only when the open scene has a file to save to.
@@ -719,6 +742,10 @@ impl Editor {
         match choice {
             OpenChoice::Cancel => return,
             OpenChoice::Save => {
+                if sim_state(world) != SimulationState::Editing {
+                    self.set_status_error("Stop playing to open a scene".into());
+                    return;
+                }
                 let Some(current) = self.current_scene.clone() else {
                     self.set_status_error("Use File \u{25b8} Save As first".into());
                     return;
@@ -785,6 +812,10 @@ impl Editor {
                 .collect()
         });
         let shown = std::mem::take(&mut self.content_shown);
+        // A browser in a hidden tab cannot own the keyboard.
+        if !shown {
+            self.content.focused = false;
+        }
         if dropped.is_empty() {
             return;
         }
@@ -2173,6 +2204,8 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
             }
             EditorTab::ContentBrowser => {
                 self.editor.content_shown = true;
+                self.editor.content.blocked =
+                    self.editor.delete_confirm.is_some() || self.editor.confirm_open.is_some();
                 self.editor.content.ui(ui);
                 self.editor.apply_content_requests(self.world);
             }
@@ -3387,6 +3420,11 @@ mod tests {
         editor.set_selected(Some(entity));
         editor.content.open(root.join("assets/models"));
         editor.content.select(Some(x.clone()));
+        // One frame first: the browser tab has been drawn, as in the running editor.
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            editor.build_ui(&mut world, ui)
+        });
         editor.content.focused = true;
         editor_key(&mut editor, &mut world, egui::Key::Delete);
         assert!(world.get::<melon_core::PendingDelete>(entity).is_none());
@@ -3487,9 +3525,18 @@ mod tests {
         let (mut editor, mut world, root) = browser_project("open_playing");
         let scene = scene_file(&root);
         world.insert_resource(SimulationState::Playing);
+        editor.set_current_scene(root.join("assets/scenes/current.ron"));
         editor.content.request(content::BrowserRequest::Open(scene));
         editor.apply_content_requests(&mut world);
-        editor.resolve_open(&mut world, OpenChoice::DontSave);
+        assert!(
+            editor.confirm_open.is_none(),
+            "no Save prompt while playing"
+        );
+        editor.resolve_open(&mut world, OpenChoice::Save);
+        assert!(
+            !root.join("assets/scenes/current.ron").exists(),
+            "play state not saved"
+        );
         assert!(editor.take_pending_operation().is_none());
         let status = editor
             .status_message
@@ -3548,6 +3595,92 @@ mod tests {
         let imported = root.join("assets/crate.glb");
         assert!(imported.exists());
         assert!(melon_core::meta_path(&imported).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn renaming_the_open_scene_updates_current_scene() {
+        let (mut editor, mut world, root) = browser_project("rename_open_scene");
+        let scene = scene_file(&root);
+        editor.set_current_scene(scene.clone());
+        editor
+            .content
+            .request(content::BrowserRequest::Rename(scene, "level2.ron".into()));
+        editor.apply_content_requests(&mut world);
+        assert_eq!(
+            editor.current_scene,
+            Some(root.join("assets/scenes/level2.ron"))
+        );
+        let folder = root.join("assets/scenes");
+        editor
+            .content
+            .request(content::BrowserRequest::Rename(folder, "levels".into()));
+        editor.apply_content_requests(&mut world);
+        assert_eq!(
+            editor.current_scene,
+            Some(root.join("assets/levels/level2.ron"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn new_folder_elsewhere_shows_it_for_renaming() {
+        let (mut editor, mut world, root) = browser_project("new_folder_elsewhere");
+        editor.content.set_search("x".into());
+        let models = root.join("assets/models");
+        editor
+            .content
+            .request(content::BrowserRequest::NewFolder(models.clone()));
+        editor.apply_content_requests(&mut world);
+        assert_eq!(editor.content.current(), models);
+        assert_eq!(editor.content.search(), "");
+        assert!(
+            editor
+                .content
+                .visible_entries()
+                .iter()
+                .any(|e| e.path == models.join("New Folder"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hidden_browser_loses_focus() {
+        let (mut editor, mut world, root) = browser_project("hidden_focus");
+        let tab = editor
+            .dock
+            .find_tab(&layout::EditorTab::ContentBrowser)
+            .unwrap();
+        editor.dock.remove_tab(tab);
+        editor.content.focused = true;
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                editor.build_ui(&mut world, ui)
+            });
+        }
+        assert!(!editor.content.has_focus());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn browser_keys_wait_while_a_dialog_is_open() {
+        let (mut editor, mut world, root) = browser_project("keys_dialog");
+        let scene = scene_file(&root);
+        editor.content.open(root.join("assets/scenes"));
+        editor.content.select(Some(scene.clone()));
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            editor.build_ui(&mut world, ui)
+        });
+        editor.content.focused = true;
+        editor.delete_confirm = Some(DeleteConfirm {
+            path: scene,
+            used_by: Vec::new(),
+        });
+        editor_key(&mut editor, &mut world, egui::Key::Enter);
+        assert!(editor.confirm_open.is_none());
+        assert!(editor.content.take_requests().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -140,6 +140,15 @@ impl ContentBrowser {
         if pressed {
             self.focused = press_pos.is_some_and(|p| ui.max_rect().contains(p));
         }
+        // A rename of an item that is not shown (other folder, filtered
+        // out) could never finish and would hold the keys.
+        if self
+            .renaming
+            .as_ref()
+            .is_some_and(|r| !self.visible_entries().iter().any(|e| e.path == r.path))
+        {
+            self.renaming = None;
+        }
         self.shortcut_keys(ui, &mut actions);
 
         self.toolbar(ui, &mut actions);
@@ -220,18 +229,20 @@ impl ContentBrowser {
     /// F2 / Ctrl+D / Delete / Enter on the selection, only while the browser
     /// has focus and no text field is being typed in.
     fn shortcut_keys(&self, ui: &egui::Ui, actions: &mut Vec<Action>) {
-        if !self.focused || self.renaming.is_some() || ui.ctx().text_edit_focused() {
+        if !self.focused || self.blocked || self.renaming.is_some() || ui.ctx().text_edit_focused()
+        {
             return;
         }
         let Some(selected) = self.selected().map(Path::to_path_buf) else {
             return;
         };
+        // Fresh presses only: a held Ctrl+D must not keep duplicating.
         let (rename, duplicate, delete, open) = ui.input(|i| {
             (
-                i.key_pressed(egui::Key::F2),
-                i.modifiers.command && i.key_pressed(egui::Key::D),
-                i.key_pressed(egui::Key::Delete),
-                i.key_pressed(egui::Key::Enter),
+                crate::fresh_press(i, egui::Key::F2),
+                i.modifiers.command && crate::fresh_press(i, egui::Key::D),
+                crate::fresh_press(i, egui::Key::Delete),
+                crate::fresh_press(i, egui::Key::Enter),
             )
         });
         if rename {
@@ -702,6 +713,27 @@ mod tests {
         let _ = ctx.run_ui(input, |ui| browser.ui(ui));
     }
 
+    /// Like `frame`, with Ctrl / Cmd held (egui reads modifiers from the
+    /// raw input, not from the key events).
+    fn frame_ctrl(
+        browser: &mut ContentBrowser,
+        ctx: &egui::Context,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 500.0),
+            )),
+            time: Some(time),
+            modifiers: egui::Modifiers::COMMAND,
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| browser.ui(ui));
+    }
+
     fn click(pos: egui::Pos2, button: egui::PointerButton) -> Vec<egui::Event> {
         let press = |pressed| egui::Event::PointerButton {
             pos,
@@ -957,8 +989,16 @@ mod tests {
             [BrowserRequest::AskDelete(dir.join("a.glb"))]
         );
         // Draw the browser in the left half only, so the right half is outside it.
-        let half_frame = |browser: &mut ContentBrowser, time: f64, events| {
+        let half_frame = |browser: &mut ContentBrowser, time: f64, events: Vec<egui::Event>| {
+            let ctrl = events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Key { modifiers, .. } if modifiers.command));
             let input = egui::RawInput {
+                modifiers: if ctrl {
+                    egui::Modifiers::COMMAND
+                } else {
+                    egui::Modifiers::NONE
+                },
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
                     egui::vec2(900.0, 500.0),
@@ -1028,6 +1068,40 @@ mod tests {
             browser.take_requests(),
             [BrowserRequest::Move(dir.join("x.glb"), dir.join("c"))]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn held_ctrl_d_duplicates_once() {
+        let dir = temp_dir("ctrl_d_repeat");
+        let (mut browser, ctx, t) = focused_on_a(&dir);
+        let press = |repeat| egui::Event::Key {
+            key: egui::Key::D,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        frame_ctrl(&mut browser, &ctx, t + 0.1, vec![press(false)]);
+        assert_eq!(browser.take_requests().len(), 1);
+        frame_ctrl(&mut browser, &ctx, t + 0.2, vec![press(true)]);
+        frame_ctrl(&mut browser, &ctx, t + 0.3, vec![press(true)]);
+        assert!(
+            browser.take_requests().is_empty(),
+            "key repeat does not duplicate again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_of_a_hidden_item_is_dropped() {
+        let dir = temp_dir("rename_hidden");
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.start_rename(dir.join("a/b"));
+        let ctx = egui::Context::default();
+        frame(&mut browser, &ctx, 0.0, Vec::new());
+        assert!(browser.renaming.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

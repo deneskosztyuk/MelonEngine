@@ -250,6 +250,8 @@ pub struct ContentBrowser {
     /// Delete, Enter) act on the selection.
     pub(crate) focused: bool,
     pub(crate) renaming: Option<Renaming>,
+    /// An editor dialog is open: the browser's keys wait.
+    pub(crate) blocked: bool,
 }
 
 impl ContentBrowser {
@@ -273,6 +275,7 @@ impl ContentBrowser {
             requests: Vec::new(),
             focused: false,
             renaming: None,
+            blocked: false,
         };
         browser.refresh();
         browser
