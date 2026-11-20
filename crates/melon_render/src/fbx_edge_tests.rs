@@ -156,13 +156,25 @@ struct Spec {
 fn p3(name: &str, kind: &str, v: [f64; 3]) -> N {
     n(
         "P",
-        vec![s(name), s(kind), s(""), s("A"), P::D(v[0]), P::D(v[1]), P::D(v[2])],
+        vec![
+            s(name),
+            s(kind),
+            s(""),
+            s("A"),
+            P::D(v[0]),
+            P::D(v[1]),
+            P::D(v[2]),
+        ],
         vec![],
     )
 }
 
 fn pi(name: &str, v: i32) -> N {
-    n("P", vec![s(name), s("int"), s("Integer"), s(""), P::I(v)], vec![])
+    n(
+        "P",
+        vec![s(name), s("int"), s("Integer"), s(""), P::I(v)],
+        vec![],
+    )
 }
 
 impl Spec {
@@ -326,7 +338,12 @@ impl Spec {
                     n("RelativeFilename", vec![s(&t.relative)], vec![]),
                 ],
             ));
-            connections.push(conn("OP", id, 3000 + t.material as i64, Some("DiffuseColor")));
+            connections.push(conn(
+                "OP",
+                id,
+                3000 + t.material as i64,
+                Some("DiffuseColor"),
+            ));
         }
         if self.skin_and_animation {
             let count = self.vertices.len();
@@ -342,11 +359,7 @@ impl Spec {
                     "SubDeformer::c",
                     "Cluster",
                     vec![
-                        n(
-                            "Indexes",
-                            vec![P::Iv((0..count as i32).collect())],
-                            vec![],
-                        ),
+                        n("Indexes", vec![P::Iv((0..count as i32).collect())], vec![]),
                         n("Weights", vec![P::Dv(vec![1.0; count])], vec![]),
                         n("Transform", vec![P::Dv(identity())], vec![]),
                         n("TransformLink", vec![P::Dv(identity())], vec![]),
@@ -364,7 +377,11 @@ impl Spec {
                         n("KeyTime", vec![P::Dv(vec![0.0, 46186158000.0])], vec![]),
                         n("KeyValueFloat", vec![P::Dv(vec![0.0, 1.0])], vec![]),
                         n("KeyAttrFlags", vec![P::Iv(vec![24836])], vec![]),
-                        n("KeyAttrDataFloat", vec![P::Dv(vec![0.0, 0.0, 0.0, 0.0])], vec![]),
+                        n(
+                            "KeyAttrDataFloat",
+                            vec![P::Dv(vec![0.0, 0.0, 0.0, 0.0])],
+                            vec![],
+                        ),
                         n("KeyAttrRefCount", vec![P::Iv(vec![2])], vec![]),
                     ],
                 ),
@@ -393,7 +410,13 @@ impl Spec {
                         pi("CoordAxis", 0),
                         n(
                             "P",
-                            vec![s("UnitScaleFactor"), s("double"), s("Number"), s(""), P::D(100.0)],
+                            vec![
+                                s("UnitScaleFactor"),
+                                s("double"),
+                                s("Number"),
+                                s(""),
+                                P::D(100.0),
+                            ],
                             vec![],
                         ),
                     ],
@@ -406,7 +429,9 @@ impl Spec {
 }
 
 fn identity() -> Vec<f64> {
-    (0..16).map(|i| if i % 5 == 0 { 1.0 } else { 0.0 }).collect()
+    (0..16)
+        .map(|i| if i % 5 == 0 { 1.0 } else { 0.0 })
+        .collect()
 }
 
 fn conn(kind: &str, a: i64, b: i64, prop: Option<&str>) -> N {
@@ -553,9 +578,10 @@ fn no_materials_no_uvs_no_normals() {
     for v in &model.meshes[0][0].vertices {
         assert!(
             (Vec3::from_array(v.normal).length() - 1.0).abs() < 1e-3,
-            "{:?}", vd(&v)
+            "{:?}",
+            vd(v)
         );
-        assert!(v.normal[2].abs() > 0.99, "{:?}", vd(&v));
+        assert!(v.normal[2].abs() > 0.99, "{:?}", vd(v));
         assert_eq!(v.uv, [0.0, 0.0]);
     }
 }
@@ -608,7 +634,12 @@ fn non_uniform_scale_pivot_and_geometric_transform_land_where_the_file_says() {
     let model = load(&spec);
     let world = Mat4::from_translation(Vec3::new(10.0, 0.0, 0.0))
         * Mat4::from_translation(Vec3::X)
-        * Mat4::from_quat(Quat::from_euler(EulerRot::ZYX, 0.0, 90f32.to_radians(), 0.0))
+        * Mat4::from_quat(Quat::from_euler(
+            EulerRot::ZYX,
+            0.0,
+            90f32.to_radians(),
+            0.0,
+        ))
         * Mat4::from_translation(-Vec3::X)
         * Mat4::from_scale(Vec3::new(2.0, 1.0, 3.0))
         * Mat4::from_translation(Vec3::new(0.0, 5.0, 0.0))
@@ -645,7 +676,11 @@ fn normals_follow_a_non_uniform_scale_on_a_tilted_surface() {
         .cross(p(indices[2]) - p(indices[0]))
         .normalize();
     for v in &vertices {
-        assert!(Vec3::from_array(v.normal).dot(face) > 0.999, "{:?} vs {face}", vd(&v));
+        assert!(
+            Vec3::from_array(v.normal).dot(face) > 0.999,
+            "{:?} vs {face}",
+            vd(v)
+        );
     }
 }
 
@@ -667,6 +702,11 @@ fn assert_tangent_frames(model: &FbxModel) {
                 let v = &vertices[i as usize];
                 let n = Vec3::from_array(v.normal);
                 let tan = Vec3::new(v.tangent[0], v.tangent[1], v.tangent[2]);
+                assert!(
+                    n.dot(tan).abs() < 1e-3,
+                    "tangent off the surface: {:?}",
+                    vd(v)
+                );
                 let b = n.cross(tan) * v.tangent[3];
                 assert!(b.dot(bitan) < 0.0, "bitangent sign wrong: {:?}", vd(v));
             }
@@ -680,7 +720,7 @@ fn tangent_sign_is_right_with_and_without_a_mirror() {
         for scale in [[1.0, 1.0, 1.0], [-1.0, 1.0, 1.0], [1.0, -1.0, -1.0]] {
             let mut spec = quad();
             spec.tangents = tangents;
-            spec.model_props = vec![("Lcl Scaling", scale)];
+            spec.model_props = vec![("Lcl Scaling", scale), ("Lcl Rotation", [30.0, 40.0, 50.0])];
             assert_tangent_frames(&load(&spec));
         }
     }
@@ -735,7 +775,10 @@ fn tex_spec(textures: Vec<Tex>, materials: usize) -> Spec {
 
 #[test]
 fn foreign_absolute_texture_path_falls_back_to_the_same_folder() {
-    for file in [r"C:\Users\someone\Pictures\skin.png", "/home/someone/skin.png"] {
+    for file in [
+        r"C:\Users\someone\Pictures\skin.png",
+        "/home/someone/skin.png",
+    ] {
         let spec = tex_spec(
             vec![Tex {
                 material: 0,
@@ -802,7 +845,9 @@ fn a_texture_used_by_two_materials_is_read_once() {
         2,
     );
     let mut tree = spec.tree();
-    tree[2].kids.push(conn("OP", 4000, 3001, Some("DiffuseColor")));
+    tree[2]
+        .kids
+        .push(conn("OP", 4000, 3001, Some("DiffuseColor")));
     let reads = Cell::new(0);
     let model = import(
         "assets/models/m.fbx",
@@ -814,7 +859,10 @@ fn a_texture_used_by_two_materials_is_read_once() {
     )
     .unwrap();
     assert_eq!(model.textures.len(), 1);
-    assert_eq!(model.materials[0].textures[0], model.materials[1].textures[0]);
+    assert_eq!(
+        model.materials[0].textures[0],
+        model.materials[1].textures[0]
+    );
     assert!(model.materials[1].textures[0].is_some());
     assert_eq!(reads.get(), 1);
 }
@@ -825,7 +873,11 @@ fn big_binary_file_loads_in_reasonable_time() {
     let mut vertices = Vec::new();
     for y in 0..=N {
         for x in 0..=N {
-            vertices.push([x as f64 * 0.01, ((x * y) % 7) as f64 * 0.001, y as f64 * 0.01]);
+            vertices.push([
+                x as f64 * 0.01,
+                ((x * y) % 7) as f64 * 0.001,
+                y as f64 * 0.01,
+            ]);
         }
     }
     let mut polys = Vec::new();
@@ -848,4 +900,181 @@ fn big_binary_file_loads_in_reasonable_time() {
     );
     assert_eq!(triangle_count(&model), N * N * 2);
     assert!(ms < 20_000, "{ms} ms");
+}
+
+/// Loads every .fbx / .gltf / .glb under `$MELON_ASSET_CORPUS` through the
+/// CPU side of the engine's load path and prints a summary (no GPU upload).
+/// `MELON_ASSET_CORPUS=<dir> cargo test -p melon_render corpus -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn corpus_loads_without_panics() {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+    use std::time::Instant;
+
+    let Some(root) = std::env::var_os("MELON_ASSET_CORPUS") else {
+        println!("MELON_ASSET_CORPUS not set");
+        return;
+    };
+    let root = PathBuf::from(root);
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| {
+                ["fbx", "gltf", "glb"].contains(&x.to_string_lossy().to_lowercase().as_str())
+            }) {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&root, &mut files);
+    files.sort();
+
+    type Loaded = Result<(usize, Option<(Vec3, Vec3)>, usize), String>;
+    struct Done {
+        name: String,
+        ms: u128,
+        triangles: usize,
+        extent: Option<Vec3>,
+        missing: usize,
+    }
+    let (mut ok, mut failures) = (Vec::<Done>::new(), Vec::<(String, String)>::new());
+    let mut missing_names = Vec::<String>::new();
+    for file in &files {
+        let name = file
+            .strip_prefix(&root)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let start = Instant::now();
+        let result = std::panic::catch_unwind(|| -> Loaded {
+            let full = file.to_string_lossy().to_string();
+            if crate::fbx::is_fbx(&full) {
+                let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
+                let found = RefCell::new(BTreeSet::new());
+                let lost = RefCell::new(BTreeSet::new());
+                let model = import(
+                    &full,
+                    &bytes,
+                    Some(&|p| {
+                        let base = p.rsplit('/').next().unwrap_or(p).to_string();
+                        match std::fs::read(p) {
+                            Ok(b) => {
+                                found.borrow_mut().insert(base);
+                                Ok(b)
+                            }
+                            Err(e) => {
+                                lost.borrow_mut().insert(base);
+                                Err(e)
+                            }
+                        }
+                    }),
+                )
+                .map_err(|e| format!("{e:#}"))?;
+                let missing: Vec<String> =
+                    lost.borrow().difference(&found.borrow()).cloned().collect();
+                for m in &missing {
+                    println!(
+                        "  missing texture {m} ({})",
+                        file.file_name().unwrap().to_string_lossy()
+                    );
+                }
+                let tris = triangle_count(&model);
+                // Every texture bound must at least decode.
+                for t in &model.textures {
+                    if let Err(e) = image::load_from_memory(&t.bytes) {
+                        println!("  undecodable texture {}: {e}", t.file_name);
+                    }
+                }
+                Ok((tris, model.bounds(), missing.len()))
+            } else {
+                let (doc, buffers, images) = gltf::import(file).map_err(|e| e.to_string())?;
+                let _ = images;
+                let mut tris = 0;
+                for mesh in doc.meshes() {
+                    for prim in mesh.primitives() {
+                        let reader = prim.reader(|b| Some(&buffers[b.index()]));
+                        tris += reader
+                            .read_indices()
+                            .map(|i| i.into_u32().count())
+                            .or_else(|| reader.read_positions().map(|p| p.count()))
+                            .unwrap_or(0)
+                            / 3;
+                    }
+                }
+                let bounds = crate::gltf_bounds(file).map_err(|e| format!("{e:#}"))?;
+                Ok((tris, bounds, 0))
+            }
+        });
+        let ms = start.elapsed().as_millis();
+        match result {
+            Ok(Ok((triangles, bounds, missing))) => ok.push(Done {
+                name,
+                ms,
+                triangles,
+                extent: bounds.map(|(lo, hi)| hi - lo),
+                missing,
+            }),
+            Ok(Err(e)) => failures.push((name, e)),
+            Err(_) => failures.push((name, "PANIC".into())),
+        }
+    }
+    println!(
+        "\n=== corpus: {} files, {} ok, {} failed ===",
+        files.len(),
+        ok.len(),
+        failures.len()
+    );
+    for (n, e) in &failures {
+        println!("FAIL {n}: {e}");
+    }
+    let missing: usize = ok.iter().map(|d| d.missing).sum();
+    for d in ok.iter().filter(|d| d.missing > 0) {
+        missing_names.push(d.name.clone());
+    }
+    println!(
+        "missing textures: {missing} in {} files",
+        missing_names.len()
+    );
+    let mut slow: Vec<&Done> = ok.iter().collect();
+    slow.sort_by_key(|d| std::cmp::Reverse(d.ms));
+    println!("slowest:");
+    for d in slow.iter().take(10) {
+        println!("  {} ms  {} ({} tris)", d.ms, d.name, d.triangles);
+    }
+    println!("slowest fbx:");
+    for d in slow
+        .iter()
+        .filter(|d| d.name.to_lowercase().ends_with(".fbx"))
+        .take(5)
+    {
+        println!("  {} ms  {} ({} tris)", d.ms, d.name, d.triangles);
+    }
+    let mut tris: Vec<usize> = ok.iter().map(|d| d.triangles).collect();
+    tris.sort();
+    if !tris.is_empty() {
+        println!(
+            "triangles min/median/max: {} / {} / {}",
+            tris[0],
+            tris[tris.len() / 2],
+            tris[tris.len() - 1]
+        );
+    }
+    for d in &ok {
+        match d.extent {
+            None => println!("NO MESH: {}", d.name),
+            Some(e) => {
+                let m = e.max_element();
+                if !(0.01..=100.0).contains(&m) {
+                    println!("SUSPECT SIZE {m:.4} m: {} ({e})", d.name);
+                }
+            }
+        }
+    }
 }

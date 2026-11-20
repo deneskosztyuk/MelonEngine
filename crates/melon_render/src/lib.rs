@@ -7610,6 +7610,8 @@ mod tests {
         let mut packed = fresh_ids_server(root.clone(), 9400);
         packed.set_pack(Arc::new(melon_core::pack::Pack::open(&pak).unwrap()));
         let from_pack = thumbnail_pixels(r, &mut packed, "assets/models/box.fbx");
+        let packed_part: Handle<Model> = packed.load("assets/models/box.fbx#mesh0");
+        let packed_part_bounds = cache.get(r.scene(), &mut packed, packed_part).bounds;
         let _ = std::fs::remove_dir_all(&root);
 
         let (lo, hi) = (
@@ -7626,6 +7628,9 @@ mod tests {
             .abs_diff_eq(lo - glam::Vec3::new(1.0, 2.0, 3.0), 1e-4))
         {
             return Err(format!("fbx #mesh0 is not in mesh space: {part_bounds:?}"));
+        }
+        if packed_part_bounds != part_bounds {
+            return Err(format!("fbx #mesh0 from the pack: {packed_part_bounds:?}"));
         }
         if on_disk? != from_pack? {
             return Err("fbx from the pack looks different from the one on disk".into());

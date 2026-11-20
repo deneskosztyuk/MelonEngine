@@ -288,6 +288,30 @@ mod tests {
     }
 
     #[test]
+    fn fbx_texture_with_other_bytes_next_to_the_model_gets_the_model_name_prefix() {
+        use crate::fbx::fixture::Cube;
+        let dir = extract_dir("extract_fbx_clash");
+        let theirs = png_bytes([1, 2, 3, 255]);
+        let ours = png_bytes([9, 9, 9, 255]);
+        std::fs::write(dir.join("t.png"), &theirs).unwrap();
+        let cube = Cube {
+            texture: Some("t.png"),
+            embedded: Some(ours.clone()),
+            ..Cube::default()
+        };
+        std::fs::write(dir.join("box.fbx"), cube.ascii()).unwrap();
+        let parts = extract_materials(&dir.join("box.fbx"), "assets/models").unwrap();
+        let mat = MaterialAsset::read(&dir.join(parts[0].rsplit('/').next().unwrap())).unwrap();
+        assert_eq!(
+            mat.base_color_texture.unwrap().path,
+            "assets/models/box_t.png"
+        );
+        assert_eq!(std::fs::read(dir.join("t.png")).unwrap(), theirs);
+        assert_eq!(std::fs::read(dir.join("box_t.png")).unwrap(), ours);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn fbx_texture_already_next_to_the_model_is_kept_not_overwritten() {
         use crate::fbx::fixture::Cube;
         let dir = extract_dir("extract_fbx_beside");
