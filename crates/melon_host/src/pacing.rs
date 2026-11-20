@@ -80,9 +80,18 @@ pub enum Stage {
     Render,
     /// `end_frame`: submit, poll and present.
     Submit,
+    /// A Content Browser thumbnail rendered after the frame (its own submit).
+    Thumbnail,
 }
 
-const STAGE_NAMES: [&str; 5] = ["update", "acquire", "editor", "render", "submit"];
+const STAGE_NAMES: [&str; 6] = [
+    "update",
+    "acquire",
+    "editor",
+    "render",
+    "submit",
+    "thumbnail",
+];
 
 /// Seconds between `MELON_FRAME_STATS` lines.
 const REPORT_INTERVAL: Duration = Duration::from_secs(2);
@@ -96,7 +105,7 @@ pub struct FrameStats {
     frame_start: Option<Instant>,
     mark: Option<Instant>,
     /// Stage times of the frame in flight, in seconds.
-    stages: [f32; 5],
+    stages: [f32; 6],
     /// Seconds of the interval in flight spent in winit callbacks other than
     /// `RedrawRequested` (event handling) and in the frame cap sleep.
     events: f32,
@@ -104,7 +113,7 @@ pub struct FrameStats {
     frames: u32,
     total: f32,
     worst: f32,
-    worst_stages: [f32; 5],
+    worst_stages: [f32; 6],
     worst_events: f32,
     worst_sleep: f32,
     /// The latest averaged GPU total (`RenderTimings::total`), ms.
@@ -196,7 +205,7 @@ impl FrameStats {
         }
         self.frame_start = Some(now);
         self.mark = Some(now);
-        self.stages = [0.0; 5];
+        self.stages = [0.0; 6];
         self.events = 0.0;
         self.sleep = 0.0;
         let window_start = *self.window_start.get_or_insert(now);
@@ -356,7 +365,7 @@ mod tests {
         assert_eq!(
             line,
             "frame stats: 99.5 fps, avg 10.05 ms, worst 20.00 ms (update 0.00, acquire 15.00, \
-             editor 0.00, render 0.00, submit 1.00, events 0.00, sleep 0.00, other 4.00), gpu -, \
+             editor 0.00, render 0.00, submit 1.00, thumbnail 0.00, events 0.00, sleep 0.00, other 4.00), gpu -, \
              events/frame: window 1.0, device 2.0"
         );
         assert_eq!(stats.frames, 0, "a new window starts");
@@ -393,7 +402,7 @@ mod tests {
                 assert!(
                     line.contains(
                         "worst 100.00 ms (update 0.00, acquire 0.00, editor 0.00, render 4.00, \
-                         submit 0.00, events 30.00, sleep 6.00, other 60.00), gpu 5.25 ms"
+                         submit 0.00, thumbnail 0.00, events 30.00, sleep 6.00, other 60.00), gpu 5.25 ms"
                     ),
                     "{line}"
                 );

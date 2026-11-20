@@ -560,6 +560,7 @@ impl App {
                 .map(|view| editor.register_thumbnail(renderer.device(), &view, request.existing));
             editor_ui.thumbnail_done(&request, id);
         }
+        self.stats.lap(pacing::Stage::Thumbnail);
     }
 }
 
