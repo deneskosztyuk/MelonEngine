@@ -313,6 +313,9 @@ pub struct RenderStats {
     /// Shadow-casting lights (beyond `RenderQuality::shadowed_lights`'s
     /// nearest) that did not fit the shadow atlas and drew unshadowed.
     pub shadowed_lights_dropped: u32,
+    /// Instances left out of a point / spot shadow view because it already
+    /// holds `MAX_LOCAL_CASTERS` (each tile draws at most that many).
+    pub local_casters_dropped: u32,
     /// Light-in-cluster entries over the shared index list's capacity; the
     /// clusters at its end miss lights. 0 when everything fits.
     pub light_index_overflow: u32,
@@ -1800,7 +1803,11 @@ impl Renderer {
             }
             for (list, view_box) in local_casters.iter_mut().zip(&local_boxes) {
                 if view_box.intersects_aabb(min, max) {
-                    list.push((key, *matrix));
+                    if list.len() < local_shadows::MAX_CASTERS {
+                        list.push((key, *matrix));
+                    } else {
+                        stats.local_casters_dropped += 1;
+                    }
                 }
             }
         }
@@ -7678,6 +7685,58 @@ mod tests {
 
     /// Dragging a sky slider changes the IBL every frame: the prefiltered
     /// texture is rewritten in place, never reallocated.
+    /// A shadow tile draws at most `MAX_CASTERS` instances; more are counted
+    /// as dropped, fewer are all drawn.
+    fn check_local_shadow_casters_are_capped(r: &mut Renderer) -> Result<(), String> {
+        let mut dropped = |count: usize| {
+            let mut server = repo_server();
+            r.model_cache = ModelCache::new(&r.scene);
+            let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+            let side = (count as f32).sqrt().ceil() as usize;
+            let models = (0..count)
+                .map(|i| {
+                    let (x, z) = ((i % side) as f32, (i / side) as f32);
+                    let at = glam::Vec3::new(x * 0.3 - 4.0, 1.0, z * 0.3 - 4.0);
+                    (
+                        glam::Mat4::from_scale_rotation_translation(
+                            glam::Vec3::splat(0.2),
+                            glam::Quat::IDENTITY,
+                            at,
+                        ),
+                        cube,
+                    )
+                })
+                .collect();
+            let frame = FrameData {
+                view_proj: top_down_camera().view_proj(),
+                eye: top_down_camera().eye,
+                light: test_light(),
+                environment: plain_environment(),
+                models,
+                lights: vec![lights::LocalLight {
+                    cast_shadows: true,
+                    ..point_light(glam::Vec3::new(0.0, 7.0, 0.0), 20.0, 12.0)
+                }],
+                ..Default::default()
+            };
+            let mut target =
+                r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+            let mut encoder = r
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let stats = r.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
+            r.queue().submit([encoder.finish()]);
+            stats.local_casters_dropped
+        };
+        let (few, many) = (dropped(100), dropped(1600));
+        if few != 0 || many == 0 {
+            return Err(format!(
+                "local shadow casters dropped: {few} for 100 instances (want 0), {many} for 1600 (want some)"
+            ));
+        }
+        Ok(())
+    }
+
     fn check_ibl_updates_in_place(r: &mut Renderer) -> Result<(), String> {
         let before = r.scene.ibl.specular_texture().clone();
         let rebuilds = r.scene.ibl_rebuilds;
@@ -9791,6 +9850,7 @@ mod tests {
             Box::new(check_blend_material_thumbnail),
             Box::new(check_material_bad_texture_refs),
             Box::new(check_ibl_updates_in_place),
+            Box::new(check_local_shadow_casters_are_capped),
             Box::new(check_rough_surface_has_no_sky_haze),
             Box::new(check_material_cache_evicts),
             Box::new(check_mask_edge_alpha_to_coverage),

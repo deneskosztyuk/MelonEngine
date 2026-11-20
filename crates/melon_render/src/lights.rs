@@ -81,6 +81,7 @@ impl ClusterUniform {
 /// The froxel grid of one camera.
 pub struct ClusterGrid {
     view_proj: Mat4,
+    inverse: Mat4,
     eye: Vec3,
     forward: Vec3,
     near: f32,
@@ -103,6 +104,7 @@ impl ClusterGrid {
             .max(near * 1.01);
         Self {
             view_proj,
+            inverse,
             eye,
             forward,
             near,
@@ -135,7 +137,7 @@ impl ClusterGrid {
     /// World-space boxes around every cluster (x fastest, as `index`). A
     /// froxel is a skewed prism, so the box is a little loose.
     fn cluster_aabbs(&self) -> Vec<(Vec3, Vec3)> {
-        let inverse = self.view_proj.inverse();
+        let inverse = self.inverse;
         let depths: Vec<f32> = (0..=CLUSTER_Z)
             .map(|k| self.near * (k as f32 / self.depth_scale).exp())
             .collect();

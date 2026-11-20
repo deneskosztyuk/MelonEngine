@@ -18,6 +18,9 @@ const NEAR: f32 = 0.05;
 /// Smallest tile edge worth drawing.
 const MIN_TILE: u32 = 128;
 const MAX_TILE: u32 = 1024;
+/// Most instances one shadow tile draws; a crowd in a light's range would
+/// otherwise cost up to six full passes per light.
+pub const MAX_CASTERS: usize = 512;
 /// Most views per frame: 16 shadowed lights, six faces each.
 pub const MAX_VIEWS: usize = 96;
 
