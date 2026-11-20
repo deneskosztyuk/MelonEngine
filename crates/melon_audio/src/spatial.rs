@@ -15,6 +15,9 @@ pub fn should_stream(duration: Duration) -> bool {
 /// between the inverse-distance falloff `min / d`, shifted so it reaches 0
 /// exactly at `max`.
 pub fn attenuation(distance: f32, min: f32, max: f32) -> f32 {
+    if distance.is_nan() || max.is_nan() {
+        return 1.0;
+    }
     let min = min.max(0.01);
     if distance <= min {
         return 1.0;
@@ -31,7 +34,7 @@ pub fn attenuation(distance: f32, min: f32, max: f32) -> f32 {
 /// listener's right vector.
 pub fn pan(listener: Vec3, right: Vec3, source: Vec3) -> f32 {
     let to_source = source - listener;
-    if to_source.length_squared() < 1e-8 {
+    if to_source.length_squared().is_nan() || to_source.length_squared() < 1e-8 {
         return 0.0;
     }
     to_source
@@ -73,6 +76,23 @@ mod tests {
         );
         assert_eq!(attenuation(11.0, 10.0, 3.0), 0.0);
         assert!(attenuation(0.5, 0.0, 10.0).is_finite());
+    }
+
+    #[test]
+    fn nan_and_negative_inputs_stay_finite() {
+        for (d, min, max) in [
+            (f32::NAN, 1.0, 10.0),
+            (5.0, f32::NAN, 10.0),
+            (5.0, 1.0, f32::NAN),
+            (-3.0, -1.0, 10.0),
+            (5.0, 1.0, -2.0),
+            (f32::INFINITY, 1.0, 10.0),
+        ] {
+            let g = attenuation(d, min, max);
+            assert!((0.0..=1.0).contains(&g), "{d} {min} {max} -> {g}");
+        }
+        assert!(pan(Vec3::NAN, Vec3::X, Vec3::ONE).is_finite());
+        assert!(pan(Vec3::ZERO, Vec3::NAN, Vec3::ONE).is_finite());
     }
 
     #[test]

@@ -354,7 +354,10 @@ impl Director {
                 let handle = server.load::<AudioClip>(&voice.clip);
                 server.version(handle)
             };
-            if current != voice.version && !matches!(voice.kind, Kind::OneShot { .. }) {
+            let renamed = matches!(id, VoiceId::Source(e)
+                if world.get::<AudioSource>(e).is_some_and(|s| s.clip != voice.clip));
+            if (renamed || current != voice.version) && !matches!(voice.kind, Kind::OneShot { .. })
+            {
                 let clip = voice.clip.clone();
                 self.remove(backend, id);
                 match id {
@@ -367,6 +370,15 @@ impl Director {
                 backend.set(id, mix.volume, mix.pan, mix.pitch);
             }
         }
+    }
+}
+
+/// Volume clamped to 0..1; NaN is silence.
+fn unit(volume: f32) -> f32 {
+    if volume.is_nan() {
+        0.0
+    } else {
+        volume.clamp(0.0, 1.0)
     }
 }
 
@@ -385,9 +397,13 @@ fn mix_of(world: &World, ears: Option<(Vec3, Vec3)>, id: VoiceId, kind: &Kind) -
                 (1.0, 0.0)
             };
             Some(Mix {
-                volume: source.volume.clamp(0.0, 1.0) * gain,
+                volume: unit(source.volume) * gain,
                 pan,
-                pitch: source.pitch.clamp(0.1, 4.0),
+                pitch: if source.pitch.is_nan() {
+                    1.0
+                } else {
+                    source.pitch.clamp(0.1, 4.0)
+                },
             })
         }
         Kind::OneShot {
@@ -399,7 +415,7 @@ fn mix_of(world: &World, ears: Option<(Vec3, Vec3)>, id: VoiceId, kind: &Kind) -
                 None => (1.0, 0.0),
             };
             Some(Mix {
-                volume: volume.clamp(0.0, 1.0) * gain,
+                volume: unit(*volume) * gain,
                 pan,
                 pitch: 1.0,
             })
@@ -705,6 +721,218 @@ mod tests {
         let (mut d, mut m) = (Director::default(), Mock::default());
         step(&mut d, &mut w, &mut m);
         assert!(m.last[&VoiceId::Source(e)].1 < -0.99);
+    }
+
+    #[test]
+    fn nan_values_reach_the_backend_finite() {
+        let mut w = world(SimulationState::Playing);
+        let e = w
+            .spawn((
+                AudioSource {
+                    clip: "assets/a.ogg".into(),
+                    play_on_start: true,
+                    spatial: true,
+                    volume: f32::NAN,
+                    pitch: f32::NAN,
+                    min_distance: f32::NAN,
+                    max_distance: f32::NAN,
+                    ..AudioSource::default()
+                },
+                Transform::from_translation(Vec3::new(f32::NAN, 0.0, 0.0)),
+            ))
+            .id();
+        w.spawn((AudioListener, Transform::default()));
+        let (mut d, mut m) = (Director::default(), Mock::default());
+        step(&mut d, &mut w, &mut m);
+        step(&mut d, &mut w, &mut m);
+        let (v, p, r) = m.last[&VoiceId::Source(e)];
+        assert!(
+            v.is_finite() && p.is_finite() && r.is_finite(),
+            "{v} {p} {r}"
+        );
+        assert!((0.0..=1.0).contains(&v) && (0.1..=4.0).contains(&r));
+    }
+
+    #[test]
+    fn negative_and_huge_volume_clamp() {
+        let mut w = world(SimulationState::Playing);
+        let e = source(&mut w, true);
+        let (mut d, mut m) = (Director::default(), Mock::default());
+        w.get_mut::<AudioSource>(e).unwrap().volume = -2.0;
+        step(&mut d, &mut w, &mut m);
+        assert_eq!(m.last[&VoiceId::Source(e)].0, 0.0);
+        w.get_mut::<AudioSource>(e).unwrap().volume = 9.0;
+        step(&mut d, &mut w, &mut m);
+        assert_eq!(m.last[&VoiceId::Source(e)].0, 1.0);
+    }
+
+    #[test]
+    fn listener_at_source_position_is_full_and_centred() {
+        let mut w = world(SimulationState::Playing);
+        let at = Vec3::new(3.0, 1.0, 2.0);
+        let e = w
+            .spawn((
+                AudioSource {
+                    clip: "assets/a.ogg".into(),
+                    spatial: true,
+                    play_on_start: true,
+                    ..AudioSource::default()
+                },
+                Transform::from_translation(at),
+            ))
+            .id();
+        w.spawn((AudioListener, Transform::from_translation(at)));
+        let (mut d, mut m) = (Director::default(), Mock::default());
+        step(&mut d, &mut w, &mut m);
+        assert_eq!(m.last[&VoiceId::Source(e)], (1.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn min_over_max_distance_does_not_panic() {
+        let mut w = world(SimulationState::Playing);
+        let e = w
+            .spawn((
+                AudioSource {
+                    clip: "assets/a.ogg".into(),
+                    spatial: true,
+                    play_on_start: true,
+                    min_distance: 50.0,
+                    max_distance: 5.0,
+                    ..AudioSource::default()
+                },
+                Transform::from_translation(Vec3::new(20.0, 0.0, 0.0)),
+            ))
+            .id();
+        w.spawn((AudioListener, Transform::default()));
+        let (mut d, mut m) = (Director::default(), Mock::default());
+        step(&mut d, &mut w, &mut m);
+        assert!(m.last[&VoiceId::Source(e)].0.is_finite());
+    }
+
+    #[test]
+    fn changing_the_clip_while_playing_restarts_it() {
+        let mut w = world(SimulationState::Playing);
+        let e = source(&mut w, true);
+        let (mut d, mut m) = (Director::default(), Mock::default());
+        step(&mut d, &mut w, &mut m);
+        w.get_mut::<AudioSource>(e).unwrap().clip = "assets/b.ogg".into();
+        step(&mut d, &mut w, &mut m);
+        step(&mut d, &mut w, &mut m);
+        assert_eq!((m.count("stop source"), m.count("play source")), (1, 2));
+    }
+
+    #[test]
+    fn request_stop_then_play_restarts() {
+        let mut w = world(SimulationState::Playing);
+        let e = source(&mut w, true);
+        let (mut d, mut m) = (Director::default(), Mock::default());
+        step(&mut d, &mut w, &mut m);
+        w.resource_mut::<AudioRequests>().stop(e);
+        step(&mut d, &mut w, &mut m);
+        step(&mut d, &mut w, &mut m);
+        assert_eq!(m.count("play source"), 1, "play_on_start does not refire");
+        w.resource_mut::<AudioRequests>().play(e);
+        step(&mut d, &mut w, &mut m);
+        assert_eq!(m.count("play source"), 2);
+    }
+
+    #[test]
+    fn user_paused_source_stays_paused_across_game_pause() {
+        let mut w = world(SimulationState::Playing);
+        let e = source(&mut w, true);
+        let (mut d, mut m) = (Director::default(), Mock::default());
+        step(&mut d, &mut w, &mut m);
+        w.resource_mut::<AudioRequests>().pause(e);
+        step(&mut d, &mut w, &mut m);
+        w.insert_resource(SimulationState::Paused);
+        step(&mut d, &mut w, &mut m);
+        w.insert_resource(SimulationState::Playing);
+        step(&mut d, &mut w, &mut m);
+        assert_eq!(m.count("resume"), 0);
+    }
+
+    #[test]
+    fn game_requests_ignored_while_paused() {
+        let mut w = world(SimulationState::Paused);
+        let e = source(&mut w, false);
+        w.resource_mut::<AudioRequests>().play(e);
+        let (mut d, mut m) = (Director::default(), Mock::default());
+        step(&mut d, &mut w, &mut m);
+        assert_eq!(m.count("play"), 0);
+    }
+
+    #[test]
+    fn play_on_start_source_spawned_while_playing_fires() {
+        let mut w = world(SimulationState::Playing);
+        let (mut d, mut m) = (Director::default(), Mock::default());
+        step(&mut d, &mut w, &mut m);
+        source(&mut w, true);
+        step(&mut d, &mut w, &mut m);
+        assert_eq!(m.count("play source"), 1);
+    }
+
+    #[test]
+    fn removed_bus_falls_back_to_master_gain() {
+        let mut w = world(SimulationState::Playing);
+        w.resource_mut::<AudioSettings>().buses[0].volume = 0.5;
+        w.resource_mut::<AudioSettings>()
+            .buses
+            .retain(|b| b.name != "Sfx");
+        source(&mut w, true);
+        let (mut d, mut m) = (Director::default(), Mock::default());
+        step(&mut d, &mut w, &mut m);
+        assert!(!m.gains.contains_key("Sfx"));
+        assert_eq!(w.resource::<AudioSettings>().gain("Sfx"), 0.5);
+    }
+
+    #[test]
+    fn hot_reloaded_clip_restarts_the_source() {
+        let root = std::env::temp_dir().join("melon_audio_hot_reload");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let file = root.join("assets/a.ogg");
+        std::fs::write(&file, b"one").unwrap();
+        let mut w = world(SimulationState::Playing);
+        w.insert_resource(AssetServer::new(root.clone()));
+        let e = source(&mut w, true);
+        let (mut d, mut m) = (Director::default(), Mock::default());
+        step(&mut d, &mut w, &mut m);
+        std::fs::write(&file, b"two").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        w.resource_mut::<AssetServer>().poll_changes();
+        step(&mut d, &mut w, &mut m);
+        assert_eq!((m.count("stop source"), m.count("play source")), (1, 2));
+        assert!(d.voices.contains_key(&VoiceId::Source(e)));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn requests_for_missing_entities_or_clips_do_not_panic() {
+        let mut w = world(SimulationState::Playing);
+        let e = source(&mut w, false);
+        let ghost = w.spawn_empty().id();
+        w.despawn(ghost);
+        let mut q = w.resource_mut::<AudioRequests>();
+        q.play(e);
+        q.play(ghost);
+        q.pause(ghost);
+        q.stop(ghost);
+        q.set_volume(ghost, 1.0);
+        let (mut d, mut m) = (
+            Director::default(),
+            Mock {
+                fail: true,
+                ..Mock::default()
+            },
+        );
+        step(&mut d, &mut w, &mut m);
+        assert!(d.voices.is_empty());
     }
 
     #[test]
