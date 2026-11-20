@@ -51,6 +51,7 @@ impl ModelCache {
                 continue;
             }
             server.set_bounds(sibling, model.bounds.0, model.bounds.1);
+            server.set_part_bounds(sibling, model.part_bounds.clone());
             let version = server.version(sibling);
             self.models
                 .insert(sibling.id(), CachedModel { version, model });
@@ -120,6 +121,12 @@ impl ModelCache {
                     self.builtin_sphere.bounds
                 };
                 server.set_bounds(handle, min, max);
+                let parts = if path == "builtin:cube" {
+                    self.builtin_cube.part_bounds.clone()
+                } else {
+                    self.builtin_sphere.part_bounds.clone()
+                };
+                server.set_part_bounds(handle, parts);
             }
             return;
         }
@@ -141,6 +148,7 @@ impl ModelCache {
             match result {
                 Ok(model) => {
                     server.set_bounds(handle, model.bounds.0, model.bounds.1);
+                    server.set_part_bounds(handle, model.part_bounds.clone());
                     self.models.insert(id, CachedModel { version, model });
                 }
                 Err(error) => {

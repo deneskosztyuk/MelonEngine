@@ -527,6 +527,8 @@ pub struct LoadedModel {
     pub material_bind_groups: Vec<wgpu::BindGroup>,
     /// `Surface` of each material (same order).
     pub surfaces: Vec<Surface>,
+    /// Local-space bounds of each part (same order).
+    pub part_bounds: Vec<(glam::Vec3, glam::Vec3)>,
     /// Local-space bounds (min, max) of every part, node transforms included.
     pub bounds: (glam::Vec3, glam::Vec3),
 }
@@ -4221,6 +4223,7 @@ impl SceneRenderer {
                     meshes: Vec::new(),
                     material_bind_groups: Vec::new(),
                     surfaces: Vec::new(),
+                    part_bounds: Vec::new(),
                     bounds: (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)),
                 };
                 for primitive in gltf_mesh.primitives() {
@@ -4312,6 +4315,7 @@ impl SceneRenderer {
             }],
             material_bind_groups: vec![self.checker_material.clone()],
             surfaces: vec![Surface::default()],
+            part_bounds: vec![(glam::Vec3::splat(-0.5), glam::Vec3::splat(0.5))],
             bounds: (glam::Vec3::splat(-0.5), glam::Vec3::splat(0.5)),
         }
     }
@@ -4322,6 +4326,7 @@ impl SceneRenderer {
             meshes: vec![self.cube_mesh()],
             material_bind_groups: vec![self.checker_material.clone()],
             surfaces: vec![Surface::default()],
+            part_bounds: vec![(glam::Vec3::splat(-0.5), glam::Vec3::splat(0.5))],
             bounds: (glam::Vec3::splat(-0.5), glam::Vec3::splat(0.5)),
         }
     }
@@ -4336,6 +4341,7 @@ impl SceneRenderer {
             meshes: Vec::new(),
             material_bind_groups: Vec::new(),
             surfaces: Vec::new(),
+            part_bounds: Vec::new(),
             bounds: (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)),
         };
         let scene = document
@@ -4475,6 +4481,12 @@ impl SceneRenderer {
                 contents: bytemuck::cast_slice(&indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
+        let (mut lo, mut hi) = (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN));
+        for v in &vertices {
+            lo = lo.min(glam::Vec3::from_array(v.position));
+            hi = hi.max(glam::Vec3::from_array(v.position));
+        }
+        model.part_bounds.push((lo, hi));
         model.meshes.push(Mesh {
             vertex_buffer,
             index_buffer,
@@ -6895,6 +6907,10 @@ mod tests {
         };
         let centre = at(THUMBNAIL_SIZE / 2, THUMBNAIL_SIZE / 2);
         let corner = at(2, 2);
+        let sphere: melon_core::Handle<melon_core::Model> = server.load("builtin:sphere");
+        if server.part_bounds(sphere).len() != 1 {
+            return Err("the sphere should publish its one part's bounds".into());
+        }
         if centre[0] < centre[1].saturating_add(60) {
             return Err(format!("the sphere should be red: {centre:?}"));
         }

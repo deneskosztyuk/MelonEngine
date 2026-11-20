@@ -223,6 +223,27 @@ pub fn pick(world: &mut World, origin: Vec3, dir: Vec3) -> Option<Entity> {
         .map(|(_, entity)| entity)
 }
 
+/// `pick`, plus the mesh part of the hit entity's model under the ray (the
+/// nearest part box; `None` when the model has no known parts, or for a
+/// light).
+pub fn pick_part(world: &mut World, origin: Vec3, dir: Vec3) -> Option<(Entity, Option<usize>)> {
+    let entity = pick(world, origin, dir)?;
+    let part = (|| {
+        let model = *world.get::<Handle<Model>>(entity)?;
+        let inverse = world_matrix(world, entity).inverse();
+        let o = inverse.transform_point3(origin);
+        let d = inverse.transform_vector3(dir);
+        let parts = world.get_resource::<AssetServer>()?.part_bounds(model);
+        parts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (min, max))| ray_box(o, d, *min, *max).map(|t| (t, i)))
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, i)| i)
+    })();
+    Some((entity, part))
+}
+
 /// Radius of a light's viewport icon, which is also its pick radius.
 pub const LIGHT_ICON_RADIUS: f32 = 0.18;
 
@@ -603,6 +624,27 @@ mod tests {
         assert!(!light_lines(&world, spot).is_empty());
         let plain = world.spawn(Transform::default()).id();
         assert!(light_lines(&world, plain).is_empty());
+    }
+
+    #[test]
+    fn pick_part_names_the_mesh_part_under_the_ray() {
+        let mut world = World::new();
+        let mut server = AssetServer::new(".".into());
+        let model: Handle<Model> = server.load("assets/two.glb");
+        server.set_bounds(model, Vec3::new(-2.0, -0.5, -0.5), Vec3::new(2.0, 0.5, 0.5));
+        server.set_part_bounds(
+            model,
+            vec![
+                (Vec3::new(-2.0, -0.5, -0.5), Vec3::new(0.0, 0.5, 0.5)),
+                (Vec3::new(0.0, -0.5, -0.5), Vec3::new(2.0, 0.5, 0.5)),
+            ],
+        );
+        world.insert_resource(server);
+        let e = world.spawn((Transform::default(), model)).id();
+        let mut from = |x: f32| pick_part(&mut world, Vec3::new(x, 0.0, 5.0), Vec3::NEG_Z);
+        assert_eq!(from(-1.0), Some((e, Some(0))));
+        assert_eq!(from(1.0), Some((e, Some(1))));
+        assert_eq!(from(3.0), None);
     }
 
     fn approx(a: Vec3, b: Vec3) -> bool {

@@ -31,6 +31,7 @@ pub mod gizmo;
 pub mod history;
 pub mod inspect;
 pub mod layout;
+mod material_assign;
 mod material_card;
 pub mod physics_settings;
 pub mod play;
@@ -348,6 +349,45 @@ impl Editor {
         self.history
             .record_created(world, cube, label, self.selected);
         self.selected = Some(cube);
+    }
+
+    /// Assign the `.mat` file `path` (project-relative) to part `part` of
+    /// `entity`'s model, or to every part for `None`, as one undo step.
+    pub(crate) fn assign_material_step(
+        &mut self,
+        world: &mut World,
+        entity: Entity,
+        path: &str,
+        part: Option<usize>,
+    ) {
+        let Some(model) = world.get::<Handle<Model>>(entity).copied() else {
+            return;
+        };
+        let parts = world
+            .get_resource::<AssetServer>()
+            .map_or(0, |server| server.part_bounds(model).len());
+        let slot = material_assign::slot_for(&self.project_root, path);
+        let before = self.history.begin(world, &[entity]);
+        let mut materials = world
+            .get::<melon_core::MeshMaterials>(entity)
+            .cloned()
+            .unwrap_or_default();
+        material_assign::assign(&mut materials.parts, part, parts, slot);
+        world.entity_mut(entity).insert(materials);
+        self.history.commit(
+            world,
+            before,
+            &[],
+            "Assign Material".to_string(),
+            self.selected,
+            self.selected,
+        );
+    }
+
+    /// The project-relative `.mat` path of a Content Browser drag, if it is one.
+    fn dragged_material(&self, drag: &content::AssetDrag) -> Option<String> {
+        let rel = melon_core::assets::project_relative(&self.project_root, &drag.path)?;
+        content::has_extension(&rel, &["mat"]).then_some(rel)
     }
 
     /// Spawn a light, select it and record it as a step.
@@ -859,6 +899,17 @@ impl Editor {
                 FieldWidget {
                     label: Some("Volume (linear)"),
                     kind: WidgetKind::Slider { min: 0.0, max: 1.0 },
+                },
+            );
+        }
+        if type_path == melon_core::MeshMaterials::type_path() {
+            widgets.insert(
+                "parts",
+                FieldWidget {
+                    label: Some("Materials"),
+                    kind: WidgetKind::Materials {
+                        root: self.project_root.clone(),
+                    },
                 },
             );
         }
@@ -1498,14 +1549,22 @@ impl Editor {
         let vp = viewport_input(&ctx, &response, rect);
         // A model dragged from the Content Browser lands on the ground under the cursor.
         if let Some(drag) = response.dnd_release_payload::<content::AssetDrag>()
-            && let Some(path) = drag.model.clone()
-            && content::is_model_path(&path)
             && let (Some(pointer), Some(camera)) =
                 (vp.pointer, world.get_resource::<Camera>().copied())
         {
-            let at = viewport::drop_point(&camera, pointer, vp.size);
-            self.spawn_model_step(world, &path, at, None);
-            self.gizmo_drag = None;
+            if let Some(path) = drag.model.clone()
+                && content::is_model_path(&path)
+            {
+                let at = viewport::drop_point(&camera, pointer, vp.size);
+                self.spawn_model_step(world, &path, at, None);
+                self.gizmo_drag = None;
+            } else if let Some(path) = self.dragged_material(&drag) {
+                // A material goes on the part of the entity under the cursor.
+                let (origin, dir) = camera.screen_to_world_ray(pointer, vp.size);
+                if let Some((entity, part)) = viewport::pick_part(world, origin, dir) {
+                    self.assign_material_step(world, entity, &path, part);
+                }
+            }
         }
         self.flying = vp.right_down;
         let focus = focus_after_click(sim_state(world), input_focus(world), vp.left_clicked);
@@ -1666,6 +1725,7 @@ impl Editor {
         let mut row_action: Option<(RowAction, Entity)> = None;
         let mut reparent: Option<(Entity, Option<Entity>)> = None;
         let mut model_drop: Option<(String, Option<Entity>)> = None;
+        let mut material_drop: Option<(String, Entity)> = None;
         // Inline rename finished this frame: the new text, or `None` for Esc.
         let mut rename_done: Option<(Entity, Option<String>)> = None;
         let searching = !self.hierarchy_query.trim().is_empty();
@@ -1688,7 +1748,10 @@ impl Editor {
         let carried_entity = egui::DragAndDrop::payload::<Entity>(ui.ctx()).map(|e| *e);
         let carried_model = egui::DragAndDrop::payload::<content::AssetDrag>(ui.ctx())
             .and_then(|drag| drag.model.clone());
-        let carrying = carried_entity.is_some() || carried_model.is_some();
+        let carried_material = egui::DragAndDrop::payload::<content::AssetDrag>(ui.ctx())
+            .and_then(|drag| self.dragged_material(&drag));
+        let carrying =
+            carried_entity.is_some() || carried_model.is_some() || carried_material.is_some();
         let released = ui.ctx().input(|i| i.pointer.any_released());
         // Row the pointer was released over, if any (a row wins over the zone).
         let mut released_on_row: Option<Entity> = None;
@@ -1871,6 +1934,14 @@ impl Editor {
             if let Some(path) = carried_model {
                 model_drop = Some((path, released_on_row));
             }
+            if let (Some(path), Some(row)) = (carried_material, released_on_row) {
+                material_drop = Some((path, row));
+            }
+        }
+
+        // A material dropped on a row goes on every part of that entity.
+        if let Some((path, entity)) = material_drop {
+            self.assign_material_step(world, entity, &path, None);
         }
 
         if let Some((entity, new_name)) = rename_done {
@@ -4175,6 +4246,37 @@ mod tests {
             world.resource::<AssetServer>().path(h),
             "assets/models/sub/Barrel.glb"
         );
+    }
+
+    #[test]
+    fn assigning_a_material_is_one_undoable_step_and_part_aware() {
+        use melon_core::MeshMaterials;
+        let (mut editor, mut world, root) = browser_project("assign_material");
+        std::fs::write(root.join("assets/m.mat"), "()").unwrap();
+        let model: Handle<Model> = world.resource_mut::<AssetServer>().load("builtin:cube");
+        let e = world
+            .spawn((Name("Cube".to_string()), Transform::default(), model))
+            .id();
+        world
+            .resource_mut::<AssetServer>()
+            .set_part_bounds(model, vec![(glam::Vec3::ZERO, glam::Vec3::ONE); 3]);
+        editor.assign_material_step(&mut world, e, "assets/m.mat", None);
+        let parts = world.get::<MeshMaterials>(e).unwrap().parts.clone();
+        assert_eq!(parts.len(), 3, "every part of the model");
+        assert!(parts.iter().all(|p| p.path == "assets/m.mat"));
+        assert_eq!(editor.history.undo_label(), Some("Assign Material"));
+        editor.assign_material_step(&mut world, e, "assets/other.mat", Some(1));
+        let parts = world.get::<MeshMaterials>(e).unwrap().parts.clone();
+        assert_eq!(parts[1].path, "assets/other.mat");
+        assert_eq!(parts[0].path, "assets/m.mat");
+        editor.undo(&mut world);
+        assert_eq!(
+            world.get::<MeshMaterials>(e).unwrap().parts[1].path,
+            "assets/m.mat"
+        );
+        editor.undo(&mut world);
+        assert!(world.get::<MeshMaterials>(e).is_none(), "undone to none");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

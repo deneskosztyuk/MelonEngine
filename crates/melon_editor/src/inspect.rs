@@ -43,6 +43,9 @@ pub enum WidgetKind {
     Layers(Vec<String>),
     /// An `f32` slider.
     Slider { min: f32, max: f32 },
+    /// A `Vec<MaterialSlot>`: one picker per mesh part (`.mat` files under
+    /// `<root>/assets`), each a drop target for Content Browser drags.
+    Materials { root: PathBuf },
 }
 
 pub type FieldWidgets = HashMap<&'static str, FieldWidget>;
@@ -82,6 +85,25 @@ fn layer_label(names: &[String], i: usize) -> String {
 fn dropped_asset(root: &Path, dragged: &Path, extensions: &[&str]) -> Option<String> {
     let rel = melon_core::assets::project_relative(root, dragged)?;
     content::has_extension(&rel, extensions).then_some(rel)
+}
+
+/// Put the `.mat` file `dragged` on slot `index` (or add a slot for
+/// `None`); false when it is not a project material.
+fn drop_material(
+    root: &Path,
+    slots: &mut Vec<melon_core::MaterialSlot>,
+    index: Option<usize>,
+    dragged: &Path,
+) -> bool {
+    let Some(rel) = dropped_asset(root, dragged, &["mat"]) else {
+        return false;
+    };
+    let slot = crate::material_assign::slot_for(root, &rel);
+    match index {
+        Some(i) if i < slots.len() => slots[i] = slot,
+        _ => slots.push(slot),
+    }
+    true
 }
 
 /// The editor for a field with a `FieldWidget`; `None` when the value is not
@@ -130,6 +152,60 @@ fn widget_ui(
                         }
                     }
                 });
+            Some(changed)
+        }
+        WidgetKind::Materials { root } => {
+            let slots = value.try_downcast_mut::<Vec<melon_core::MaterialSlot>>()?;
+            let mut changed = false;
+            for i in 0..slots.len() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Part {i}"));
+                    let current = slots[i].path.clone();
+                    let text = if current.is_empty() {
+                        "Keep glTF material".to_string()
+                    } else {
+                        current.clone()
+                    };
+                    let combo = egui::ComboBox::from_id_salt(id.with(i))
+                        .selected_text(text)
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(current.is_empty(), "Keep glTF material")
+                                .clicked()
+                            {
+                                slots[i] = melon_core::MaterialSlot::default();
+                                changed = true;
+                            }
+                            for path in content::asset_list(root, &["mat"]) {
+                                if ui.selectable_label(current == path, &path).clicked() {
+                                    slots[i] = crate::material_assign::slot_for(root, &path);
+                                    changed = true;
+                                }
+                            }
+                        });
+                    let drop = ui.interact(
+                        combo.response.rect,
+                        id.with(("drop", i)),
+                        egui::Sense::hover(),
+                    );
+                    if let Some(drag) = drop.dnd_release_payload::<AssetDrag>() {
+                        changed |= drop_material(root, slots, Some(i), &drag.path);
+                    }
+                });
+            }
+            let add = ui.button("Add part");
+            if add.clicked() {
+                slots.push(melon_core::MaterialSlot::default());
+                changed = true;
+            }
+            // A material dropped on the button adds a part with it.
+            if let Some(drag) = ui
+                .interact(add.rect, id.with("add_drop"), egui::Sense::hover())
+                .dnd_release_payload::<AssetDrag>()
+            {
+                changed |= drop_material(root, slots, None, &drag.path);
+            }
             Some(changed)
         }
         WidgetKind::Asset { root, extensions } => {
@@ -688,6 +764,69 @@ mod tests {
             None
         );
         assert_eq!(dropped_asset(root, Path::new("/q/a.wav"), &ext), None);
+    }
+
+    #[test]
+    fn material_slots_take_a_dropped_material_and_a_picked_one() {
+        use melon_core::MaterialSlot;
+        let root = Path::new("/p");
+        let mut slots = vec![MaterialSlot::default(), MaterialSlot::default()];
+        // Dropping on slot 1 sets only that slot.
+        assert!(drop_material(
+            root,
+            &mut slots,
+            Some(1),
+            Path::new("/p/assets/m.mat")
+        ));
+        assert_eq!(slots[0].path, "");
+        assert_eq!(slots[1].path, "assets/m.mat");
+        // Not a material, or outside the project: refused.
+        assert!(!drop_material(
+            root,
+            &mut slots,
+            Some(0),
+            Path::new("/p/assets/a.glb")
+        ));
+        assert!(!drop_material(
+            root,
+            &mut slots,
+            Some(0),
+            Path::new("/q/m.mat")
+        ));
+        // Dropping on the empty list adds one slot.
+        let mut none = Vec::new();
+        assert!(drop_material(
+            root,
+            &mut none,
+            None,
+            Path::new("/p/assets/n.mat")
+        ));
+        assert_eq!(none.len(), 1);
+    }
+
+    #[test]
+    fn material_slots_widget_draws_its_rows() {
+        use melon_core::MaterialSlot;
+        let ctx = egui::Context::default();
+        let mut slots = vec![MaterialSlot {
+            guid: String::new(),
+            path: "assets/m.mat".into(),
+        }];
+        let widget = WidgetKind::Materials {
+            root: PathBuf::from("/p"),
+        };
+        let mut shown = String::new();
+        let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let changed = widget_ui(ui, egui::Id::new("slots"), &mut slots, &widget);
+            assert_eq!(changed, Some(false));
+        });
+        for clipped in &out.shapes {
+            shown.push_str(&format!("{:?}", clipped.shape));
+        }
+        assert!(
+            shown.contains("assets/m.mat") && shown.contains("Add part"),
+            "{shown}"
+        );
     }
 
     #[test]

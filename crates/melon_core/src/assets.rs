@@ -138,6 +138,7 @@ struct AssetEntry {
     version: u32,
     modified: Option<SystemTime>,
     bounds: Option<(Vec3, Vec3)>,
+    part_bounds: Vec<(Vec3, Vec3)>,
 }
 
 /// Registry of every asset path the project uses.
@@ -199,6 +200,7 @@ impl AssetServer {
                     version: 0,
                     modified,
                     bounds: None,
+                    part_bounds: Vec::new(),
                 });
                 self.by_path.insert(path, id);
                 id
@@ -234,6 +236,20 @@ impl AssetServer {
         max: Vec3,
     ) {
         self.entries[handle.id as usize].bounds = Some((min, max));
+    }
+
+    /// Local-space bounds of each mesh part (material slot), written by the
+    /// renderer after loading; empty until then.
+    pub fn set_part_bounds<T: Send + Sync + 'static>(
+        &mut self,
+        handle: Handle<T>,
+        parts: Vec<(Vec3, Vec3)>,
+    ) {
+        self.entries[handle.id as usize].part_bounds = parts;
+    }
+
+    pub fn part_bounds<T: Send + Sync + 'static>(&self, handle: Handle<T>) -> &[(Vec3, Vec3)] {
+        &self.entries[handle.id as usize].part_bounds
     }
 
     pub fn bounds<T: Send + Sync + 'static>(&self, handle: Handle<T>) -> Option<(Vec3, Vec3)> {
