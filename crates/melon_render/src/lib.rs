@@ -90,6 +90,10 @@ struct LightUniform {
     ambient: f32,
     color: [f32; 3],
     _pad: f32,
+    sky_color: [f32; 3],
+    _pad1: f32,
+    ground_color: [f32; 3],
+    _pad2: f32,
     light_view_proj: [[f32; 4]; 4],
 }
 
@@ -452,12 +456,9 @@ impl Renderer {
     ) {
         let scene = &mut self.scene;
         scene.update_camera(frame.view_proj);
-        let to_light = frame.light.to_light();
         scene.update_light(
-            to_light,
-            frame.light.ambient,
-            frame.light.color,
-            directional_light_view_proj(to_light, SHADOW_CENTER, SHADOW_RADIUS),
+            &frame.light,
+            directional_light_view_proj(frame.light.to_light(), SHADOW_CENTER, SHADOW_RADIUS),
         );
         let matrices: Vec<glam::Mat4> = frame.models.iter().map(|(m, _)| *m).collect();
         scene.update_model_uniforms(&matrices);
@@ -1425,20 +1426,17 @@ impl SceneRenderer {
             .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[uniform]));
     }
 
-    /// `to_light` points from the scene toward the light (world space, normalized).
     /// `light_view_proj` is the shadow box, see [`directional_light_view_proj`].
-    pub fn update_light(
-        &self,
-        to_light: glam::Vec3,
-        ambient: f32,
-        color: glam::Vec3,
-        light_view_proj: glam::Mat4,
-    ) {
+    pub fn update_light(&self, light: &melon_core::Light, light_view_proj: glam::Mat4) {
         let uniform = LightUniform {
-            direction: to_light.to_array(),
-            ambient,
-            color: color.to_array(),
+            direction: light.to_light().to_array(),
+            ambient: light.ambient,
+            color: light.color.to_array(),
             _pad: 0.0,
+            sky_color: light.sky_color.to_array(),
+            _pad1: 0.0,
+            ground_color: light.ground_color.to_array(),
+            _pad2: 0.0,
             light_view_proj: light_view_proj.to_cols_array_2d(),
         };
         self.queue
@@ -2093,8 +2091,8 @@ mod tests {
     }
 
     #[test]
-    fn light_uniform_size_is_96() {
-        assert_eq!(std::mem::size_of::<LightUniform>(), 96);
+    fn light_uniform_size_is_128() {
+        assert_eq!(std::mem::size_of::<LightUniform>(), 128);
     }
 
     fn clip(m: glam::Mat4, p: glam::Vec3) -> glam::Vec3 {
@@ -2138,10 +2136,24 @@ mod tests {
     /// World (-3.44, 0, 0): on the floor, in the open, left of the shadow.
     const FAR_LEFT_PX: (u32, u32) = (4, 32);
 
+    /// The test scene's sun: 45 degrees from +X. White ambient from every
+    /// side, so all colour channels match (`value_at` reads one).
+    fn test_light() -> melon_core::Light {
+        melon_core::Light {
+            direction: -glam::Vec3::new(1.0, 1.0, 0.0).normalize(),
+            sky_color: glam::Vec3::ONE,
+            ground_color: glam::Vec3::ONE,
+            ..Default::default()
+        }
+    }
+
     /// Renders the test scene and returns TEST_SIZE x TEST_SIZE RGBA8 sRGB pixels.
     /// The shadow box has half-size `shadow_radius` around `shadow_center`.
+    /// `from_below` puts the camera under the floor, looking up at its underside.
     fn render_test_scene(
         r: &mut Renderer,
+        light: &melon_core::Light,
+        from_below: bool,
         shadow_center: glam::Vec3,
         shadow_radius: f32,
     ) -> Vec<u8> {
@@ -2156,14 +2168,15 @@ mod tests {
 
         r.update_camera(
             directx::orthographic(-4.0, 4.0, -4.0, 4.0, 0.1, 20.0)
-                * view::look_at_mat4(Vec3::new(0.0, 10.0, 0.0), Vec3::ZERO, Vec3::NEG_Z),
+                * view::look_at_mat4(
+                    Vec3::new(0.0, if from_below { -10.0 } else { 10.0 }, 0.0),
+                    Vec3::ZERO,
+                    Vec3::NEG_Z,
+                ),
         );
-        let to_light = Vec3::new(1.0, 1.0, 0.0).normalize();
         r.update_light(
-            to_light,
-            0.2,
-            Vec3::ONE,
-            directional_light_view_proj(to_light, shadow_center, shadow_radius),
+            light,
+            directional_light_view_proj(light.to_light(), shadow_center, shadow_radius),
         );
         r.update_model_uniforms(&[
             Mat4::from_scale_rotation_translation(
@@ -2446,7 +2459,12 @@ mod tests {
             encoder,
             &target.color_texture,
         );
-        let i = (((TEST_SIZE / 2) * TEST_SIZE + TEST_SIZE / 2) * 4) as usize;
+        pixel_at(renderer, &pixels, (TEST_SIZE / 2, TEST_SIZE / 2))
+    }
+
+    /// RGBA at pixel `(x, y)` of a TEST_SIZE readback.
+    fn pixel_at(renderer: &Renderer, pixels: &[u8], (x, y): (u32, u32)) -> [u8; 4] {
+        let i = ((y * TEST_SIZE + x) * 4) as usize;
         let px = [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]];
         // The display texture may be BGRA: report as RGBA.
         if renderer.surface_format().remove_srgb_suffix() == wgpu::TextureFormat::Bgra8Unorm {
@@ -2798,7 +2816,8 @@ mod tests {
                 }
             }),
             Box::new(|renderer| {
-                let pixels = render_test_scene(renderer, glam::Vec3::ZERO, 20.0);
+                let pixels =
+                    render_test_scene(renderer, &test_light(), false, glam::Vec3::ZERO, 20.0);
                 let (shadow, lit) = (value_at(&pixels, SHADOW_PX), value_at(&pixels, LIT_PX));
                 if shadow < 170 && lit > 200 {
                     Ok(())
@@ -2809,11 +2828,37 @@ mod tests {
                 }
             }),
             Box::new(|renderer| {
+                // Shadowed floor faces up: only the sky colour reaches it.
+                let light = melon_core::Light {
+                    sky_color: glam::Vec3::X,
+                    ground_color: glam::Vec3::Z,
+                    ..test_light()
+                };
+                let up = render_test_scene(renderer, &light, false, glam::Vec3::ZERO, 20.0);
+                let px = pixel_at(renderer, &up, SHADOW_PX);
+                // The floor's underside faces down: only the ground colour.
+                let down = render_test_scene(renderer, &light, true, glam::Vec3::ZERO, 20.0);
+                let below = pixel_at(renderer, &down, (TEST_SIZE / 2, TEST_SIZE / 2));
+                if px[0] > px[2] && below[2] > below[0] {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "hemisphere_ambient: up-facing SHADOW_PX {px:?} (want red > blue), down-facing centre {below:?} (want blue > red)"
+                    ))
+                }
+            }),
+            Box::new(|renderer| {
                 // The box edge nearest FAR_LEFT_PX runs through the occluder,
                 // and FAR_LEFT_PX sits within the box's depth range but past
                 // that edge. Without the uv-range check, clamp-to-edge would
                 // read the occluder's depth there and shadow it.
-                let pixels = render_test_scene(renderer, glam::Vec3::new(0.12, 0.0, 0.0), 1.5);
+                let pixels = render_test_scene(
+                    renderer,
+                    &test_light(),
+                    false,
+                    glam::Vec3::new(0.12, 0.0, 0.0),
+                    1.5,
+                );
                 let v = value_at(&pixels, FAR_LEFT_PX);
                 if v > 200 {
                     Ok(())
@@ -2847,7 +2892,8 @@ mod tests {
                 }
             }),
             Box::new(|renderer| {
-                let pixels = render_test_scene(renderer, glam::Vec3::ZERO, 20.0);
+                let pixels =
+                    render_test_scene(renderer, &test_light(), false, glam::Vec3::ZERO, 20.0);
                 let v = value_at(&pixels, LIT_PX);
                 if v > 200 {
                     Ok(())

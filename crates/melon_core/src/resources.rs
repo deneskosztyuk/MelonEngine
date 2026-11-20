@@ -104,8 +104,13 @@ impl Camera {
 pub struct Light {
     /// Direction the light travels (from the light into the scene).
     pub direction: Vec3,
+    /// Overall ambient intensity (0..1). The sun's diffuse is scaled by `1 - ambient`.
     pub ambient: f32,
     pub color: Vec3,
+    /// Ambient colour from above (linear RGB): lights surfaces facing up.
+    pub sky_color: Vec3,
+    /// Ambient colour from below (linear RGB): lights surfaces facing down.
+    pub ground_color: Vec3,
 }
 
 impl Light {
@@ -166,6 +171,10 @@ impl Default for Light {
             direction: Vec3::new(0.5, -1.0, 0.5).normalize(),
             ambient: 0.2,
             color: Vec3::ONE,
+            // Clear day: cool blue sky, warm darker ground. Their midpoint is
+            // a little brighter than the old flat white ambient.
+            sky_color: Vec3::new(1.2, 1.4, 1.8),
+            ground_color: Vec3::new(0.9, 0.75, 0.55),
         }
     }
 }
@@ -333,6 +342,18 @@ mod tests {
         assert!((l.direction.length() - 1.0).abs() < 1e-6);
         assert!((l.ambient - 0.2).abs() < 1e-6);
         assert_eq!(l.color, Vec3::ONE);
+    }
+
+    #[test]
+    fn light_default_hemisphere_is_a_clear_day() {
+        let l = Light::default();
+        let lum = |c: Vec3| c.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+        for c in [l.sky_color, l.ground_color] {
+            assert!(c.is_finite() && c.min_element() >= 0.0, "{c:?}");
+        }
+        assert!(lum(l.sky_color) > lum(l.ground_color));
+        // A side-facing surface gets the midpoint; at least the old flat white.
+        assert!(lum((l.sky_color + l.ground_color) * 0.5) >= 1.0);
     }
 
     #[test]

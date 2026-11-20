@@ -1,6 +1,6 @@
 // M4 mesh shader. Vertex has position + normal + uv. Camera uniform carries
-// view_proj. Light uniform carries direction + ambient + the sun's shadow
-// matrix. Texture + sampler in group 2. Per-vertex color is dropped — replaced
+// view_proj. Light uniform carries direction + ambient (sky/ground hemisphere)
+// + the sun's shadow matrix. Texture + sampler in group 2. Per-vertex color is dropped — replaced
 // by textured PBR-ish shading. Output is linear HDR; the tonemap pass maps it
 // to the display.
 
@@ -20,6 +20,12 @@ struct LightUniform {
     ambient: f32,
     // Light color (linear, 0..1).
     color: vec3f,
+    _pad: f32,
+    // Ambient from above / below (linear RGB), blended by the world normal.
+    sky_color: vec3f,
+    _pad1: f32,
+    ground_color: vec3f,
+    _pad2: f32,
     // World -> shadow map clip space (orthographic, from the sun).
     light_view_proj: mat4x4f,
 };
@@ -86,7 +92,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let ndl = max(dot(n, light.direction), 0.0);
     let albedo = textureSample(albedo_tex, albedo_sampler, in.uv).rgb;
 
-    let ambient = light.ambient * albedo;
+    let hemi = mix(light.ground_color, light.sky_color, n.y * 0.5 + 0.5);
+    let ambient = light.ambient * hemi * albedo;
     let diffuse = (1.0 - light.ambient) * ndl * albedo * light.color
         * shadow_factor(in.world_pos);
 

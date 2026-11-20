@@ -113,6 +113,7 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 - **Light direction sign.** `Light::direction` is the direction light travels
   (from the light into the scene). Shaders want the opposite; pass
   `Light::to_light()`.
+- **Ambient.** A sky/ground hemisphere on `Light` (`sky_color`, `ground_color`, scaled by `ambient`), blended by the world normal's y.
 - **Camera conventions.** Right-handed, DirectX depth (near = 0, far = 1).
   Screen helpers take logical points.
 - **Checking rendering.** Agents verify rendering with the snapshot example
