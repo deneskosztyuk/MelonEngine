@@ -85,11 +85,16 @@ pub fn reconcile(server: &mut AssetServer) {
             && new != old
             // A case-only rename: the old spelling still "exists" on a
             // case-insensitive file system.
-            && (!root.join(&old).exists() || old.eq_ignore_ascii_case(&new))
+            && (!root.join(&old).exists() || same_ignoring_case(&old, &new))
         {
             server.rename_path(&old, &new);
         }
     }
+}
+
+/// Names that differ only in (Unicode) case, as on Windows.
+pub(crate) fn same_ignoring_case(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
 }
 
 /// Creation time for the duplicate tie-break; unknown sorts last.
@@ -284,6 +289,23 @@ mod tests {
         reconcile(&mut server);
         assert_eq!(server.path(h), "assets/models/A.glb");
         assert_eq!(server.path_of_guid(g), Some("assets/models/A.glb"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reconcile_follows_non_ascii_case_only_rename() {
+        let root = temp_root("case_only_unicode");
+        let a = write(&root, "assets/models/ä.glb");
+        let g = AssetGuid::new();
+        write_meta_for(&a, g);
+        let mut server = AssetServer::new(root.clone());
+        reconcile(&mut server);
+        let h: Handle<Model> = server.load("assets/models/ä.glb");
+        let upper = root.join("assets/models/Ä.glb");
+        std::fs::rename(&a, &upper).unwrap();
+        std::fs::rename(meta_path(&a), meta_path(&upper)).unwrap();
+        reconcile(&mut server);
+        assert_eq!(server.path(h), "assets/models/Ä.glb");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

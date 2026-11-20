@@ -7,7 +7,7 @@ use anyhow::{Context, bail};
 use melon_core::assets::project_relative;
 use melon_core::{AssetServer, meta_path};
 
-use crate::asset_db::reconcile;
+use crate::asset_db::{reconcile, same_ignoring_case};
 
 /// Reject names the file system or the asset walk cannot handle.
 pub fn validate_name(name: &str) -> anyhow::Result<()> {
@@ -34,12 +34,11 @@ pub fn validate_name(name: &str) -> anyhow::Result<()> {
 /// Something named `name` is already in `folder` (case-insensitive, as on
 /// Windows).
 fn name_taken(folder: &Path, name: &str) -> bool {
-    let name = name.to_lowercase();
     std::fs::read_dir(folder)
         .into_iter()
         .flatten()
         .flatten()
-        .any(|e| e.file_name().to_string_lossy().to_lowercase() == name)
+        .any(|e| same_ignoring_case(&e.file_name().to_string_lossy(), name))
 }
 
 /// `folder/name`, or `stem 2.ext`, `stem 3.ext`, ... if that is taken.
@@ -79,7 +78,7 @@ pub fn rename(server: &mut AssetServer, path: &Path, new_name: &str) -> anyhow::
         return Ok(path.to_path_buf());
     }
     // A case-only rename of the same item is fine; anything else that exists is a clash.
-    if !old_name.eq_ignore_ascii_case(new_name) && name_taken(parent, new_name) {
+    if !same_ignoring_case(&old_name, new_name) && name_taken(parent, new_name) {
         bail!("'{new_name}' already exists here");
     }
     let target = parent.join(new_name);
@@ -484,6 +483,17 @@ mod tests {
         rename(&mut server, &a, "A.glb").unwrap();
         assert_eq!(server.path(h), "assets/models/A.glb");
         assert_eq!(server.guid_of("assets/models/A.glb"), Some(g));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rename_case_only_non_ascii_keeps_handle() {
+        let (root, mut server) = project("rename_case_unicode");
+        let (a, g) = asset(&root, &mut server, "assets/models/ä.glb");
+        let h: Handle<Model> = server.load("assets/models/ä.glb");
+        rename(&mut server, &a, "Ä.glb").unwrap();
+        assert_eq!(server.path(h), "assets/models/Ä.glb");
+        assert_eq!(server.guid_of("assets/models/Ä.glb"), Some(g));
         let _ = std::fs::remove_dir_all(&root);
     }
 
