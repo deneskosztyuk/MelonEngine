@@ -40,20 +40,24 @@ struct Cache {
     carriers: (usize, Option<Entity>),
 }
 
-/// Every carrier: those in the Hierarchy (roots in `RootOrder`, then children
-/// depth first) first, then any others (no `Name` / `Transform`) by entity
-/// index.
+/// Every live carrier. One (the usual case) needs no ordering; with more,
+/// those in the Hierarchy (roots in `RootOrder`, then children depth first)
+/// come first, then any others (no `Name` / `Transform`) by entity index.
 fn carriers(world: &mut World) -> Vec<Entity> {
+    use bevy_ecs::query::{With, Without};
+    let mut rest: Vec<Entity> = world
+        .query_filtered::<Entity, (With<WorldEnvironment>, Without<crate::PendingDelete>)>()
+        .iter(world)
+        .collect();
+    if rest.len() < 2 {
+        return rest;
+    }
     let mut found: Vec<Entity> = crate::hierarchy::depth_first(world)
         .into_iter()
         .map(|(e, _)| e)
-        .filter(|&e| world.get::<WorldEnvironment>(e).is_some())
+        .filter(|e| rest.contains(e))
         .collect();
-    let mut rest: Vec<Entity> = world
-        .query_filtered::<Entity, bevy_ecs::query::With<WorldEnvironment>>()
-        .iter(world)
-        .filter(|e| !found.contains(e))
-        .collect();
+    rest.retain(|e| !found.contains(e));
     rest.sort_by_key(|e| e.index());
     found.extend(rest);
     found
@@ -135,7 +139,7 @@ fn resolve_asset(
     if cache.handle != Some(id) {
         cache.asset = None;
     }
-    if (cache.handle, cache.version) != (Some(id), version) || cache.asset.is_none() {
+    if (cache.handle, cache.version) != (Some(id), version) {
         let path = server.path(handle).to_string();
         let parsed = server
             .read(&path)
@@ -376,6 +380,68 @@ mod tests {
         core.world.resource_mut::<AssetServer>().poll_changes();
         run(&mut core.world);
         assert_eq!(fog(&core.world), 0.04);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refresh_applies_a_write_without_polling() {
+        let (root, mut core) = project("refresh");
+        let file = root.join("assets/a.env");
+        write(&root, "assets/a.env", "(fog: (density: 0.02))");
+        carrier(&mut core.world, "Env", "assets/a.env");
+        run(&mut core.world);
+        write(&root, "assets/a.env", "(fog: (density: 0.04))");
+        let f = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        f.set_modified(SystemTime::now() + Duration::from_secs(2))
+            .unwrap();
+        core.world
+            .resource_mut::<AssetServer>()
+            .refresh("./assets/a.env");
+        core.world.resource_mut::<AssetServer>().refresh("nope.env");
+        run(&mut core.world);
+        assert_eq!(fog(&core.world), 0.04);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pending_delete_carrier_is_ignored() {
+        let (root, mut core) = project("pending");
+        write(&root, "assets/a.env", "(fog: (density: 0.1))");
+        write(&root, "assets/b.env", "(fog: (density: 0.2))");
+        let a = carrier(&mut core.world, "A", "assets/a.env");
+        let b = carrier(&mut core.world, "B", "assets/b.env");
+        core.world.entity_mut(a).insert(crate::PendingDelete);
+        run(&mut core.world);
+        assert_eq!(active_environment(&mut core.world), Some(b));
+        assert_eq!(fog(&core.world), 0.2);
+        core.world.entity_mut(b).insert(crate::PendingDelete);
+        assert_eq!(active_environment(&mut core.world), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_never_good_broken_file_is_read_once_per_version() {
+        let (root, mut core) = project("neverread");
+        write(&root, "assets/a.env", "(fog: ");
+        carrier(&mut core.world, "Env", "assets/a.env");
+        run(&mut core.world);
+        let read_at = |w: &World| w.resource::<Cache>().failed;
+        let first = read_at(&core.world);
+        assert!(first.is_some());
+        // Fixing the file on disk without a version bump must not be seen
+        // (no re-read per frame); a bump is.
+        write(&root, "assets/a.env", "(fog: (density: 0.3))");
+        run(&mut core.world);
+        assert_eq!(fog(&core.world), Environment::default().fog_density);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("assets/a.env"))
+            .unwrap();
+        f.set_modified(SystemTime::now() + Duration::from_secs(2))
+            .unwrap();
+        core.world.resource_mut::<AssetServer>().poll_changes();
+        run(&mut core.world);
+        assert_eq!(fog(&core.world), 0.3);
         let _ = std::fs::remove_dir_all(&root);
     }
 
