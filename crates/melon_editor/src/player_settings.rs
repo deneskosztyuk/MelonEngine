@@ -201,11 +201,13 @@ mod tests {
     fn apply_refuses_an_invalid_name() {
         let dir = temp_dir("refuse");
         let mut world = world();
-        let mut panel = PlayerSettingsPanel::default();
-        panel.pending = Some(PlayerSettings {
-            game_name: "a/b".into(),
+        let mut panel = PlayerSettingsPanel {
+            pending: Some(PlayerSettings {
+                game_name: "a/b".into(),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         let status = panel.apply(&mut world, &dir);
         assert!(matches!(status, Some((StatusKind::Warning, _))));
         assert_eq!(
