@@ -117,6 +117,11 @@ Status marks:
 
 - ✅ `AssetServer`: handles, GUIDs from `.meta` sidecars, file hot reload,
   glTF node trees and per-mesh unpacking.
+- 🧪 FBX models (ufbx, binary and ASCII): metres / Y up conversion,
+  materials and textures, node tree, thumbnails, drag-in, Extract Materials
+  and `game.pak`, like glTF. No skinning or animation yet (the Animation
+  area adds them for glTF and FBX alike). Manual check: the horse, see
+  `AGENTS.md` (Assets).
 - 🧪 P9 Ship builds: player mode (no editor linked), Project Settings >
   Player (`config/player.ron`), `game.pak` asset pack (`.gltf` with external
   files supported), File > Build (cancel, remembered output folder, Open
@@ -153,7 +158,7 @@ Status marks:
 
 ### Assets & Packaging
 
-- 🟡 Import pipeline: glTF, images, audio with fixed rules; no per-asset
+- 🟡 Import pipeline: glTF, FBX, images (png / jpg / hdr), audio with fixed rules; no per-asset
   import settings.
 - 🟡 Packaging: Windows only; no custom exe icon or version stamp; each
   build also compiles the unused `melon_game` dylib.
@@ -180,7 +185,8 @@ Status marks:
 
 ### Animation
 
-- ❌ P5 glTF skinning, animation clips, blending.
+- ❌ P5 glTF and FBX skinning, animation clips, blending (ufbx keeps the
+  skin and clip data reachable).
 
 ### UI
 

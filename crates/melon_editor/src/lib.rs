@@ -30,6 +30,7 @@ mod content_view;
 mod drawer;
 pub mod gizmo;
 pub mod history;
+mod import_card;
 pub mod inspect;
 pub mod layout;
 mod material_assign;
@@ -2120,6 +2121,11 @@ impl Editor {
             .retain(|cached, _| asset.as_ref().is_some_and(|(path, _)| path == cached));
         if let Some((path, details)) = &asset {
             self.asset_card(ui, path, details);
+            if details.kind == content::AssetKind::Model && import_card::has_settings(path) {
+                let mut fills = theme::colors::INSPECTOR_CARDS;
+                fills.swap(0, 1);
+                import_card::show(ui, &mut fills, path);
+            }
             if details.kind == content::AssetKind::Material {
                 material_card::show(ui, path, world.get_resource::<AssetServer>());
             }
@@ -2973,27 +2979,21 @@ impl Editor {
         details: &content::AssetDetails,
     ) {
         let model = details.kind == content::AssetKind::Model;
-        // Read from the file (not the GPU cache, which only knows what is
-        // drawn), again only when its modified time changes.
+        // Read once per file version by `melon_render::model_summary`, which
+        // `spawn_model` shares (not the GPU cache, which only knows what is
+        // drawn).
         let info = model.then(|| {
-            let stale = self
-                .mesh_counts
-                .get(path)
-                .is_none_or(|(modified, _)| *modified != details.modified);
-            if stale {
-                let read = melon_render::gltf_nodes(path).and_then(|nodes| {
-                    let meshes = nodes
-                        .iter()
-                        .filter_map(|n| n.mesh)
-                        .collect::<std::collections::HashSet<_>>()
-                        .len();
-                    Ok((meshes, melon_render::gltf_bounds(path)?))
-                });
-                self.mesh_counts.insert(
-                    path.to_path_buf(),
-                    (details.modified, read.map_err(|e| format!("{e:#}"))),
-                );
-            }
+            let read = melon_render::model_summary(path).map(|summary| {
+                let meshes = summary
+                    .nodes
+                    .iter()
+                    .filter_map(|n| n.mesh)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len();
+                (meshes, summary.bounds)
+            });
+            self.mesh_counts
+                .insert(path.to_path_buf(), (details.modified, read));
             self.mesh_counts[path].1.clone()
         });
         let meshes = info.as_ref().map(|info| match info {
@@ -3149,8 +3149,9 @@ pub fn spawn_model(
         .file_stem()
         .map_or_else(|| "Model".to_string(), |s| s.to_string_lossy().into_owned());
     let nodes = (!path.starts_with(melon_core::assets::BUILTIN_PREFIX))
-        .then(|| melon_render::gltf_nodes(&project_root.join(path)).ok())
-        .flatten();
+        .then(|| melon_render::model_summary(&project_root.join(path)).ok())
+        .flatten()
+        .map(|summary| summary.nodes.clone());
     world.get_resource_or_insert_with(|| AssetServer::new(".".into()));
     let root = world
         .spawn((Name(name), Transform::from_translation(at)))
@@ -4183,6 +4184,97 @@ mod tests {
             .map(|h| world.resource::<AssetServer>().path(*h).to_string())
     }
 
+    /// One triangle at (3, 0, 0) with a green material, in metres, Y up.
+    pub(crate) const TRIANGLE_FBX: &str = r#"; FBX 7.3.0 project file
+FBXHeaderExtension:  {
+	FBXHeaderVersion: 1003
+	FBXVersion: 7300
+}
+GlobalSettings:  {
+	Version: 1000
+	Properties70:  {
+		P: "UpAxis", "int", "Integer", "",1
+		P: "UpAxisSign", "int", "Integer", "",1
+		P: "FrontAxis", "int", "Integer", "",2
+		P: "FrontAxisSign", "int", "Integer", "",1
+		P: "CoordAxis", "int", "Integer", "",0
+		P: "CoordAxisSign", "int", "Integer", "",1
+		P: "UnitScaleFactor", "double", "Number", "",100
+	}
+}
+Objects:  {
+	Geometry: 1000, "Geometry::Tri", "Mesh" {
+		Vertices: *9 { a: 0,0,0,1,0,0,0,1,0 }
+		PolygonVertexIndex: *3 { a: 0,1,-3 }
+		LayerElementMaterial: 0 {
+			Version: 101
+			Name: ""
+			MappingInformationType: "AllSame"
+			ReferenceInformationType: "IndexToDirect"
+			Materials: *1 { a: 0 }
+		}
+		Layer: 0 {
+			Version: 100
+			LayerElement:  {
+				Type: "LayerElementMaterial"
+				TypedIndex: 0
+			}
+		}
+	}
+	Model: 2000, "Model::Tri", "Mesh" {
+		Version: 232
+		Properties70:  {
+			P: "Lcl Translation", "Lcl Translation", "", "A",3,0,0
+		}
+	}
+	Material: 3000, "Material::Paint", "" {
+		Version: 102
+		ShadingModel: "lambert"
+		Properties70:  {
+			P: "DiffuseColor", "Color", "", "A",0,1,0
+		}
+	}
+}
+Connections:  {
+	C: "OO",2000,0
+	C: "OO",1000,2000
+	C: "OO",3000,2000
+}
+"#;
+
+    #[test]
+    fn unpacked_fbx_drop_spawns_root_and_node_child() {
+        let root_dir = two_node_project("fbx_tree");
+        std::fs::write(root_dir.join("assets/models/tri.fbx"), TRIANGLE_FBX).unwrap();
+        let mut world = World::new();
+        let root = spawn_model(
+            &mut world,
+            &root_dir,
+            "assets/models/tri.fbx",
+            glam::Vec3::ZERO,
+            None,
+        );
+        assert!(model_path(&world, root).is_none());
+        let children: Vec<Entity> = world
+            .get::<melon_core::Children>(root)
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(children.len(), 1);
+        let child = children[0];
+        assert_eq!(world.get::<Name>(child).unwrap().0, "Tri");
+        assert_eq!(
+            world.get::<Transform>(child).unwrap().translation,
+            glam::Vec3::new(3.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            model_path(&world, child).as_deref(),
+            Some("assets/models/tri.fbx#mesh0")
+        );
+        let _ = std::fs::remove_dir_all(&root_dir);
+    }
+
     #[test]
     fn unpacked_drop_spawns_root_and_node_children() {
         let root_dir = two_node_project("tree");
@@ -4941,6 +5033,120 @@ mod tests {
         );
         assert!(melon_core::meta_path(&y).exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn fbx_browser_project(name: &str) -> (Editor, World, std::path::PathBuf, std::path::PathBuf) {
+        let (editor, mut world, root) = browser_project(name);
+        let fbx = root.join("assets/models/tri.fbx");
+        std::fs::write(&fbx, TRIANGLE_FBX).unwrap();
+        asset_db::reconcile(&mut world.resource_mut::<AssetServer>());
+        (editor, world, root, fbx)
+    }
+
+    #[test]
+    fn selecting_then_dropping_an_fbx_parses_it_once() {
+        let (mut editor, mut world, root, fbx) = fbx_browser_project("fbx_parse_once");
+        let before = melon_render::fbx_parses_on_this_thread();
+        editor.content.select(Some(fbx));
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            editor.build_inspector(&mut world, ui)
+        });
+        spawn_model(
+            &mut world,
+            &root,
+            "assets/models/tri.fbx",
+            glam::Vec3::ZERO,
+            None,
+        );
+        assert_eq!(melon_render::fbx_parses_on_this_thread() - before, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One frame of the Inspector with a click on `id`'s widget (if any).
+    fn import_frame(
+        ctx: &egui::Context,
+        editor: &mut Editor,
+        world: &mut World,
+        click: Option<egui::Id>,
+    ) {
+        let mut events = Vec::new();
+        if let Some(id) = click {
+            let pos = ctx.read_response(id).expect("widget drawn").rect.center();
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            events = vec![egui::Event::PointerMoved(pos), button(true), button(false)];
+        }
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ui| editor.build_inspector(world, ui),
+        );
+    }
+
+    #[test]
+    fn import_settings_wait_for_apply_and_revert_drops_them() {
+        use melon_core::ImportSettings;
+        let (mut editor, mut world, root, fbx) = fbx_browser_project("fbx_import_card");
+        editor.content.select(Some(fbx.clone()));
+        let ctx = egui::Context::default();
+        let (apply, revert) = (import_card::apply_id(&fbx), import_card::revert_id(&fbx));
+        let edit = |settings: ImportSettings| {
+            ctx.data_mut(|d| d.insert_temp(import_card::memory_id(&fbx), settings))
+        };
+        for _ in 0..2 {
+            import_frame(&ctx, &mut editor, &mut world, None);
+        }
+        // Nothing edited: Apply is disabled, nothing is written.
+        import_frame(&ctx, &mut editor, &mut world, Some(apply));
+        assert_eq!(ImportSettings::read(&fbx), ImportSettings::default());
+        // An edit waits in memory; Revert drops it.
+        let scaled = ImportSettings {
+            scale: 2.0,
+            forward_flip: true,
+            ..Default::default()
+        };
+        edit(scaled);
+        import_frame(&ctx, &mut editor, &mut world, None);
+        assert_eq!(ImportSettings::read(&fbx), ImportSettings::default());
+        import_frame(&ctx, &mut editor, &mut world, Some(revert));
+        import_frame(&ctx, &mut editor, &mut world, None);
+        assert!(
+            ctx.data(|d| d.get_temp::<ImportSettings>(import_card::memory_id(&fbx)))
+                .is_none()
+        );
+        // Apply writes the `.meta`, keeping the GUID.
+        let guid = editor_guid(&world, "assets/models/tri.fbx");
+        edit(scaled);
+        import_frame(&ctx, &mut editor, &mut world, None);
+        import_frame(&ctx, &mut editor, &mut world, Some(apply));
+        assert_eq!(ImportSettings::read(&fbx), scaled);
+        assert_eq!(
+            melon_core::AssetMeta::read(&melon_core::meta_path(&fbx))
+                .unwrap()
+                .guid,
+            guid
+        );
+        // A glTF shows no card.
+        editor
+            .content
+            .select(Some(root.join("assets/models/x.glb")));
+        import_frame(&ctx, &mut editor, &mut world, None);
+        assert!(
+            ctx.read_response(import_card::apply_id(&root.join("assets/models/x.glb")))
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn editor_guid(world: &World, path: &str) -> melon_core::AssetGuid {
+        world.resource::<AssetServer>().guid_of(path).unwrap()
     }
 
     #[test]

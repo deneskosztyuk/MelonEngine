@@ -88,14 +88,78 @@ impl AssetMeta {
     }
 
     pub fn to_ron(&self) -> String {
+        self.to_ron_with(None)
+    }
+
+    /// `to_ron` plus the model's import settings (omitted when `None`).
+    pub fn to_ron_with(&self, import: Option<&ImportSettings>) -> String {
+        let import = import
+            .and_then(|i| ron::to_string(i).ok())
+            .map_or_else(String::new, |i| format!(", import: Some({i})"));
         format!(
-            "(version: {}, guid: \"{}\")
+            "(version: {}, guid: \"{}\"{import})
 ",
             self.version, self.guid
         )
     }
 }
 
+/// Per-asset import settings of a model, an optional `import` field of its
+/// `.meta`. The defaults leave a model as the file says.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+pub struct ImportSettings {
+    /// Uniform scale, multiplied after the unit conversion.
+    pub scale: f32,
+    /// Convert the file's unit to metres (off: the file's numbers are metres).
+    pub use_file_units: bool,
+    /// Turn the model 180 degrees about Y (files that face -Z).
+    pub forward_flip: bool,
+    /// Flip the green channel of normal maps (DirectX to OpenGL).
+    pub normal_y_flip: bool,
+}
+
+impl Default for ImportSettings {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            use_file_units: true,
+            forward_flip: false,
+            normal_y_flip: false,
+        }
+    }
+}
+
+impl ImportSettings {
+    /// The `import` field of `.meta` text; defaults when absent or unreadable.
+    pub fn from_meta_text(text: &str) -> Self {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            import: Option<ImportSettings>,
+        }
+        ron::from_str::<Wrapper>(text)
+            .ok()
+            .and_then(|w| w.import)
+            .unwrap_or_default()
+    }
+
+    /// Settings of the asset file `asset` (its `.meta` next to it).
+    pub fn read(asset: &Path) -> Self {
+        std::fs::read_to_string(meta_path(asset))
+            .map(|t| Self::from_meta_text(&t))
+            .unwrap_or_default()
+    }
+
+    /// Write `self` into `asset`'s `.meta`, keeping its GUID. The asset needs a
+    /// valid `.meta` already.
+    pub fn write(&self, asset: &Path) -> anyhow::Result<()> {
+        let meta = AssetMeta::read(&meta_path(asset))?;
+        let import = (*self != Self::default()).then_some(self);
+        std::fs::write(meta_path(asset), meta.to_ron_with(import))?;
+        Ok(())
+    }
+}
 /// The sidecar of `asset`: its full file name plus `.meta`.
 pub fn meta_path(asset: &Path) -> PathBuf {
     let mut name = asset.file_name().unwrap_or_default().to_os_string();
@@ -301,6 +365,30 @@ impl AssetServer {
         self.pack = Some(pack);
     }
 
+    /// Import settings of the model file `path` from its `.meta` (the pack
+    /// carries the `.meta`s that differ from the defaults).
+    pub fn import_settings(&self, path: &str) -> ImportSettings {
+        let file = normalise(split_mesh_fragment(path).0);
+        self.read(&format!("{file}.meta"))
+            .map(|b| ImportSettings::from_meta_text(&String::from_utf8_lossy(&b)))
+            .unwrap_or_default()
+    }
+
+    /// Every project file path (the pack's, or the files under `<root>/assets`
+    /// without `.meta` sidecars), sorted, `/` separated.
+    pub fn file_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = match &self.pack {
+            Some(pack) => pack.entries().map(|(p, _)| p.to_string()).collect(),
+            None => asset_dir_files(&self.root)
+                .iter()
+                .filter_map(|f| project_relative(&self.root, f))
+                .collect(),
+        };
+        paths.retain(|p| !p.ends_with(".meta"));
+        paths.sort();
+        paths
+    }
+
     pub fn has_pack(&self) -> bool {
         self.pack.is_some()
     }
@@ -409,9 +497,10 @@ impl AssetServer {
         if path.starts_with(BUILTIN_PREFIX) || self.pack.is_some() {
             return None;
         }
-        std::fs::metadata(self.root.join(split_mesh_fragment(path).0))
-            .and_then(|m| m.modified())
-            .ok()
+        // The `.meta` counts too: its import settings change what loads.
+        let file = self.root.join(split_mesh_fragment(path).0);
+        let time = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        time(&file).map(|t| t.max(time(&meta_path(&file)).unwrap_or(t)))
     }
 
     /// Check every file-backed asset's modified time; a change (or a file
@@ -715,6 +804,65 @@ mod tests {
         };
         std::fs::write(meta_path(&file), meta.to_ron()).unwrap();
         guid
+    }
+
+    #[test]
+    fn import_settings_round_trip_through_meta_and_server() {
+        let root = temp_root("import_settings");
+        let guid = write_asset_with_meta(&root, "assets/models/a.fbx");
+        let file = root.join("assets/models/a.fbx");
+        let server = AssetServer::new(root.clone());
+        assert_eq!(
+            server.import_settings("assets/models/a.fbx"),
+            ImportSettings::default()
+        );
+        let settings = ImportSettings {
+            scale: 2.5,
+            use_file_units: false,
+            forward_flip: true,
+            normal_y_flip: true,
+        };
+        settings.write(&file).unwrap();
+        assert_eq!(ImportSettings::read(&file), settings);
+        assert_eq!(
+            server.import_settings("assets/models/a.fbx#mesh1"),
+            settings
+        );
+        assert_eq!(AssetMeta::read(&meta_path(&file)).unwrap().guid, guid);
+        // Defaults are written as a plain meta again.
+        ImportSettings::default().write(&file).unwrap();
+        let text = std::fs::read_to_string(meta_path(&file)).unwrap();
+        assert!(!text.contains("import"), "{text}");
+        // A model's file mtime or its meta's change bumps the version.
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn meta_change_reloads_the_model() {
+        let root = temp_root("meta_poll");
+        write_asset_with_meta(&root, "assets/models/a.fbx");
+        let file = root.join("assets/models/a.fbx");
+        let mut server = AssetServer::new(root.clone());
+        let h: Handle<Model> = server.load("assets/models/a.fbx");
+        server.poll_changes();
+        assert_eq!(server.version(h), 0);
+        touch_later(&meta_path(&file));
+        server.poll_changes();
+        assert_eq!(server.version(h), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_paths_lists_assets_without_metas() {
+        let root = temp_root("file_paths");
+        write_asset_with_meta(&root, "assets/models/b.fbx");
+        write_asset_with_meta(&root, "assets/Textures/a.png");
+        let server = AssetServer::new(root.clone());
+        assert_eq!(
+            server.file_paths(),
+            ["assets/Textures/a.png", "assets/models/b.fbx"]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

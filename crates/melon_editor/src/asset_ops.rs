@@ -90,7 +90,7 @@ pub(crate) const ONE_MATERIAL_GLTF: &str = r#"{
         "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0]}]
 }"#;
 
-/// Unpack the materials of the glTF `model` into `.mat` files (and png
+/// Unpack the materials of the glTF or FBX `model` into `.mat` files (and png
 /// textures) next to it, give them `.meta`s and fill their texture GUIDs.
 /// Returns the project-relative `.mat` path of each mesh part, in part order.
 pub fn extract_materials(server: &mut AssetServer, model: &Path) -> anyhow::Result<Vec<String>> {
@@ -495,6 +495,23 @@ mod tests {
         let parts = extract_materials(&mut server, &model).unwrap();
         assert_eq!(parts, ["assets/models/thing_Paint.mat"]);
         let mat = root.join("assets/models/thing_Paint.mat");
+        assert_eq!(
+            melon_core::MaterialAsset::read(&mat).unwrap().base_color,
+            [0.0, 1.0, 0.0, 1.0]
+        );
+        assert!(meta_path(&mat).is_file(), "the .mat has a .meta");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extract_materials_of_an_fbx_writes_mats_with_metas() {
+        let (root, mut server) = project("extract_fbx");
+        let model = root.join("assets/models/tri.fbx");
+        std::fs::write(&model, crate::tests::TRIANGLE_FBX).unwrap();
+        reconcile(&mut server);
+        let parts = extract_materials(&mut server, &model).unwrap();
+        assert_eq!(parts, ["assets/models/tri_Paint.mat"]);
+        let mat = root.join("assets/models/tri_Paint.mat");
         assert_eq!(
             melon_core::MaterialAsset::read(&mat).unwrap().base_color,
             [0.0, 1.0, 0.0, 1.0]
