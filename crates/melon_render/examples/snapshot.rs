@@ -3,8 +3,10 @@
 // Views: overview (default), low, sun, materials, corner, crowd (overview
 // plus about 10,000 grey cubes and spheres). Prints the mean frame time and
 // the `RenderStats`.
-// Debug flags: --ao-only saves the SSAO term (grey, white = open) instead of
-// the image; --no-ao renders with `ao_strength` 0.
+// Debug flags (any order): --ao-only saves the SSAO term (grey, white =
+// open) instead of the image; --no-ao renders with `ao_strength` 0;
+// --no-shadow moves the scene and camera far outside the fixed shadow box, so
+// nothing casts or receives sun shadows (the image is otherwise unchanged).
 
 use std::sync::Arc;
 
@@ -171,13 +173,25 @@ fn render_and_wait(
     Ok(stats)
 }
 
-fn render(window: Arc<Window>, out: &str, view: &str, flag: Option<&str>) -> Result<()> {
-    let ao_only = match flag {
-        None | Some("--no-ao") => false,
-        Some("--ao-only") => true,
-        Some(other) => bail!("unknown flag {other:?}; expected --ao-only or --no-ao"),
+/// Debug offset for `--no-shadow`: far outside the shadow box around the origin.
+const NO_SHADOW_OFFSET: Vec3 = Vec3::new(200.0, 0.0, 0.0);
+
+fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Result<()> {
+    for flag in flags {
+        if !["--ao-only", "--no-ao", "--no-shadow"].contains(&flag.as_str()) {
+            bail!("unknown flag {flag:?}; expected --ao-only, --no-ao or --no-shadow");
+        }
+    }
+    let has = |f: &str| flags.iter().any(|x| x == f);
+    let ao_only = has("--ao-only");
+    let offset = if has("--no-shadow") {
+        NO_SHADOW_OFFSET
+    } else {
+        Vec3::ZERO
     };
-    let camera = camera(view)?;
+    let mut camera = camera(view)?;
+    camera.eye += offset;
+    camera.center += offset;
     let mut renderer = pollster::block_on(Renderer::new(window))?;
     let target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(WIDTH, HEIGHT));
     let mut server = AssetServer::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..").into());
@@ -186,13 +200,16 @@ fn render(window: Arc<Window>, out: &str, view: &str, flag: Option<&str>) -> Res
         eye: camera.eye,
         light: Light::default(),
         environment: Environment {
-            ao_strength: if flag == Some("--no-ao") { 0.0 } else { 1.0 },
+            ao_strength: if has("--no-ao") { 0.0 } else { 1.0 },
             ..Default::default()
         },
         models: review_scene(&mut server),
     };
     if view == "crowd" {
         frame.models.extend(crowd(&mut server));
+    }
+    for (matrix, _) in &mut frame.models {
+        *matrix = Mat4::from_translation(offset) * *matrix;
     }
 
     let device = renderer.device().clone();
@@ -272,7 +289,7 @@ fn render(window: Arc<Window>, out: &str, view: &str, flag: Option<&str>) -> Res
 struct App {
     out: String,
     view: String,
-    flag: Option<String>,
+    flags: Vec<String>,
     result: Option<Result<()>>,
 }
 
@@ -286,7 +303,7 @@ impl ApplicationHandler for App {
                 event_loop
                     .create_window(attrs)
                     .context("failed to create hidden window")
-                    .and_then(|w| render(Arc::new(w), &self.out, &self.view, self.flag.as_deref())),
+                    .and_then(|w| render(Arc::new(w), &self.out, &self.view, &self.flags)),
             );
         }
         event_loop.exit();
@@ -298,10 +315,10 @@ impl ApplicationHandler for App {
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let out = args.next().context(
-        "usage: snapshot <out.png> [overview|low|sun|materials|corner|crowd] [--ao-only|--no-ao]",
+        "usage: snapshot <out.png> [overview|low|sun|materials|corner|crowd] [--ao-only] [--no-ao] [--no-shadow]",
     )?;
     let view = args.next().unwrap_or_else(|| "overview".into());
-    let flag = args.next();
+    let flags = args.collect();
 
     #[cfg(target_os = "windows")]
     let event_loop = {
@@ -314,7 +331,7 @@ fn main() -> Result<()> {
     let mut app = App {
         out: out.clone(),
         view,
-        flag,
+        flags,
         result: None,
     };
     event_loop.run_app(&mut app)?;
