@@ -9,7 +9,7 @@ Current state and planned work: `docs/ROADMAP.md`.
 |---|---|
 | `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera. No GPU or window code. |
 | `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache`) records sun shadow pass, depth/normal prepass, SSAO passes, the GI mode's passes (`gi/`: DDGI voxel and probe passes or SSGI), 3D pass into HDR target, bloom passes, tonemap pass; `ui_pass` for the editor. |
-| `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource) and ECS sync systems. |
+| `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource): component sync (`sync.rs`), scene queries (`queries.rs`), character controller, mesh collider triangles. See "Physics" below. |
 | `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), Content Drawer (`drawer.rs`), asset `.meta` files (`asset_db.rs`), file operations (`asset_ops.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), Project Settings window (`project_settings.rs`). |
 | `crates/melon_game` | Game logic as an `rlib` + `dylib`, hot-reloaded in dev builds. |
 | `crates/melon_host` | Binary: winit event loop, input mapping, frame order (core update, editor, extract, render_scene, ui pass). No render pass code. |
@@ -214,7 +214,52 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   returns `RenderStats` (draws, instances, culled).
 - **Deleting entities.** Call `melon_core::hierarchy::mark_for_delete` (marks
   the subtree `PendingDelete`); `cleanup_deleted_system` removes the rapier
-  bodies and despawns. Do not despawn physics entities directly.
+  bodies and despawns. Do not despawn physics entities directly (a stray
+  despawn is swept by `sync_components`, but joints and events lag a step).
+- **Physics (`melon_physics`).** Game data is in `melon_core::physics`
+  (usable from `melon_game`): `RigidBody` (kind, mass, damping, gravity
+  scale, per-axis rotation lock, ccd), `Collider` (shape `Box` /
+  `Sphere` / `Capsule` / `Mesh`, flat fields `half_extents`, `radius`,
+  `half_height` because the Inspector edits unit enums only; friction,
+  restitution, `sensor`, `membership` / `filter` bit masks),
+  `CharacterController`, `Joint`; all registered, so scenes and the
+  Inspector need no special code. A collider without a body is static; a
+  collider on a child attaches to the nearest ancestor body (a body's mass
+  is shared by its solid colliders). Shapes follow the entity's world
+  scale. Rapier objects are internal: `melon_physics::sync_components`
+  (system `sync_components_system`, run in `FixedUpdate` and in `PostUpdate`
+  so edit mode and Inspector edits are covered; scene load and the
+  Inspector call it directly) compares each component with what it last
+  built (`RigidBodyComponent` / `ColliderComponent` / `JointComponent` hold
+  the handles and the built copy) and creates, updates in place (body
+  parameters keep velocity), rebuilds (collider shape, owner, scale) or
+  removes; objects of despawned entities are swept. Never insert those
+  handle components yourself. Fixed bodies and kinematic bodies follow
+  their `Transform` (kinematic via the next-position API, so they push);
+  dynamic bodies write theirs. Mesh colliders read positions and indices of
+  the entity's glTF (`x.glb#meshN` unbaked, a whole file with node
+  transforms; `builtin:cube` is a unit box); a missing or broken model warns
+  and builds no collider (no retry until the component changes).
+  Queries: `Res<PhysicsQueries>` (`raycast`, `raycast_all`, `sphere_cast`,
+  `overlap_sphere`, `overlap_box` with `QueryFilter { layers, exclude,
+  sensors }`) read a snapshot (broad phase + colliders clone) published at
+  the end of each physics step, so they see the world of the last step and
+  nothing before the first one. Events: `Messages<CollisionEvent>`
+  (`Started` / `Ended` for solids, `TriggerEntered` / `TriggerExited` for
+  sensors, read with `MessageReader` in `FixedUpdate`; events of removed
+  colliders are dropped). Character: set `CharacterController::move_by`
+  (world-space delta, include gravity) each fixed step before
+  `character_controller_system`; it moves the `Transform` with rapier's
+  `KinematicCharacterController` (offset, max slope in degrees, autostep
+  height, snap distance) and writes `grounded` / `applied`. It sees colliders
+  of the last step; a capsule's round bottom climbs a ledge only with a
+  large enough move per step (about 0.1 m). Joints connect the entity's body
+  to its nearest ancestor body, or a fixed world body (then `parent_anchor`
+  is a world position); the bodies are assumed aligned at creation (hinge /
+  slider axes are the same vector on both bodies; `Fixed` keeps the
+  relative rotation). Ball `cone_limit` bounds the Y and Z swing, twist is
+  free. The Scene view draws green outlines of the selected entity's
+  colliders (and its descendants'; a mesh collider as its model bounds).
 - **Hierarchy.** Parents use bevy's `ChildOf` / `Children`. `Transform` is
   local to the parent; for world poses use `melon_core::hierarchy`
   (`world_matrix`, `set_world_transform`, `set_parent_keep_world`,
@@ -255,7 +300,7 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   Auxiliary views (thumbnails) go in their own submission after the
   frame's. A second main view (a Game view next to the Scene view) needs
   per-view uniform and instance buffers first.
-- **Scene format.** RON, `SCENE_VERSION = 5` in `melon_editor/src/scene.rs`:
+- **Scene format.** RON, `SCENE_VERSION = 6` in `melon_editor/src/scene.rs`:
   each entity has `name`, `parent` (index into `entities`), `model` (path,
   `#mesh<N>` included), `model_guid` (wins when it resolves, so a scene
   written by hand may give only `model`) and `components`, a map from type
@@ -263,7 +308,10 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   local to the parent). Adding a saved component = `#[derive(Component,
   Reflect)]` + `register_component`; no `SceneEntity` edit. Unknown or
   unreadable components are kept (`KeptComponents`, written back unchanged,
-  inserted once their type registers). Versions 1-4 still load (old fields
+  inserted once their type registers). Version 6 stores bodies as `RigidBody`
+  + `Collider` components; version 1-5 `BodyInfo` (world-unit half extents) is
+  converted on load to a box collider (extents divided by the entity scale;
+  kind `None` = no body). Versions 1-4 still load (old fields
   converted on load). Scene code needs the world's `AppTypeRegistry`: tests
   use `Core::new().world`, not `World::new()`. Bump the version on breaking
   changes and keep reading the old one.
