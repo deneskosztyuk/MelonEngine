@@ -124,6 +124,12 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   mesh unbaked (used by unpacked models). Never store handle ids in
   files. `melon_render::ModelCache` turns handles into GPU models; changed
   files hot-reload (poll every 0.5 s); a broken file keeps the last good model.
+- **Asset `.meta` files.** Every file under `assets/` has a `<file>.meta`
+  sidecar holding its GUID (`(version: 1, guid: "…")`); commit it with the
+  asset. Rename or move an asset only together with its `.meta` (in the
+  editor, or both files in Explorer), or references to it break. The
+  editor's `asset_db::reconcile` writes missing `.meta` files at startup;
+  `melon_core` only reads them (`AssetServer::scan_metas`).
 - **Scene format.** RON, `SCENE_VERSION = 3` in `melon_editor/src/scene.rs`:
   `parent` is an index into `entities`, `transform` is local (versions 1 and 2
   still load, all roots). Adding a saved component means changing

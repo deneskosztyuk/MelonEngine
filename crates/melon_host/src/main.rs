@@ -318,8 +318,9 @@ impl App {
         core.world.insert_resource(Input::default());
 
         // Asset paths are relative to the project root (the source tree in dev builds).
-        core.world
-            .insert_resource(melon_core::AssetServer::new(PROJECT_ROOT.into()));
+        let mut assets = melon_core::AssetServer::new(PROJECT_ROOT.into());
+        melon_editor::asset_db::reconcile(&mut assets);
+        core.world.insert_resource(assets);
         let map_path = melon_editor::project_settings::mapping_path(PROJECT_ROOT.as_ref());
         let (input_map, outcome) = melon_core::InputMap::load(&map_path);
         let input_map_broken = match outcome {

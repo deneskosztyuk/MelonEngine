@@ -17,6 +17,7 @@ use tracing::instrument;
 use winit::event::WindowEvent;
 use winit::window::Window;
 
+pub mod asset_db;
 pub mod console;
 pub mod content;
 pub mod gizmo;
