@@ -1,4 +1,5 @@
-//! Exports `MELON_CORE_SOURCE_HASH`, a digest of every file under `src/`, so
+//! Exports `MELON_CORE_SOURCE_HASH`, a digest of every `.rs` file under
+//! `src/` (editor swap and backup files are skipped), so
 //! `abi_fingerprint` changes whenever engine source changes.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -10,7 +11,7 @@ fn collect(dir: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
         let path = entry?.path();
         if path.is_dir() {
             collect(&path, files)?;
-        } else {
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
             files.push(path);
         }
     }

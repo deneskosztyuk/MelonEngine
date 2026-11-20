@@ -14,8 +14,8 @@ v0.1 — released.
 | `melon_render` | wgpu device/swapchain, pipelines, meshes, glTF loading, WGSL shaders. Frame: sun shadow pass, 3D pass into an HDR target, then a tonemap pass onto the display, then an overlay pass (solid editor shapes such as the gizmo) |
 | `melon_physics` | rapier3d wrapper + transform sync systems |
 | `melon_editor` | egui-wgpu debug overlay (FPS, inspector, gizmos) |
-| `melon_host` | Binary crate: winit event loop, wires all systems, owns hot-reloader |
-| `melon_game` | Dylib crate: game logic, hot-reloadable |
+| `melon_host` | Binary crate: winit event loop, wires all systems, loads the game plugin |
+| `melon_game` | Game plugin (`GamePlugin`): game logic, live-reloaded in dev builds |
 
 ## Run
 
@@ -24,6 +24,25 @@ Dev build with hot reload:
 ```sh
 cargo run -p melon_host
 ```
+
+Hot reload: while it runs, edit `crates/melon_game` and rebuild only the game
+crate. The editor reloads the game plugin and the Console shows "Game plugin
+reloaded"; the scene stays as it is.
+
+```sh
+just game      # cargo build -p melon_host --lib
+```
+
+Changing the fields of any game component **or resource** type needs a
+restart. Only a size/align change of a resource registered in `build` is
+detected (the plugin stops with an error); any other field change is not, so
+always restart. `build` must be idempotent: only `add_systems`,
+`init_resource`, `insert_resource`. Spawning entities, observers or component
+hooks from `build` repeats on every reload (a second hook registration panics).
+
+`cargo test` / `just test` while a dev-run is open rewrites
+`target/debug/melon_game.dll` with other features; the running host refuses
+that reload (fingerprint error). Run `just game` again.
 
 Or via the justfile:
 
@@ -69,12 +88,36 @@ Editor:
 - **Edit ▸ Project Settings ▸ Quality** — render quality presets (Low / Medium / High / Max) and
   each setting (GI, AO, shadow map, MSAA, bloom, frame pacing), with the measured GPU ms per pass;
   Apply to use, Save as / Load for named profiles
-- **Ctrl+S** — save the scene (File ▸ Save As… the first time)
+- **Ctrl+S** — save the scene (File ▸ Save As… the first time; it starts in
+  `assets/scenes`)
+- **Content Browser:** folder tree (right-click a folder to add it to
+  Favorites), clickable path, Back / Forward (also mouse buttons 4 / 5),
+  search (this folder and below), type filter chips, and a size slider whose
+  far left switches tiles to a list. Model tiles show a rendered thumbnail
+  (one per frame, refreshed when the file changes). Click selects; double-click (or Enter)
+  opens a folder, asks Save / Don't Save / Cancel and loads a scene (`.ron`
+  in `assets/`), or opens any other file in its default app. Right-click:
+  New Folder, Rename (**F2**), Duplicate (**Ctrl+D**), Delete (**Del**, to the
+  Recycle Bin; the dialog lists scenes that use it), Show in Explorer. Drag
+  an item onto a folder to move it; drag files from Explorer onto the window
+  to copy them into the current folder. Each `.meta` moves with its file. Favorites, size, folder and tree width are saved to
+  `.melon/content_browser.ron`.
+- **Ctrl+Space** (or the status bar's **Content Drawer** button) — the
+  Content Browser in a drawer that slides up over the panels, when its tab
+  is not in front (otherwise it brings the tab to the front). It hides on
+  Esc, Ctrl+Space, a click outside it, or dragging an item out of it (the
+  item drops on the Scene or Hierarchy below). **Dock in Layout** moves it
+  back to its tab.
 - **Models:** drag a `.glb` / `.gltf` from the Content Browser into the Scene
   (lands on the ground under the cursor) or the Hierarchy (at the origin, or
   under the row you drop it on). It unpacks into an entity per glTF node. Or
-  pick a whole file in the Inspector's **Mesh** field. Edit and re-export a model and
-  the editor reloads it within about a second.
+  pick a whole file in the Inspector's **Mesh** field, or drop one from the
+  Content Browser onto it; **Show** jumps the browser to the model's file.
+  Edit and re-export a model and the editor reloads it within about a second.
+- Files added, moved or deleted under `assets/` outside the editor show up
+  in the Content Browser within about half a second (move a file together
+  with its `.meta` to keep references). Selecting a file in the browser shows
+  its details (path, size, GUID, meshes, bounds) in the Inspector.
 - **Hierarchy:** drag an entity onto another to make it a child (it keeps its
   place in the world), or onto the empty space below to make it a root.
   Deleting an entity deletes its children.
@@ -107,7 +150,7 @@ entity. See `assets/README.md` for details.
 - **Window**: winit 0.30
 - **Physics**: rapier3d 0.34
 - **Editor UI**: egui 0.35 + egui-wgpu + egui-winit
-- **Hot reload**: hot-lib-reloader 0.8
+- **Game reload**: libloading 0.8
 - **Assets**: gltf 1.4, image 0.25
 - **Math**: glam 0.33
 

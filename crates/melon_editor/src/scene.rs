@@ -4,17 +4,19 @@ use anyhow::{Context, Result, bail};
 use bevy_ecs::entity::Entity;
 use bevy_ecs::query::With;
 use bevy_ecs::world::World;
+use melon_core::assets::split_mesh_fragment;
 use melon_core::hierarchy::{depth_first, world_matrix};
 use melon_core::{
-    Aabb, AssetServer, Bob, BodyInfo, BodyKind, ChildOf, Handle, Model, Name, NameCounter, Spin,
-    Transform,
+    Aabb, AssetGuid, AssetServer, Bob, BodyInfo, BodyKind, ChildOf, Handle, Model, Name,
+    NameCounter, Spin, Transform,
 };
 use melon_physics::{ColliderComponent, PhysicsWorld, RigidBodyComponent, RigidBodyType};
 use serde::{Deserialize, Serialize};
 
 /// 2: entities store a model path (`model`) instead of `mesh_ref`.
 /// 3: entities store a `parent` index; `transform` is local to the parent.
-const SCENE_VERSION: u32 = 3;
+/// 4: entities also store `model_guid`; it wins over `model` when it resolves.
+const SCENE_VERSION: u32 = 4;
 
 /// Version 1 `mesh_ref` values, read so old scenes still load.
 #[derive(Deserialize, Clone, Copy)]
@@ -54,6 +56,9 @@ pub struct SceneEntity {
     /// Model asset path (project-relative, or `builtin:cube`).
     #[serde(default)]
     model: Option<String>,
+    /// GUID of the model file (version 4+); `model` is the fallback.
+    #[serde(default)]
+    model_guid: Option<AssetGuid>,
     #[serde(default)]
     aabb: Option<Aabb>,
     #[serde(default)]
@@ -93,6 +98,10 @@ pub fn scene_to_data(world: &mut World) -> SceneData {
                 .get::<Handle<Model>>(e)
                 .zip(server)
                 .map(|(h, s)| s.path(*h).to_string()),
+            model_guid: world
+                .get::<Handle<Model>>(e)
+                .zip(server)
+                .and_then(|(h, s)| s.guid_of(s.path(*h))),
             aabb: world.get::<Aabb>(e).copied(),
             body_info: world.get::<BodyInfo>(e).copied(),
             spin: world.get::<Spin>(e).copied(),
@@ -278,9 +287,18 @@ fn spawn_scene_entity(world: &mut World, entity: &SceneEntity) -> Entity {
         .clone()
         .or_else(|| entity.mesh_ref.map(|m| m.model_path().to_string()));
     if let Some(path) = model {
-        let handle: Handle<Model> = world
-            .get_resource_or_insert_with(|| AssetServer::new(".".into()))
-            .load(&path);
+        let server = &mut *world.get_resource_or_insert_with(|| AssetServer::new(".".into()));
+        let by_guid = entity.model_guid.and_then(|guid| {
+            let handle = server.load_guid(guid, split_mesh_fragment(&path).1);
+            if handle.is_none() {
+                tracing::warn!(
+                    "entity '{}': model GUID {guid} not found; using {path}",
+                    entity.name
+                );
+            }
+            handle
+        });
+        let handle: Handle<Model> = by_guid.unwrap_or_else(|| server.load(&path));
         world.entity_mut(id).insert(handle);
     }
 
@@ -401,6 +419,7 @@ mod tests {
             parent,
             mesh_ref: None,
             model: None,
+            model_guid: None,
             aabb: None,
             body_info: None,
             spin: None,
@@ -856,5 +875,205 @@ mod tests {
         assert_eq!(has_rb, 1, "entity should have RigidBodyComponent");
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// A temp project with `assets/models/a.glb` and its `.meta`, and a world
+    /// whose `AssetServer` has scanned it.
+    fn guid_world(name: &str) -> (World, std::path::PathBuf, melon_core::AssetGuid) {
+        let root = std::env::temp_dir().join(format!("melon_scene_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let file = root.join("assets/models/a.glb");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        let guid = melon_core::AssetGuid::new();
+        let meta = melon_core::AssetMeta {
+            version: melon_core::META_VERSION,
+            guid,
+        };
+        std::fs::write(melon_core::meta_path(&file), meta.to_ron()).unwrap();
+        let mut server = AssetServer::new(root.clone());
+        server.scan_metas();
+        let mut world = World::new();
+        world.insert_resource(server);
+        (world, root, guid)
+    }
+
+    fn one_entity_scene(model: &str, guid: Option<melon_core::AssetGuid>) -> SceneData {
+        let guid = guid.map_or("None".to_string(), |g| format!("Some(\"{g}\")"));
+        let ron = format!(
+            r#"(version: 4, entities: [(name: "A", transform: (translation: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0, 1.0), scale: (1.0, 1.0, 1.0)), model: Some("{model}"), model_guid: {guid})], name_counter: 0)"#
+        );
+        ron::from_str(&ron).unwrap()
+    }
+
+    #[test]
+    fn v4_save_writes_model_guid() {
+        let (mut world, root, guid) = guid_world("v4_save");
+        let h: Handle<Model> = world
+            .resource_mut::<AssetServer>()
+            .load("assets/models/a.glb#mesh1");
+        world.spawn((Name("A".to_string()), Transform::default(), h));
+        let data = scene_to_data(&mut world);
+        let ron = ron::to_string(&data).unwrap();
+        assert!(
+            ron.contains(&format!("model_guid:Some(\"{guid}\")")),
+            "{ron}"
+        );
+        assert!(ron.contains("assets/models/a.glb#mesh1"), "{ron}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn v4_guid_wins_over_stale_path() {
+        let (mut world, root, guid) = guid_world("v4_stale");
+        let data = one_entity_scene("assets/models/old.glb#mesh1", Some(guid));
+        apply_scene(&mut world, &mut PhysicsWorld::new(), &data).unwrap();
+        assert_eq!(model_path_of(&mut world, "A"), "assets/models/a.glb#mesh1");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn v4_unknown_guid_falls_back_to_path() {
+        let (mut world, root, _) = guid_world("v4_unknown");
+        let data = one_entity_scene("assets/models/a.glb", Some(melon_core::AssetGuid::new()));
+        apply_scene(&mut world, &mut PhysicsWorld::new(), &data).unwrap();
+        assert_eq!(model_path_of(&mut world, "A"), "assets/models/a.glb");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn v4_path_only_entity_loads() {
+        let (mut world, root, _) = guid_world("v4_path_only");
+        let ron = r#"(version: 4, entities: [(name: "A", transform: (translation: (0.0, 0.0, 0.0), rotation: (0.0, 0.0, 0.0, 1.0), scale: (1.0, 1.0, 1.0)), model: Some("assets/models/a.glb"))], name_counter: 0)"#;
+        let data: SceneData = ron::from_str(ron).unwrap();
+        apply_scene(&mut world, &mut PhysicsWorld::new(), &data).unwrap();
+        assert_eq!(model_path_of(&mut world, "A"), "assets/models/a.glb");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Checks the two-entity scene the v3 and v4 fixtures hold.
+    fn assert_fixture_scene(data: &SceneData, version: u32) {
+        assert_eq!(data.version, version);
+        assert_eq!(data.name_counter, 3);
+        let [floor, cube] = &data.entities[..] else {
+            panic!("expected 2 entities");
+        };
+        assert_eq!(floor.name, "Floor");
+        assert_eq!(floor.transform.translation, Vec3::new(0.0, -1.0, 0.0));
+        assert_eq!(floor.transform.rotation, Quat::IDENTITY);
+        assert_eq!(floor.transform.scale, Vec3::ONE);
+        assert_eq!(floor.parent, None);
+        assert_eq!(floor.model.as_deref(), Some("builtin:cube"));
+        assert_eq!(floor.model_guid, None);
+        assert_eq!(floor.aabb.unwrap().half_extents, Vec3::new(10.0, 0.5, 10.0));
+        let body = floor.body_info.unwrap();
+        assert_eq!(body.body_type, BodyKind::Fixed);
+        assert_eq!(body.half_extents, Vec3::new(10.0, 0.5, 10.0));
+        assert!(floor.spin.is_none() && floor.bob.is_none());
+        assert_eq!(cube.name, "Cube");
+        assert_eq!(cube.transform.translation, Vec3::new(0.0, 2.0, 0.0));
+        assert_eq!(cube.parent, Some(0));
+        assert_eq!(cube.model.as_deref(), Some("assets/models/cube.glb"));
+        assert!(cube.aabb.is_none() && cube.body_info.is_none());
+        assert!(cube.spin.is_some() && cube.bob.is_some());
+    }
+
+    /// Fixture: `save_scene` output (ron 0.8 pretty) of a version 3 scene.
+    #[test]
+    fn v3_scene_fixture_loads() {
+        let ron = r#"(
+    version: 3,
+    entities: [
+        (
+            name: "Floor",
+            transform: (
+                translation: (0.0, -1.0, 0.0),
+                rotation: (0.0, 0.0, 0.0, 1.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            parent: None,
+            model: Some("builtin:cube"),
+            aabb: Some((
+                half_extents: (10.0, 0.5, 10.0),
+            )),
+            body_info: Some((
+                body_type: Fixed,
+                half_extents: (10.0, 0.5, 10.0),
+            )),
+            spin: None,
+            bob: None,
+        ),
+        (
+            name: "Cube",
+            transform: (
+                translation: (0.0, 2.0, 0.0),
+                rotation: (0.0, 0.0, 0.0, 1.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            parent: Some(0),
+            model: Some("assets/models/cube.glb"),
+            aabb: None,
+            body_info: None,
+            spin: Some(()),
+            bob: Some(()),
+        ),
+    ],
+    name_counter: 3,
+)"#;
+        let data: SceneData = ron::from_str(ron).unwrap();
+        assert_fixture_scene(&data, 3);
+        assert_eq!(data.entities[1].model_guid, None);
+    }
+
+    /// Fixture: `save_scene` output (ron 0.8 pretty) of a version 4 scene.
+    #[test]
+    fn v4_scene_fixture_loads() {
+        let ron = r#"(
+    version: 4,
+    entities: [
+        (
+            name: "Floor",
+            transform: (
+                translation: (0.0, -1.0, 0.0),
+                rotation: (0.0, 0.0, 0.0, 1.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            parent: None,
+            model: Some("builtin:cube"),
+            model_guid: None,
+            aabb: Some((
+                half_extents: (10.0, 0.5, 10.0),
+            )),
+            body_info: Some((
+                body_type: Fixed,
+                half_extents: (10.0, 0.5, 10.0),
+            )),
+            spin: None,
+            bob: None,
+        ),
+        (
+            name: "Cube",
+            transform: (
+                translation: (0.0, 2.0, 0.0),
+                rotation: (0.0, 0.0, 0.0, 1.0),
+                scale: (1.0, 1.0, 1.0),
+            ),
+            parent: Some(0),
+            model: Some("assets/models/cube.glb"),
+            model_guid: Some("334087e7-ba37-4ff4-b11f-bc731349dbfa"),
+            aabb: None,
+            body_info: None,
+            spin: Some(()),
+            bob: Some(()),
+        ),
+    ],
+    name_counter: 3,
+)"#;
+        let data: SceneData = ron::from_str(ron).unwrap();
+        assert_fixture_scene(&data, 4);
+        assert_eq!(
+            data.entities[1].model_guid,
+            Some("334087e7-ba37-4ff4-b11f-bc731349dbfa".parse().unwrap())
+        );
     }
 }

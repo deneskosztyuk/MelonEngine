@@ -17,8 +17,13 @@ use tracing::instrument;
 use winit::event::WindowEvent;
 use winit::window::Window;
 
+pub mod asset_db;
+pub mod asset_ops;
+pub mod asset_watch;
 pub mod console;
 pub mod content;
+mod content_view;
+mod drawer;
 pub mod gizmo;
 pub mod layout;
 pub mod play;
@@ -26,6 +31,7 @@ pub mod project_settings;
 pub mod quality_settings;
 pub mod scene;
 pub mod theme;
+pub mod thumbnails;
 mod toolbar_icon;
 use toolbar_icon::ToolbarIcon;
 pub mod viewport;
@@ -63,6 +69,24 @@ struct GizmoDrag {
 }
 
 /// Pending scene operation for the host to execute.
+/// Mesh count and bounds read from a glTF file for the Asset card.
+type ModelInfo = (usize, Option<(glam::Vec3, glam::Vec3)>);
+
+/// The answer to "Open <scene>?".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenChoice {
+    Save,
+    DontSave,
+    Cancel,
+}
+
+/// What the delete dialog shows.
+struct DeleteConfirm {
+    path: std::path::PathBuf,
+    /// Project-relative scene files (and "the open scene") that use it.
+    used_by: Vec<String>,
+}
+
 pub enum PendingOperation {
     Save(std::path::PathBuf),
     Load(std::path::PathBuf),
@@ -92,6 +116,36 @@ pub struct Editor {
     overlay_draws: Vec<melon_render::OverlayDraw>,
     pending_dialog: Option<DialogChannel>,
     pending_operation: Option<PendingOperation>,
+    /// A Content Browser delete waiting for Delete / Cancel.
+    delete_confirm: Option<DeleteConfirm>,
+    /// A scene opened from the Content Browser, waiting for Save / Don't
+    /// Save / Cancel.
+    confirm_open: Option<std::path::PathBuf>,
+    /// The Content Browser tab was drawn last frame (it takes OS file drops).
+    content_shown: bool,
+    /// The Content Browser tab (not the drawer) was drawn last frame;
+    /// during the dock, whether it was drawn this frame.
+    content_tab_shown: bool,
+    drawer: drawer::DrawerState,
+    /// Follows changes under `assets/` made outside the editor; `None` if
+    /// it could not start (Refresh still works).
+    watcher: Option<asset_watch::AssetWatcher>,
+    /// When `keep_watching` next checks the watcher; `None` until a
+    /// project is set.
+    watch_check: Option<std::time::Instant>,
+    /// A new file is waiting for its `.meta` (`asset_watch::META_GRACE`):
+    /// reconcile again at this time.
+    meta_recheck: Option<std::time::Instant>,
+    /// glTF mesh counts for the Inspector's Asset card, by file and its
+    /// modified time (re-read only when the file changes). Holds only the
+    /// browser selection.
+    mesh_counts: std::collections::HashMap<
+        std::path::PathBuf,
+        (Option<std::time::SystemTime>, Result<ModelInfo, String>),
+    >,
+    /// "Show" asked for the Content Browser tab; applied once the dock is
+    /// back in `self.dock` (panels draw while it is taken out).
+    focus_content_tab: bool,
     status_message: Option<(String, StatusKind, std::time::Instant)>,
     /// egui texture showing the scene (set by `EditorOverlay`).
     viewport_texture: Option<egui::TextureId>,
@@ -113,6 +167,7 @@ pub struct Editor {
     /// Dockable panel arrangement (saved between runs).
     dock: egui_dock::DockState<layout::EditorTab>,
     content: content::ContentBrowser,
+    content_settings_file: std::path::PathBuf,
     /// Where the dock layout is saved (under the project root).
     layout_file: std::path::PathBuf,
     /// Project folder: asset paths are relative to it.
@@ -141,6 +196,16 @@ impl Default for Editor {
             overlay_draws: Vec::new(),
             pending_dialog: None,
             pending_operation: None,
+            delete_confirm: None,
+            confirm_open: None,
+            content_shown: false,
+            content_tab_shown: false,
+            drawer: drawer::DrawerState::default(),
+            watcher: None,
+            watch_check: None,
+            meta_recheck: None,
+            mesh_counts: std::collections::HashMap::new(),
+            focus_content_tab: false,
             status_message: None,
             viewport_texture: None,
             viewport_size: winit::dpi::PhysicalSize::new(1, 1),
@@ -153,6 +218,7 @@ impl Default for Editor {
             console_filter: console::ConsoleFilter::default(),
             dock: layout::default_layout(),
             content: content::ContentBrowser::new("assets".into()),
+            content_settings_file: content::settings_path(),
             layout_file: layout::layout_path(),
             project_root: ".".into(),
             hierarchy_query: String::new(),
@@ -177,8 +243,17 @@ impl Editor {
     /// `<root>/.melon/editor_layout.ron`, whatever the working directory.
     pub fn set_project_root(&mut self, root: &std::path::Path) {
         self.content = content::ContentBrowser::new(root.join("assets"));
+        self.content_settings_file = root.join(content::settings_path());
+        self.content.load_settings(&self.content_settings_file);
         self.layout_file = root.join(layout::layout_path());
         self.project_root = root.to_path_buf();
+        let now = std::time::Instant::now();
+        self.watcher = None;
+        self.watch_check = Some(now);
+        self.keep_watching(now);
+        if self.watcher.is_none() {
+            tracing::warn!("assets/ is not watched yet (use Refresh); retrying");
+        }
         self.dock = layout::load_layout(&self.layout_file);
     }
 
@@ -186,6 +261,9 @@ impl Editor {
     pub fn save_layout(&self) {
         if let Err(error) = layout::save_layout(&self.dock, &self.layout_file) {
             tracing::warn!(?error, "could not save the editor layout");
+        }
+        if let Err(error) = self.content.save_settings(&self.content_settings_file) {
+            tracing::warn!(?error, "could not save the content browser settings");
         }
     }
 
@@ -207,10 +285,18 @@ impl Editor {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
+        // Scenes live in assets/scenes so the Content Browser shows them.
+        let scenes = self.project_root.join("assets/scenes");
+        if save && let Err(error) = std::fs::create_dir_all(&scenes) {
+            tracing::warn!("could not create {}: {error}", scenes.display());
+        }
         std::thread::spawn(move || {
             let dialog = rfd::FileDialog::new().add_filter("RON", &["ron"]);
             let path = if save {
-                dialog.set_file_name("scene.ron").save_file()
+                dialog
+                    .set_directory(&scenes)
+                    .set_file_name("scene.ron")
+                    .save_file()
             } else {
                 dialog.pick_file()
             };
@@ -271,6 +357,7 @@ impl Editor {
                 egui::Key::E,
                 egui::Key::R,
                 egui::Key::Escape,
+                egui::Key::Space,
             ]
             .into_iter()
             .filter(|key| fresh_press(i, *key))
@@ -286,10 +373,13 @@ impl Editor {
             match shortcut {
                 Shortcut::ReleaseGame => world.insert_resource(InputFocus::Editor),
                 Shortcut::Save => self.save(world),
+                // With the Content Browser focused, Delete is its file delete.
+                Shortcut::Delete if self.content.has_focus() => {}
                 Shortcut::Delete => self.delete_selected(world),
                 Shortcut::Move => self.gizmo_mode = GizmoMode::Move,
                 Shortcut::Rotate => self.gizmo_mode = GizmoMode::Rotate,
                 Shortcut::Scale => self.gizmo_mode = GizmoMode::Scale,
+                Shortcut::ToggleDrawer => self.toggle_drawer(),
             }
         }
     }
@@ -424,6 +514,13 @@ impl Editor {
                 }
             } else {
                 ui.colored_label(theme::colors::SUCCESS, "Ready");
+            }
+            let button = ui
+                .add(egui::Button::selectable(self.drawer.open, "Content Drawer"))
+                .on_hover_text("Ctrl+Space");
+            self.drawer.button = Some(button.rect);
+            if button.clicked() {
+                self.toggle_drawer();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let tool = match self.gizmo_mode {
@@ -568,6 +665,367 @@ impl Editor {
         }
     }
 
+    /// Once outside changes under `assets/` settle: reconcile `.meta` files
+    /// and refresh the browser. A file that only just changed waits
+    /// `META_GRACE` for its own `.meta` before getting a new one.
+    fn follow_asset_changes(&mut self, world: &mut World, ui: &egui::Ui, now: std::time::Instant) {
+        let restarted = self.keep_watching(now);
+        let Some(watcher) = &mut self.watcher else {
+            if self.watch_check.is_some() {
+                ui.ctx().request_repaint_after(asset_watch::RETRY);
+            }
+            return;
+        };
+        // Changes made while nothing watched are caught up at once.
+        let settled = watcher.poll(now) || restarted;
+        if watcher.pending() {
+            // Settle even if the user does not move the mouse.
+            ui.ctx().request_repaint_after(asset_watch::QUIET);
+        }
+        if let Some(at) = self.meta_recheck {
+            ui.ctx()
+                .request_repaint_after(at.saturating_duration_since(now));
+        }
+        let recheck = self.meta_recheck.is_some_and(|at| now >= at);
+        if !settled && !recheck {
+            return;
+        }
+        if !world.contains_resource::<AssetServer>() {
+            world.insert_resource(AssetServer::new(self.project_root.clone()));
+        }
+        let waiting =
+            asset_db::reconcile_except(&mut world.resource_mut::<AssetServer>(), |file| {
+                watcher.touched.recent(file, now)
+            });
+        self.meta_recheck = waiting.then(|| now + asset_watch::META_GRACE);
+        self.content.refresh();
+    }
+
+    /// Every `RETRY`: drop the watcher if `assets/` is gone (notify stops
+    /// silently then), start one if it is there. True when one started.
+    // shortcut: a delete and recreate within RETRY is not noticed; compare the folder's identity if that bites.
+    fn keep_watching(&mut self, now: std::time::Instant) -> bool {
+        if self.watch_check.is_none_or(|check| now < check) {
+            return false;
+        }
+        self.watch_check = Some(now + asset_watch::RETRY);
+        let assets = self.project_root.join("assets");
+        if !assets.is_dir() {
+            if self.watcher.take().is_some() {
+                tracing::warn!("assets/ is gone; live updates resume when it is back");
+            }
+            return false;
+        }
+        if self.watcher.is_some() {
+            return false;
+        }
+        match asset_watch::AssetWatcher::start(&assets) {
+            Ok(watcher) => {
+                tracing::info!("watching {} for outside changes", assets.display());
+                self.watcher = Some(watcher);
+                true
+            }
+            Err(error) => {
+                tracing::debug!("assets/ watcher did not start: {error}");
+                false
+            }
+        }
+    }
+
+    /// The next model thumbnail to render (at most one per frame; the host
+    /// calls this after `end_frame`).
+    pub fn thumbnail_request(&mut self, world: &mut World) -> Option<thumbnails::ThumbnailRequest> {
+        let mut server = world.get_resource_mut::<AssetServer>()?;
+        self.content.thumbnails.request(&mut server)
+    }
+
+    /// The host rendered (`Some`) or could not render (`None`) `request`.
+    pub fn thumbnail_done(
+        &mut self,
+        request: &thumbnails::ThumbnailRequest,
+        id: Option<egui::TextureId>,
+    ) {
+        self.content.thumbnails.finish(request, id);
+    }
+
+    /// Run the file operations the Content Browser asked for this frame.
+    pub fn apply_content_requests(&mut self, world: &mut World) {
+        for request in self.content.take_requests() {
+            if let Err(error) = self.run_content_request(world, request) {
+                tracing::warn!("{error:#}");
+                self.set_status_error(format!("{error:#}"));
+            }
+        }
+    }
+
+    fn run_content_request(
+        &mut self,
+        world: &mut World,
+        request: content::BrowserRequest,
+    ) -> anyhow::Result<()> {
+        use content::BrowserRequest as Request;
+        if !world.contains_resource::<AssetServer>() {
+            world.insert_resource(AssetServer::new(self.project_root.clone()));
+        }
+        let done = match request {
+            Request::NewFolder(parent) => {
+                let dir =
+                    asset_ops::create_folder(&mut world.resource_mut::<AssetServer>(), &parent)?;
+                // Show the folder it went into (no search), so the rename field is on screen.
+                self.content.open(parent);
+                self.content.set_search(String::new());
+                self.content.refresh();
+                self.content.start_rename(dir.clone());
+                Some(dir)
+            }
+            Request::Rename(path, name) => {
+                let new =
+                    asset_ops::rename(&mut world.resource_mut::<AssetServer>(), &path, &name)?;
+                self.follow_current_scene(&path, &new);
+                Some(new)
+            }
+            Request::Duplicate(path) => Some(asset_ops::duplicate(
+                &mut world.resource_mut::<AssetServer>(),
+                &path,
+            )?),
+            Request::Move(path, folder) => {
+                let new =
+                    asset_ops::move_to(&mut world.resource_mut::<AssetServer>(), &path, &folder)?;
+                self.follow_current_scene(&path, &new);
+                Some(new)
+            }
+            Request::Import(files, folder) => {
+                let results =
+                    asset_ops::import(&mut world.resource_mut::<AssetServer>(), &files, &folder);
+                let mut last = None;
+                for result in results {
+                    match result {
+                        Ok(path) => last = Some(path),
+                        Err(error) => {
+                            tracing::warn!("import: {error:#}");
+                            self.set_status_error(format!("Import failed: {error:#}"));
+                        }
+                    }
+                }
+                last
+            }
+            Request::AskDelete(path) => {
+                let needles = asset_ops::reference_needles(world.resource::<AssetServer>(), &path);
+                let mut used_by: Vec<String> =
+                    asset_ops::scene_references(&self.project_root, &needles)
+                        .iter()
+                        .map(|f| {
+                            melon_core::assets::project_relative(&self.project_root, f)
+                                .unwrap_or_else(|| f.display().to_string())
+                        })
+                        .collect();
+                let open =
+                    world.resource_scope(|world, server: bevy_ecs::world::Mut<AssetServer>| {
+                        asset_ops::open_scene_uses(world, &server, &path)
+                    });
+                if open {
+                    used_by.push("the open scene".to_string());
+                }
+                self.delete_confirm = Some(DeleteConfirm { path, used_by });
+                None
+            }
+            Request::Reveal(path) => {
+                asset_ops::reveal(&path);
+                None
+            }
+            Request::Open(path) => {
+                if path.is_dir() {
+                    self.content.open(path);
+                } else if content::is_scene_path(&self.project_root, &path) {
+                    // Asking "Save?" while playing would save the play state.
+                    if sim_state(world) != SimulationState::Editing {
+                        anyhow::bail!("Stop playing to open a scene");
+                    }
+                    self.confirm_open = Some(path);
+                } else {
+                    asset_ops::open_external(&path);
+                }
+                None
+            }
+        };
+        if let Some(path) = done {
+            self.content.refresh();
+            self.content.select(Some(path));
+        }
+        Ok(())
+    }
+
+    /// The open scene's file (or a folder holding it) moved: Ctrl+S must
+    /// write to the new place.
+    fn follow_current_scene(&mut self, old: &std::path::Path, new: &std::path::Path) {
+        if let Some(current) = &self.current_scene
+            && let Ok(rest) = current.strip_prefix(old)
+        {
+            self.current_scene = Some(if rest.as_os_str().is_empty() {
+                new.to_path_buf()
+            } else {
+                new.join(rest)
+            });
+        }
+    }
+
+    /// Save is offered only when the open scene has a file to save to.
+    pub fn open_scene_can_save(&self) -> bool {
+        self.current_scene.is_some()
+    }
+
+    /// Act on the answer to "Open <scene>?": Save writes the current scene
+    /// first; both Save and Don't Save then load (only while editing).
+    pub fn resolve_open(&mut self, world: &mut World, choice: OpenChoice) {
+        let Some(path) = self.confirm_open.take() else {
+            return;
+        };
+        match choice {
+            OpenChoice::Cancel => return,
+            OpenChoice::Save => {
+                if sim_state(world) != SimulationState::Editing {
+                    self.set_status_error("Stop playing to open a scene".into());
+                    return;
+                }
+                let Some(current) = self.current_scene.clone() else {
+                    self.set_status_error("Use File \u{25b8} Save As first".into());
+                    return;
+                };
+                if let Err(e) = scene::save_scene(world, &current) {
+                    self.set_status_error(format!("Save failed: {e}"));
+                    return;
+                }
+            }
+            OpenChoice::DontSave => {}
+        }
+        match dialog_operation(false, path, sim_state(world)) {
+            Some(operation) => self.pending_operation = Some(operation),
+            None => self.set_status_error("Stop playing to open a scene".into()),
+        }
+    }
+
+    /// Save / Don't Save / Cancel before a scene opened from the browser.
+    fn open_scene_dialog(&mut self, world: &mut World, ui: &egui::Ui) {
+        let Some(path) = &self.confirm_open else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let can_save = self.open_scene_can_save();
+        let mut choice = None;
+        let modal = egui::Modal::new(egui::Id::new("content_open_scene")).show(ui.ctx(), |ui| {
+            ui.heading(format!("Open {name}?"));
+            ui.label("Unsaved changes in the current scene are lost.");
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(can_save, egui::Button::new("Save"))
+                    .on_disabled_hover_text("Use File \u{25b8} Save As first")
+                    .clicked()
+                {
+                    choice = Some(OpenChoice::Save);
+                }
+                if ui.button("Don't Save").clicked() {
+                    choice = Some(OpenChoice::DontSave);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(OpenChoice::Cancel);
+                }
+            });
+        });
+        if choice.is_none() && modal.should_close() {
+            choice = Some(OpenChoice::Cancel);
+        }
+        if let Some(choice) = choice {
+            self.resolve_open(world, choice);
+        }
+    }
+
+    /// Files dropped on the window from the OS go into the Content Browser's
+    /// folder (winit gives no drop position on Windows, so the visible
+    /// browser takes them).
+    fn take_dropped_files(&mut self, ui: &egui::Ui) {
+        let dropped: Vec<std::path::PathBuf> = ui.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        let shown = std::mem::take(&mut self.content_shown);
+        // A browser in a hidden tab cannot own the keyboard.
+        if !shown {
+            self.content.focused = false;
+        }
+        if dropped.is_empty() {
+            return;
+        }
+        if shown {
+            let folder = self.content.current().to_path_buf();
+            self.content
+                .request(content::BrowserRequest::Import(dropped, folder));
+        } else {
+            self.set_status_warning("Open the Content Browser to import files".into());
+        }
+    }
+
+    /// Delete / Cancel for a Content Browser delete, listing what uses it.
+    fn delete_dialog(&mut self, world: &mut World, ui: &egui::Ui) {
+        let Some(confirm) = &self.delete_confirm else {
+            return;
+        };
+        let name = confirm
+            .path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let used_by = confirm.used_by.clone();
+        let mut choice = None;
+        let modal = egui::Modal::new(egui::Id::new("content_delete")).show(ui.ctx(), |ui| {
+            ui.heading(format!("Delete {name}?"));
+            ui.label("Moves it to the Recycle Bin.");
+            if !used_by.is_empty() {
+                ui.label(egui::RichText::new("Used by:").color(theme::colors::WARNING));
+                for user in &used_by {
+                    ui.label(format!("  {user}"));
+                }
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Delete").clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(false);
+                }
+            });
+        });
+        if choice.is_none() && modal.should_close() {
+            choice = Some(false);
+        }
+        let Some(delete) = choice else {
+            return;
+        };
+        let Some(confirm) = self.delete_confirm.take() else {
+            return;
+        };
+        if !delete {
+            return;
+        }
+        if !world.contains_resource::<AssetServer>() {
+            world.insert_resource(AssetServer::new(self.project_root.clone()));
+        }
+        match asset_ops::delete(&mut world.resource_mut::<AssetServer>(), &confirm.path) {
+            Ok(()) => {
+                self.set_status(format!("Moved {name} to the Recycle Bin"));
+                self.content.select(None);
+                self.content.refresh();
+            }
+            Err(error) => {
+                tracing::warn!("delete: {error:#}");
+                self.set_status_error(format!("Delete failed: {error:#}"));
+            }
+        }
+    }
+
     /// Share the engine's log buffer with the Console panel.
     pub fn set_console(&mut self, log: console::ConsoleLog) {
         self.console = log;
@@ -644,6 +1102,11 @@ impl Editor {
             .show(ui, |ui| self.status_bar(world, ui));
         self.about_window(ui);
         self.project_settings_window(world, ui);
+        self.follow_asset_changes(world, ui, std::time::Instant::now());
+        self.delete_dialog(world, ui);
+        self.open_scene_dialog(world, ui);
+        self.take_dropped_files(ui);
+        self.content_tab_shown = false;
 
         // Dockable panels fill the rest of the window.
         self.overlay_draws.clear();
@@ -667,6 +1130,10 @@ impl Editor {
                     );
             });
         self.dock = dock;
+        self.drawer_ui(world, ui);
+        if std::mem::take(&mut self.focus_content_tab) {
+            layout::reopen(&mut self.dock, layout::EditorTab::ContentBrowser);
+        }
 
         // Written after every focus change of this frame; the host applies it next frame.
         let gate = game_input_gate(
@@ -697,7 +1164,8 @@ impl Editor {
         );
         let vp = viewport_input(&ctx, &response, rect);
         // A model dragged from the Content Browser lands on the ground under the cursor.
-        if let Some(path) = response.dnd_release_payload::<String>()
+        if let Some(drag) = response.dnd_release_payload::<content::AssetDrag>()
+            && let Some(path) = drag.model.clone()
             && content::is_model_path(&path)
             && let (Some(pointer), Some(camera)) =
                 (vp.pointer, world.get_resource::<Camera>().copied())
@@ -878,7 +1346,8 @@ impl Editor {
         // Read what is being dragged without taking it: egui's
         // `dnd_release_payload::<T>` takes the payload even when it isn't a `T`.
         let carried_entity = egui::DragAndDrop::payload::<Entity>(ui.ctx()).map(|e| *e);
-        let carried_model = egui::DragAndDrop::payload::<String>(ui.ctx()).map(|p| (*p).clone());
+        let carried_model = egui::DragAndDrop::payload::<content::AssetDrag>(ui.ctx())
+            .and_then(|drag| drag.model.clone());
         let carrying = carried_entity.is_some() || carried_model.is_some();
         let released = ui.ctx().input(|i| i.pointer.any_released());
         // Row the pointer was released over, if any (a row wins over the zone).
@@ -1037,8 +1506,27 @@ impl Editor {
     }
 
     fn build_inspector(&mut self, world: &mut World, ui: &mut egui::Ui) {
+        let asset = self.content.selected().and_then(|path| {
+            world
+                .get_resource::<AssetServer>()
+                .and_then(|server| content::asset_details(server, path))
+                .map(|details| (path.to_path_buf(), details))
+        });
+        // The card shows one file; keep nothing else.
+        self.mesh_counts
+            .retain(|cached, _| asset.as_ref().is_some_and(|(path, _)| path == cached));
+        if let Some((path, details)) = &asset {
+            self.asset_card(ui, path, details);
+        }
         let Some(entity) = self.selected else {
-            ui.weak("Nothing selected");
+            if asset.is_none() {
+                let label = ui.weak("Nothing selected");
+                ui.interact(
+                    label.rect,
+                    egui::Id::new("inspector_nothing"),
+                    egui::Sense::hover(),
+                );
+            }
             return;
         };
         // Read before borrowing the entity mutably (the server is a world resource).
@@ -1047,6 +1535,7 @@ impl Editor {
             .zip(world.get_resource::<AssetServer>())
             .map(|(h, server)| server.path(*h).to_string());
         let mut new_model: Option<String> = None;
+        let mut ping: Option<std::path::PathBuf> = None;
         let Ok(mut entity_mut) = world.get_entity_mut(entity) else {
             self.clear_selection();
             return;
@@ -1066,21 +1555,54 @@ impl Editor {
             inspector_card(ui, &mut card_fills, "Transform", |ui| {
                 if let Some(current) = &current_model {
                     ui.label("Mesh");
-                    egui::ComboBox::from_id_salt("inspector_mesh")
-                        .selected_text(model_label(current))
-                        .width(ui.available_width())
-                        .show_ui(ui, |ui| {
-                            // Listed only while the dropdown is open.
-                            for path in content::model_list(&self.project_root) {
-                                if ui
-                                    .selectable_label(*current == path, model_label(&path))
-                                    .on_hover_text(&path)
-                                    .clicked()
-                                {
-                                    new_model = Some(path);
+                    // The model's file, for "show" (none for `builtin:` or a missing file).
+                    let file = self
+                        .project_root
+                        .join(melon_core::assets::split_mesh_fragment(current).0);
+                    let file = (!current.starts_with(melon_core::assets::BUILTIN_PREFIX)
+                        && file.is_file())
+                    .then_some(file);
+                    let outside = file.as_ref().is_some_and(|f| !self.content.inside_root(f));
+                    ui.horizontal(|ui| {
+                        let show = ui
+                            .add_enabled(file.is_some() && !outside, egui::Button::new("Show"))
+                            .on_hover_text("Show the model in the Content Browser")
+                            .on_disabled_hover_text(if outside {
+                                "The file is outside assets/, which the Content Browser shows"
+                            } else {
+                                "No file to show"
+                            });
+                        if show.clicked() {
+                            ping = file.clone();
+                        }
+                        let combo = egui::ComboBox::from_id_salt("inspector_mesh")
+                            .selected_text(model_label(current))
+                            .width(ui.available_width())
+                            .show_ui(ui, |ui| {
+                                // Listed only while the dropdown is open.
+                                for path in content::model_list(&self.project_root) {
+                                    if ui
+                                        .selectable_label(*current == path, model_label(&path))
+                                        .on_hover_text(&path)
+                                        .clicked()
+                                    {
+                                        new_model = Some(path);
+                                    }
                                 }
-                            }
-                        });
+                            });
+                        // A model dragged from the Content Browser replaces it.
+                        let drop = ui.interact(
+                            combo.response.rect,
+                            egui::Id::new("inspector_mesh_drop"),
+                            egui::Sense::hover(),
+                        );
+                        if let Some(drag) = drop.dnd_release_payload::<content::AssetDrag>()
+                            && let Some(model) = &drag.model
+                            && content::is_model_path(model)
+                        {
+                            new_model = Some(model.clone());
+                        }
+                    });
                     ui.end_row();
                 }
 
@@ -1150,6 +1672,11 @@ impl Editor {
         if let Some(path) = new_model {
             let handle: Handle<Model> = world.resource_mut::<AssetServer>().load(&path);
             world.entity_mut(entity).insert(handle);
+        }
+        if let Some(file) = ping
+            && self.content.ping(&file)
+        {
+            self.focus_content_tab = true;
         }
     }
 
@@ -1472,6 +1999,30 @@ impl EditorOverlay {
         }
     }
 
+    /// Give egui a thumbnail view: updates `existing`, or registers a new
+    /// texture. Returns its id.
+    pub fn register_thumbnail(
+        &mut self,
+        device: &wgpu::Device,
+        view: &wgpu::TextureView,
+        existing: Option<egui::TextureId>,
+    ) -> egui::TextureId {
+        match existing {
+            Some(id) => {
+                self.renderer.update_egui_texture_from_wgpu_texture(
+                    device,
+                    view,
+                    wgpu::FilterMode::Linear,
+                    id,
+                );
+                id
+            }
+            None => self
+                .renderer
+                .register_native_texture(device, view, wgpu::FilterMode::Linear),
+        }
+    }
+
     /// Show `target`'s colour texture in the viewport panel. Call again after
     /// the target is recreated (resize).
     pub fn set_viewport_target(
@@ -1609,6 +2160,101 @@ fn inspector_card(
                 });
         });
     fills.swap(0, 1);
+}
+
+impl Editor {
+    /// The Content Browser's selected file or folder, read-only.
+    fn asset_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &std::path::Path,
+        details: &content::AssetDetails,
+    ) {
+        let model = details.kind == content::AssetKind::Model;
+        // Read from the file (not the GPU cache, which only knows what is
+        // drawn), again only when its modified time changes.
+        let info = model.then(|| {
+            let stale = self
+                .mesh_counts
+                .get(path)
+                .is_none_or(|(modified, _)| *modified != details.modified);
+            if stale {
+                let read = melon_render::gltf_nodes(path).and_then(|nodes| {
+                    let meshes = nodes
+                        .iter()
+                        .filter_map(|n| n.mesh)
+                        .collect::<std::collections::HashSet<_>>()
+                        .len();
+                    Ok((meshes, melon_render::gltf_bounds(path)?))
+                });
+                self.mesh_counts.insert(
+                    path.to_path_buf(),
+                    (details.modified, read.map_err(|e| format!("{e:#}"))),
+                );
+            }
+            self.mesh_counts[path].1.clone()
+        });
+        let meshes = info.as_ref().map(|info| match info {
+            Ok((count, _)) => count.to_string(),
+            Err(error) => error.clone(),
+        });
+        let bounds = info.as_ref().map(|info| match info {
+            Ok((_, Some((min, max)))) => format!(
+                "({:.2}, {:.2}, {:.2}) \u{2026} ({:.2}, {:.2}, {:.2})",
+                min.x, min.y, min.z, max.x, max.y, max.z
+            ),
+            Ok((_, None)) => "no meshes".to_string(),
+            Err(_) => "unknown".to_string(),
+        });
+        let mut fills = theme::colors::INSPECTOR_CARDS;
+        inspector_card(ui, &mut fills, "Asset", |ui| {
+            let name = ui.label("Name");
+            ui.interact(
+                name.rect,
+                egui::Id::new("inspector_asset_card"),
+                egui::Sense::hover(),
+            );
+            inspector_value(ui, &details.name);
+            ui.end_row();
+            ui.label("Path");
+            inspector_value(ui, &details.path);
+            ui.end_row();
+            ui.label("Type");
+            inspector_value(ui, details.kind.label());
+            ui.end_row();
+            if details.kind != content::AssetKind::Folder {
+                ui.label("Size");
+                inspector_value(ui, content::format_size(details.size));
+                ui.end_row();
+            }
+            ui.label("Modified");
+            inspector_value(
+                ui,
+                details
+                    .modified
+                    .map_or_else(|| "unknown".to_string(), content::format_modified),
+            );
+            ui.end_row();
+            ui.label("GUID");
+            inspector_value(
+                ui,
+                details
+                    .guid
+                    .map_or_else(|| "none".to_string(), |g| g.to_string()),
+            );
+            ui.end_row();
+            if let Some(meshes) = &meshes {
+                ui.label("Meshes");
+                inspector_value(ui, meshes);
+                ui.end_row();
+            }
+            if let Some(bounds) = &bounds {
+                ui.label("Bounds");
+                inspector_value(ui, bounds);
+                ui.end_row();
+            }
+        });
+    }
 }
 
 /// Fill the value column so read-only rows get the same band width as editable rows.
@@ -1786,6 +2432,8 @@ pub enum Shortcut {
     Scale,
     /// Esc: input focus back to the editor (the game keeps running).
     ReleaseGame,
+    /// Ctrl+Space: show or hide the Content Drawer.
+    ToggleDrawer,
 }
 
 /// `key` went down this frame. Key repeat does not count, so a key held since
@@ -1809,6 +2457,7 @@ pub fn shortcut_for(key: egui::Key, ctrl: bool, typing: bool, flying: bool) -> O
         egui::Key::E if !flying && !ctrl => Some(Shortcut::Rotate),
         egui::Key::R if !flying && !ctrl => Some(Shortcut::Scale),
         egui::Key::Escape => Some(Shortcut::ReleaseGame),
+        egui::Key::Space if ctrl => Some(Shortcut::ToggleDrawer),
         _ => None,
     }
 }
@@ -1868,7 +2517,14 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                     .auto_shrink(false)
                     .show(ui, |ui| self.editor.build_inspector(self.world, ui));
             }
-            EditorTab::ContentBrowser => self.editor.content.ui(ui),
+            EditorTab::ContentBrowser => {
+                self.editor.content_shown = true;
+                self.editor.content_tab_shown = true;
+                self.editor.content.blocked =
+                    self.editor.delete_confirm.is_some() || self.editor.confirm_open.is_some();
+                self.editor.content.ui(ui);
+                self.editor.apply_content_requests(self.world);
+            }
             EditorTab::Console => {
                 console::console_ui(ui, &self.editor.console, &mut self.editor.console_filter)
             }
@@ -2293,11 +2949,31 @@ mod tests {
         drop_in_hierarchy(
             &mut editor,
             &mut world,
-            "assets/models/missing.glb".to_string(),
+            content::AssetDrag {
+                path: "assets/models/missing.glb".into(),
+                model: Some("assets/models/missing.glb".to_string()),
+            },
             Some(a),
         );
         let children = world.get::<melon_core::Children>(a).map_or(0, |c| c.len());
         assert_eq!(children, 1);
+    }
+
+    #[test]
+    fn non_model_asset_drag_spawns_nothing() {
+        let (mut world, a, _) = two_roots();
+        let mut editor = Editor::new();
+        drop_in_hierarchy(
+            &mut editor,
+            &mut world,
+            content::AssetDrag {
+                path: "assets/README.md".into(),
+                model: None,
+            },
+            Some(a),
+        );
+        let children = world.get::<melon_core::Children>(a).map_or(0, |c| c.len());
+        assert_eq!(children, 0);
     }
 
     fn pending_dir(name: &str) -> std::path::PathBuf {
@@ -2539,7 +3215,13 @@ mod tests {
     fn project_root_sets_layout_file_and_assets() {
         let root = std::env::temp_dir().join(format!("melon_root_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::create_dir_all(root.join("assets/models")).unwrap();
+        std::fs::create_dir_all(root.join(".melon")).unwrap();
+        std::fs::write(
+            root.join(".melon/content_browser.ron"),
+            "(version: 1, favorites: [], tile_size: 72.0, last_folder: Some(\"models\"), tree_width: 200.0)",
+        )
+        .unwrap();
         let mut saved = layout::default_layout();
         let console = saved.find_tab(&layout::EditorTab::Console).unwrap();
         saved.remove_tab(console);
@@ -2551,7 +3233,7 @@ mod tests {
             editor.dock.find_tab(&layout::EditorTab::Console).is_none(),
             "layout loaded from the root"
         );
-        assert_eq!(editor.content.current(), root.join("assets"));
+        assert_eq!(editor.content.current(), root.join("assets/models"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3006,5 +3688,990 @@ mod tests {
             camera.eye
         );
         assert!(camera.center.distance(game_camera.center) < 1e-3);
+    }
+
+    /// An editor on a temp project with `assets/models/x.glb` (and its
+    /// `.meta`), and a world holding that project's `AssetServer`.
+    fn browser_project(name: &str) -> (Editor, World, std::path::PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("melon_browser_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("assets/models")).unwrap();
+        std::fs::write(root.join("assets/models/x.glb"), b"x").unwrap();
+        let mut server = AssetServer::new(root.clone());
+        asset_db::reconcile(&mut server);
+        let mut world = World::new();
+        world.insert_resource(server);
+        let mut editor = Editor::new();
+        editor.set_project_root(&root);
+        (editor, world, root)
+    }
+
+    fn editor_key(editor: &mut Editor, world: &mut World, key: egui::Key) {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| editor.build_ui(world, ui));
+    }
+
+    #[test]
+    fn delete_key_goes_to_the_focused_panel() {
+        let (mut editor, mut world, root) = browser_project("delete_focus");
+        let x = root.join("assets/models/x.glb");
+        let entity = world
+            .spawn((Name("E".to_string()), Transform::default()))
+            .id();
+        editor.set_selected(Some(entity));
+        editor.content.open(root.join("assets/models"));
+        editor.content.select(Some(x.clone()));
+        // One frame first: the browser tab has been drawn, as in the running editor.
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            editor.build_ui(&mut world, ui)
+        });
+        editor.content.focused = true;
+        editor_key(&mut editor, &mut world, egui::Key::Delete);
+        assert!(world.get::<melon_core::PendingDelete>(entity).is_none());
+        assert_eq!(
+            editor.delete_confirm.as_ref().map(|c| c.path.clone()),
+            Some(x.clone())
+        );
+
+        editor.delete_confirm = None;
+        editor.content.focused = false;
+        editor_key(&mut editor, &mut world, egui::Key::Delete);
+        assert!(world.get::<melon_core::PendingDelete>(entity).is_some());
+        assert!(x.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn new_folder_request_creates_and_starts_rename() {
+        let (mut editor, mut world, root) = browser_project("new_folder");
+        let assets = root.join("assets");
+        editor
+            .content
+            .request(content::BrowserRequest::NewFolder(assets.clone()));
+        editor.apply_content_requests(&mut world);
+        let made = assets.join("New Folder");
+        assert!(made.is_dir());
+        assert_eq!(editor.content.selected(), Some(made.as_path()));
+        assert_eq!(
+            editor.content.renaming.as_ref().map(|r| r.path.clone()),
+            Some(made)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rename_request_failure_goes_to_the_status_bar() {
+        let (mut editor, mut world, root) = browser_project("rename_fail");
+        let x = root.join("assets/models/x.glb");
+        editor.content.request(content::BrowserRequest::Rename(
+            x.clone(),
+            "bad/name".into(),
+        ));
+        editor.apply_content_requests(&mut world);
+        assert!(x.exists());
+        let status = editor
+            .status_message
+            .as_ref()
+            .map(|(m, ..)| m.clone())
+            .unwrap_or_default();
+        assert!(status.contains("cannot contain"), "{status}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_scene_path_only_ron_under_assets() {
+        let root = std::path::Path::new("project");
+        assert!(content::is_scene_path(
+            root,
+            &root.join("assets/scenes/a.RON")
+        ));
+        assert!(!content::is_scene_path(
+            root,
+            &root.join("config/input.ron")
+        ));
+        assert!(!content::is_scene_path(
+            root,
+            &root.join("assets/models/a.glb")
+        ));
+    }
+
+    fn scene_file(root: &std::path::Path) -> std::path::PathBuf {
+        let scene = root.join("assets/scenes/level.ron");
+        std::fs::create_dir_all(scene.parent().unwrap()).unwrap();
+        std::fs::write(&scene, "(version: 4, entities: [], name_counter: 0)").unwrap();
+        scene
+    }
+
+    #[test]
+    fn opening_a_scene_asks_first_and_dont_save_loads() {
+        let (mut editor, mut world, root) = browser_project("open_scene");
+        let scene = scene_file(&root);
+        editor
+            .content
+            .request(content::BrowserRequest::Open(scene.clone()));
+        editor.apply_content_requests(&mut world);
+        assert_eq!(editor.confirm_open, Some(scene.clone()));
+        assert!(editor.pending_operation.is_none());
+        editor.resolve_open(&mut world, OpenChoice::DontSave);
+        assert!(
+            matches!(editor.take_pending_operation(), Some(PendingOperation::Load(p)) if p == scene)
+        );
+        assert!(editor.confirm_open.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn opening_a_scene_while_playing_is_refused() {
+        let (mut editor, mut world, root) = browser_project("open_playing");
+        let scene = scene_file(&root);
+        world.insert_resource(SimulationState::Playing);
+        editor.set_current_scene(root.join("assets/scenes/current.ron"));
+        editor.content.request(content::BrowserRequest::Open(scene));
+        editor.apply_content_requests(&mut world);
+        assert!(
+            editor.confirm_open.is_none(),
+            "no Save prompt while playing"
+        );
+        editor.resolve_open(&mut world, OpenChoice::Save);
+        assert!(
+            !root.join("assets/scenes/current.ron").exists(),
+            "play state not saved"
+        );
+        assert!(editor.take_pending_operation().is_none());
+        let status = editor
+            .status_message
+            .as_ref()
+            .map(|(m, ..)| m.clone())
+            .unwrap_or_default();
+        assert!(status.contains("Stop playing"), "{status}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_choice_needs_a_current_scene() {
+        let (mut editor, mut world, root) = browser_project("open_save");
+        let scene = scene_file(&root);
+        editor
+            .content
+            .request(content::BrowserRequest::Open(scene.clone()));
+        editor.apply_content_requests(&mut world);
+        assert!(!editor.open_scene_can_save());
+        editor.resolve_open(&mut world, OpenChoice::Save);
+        assert!(editor.take_pending_operation().is_none());
+        // With a current scene, Save writes it and then loads.
+        let current = root.join("assets/scenes/current.ron");
+        editor.set_current_scene(current.clone());
+        editor
+            .content
+            .request(content::BrowserRequest::Open(scene.clone()));
+        editor.apply_content_requests(&mut world);
+        assert!(editor.open_scene_can_save());
+        editor.resolve_open(&mut world, OpenChoice::Save);
+        assert!(current.exists());
+        assert!(
+            matches!(editor.take_pending_operation(), Some(PendingOperation::Load(p)) if p == scene)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dropped_files_import_into_current_folder() {
+        let (mut editor, mut world, root) = browser_project("dropped");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("crate.glb"), b"x").unwrap();
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            editor.build_ui(&mut world, ui)
+        });
+        let input = egui::RawInput {
+            dropped_files: vec![egui::DroppedFile {
+                path: Some(outside.join("crate.glb")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| editor.build_ui(&mut world, ui));
+        let imported = root.join("assets/crate.glb");
+        assert!(imported.exists());
+        assert!(melon_core::meta_path(&imported).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn renaming_the_open_scene_updates_current_scene() {
+        let (mut editor, mut world, root) = browser_project("rename_open_scene");
+        let scene = scene_file(&root);
+        editor.set_current_scene(scene.clone());
+        editor
+            .content
+            .request(content::BrowserRequest::Rename(scene, "level2.ron".into()));
+        editor.apply_content_requests(&mut world);
+        assert_eq!(
+            editor.current_scene,
+            Some(root.join("assets/scenes/level2.ron"))
+        );
+        let folder = root.join("assets/scenes");
+        editor
+            .content
+            .request(content::BrowserRequest::Rename(folder, "levels".into()));
+        editor.apply_content_requests(&mut world);
+        assert_eq!(
+            editor.current_scene,
+            Some(root.join("assets/levels/level2.ron"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn new_folder_elsewhere_shows_it_for_renaming() {
+        let (mut editor, mut world, root) = browser_project("new_folder_elsewhere");
+        editor.content.set_search("x".into());
+        let models = root.join("assets/models");
+        editor
+            .content
+            .request(content::BrowserRequest::NewFolder(models.clone()));
+        editor.apply_content_requests(&mut world);
+        assert_eq!(editor.content.current(), models);
+        assert_eq!(editor.content.search(), "");
+        assert!(
+            editor
+                .content
+                .visible_entries()
+                .iter()
+                .any(|e| e.path == models.join("New Folder"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hidden_browser_loses_focus() {
+        let (mut editor, mut world, root) = browser_project("hidden_focus");
+        let tab = editor
+            .dock
+            .find_tab(&layout::EditorTab::ContentBrowser)
+            .unwrap();
+        editor.dock.remove_tab(tab);
+        editor.content.focused = true;
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                editor.build_ui(&mut world, ui)
+            });
+        }
+        assert!(!editor.content.has_focus());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn browser_keys_wait_while_a_dialog_is_open() {
+        let (mut editor, mut world, root) = browser_project("keys_dialog");
+        let scene = scene_file(&root);
+        editor.content.open(root.join("assets/scenes"));
+        editor.content.select(Some(scene.clone()));
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            editor.build_ui(&mut world, ui)
+        });
+        editor.content.focused = true;
+        editor.delete_confirm = Some(DeleteConfirm {
+            path: scene,
+            used_by: Vec::new(),
+        });
+        editor_key(&mut editor, &mut world, egui::Key::Enter);
+        assert!(editor.confirm_open.is_none());
+        assert!(editor.content.take_requests().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn editor_follows_outside_move_with_meta() {
+        let (mut editor, mut world, root) = browser_project("outside_move");
+        let x = root.join("assets/models/x.glb");
+        let guid = world
+            .resource::<AssetServer>()
+            .guid_of("assets/models/x.glb")
+            .unwrap();
+        let h: Handle<Model> = world
+            .resource_mut::<AssetServer>()
+            .load("assets/models/x.glb");
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            editor.build_ui(&mut world, ui)
+        });
+        let y = root.join("assets/y.glb");
+        std::fs::rename(&x, &y).unwrap();
+        std::fs::rename(melon_core::meta_path(&x), melon_core::meta_path(&y)).unwrap();
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while world.resource::<AssetServer>().path(h) != "assets/y.glb" {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "move not followed within 5 s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                editor.build_ui(&mut world, ui)
+            });
+        }
+        assert_eq!(
+            world.resource::<AssetServer>().guid_of("assets/y.glb"),
+            Some(guid)
+        );
+        assert!(melon_core::meta_path(&y).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn inspector_shows_asset_card_for_browser_selection() {
+        let (mut editor, mut world, root) = browser_project("asset_card");
+        editor
+            .content
+            .select(Some(root.join("assets/models/x.glb")));
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            editor.build_inspector(&mut world, ui)
+        });
+        assert!(
+            ctx.read_response(egui::Id::new("inspector_asset_card"))
+                .is_some()
+        );
+        assert!(
+            ctx.read_response(egui::Id::new("inspector_nothing"))
+                .is_none()
+        );
+        editor.content.select(None);
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            editor.build_inspector(&mut world, ui)
+        });
+        assert!(
+            ctx.read_response(egui::Id::new("inspector_nothing"))
+                .is_some()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn watcher_waits_before_giving_a_new_file_a_meta() {
+        let (mut editor, mut world, root) = browser_project("meta_grace");
+        let ctx = egui::Context::default();
+        let new = root.join("assets/models/new.glb");
+        std::fs::write(&new, b"x").unwrap();
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Until a settled reconcile ran and left the file waiting.
+        while editor.meta_recheck.is_none() {
+            assert!(std::time::Instant::now() < give_up, "no settle within 5 s");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                editor.follow_asset_changes(&mut world, ui, std::time::Instant::now())
+            });
+        }
+        assert!(
+            !melon_core::meta_path(&new).exists(),
+            "its .meta may still be on the way"
+        );
+        // None arrived: after the grace the file gets one.
+        let later = std::time::Instant::now() + asset_watch::META_GRACE;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            editor.follow_asset_changes(&mut world, ui, later)
+        });
+        assert!(melon_core::meta_path(&new).exists());
+        assert!(editor.meta_recheck.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn watcher_starts_once_assets_exists_and_restarts_after_removal() {
+        let root = std::env::temp_dir().join(format!("melon_rewatch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut editor = Editor::new();
+        editor.set_project_root(&root);
+        assert!(editor.watcher.is_none(), "no assets/ yet");
+        let t0 = std::time::Instant::now();
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        assert!(!editor.keep_watching(t0), "not due before the retry");
+        assert!(editor.keep_watching(t0 + asset_watch::RETRY));
+        assert!(editor.watcher.is_some());
+        std::fs::remove_dir_all(root.join("assets")).unwrap();
+        assert!(!editor.keep_watching(t0 + asset_watch::RETRY * 2));
+        assert!(editor.watcher.is_none(), "the watched root is gone");
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        assert!(editor.keep_watching(t0 + asset_watch::RETRY * 3));
+        // The new watcher sees changes.
+        let watcher = editor.watcher.as_mut().unwrap();
+        std::fs::write(root.join("assets/new.glb"), b"x").unwrap();
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !watcher.poll(std::time::Instant::now()) {
+            assert!(std::time::Instant::now() < give_up, "no event within 5 s");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        drop(editor);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn asset_card_cache_keeps_only_the_selection() {
+        let (mut editor, mut world, root) = browser_project("mesh_cache");
+        let x = root.join("assets/models/x.glb");
+        let y = root.join("assets/models/y.glb");
+        std::fs::write(&y, b"y").unwrap();
+        asset_db::reconcile(&mut world.resource_mut::<AssetServer>());
+        let ctx = egui::Context::default();
+        let mut show = |editor: &mut Editor, selection: Option<std::path::PathBuf>| {
+            editor.content.select(selection);
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                editor.build_inspector(&mut world, ui)
+            });
+        };
+        show(&mut editor, Some(x.clone()));
+        assert!(editor.mesh_counts.contains_key(&x));
+        show(&mut editor, Some(y.clone()));
+        assert_eq!(
+            editor.mesh_counts.keys().collect::<Vec<_>>(),
+            vec![&y],
+            "only the selected model stays cached"
+        );
+        show(&mut editor, None);
+        assert!(editor.mesh_counts.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Release `drag` over the Inspector's Mesh field for a selected cube.
+    fn drop_on_mesh_field(drag: content::AssetDrag) -> String {
+        // One temp project per test: they run in parallel.
+        let name = format!("mesh_drop_{}", drag.model.is_some());
+        let (mut editor, mut world, root) = browser_project(&name);
+        let cube: Handle<Model> = world.resource_mut::<AssetServer>().load("builtin:cube");
+        let entity = world
+            .spawn((Name("Cube".to_string()), Transform::default(), cube))
+            .id();
+        editor.set_selected(Some(entity));
+        let ctx = egui::Context::default();
+        let run = |editor: &mut Editor, world: &mut World, events| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| editor.build_inspector(world, ui));
+        };
+        run(&mut editor, &mut world, Vec::new());
+        let pos = ctx
+            .read_response(egui::Id::new("inspector_mesh_drop"))
+            .expect("mesh field drawn")
+            .rect
+            .center();
+        run(
+            &mut editor,
+            &mut world,
+            vec![egui::Event::PointerMoved(pos)],
+        );
+        egui::DragAndDrop::set_payload(&ctx, drag);
+        let release = egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        run(
+            &mut editor,
+            &mut world,
+            vec![egui::Event::PointerMoved(pos), release],
+        );
+        let handle = *world.get::<Handle<Model>>(entity).unwrap();
+        let path = world.resource::<AssetServer>().path(handle).to_string();
+        let _ = std::fs::remove_dir_all(&root);
+        path
+    }
+
+    #[test]
+    fn mesh_field_takes_a_model_drop() {
+        let path = drop_on_mesh_field(content::AssetDrag {
+            path: "assets/models/x.glb".into(),
+            model: Some("assets/models/x.glb".to_string()),
+        });
+        assert_eq!(path, "assets/models/x.glb");
+    }
+
+    #[test]
+    fn mesh_field_ignores_non_model_drop() {
+        let path = drop_on_mesh_field(content::AssetDrag {
+            path: "assets/x.png".into(),
+            model: None,
+        });
+        assert_eq!(path, "builtin:cube");
+    }
+
+    fn full_frame(
+        ctx: &egui::Context,
+        editor: &mut Editor,
+        world: &mut World,
+        events: Vec<egui::Event>,
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| editor.build_ui(world, ui));
+    }
+
+    /// A selected entity drawing `model` (its file at `<root>/<model>`), the
+    /// Console in front of the browser, two frames drawn. Returns the
+    /// position of the Inspector's "Show" button.
+    fn show_setup(
+        name: &str,
+        model: &str,
+    ) -> (Editor, World, std::path::PathBuf, egui::Context, egui::Pos2) {
+        let (mut editor, mut world, root) = browser_project(name);
+        let file = root.join(model);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        let handle: Handle<Model> = world.resource_mut::<AssetServer>().load(model);
+        let entity = world
+            .spawn((Name("X".to_string()), Transform::default(), handle))
+            .id();
+        editor.set_selected(Some(entity));
+        if let Some(console) = editor.dock.find_tab(&layout::EditorTab::Console) {
+            let _ = editor.dock.set_active_tab(console);
+        }
+        let ctx = egui::Context::default();
+        full_frame(&ctx, &mut editor, &mut world, Vec::new());
+        full_frame(&ctx, &mut editor, &mut world, Vec::new());
+        let combo = ctx
+            .read_response(egui::Id::new("inspector_mesh_drop"))
+            .expect("mesh field drawn")
+            .rect;
+        // "Show" sits just left of the combo box.
+        let pos = egui::pos2(combo.left() - 12.0, combo.center().y);
+        (editor, world, root, ctx, pos)
+    }
+
+    fn click_at(ctx: &egui::Context, editor: &mut Editor, world: &mut World, pos: egui::Pos2) {
+        let press = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        full_frame(
+            ctx,
+            editor,
+            world,
+            vec![egui::Event::PointerMoved(pos), press(true), press(false)],
+        );
+        full_frame(ctx, editor, world, Vec::new());
+    }
+
+    /// Whether the topmost clickable widget at `pos` was enabled last frame.
+    fn clickable_enabled_at(ctx: &egui::Context, pos: egui::Pos2) -> Option<bool> {
+        ctx.viewport(|v| {
+            v.prev_pass
+                .widgets
+                .layers()
+                .flat_map(|(_, widgets)| widgets)
+                .filter(|w| w.rect.contains(pos) && w.sense.senses_click())
+                .last()
+                .map(|w| w.enabled)
+        })
+    }
+
+    #[test]
+    fn show_is_disabled_outside_the_browser_root() {
+        let (_editor, _world, root, ctx, pos) = show_setup("show_inside", "assets/models/x.glb");
+        assert_eq!(clickable_enabled_at(&ctx, pos), Some(true));
+        let _ = std::fs::remove_dir_all(&root);
+        let (_editor, _world, root, ctx, pos) = show_setup("show_outside", "other/z.glb");
+        assert_eq!(clickable_enabled_at(&ctx, pos), Some(false));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn show_reopens_a_closed_content_browser() {
+        let (mut editor, mut world, root, ctx, pos) =
+            show_setup("show_reopen", "assets/models/x.glb");
+        let tab = editor
+            .dock
+            .find_tab(&layout::EditorTab::ContentBrowser)
+            .unwrap();
+        editor.dock.remove_tab(tab);
+        full_frame(&ctx, &mut editor, &mut world, Vec::new());
+        click_at(&ctx, &mut editor, &mut world, pos);
+        assert!(
+            editor
+                .dock
+                .find_tab(&layout::EditorTab::ContentBrowser)
+                .is_some()
+        );
+        assert!(editor.content_shown, "Show put the browser back");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn show_brings_content_browser_to_front() {
+        let (mut editor, mut world, root, ctx, pos) =
+            show_setup("show_front", "assets/models/x.glb");
+        assert!(!editor.content_shown, "browser starts behind the Console");
+        click_at(&ctx, &mut editor, &mut world, pos);
+        assert_eq!(
+            editor.content.selected(),
+            Some(root.join("assets/models/x.glb").as_path())
+        );
+        assert!(
+            editor.content_shown,
+            "Show brought the browser to the front"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One 1600 x 900 frame at `time` with `modifiers` held.
+    fn drawer_frame(
+        ctx: &egui::Context,
+        editor: &mut Editor,
+        world: &mut World,
+        time: f64,
+        modifiers: egui::Modifiers,
+        events: Vec<egui::Event>,
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            time: Some(time),
+            modifiers,
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| editor.build_ui(world, ui));
+    }
+
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    fn ctrl_space(ctx: &egui::Context, editor: &mut Editor, world: &mut World, time: f64) {
+        let ctrl = egui::Modifiers::COMMAND;
+        drawer_frame(
+            ctx,
+            editor,
+            world,
+            time,
+            ctrl,
+            vec![
+                key_event(egui::Key::Space, ctrl),
+                egui::Event::Key {
+                    key: egui::Key::Space,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: ctrl,
+                },
+            ],
+        );
+    }
+
+    fn press_events(pos: egui::Pos2) -> Vec<egui::Event> {
+        let press = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        vec![egui::Event::PointerMoved(pos), press(true), press(false)]
+    }
+
+    /// The Console in front of the Content Browser in their shared group.
+    fn hide_content_tab(editor: &mut Editor) {
+        let console = editor.dock.find_tab(&layout::EditorTab::Console).unwrap();
+        let _ = editor.dock.set_active_tab(console);
+    }
+
+    /// A project with the browser tab hidden and the drawer opened by
+    /// Ctrl+Space and slid fully in. Returns the time of the last frame.
+    fn open_drawer(name: &str) -> (Editor, World, std::path::PathBuf, egui::Context, f64) {
+        let (mut editor, mut world, root) = browser_project(name);
+        hide_content_tab(&mut editor);
+        let ctx = egui::Context::default();
+        let none = egui::Modifiers::NONE;
+        drawer_frame(&ctx, &mut editor, &mut world, 0.0, none, Vec::new());
+        ctrl_space(&ctx, &mut editor, &mut world, 0.1);
+        let mut t = 0.1;
+        for _ in 0..5 {
+            t += 0.1;
+            drawer_frame(&ctx, &mut editor, &mut world, t, none, Vec::new());
+        }
+        assert!(editor.drawer.open);
+        (editor, world, root, ctx, t)
+    }
+
+    #[test]
+    fn ctrl_space_toggles_the_drawer_when_the_tab_is_hidden() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_toggle");
+        let rect = editor.drawer.rect.expect("drawer drawn");
+        assert_eq!(rect.width(), 1600.0);
+        let full = 900.0 * theme::sizes::DRAWER_HEIGHT_SHARE;
+        assert!((rect.height() - full).abs() < 1.0, "{rect:?}");
+        assert!((rect.bottom() - (900.0 - theme::sizes::STATUS_HEIGHT)).abs() < 1.0);
+        assert!(!editor.content_tab_shown);
+        ctrl_space(&ctx, &mut editor, &mut world, t + 0.1);
+        assert!(!editor.drawer.open);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ctrl_space_with_the_tab_visible_flashes_it_instead() {
+        let (mut editor, mut world, root) = browser_project("drawer_flash");
+        let ctx = egui::Context::default();
+        drawer_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            0.0,
+            egui::Modifiers::NONE,
+            Vec::new(),
+        );
+        ctrl_space(&ctx, &mut editor, &mut world, 0.1);
+        assert!(!editor.drawer.open);
+        assert!(editor.content.flashing());
+        assert!(editor.content_tab_shown);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ctrl_space_ignored_with_game_focus() {
+        let (mut editor, mut world, root) = browser_project("drawer_game");
+        hide_content_tab(&mut editor);
+        world.insert_resource(SimulationState::Playing);
+        world.insert_resource(InputFocus::Game);
+        let ctx = egui::Context::default();
+        drawer_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            0.0,
+            egui::Modifiers::NONE,
+            Vec::new(),
+        );
+        ctrl_space(&ctx, &mut editor, &mut world, 0.1);
+        assert!(!editor.drawer.open);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn esc_closes_the_drawer() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_esc");
+        let none = egui::Modifiers::NONE;
+        let esc = vec![key_event(egui::Key::Escape, none)];
+        drawer_frame(&ctx, &mut editor, &mut world, t + 0.1, none, esc);
+        assert!(!editor.drawer.open);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn esc_while_renaming_keeps_the_drawer() {
+        let (mut editor, mut world, root, ctx, mut t) = open_drawer("drawer_rename");
+        let none = egui::Modifiers::NONE;
+        editor.content.open(root.join("assets/models"));
+        editor
+            .content
+            .start_rename(root.join("assets/models/x.glb"));
+        for _ in 0..3 {
+            t += 0.1;
+            drawer_frame(&ctx, &mut editor, &mut world, t, none, Vec::new());
+        }
+        assert!(ctx.text_edit_focused(), "rename field has focus");
+        let esc = vec![key_event(egui::Key::Escape, none)];
+        drawer_frame(&ctx, &mut editor, &mut world, t + 0.1, none, esc);
+        assert!(
+            editor.content.renaming.is_none(),
+            "Esc cancelled the rename"
+        );
+        assert!(editor.drawer.open, "and only the rename");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn press_outside_closes_inside_keeps() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_outside");
+        let none = egui::Modifiers::NONE;
+        let inside = editor.drawer.rect.unwrap().center();
+        drawer_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            t + 0.1,
+            none,
+            press_events(inside),
+        );
+        assert!(editor.drawer.open);
+        let top = egui::pos2(800.0, 5.0);
+        drawer_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            t + 0.2,
+            none,
+            press_events(top),
+        );
+        assert!(!editor.drawer.open);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn button_toggles_closed_not_reopened() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_button");
+        let none = egui::Modifiers::NONE;
+        let button = editor
+            .drawer
+            .button
+            .expect("status bar button drawn")
+            .center();
+        drawer_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            t + 0.1,
+            none,
+            press_events(button),
+        );
+        assert!(!editor.drawer.open);
+        drawer_frame(&ctx, &mut editor, &mut world, t + 0.2, none, Vec::new());
+        assert!(!editor.drawer.open);
+        drawer_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            t + 0.3,
+            none,
+            press_events(button),
+        );
+        assert!(editor.drawer.open, "the button opens it again");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dragging_out_of_the_drawer_hides_it() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_drag");
+        let none = egui::Modifiers::NONE;
+        let rect = editor.drawer.rect.unwrap();
+        let drag = content::AssetDrag {
+            path: root.join("assets/models/x.glb"),
+            model: Some("assets/models/x.glb".into()),
+        };
+        egui::DragAndDrop::set_payload(&ctx, drag);
+        let inside = vec![egui::Event::PointerMoved(rect.center())];
+        drawer_frame(&ctx, &mut editor, &mut world, t + 0.1, none, inside);
+        assert!(editor.drawer.open, "a drag inside the drawer keeps it");
+        let above = vec![egui::Event::PointerMoved(egui::pos2(
+            800.0,
+            rect.top() - 50.0,
+        ))];
+        drawer_frame(&ctx, &mut editor, &mut world, t + 0.2, none, above);
+        assert!(!editor.drawer.open);
+        assert!(
+            egui::DragAndDrop::has_payload_of_type::<content::AssetDrag>(&ctx),
+            "the drop still lands on what is under the cursor"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dock_in_layout_opens_the_tab_and_closes() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_dock");
+        editor.dock_drawer();
+        drawer_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            t + 0.1,
+            egui::Modifiers::NONE,
+            Vec::new(),
+        );
+        assert!(!editor.drawer.open);
+        assert!(editor.content_tab_shown, "the tab was drawn");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drawer_takes_dropped_files() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_drop");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("crate.glb"), b"x").unwrap();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            time: Some(t + 0.1),
+            dropped_files: vec![egui::DroppedFile {
+                path: Some(outside.join("crate.glb")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| editor.build_ui(&mut world, ui));
+        let imported = root.join("assets/crate.glb");
+        assert!(imported.exists(), "the drawer's folder took the drop");
+        assert!(melon_core::meta_path(&imported).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn closing_the_drawer_drops_browser_focus() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_focus");
+        let none = egui::Modifiers::NONE;
+        editor.content.focused = true;
+        drawer_frame(&ctx, &mut editor, &mut world, t + 0.1, none, Vec::new());
+        assert!(editor.content.has_focus(), "the drawer keeps the focus");
+        let esc = vec![key_event(egui::Key::Escape, none)];
+        drawer_frame(&ctx, &mut editor, &mut world, t + 0.2, none, esc);
+        assert!(!editor.drawer.open);
+        assert!(!editor.content.has_focus());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drawer_tiles_want_thumbnails() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_thumbs");
+        editor.content.open(root.join("assets/models"));
+        drawer_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            t + 0.1,
+            egui::Modifiers::NONE,
+            Vec::new(),
+        );
+        assert_eq!(
+            editor.content.thumbnails.wanted(),
+            ["assets/models/x.glb".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

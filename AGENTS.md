@@ -10,7 +10,7 @@ Current state and planned work: `docs/ROADMAP.md`.
 | `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera. No GPU or window code. |
 | `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache`) records sun shadow pass, depth/normal prepass, SSAO passes, the GI mode's passes (`gi/`: DDGI voxel and probe passes or SSGI), 3D pass into HDR target, bloom passes, tonemap pass; `ui_pass` for the editor. |
 | `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource) and ECS sync systems. |
-| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), Project Settings window (`project_settings.rs`). |
+| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), Content Drawer (`drawer.rs`), asset `.meta` files (`asset_db.rs`), file operations (`asset_ops.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), Project Settings window (`project_settings.rs`). |
 | `crates/melon_game` | Game logic as an `rlib` + `dylib`, hot-reloaded in dev builds. |
 | `crates/melon_host` | Binary: winit event loop, input mapping, frame order (core update, editor, extract, render_scene, ui pass). No render pass code. |
 | `assets/models` | glTF models. `cube.glb` loads at startup. `review/` holds the snapshot scene's material test models (`grey_cube`, `material_spheres`, `normal_panel`, `emissive_cube`, `red_panel`, `green_panel`), written by `cargo run -p melon_render --example gen_review_assets` from the repo root; commit them when regenerated. |
@@ -24,7 +24,8 @@ Dependency direction: `core` <- `render`, `physics` <- `editor` <- `host`.
 ```powershell
 just gate        # fmt-check + clippy -D warnings + check. Run before every commit.
 just test        # gate, then cargo test --workspace
-just dev-run     # debug build with melon_game hot reload
+just dev-run     # debug build with melon_game live reload
+just game        # rebuild only melon_game; a running dev-run reloads it
 just fast-run    # release run, no gate, no hot reload
 just snapshot    # render the review scene offscreen to target/review/snapshot.png
 ```
@@ -36,8 +37,10 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 - Edition 2024. Add dependencies to `[workspace.dependencies]` in the root
   `Cargo.toml`, then reference them with `.workspace = true`.
 - Every crate uses `[lints] workspace = true`. Clippy warnings fail the gate.
-- `unsafe_code` is denied. The only exception is `#[unsafe(no_mangle)]` on hot
-  reload entry points in `melon_game`, with `#[allow(unsafe_code)]`.
+- `unsafe_code` is denied. Two exceptions, each with `#[allow(unsafe_code)]`:
+  `#[unsafe(no_mangle)]` on the plugin entry points in `melon_game`, and the
+  host's `game_loader` module (loading the game dylib), with a safety comment
+  on each `unsafe` block.
 - Tests live in `#[cfg(test)] mod tests` at the bottom of each file. ECS
   systems are tested by building a `World`, running a one-system `Schedule`,
   and asserting on components.
@@ -46,10 +49,27 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 
 ## Gotchas
 
-- **Hot reload signatures.** A new system in `melon_game/src/lib.rs` needs
-  `#[unsafe(no_mangle)]`, and every type it uses must be imported in the
-  `hot_game` module in `melon_host/src/main.rs`. Then register it in
-  `App::new`.
+- **Game plugin.** `melon_game::GamePlugin::build` registers the game's
+  systems and resources; the host never names a game function. Dev builds
+  (`hot-reload` feature) load `melon_game.dll` from beside the host exe,
+  check `melon_game_abi()` against `melon_core::abi_fingerprint()` and call
+  `melon_game_build`; `just game` rebuilds it (`cargo build -p melon_host --lib`;
+  `cargo build -p melon_game` alone resolves other features and fails the
+  check) and the running host reloads the whole plugin (old libraries stay
+  loaded). The dylib needs Rust's `std` dll, so start dev builds through
+  cargo (`cargo run` puts it on `PATH`). Game state lives in
+  resources added with `init_resource` (`insert_resource` replaces the value
+  on every reload). Changing the fields of any game component **or
+  resource** type needs a restart. Only a size/align change of a resource
+  registered in `build` is detected (the plugin stops with an error); any
+  other field change is not, so always restart. `build` must be
+  idempotent: only `add_systems`, `init_resource`, `insert_resource`.
+  Spawning entities, observers or component hooks from `build` repeats on
+  every reload (a second hook registration panics). `cargo test` / `just test`
+  while a dev-run is open rewrites `target/debug/melon_game.dll` with other
+  features; the running host refuses that reload (fingerprint error). Run
+  `just game` again. Plugin `FixedUpdate` systems run after the
+  physics chain. Release builds call `core.add_plugin(&GamePlugin)`.
 - **Stages.** Register systems with `core.add_systems(Stage, ...)`:
   `FixedUpdate` (1/60 s, 0..N times per frame, not while paused), `Update`
   (once per frame, read `Time::delta_seconds`), `PostUpdate`. `PreUpdate`
@@ -186,9 +206,25 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   mesh unbaked (used by unpacked models). Never store handle ids in
   files. `melon_render::ModelCache` turns handles into GPU models; changed
   files hot-reload (poll every 0.5 s); a broken file keeps the last good model.
-- **Scene format.** RON, `SCENE_VERSION = 3` in `melon_editor/src/scene.rs`:
+- **Asset `.meta` files.** Every file under `assets/` has a `<file>.meta`
+  sidecar holding its GUID (`(version: 1, guid: "…")`); commit it with the
+  asset. Rename or move an asset only together with its `.meta` (in the
+  editor, or both files in Explorer), or references to it break. The
+  editor's `asset_db::reconcile` writes missing `.meta` files at startup;
+  `melon_core` only reads them (`AssetServer::scan_metas`). Editor file
+  operations go through `melon_editor::asset_ops` (moves the `.meta`, keeps
+  the `AssetServer` paths, then `reconcile`). Scenes live in `assets/scenes`.
+- **Thumbnails.** `Renderer::render_thumbnail` records and submits its own
+  command buffer; the host calls it only after `end_frame`. Shared uniforms
+  are written with `queue.write_buffer`, which applies at the next submit, so
+  a thumbnail recorded into the frame's encoder would give the Scene view
+  the thumbnail's camera. One per frame, driven by
+  `Editor::thumbnail_request` / `thumbnail_done`.
+- **Scene format.** RON, `SCENE_VERSION = 4` in `melon_editor/src/scene.rs`:
   `parent` is an index into `entities`, `transform` is local (versions 1 and 2
-  still load, all roots). Adding a saved component means changing
+  still load, all roots). `model` is the path (`#mesh<N>` included) and
+  `model_guid` the file's GUID; the GUID wins when it resolves, so a scene
+  written by hand may give only `model`. Adding a saved component means changing
   `SceneEntity`, `scene_to_data` and `spawn_scene_entity`. Bump the version on
   breaking changes and keep reading the old one.
 - **Light direction sign.** `Light::direction` is the direction light travels

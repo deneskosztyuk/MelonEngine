@@ -227,4 +227,25 @@ mod tests {
         assert!(hierarchy_matches("Ground", ""));
         assert!(hierarchy_matches("Ground", "  "));
     }
+
+    /// Fixture: a real `.melon/editor_layout.ron` written by `save_layout` (ron 0.8).
+    #[test]
+    fn editor_layout_fixture_loads() {
+        let text = include_str!("../fixtures/editor_layout.ron");
+        let state: DockState<EditorTab> = ron::from_str(text).unwrap();
+        assert_eq!(open_tabs(&state), EditorTab::ALL.to_vec());
+        let leaves: Vec<Vec<EditorTab>> = state
+            .iter_leaves()
+            .map(|(_, leaf)| leaf.tabs.clone())
+            .collect();
+        assert_eq!(
+            leaves,
+            [
+                vec![EditorTab::ContentBrowser, EditorTab::Console],
+                vec![EditorTab::Hierarchy],
+                vec![EditorTab::Scene],
+                vec![EditorTab::Inspector],
+            ]
+        );
+    }
 }

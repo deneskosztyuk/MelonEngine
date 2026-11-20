@@ -331,4 +331,54 @@ mod tests {
         assert_eq!(map, InputMap::default());
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// Fixture: `config/input.ron` as `InputMap::save` writes the defaults (ron 0.8).
+    #[test]
+    fn input_ron_fixture_loads() {
+        let ron = r#"(
+    version: 1,
+    actions: [
+        (
+            name: "MoveForward",
+            kind: Axis,
+            buttons: [],
+            axes: [
+                (
+                    positive: Key(W),
+                    negative: Key(S),
+                ),
+            ],
+        ),
+        (
+            name: "MoveRight",
+            kind: Axis,
+            buttons: [],
+            axes: [
+                (
+                    positive: Key(D),
+                    negative: Key(A),
+                ),
+            ],
+        ),
+        (
+            name: "Jump",
+            kind: Button,
+            buttons: [
+                Key(Space),
+            ],
+            axes: [],
+        ),
+        (
+            name: "Fire",
+            kind: Button,
+            buttons: [
+                Mouse(Left),
+            ],
+            axes: [],
+        ),
+    ],
+)"#;
+        let map: InputMap = ron::from_str(ron).unwrap();
+        assert_eq!(map, InputMap::default());
+    }
 }

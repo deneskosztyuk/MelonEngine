@@ -1,4 +1,5 @@
-use std::any::TypeId;
+use std::alloc::Layout;
+use std::any::{TypeId, type_name};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem::{align_of, size_of};
 
@@ -21,6 +22,8 @@ pub trait Plugin {
 pub struct App<'a> {
     pub(crate) world: &'a mut World,
     pub(crate) schedules: &'a mut Schedules,
+    /// Resources whose registered layout differs from the plugin's type.
+    pub(crate) errors: Vec<String>,
 }
 
 impl App<'_> {
@@ -31,27 +34,59 @@ impl App<'_> {
         label: impl ScheduleLabel,
         systems: impl IntoScheduleConfigs<ScheduleSystem, M>,
     ) -> &mut Self {
-        self.schedules.add_systems(label, systems);
+        let label = label.intern();
+        // An unknown label would create a schedule that never runs.
+        if self.schedules.contains(label) {
+            self.schedules.add_systems(label, systems);
+        } else {
+            tracing::warn!("Plugin systems for unknown stage {label:?} ignored");
+        }
         self
     }
 
     /// Replaces the value on every hot reload (build runs again). For state
     /// that must survive a reload, use `init_resource`.
     pub fn insert_resource<R: Resource>(&mut self, r: R) -> &mut Self {
-        self.world.insert_resource(r);
+        if self.layout_ok::<R>() {
+            self.world.insert_resource(r);
+        }
         self
     }
 
     /// Insert `R::from_world` only if `R` is missing, so the value survives
     /// hot reloads.
     pub fn init_resource<R: Resource + FromWorld>(&mut self) -> &mut Self {
-        self.world.init_resource::<R>();
+        if self.layout_ok::<R>() {
+            self.world.init_resource::<R>();
+        }
         self
+    }
+
+    /// A reloaded `R` with new fields keeps its `TypeId`, so bevy would keep
+    /// the old-size storage; record an error instead of touching it.
+    fn layout_ok<R: Resource>(&mut self) -> bool {
+        let changed = changed_layout(self.world, TypeId::of::<R>(), Layout::new::<R>());
+        if changed {
+            self.errors.push(format!(
+                "resource `{}` changed its fields; restart the editor",
+                type_name::<R>()
+            ));
+        }
+        !changed
     }
 
     pub fn world(&mut self) -> &mut World {
         self.world
     }
+}
+
+/// True if `type_id` is registered in `world` with a layout other than `layout`.
+fn changed_layout(world: &World, type_id: TypeId, layout: Layout) -> bool {
+    let components = world.components();
+    components
+        .get_valid_id(type_id)
+        .and_then(|id| components.get_info(id))
+        .is_some_and(|info| info.layout() != layout)
 }
 
 /// Hash of the types that cross the host / game dylib boundary (identity,
@@ -148,7 +183,7 @@ mod tests {
     fn rebuild_runs_each_system_once() {
         let mut core = Core::new();
         core.add_plugin(&CounterPlugin);
-        core.rebuild_plugins(build_counter);
+        core.rebuild_plugins(build_counter).unwrap();
         core.update();
         assert_eq!(core.world.resource::<Counter>().0, 1);
     }
@@ -159,7 +194,7 @@ mod tests {
         core.add_plugin(&CounterPlugin);
         core.update();
         let entity = core.world.spawn(crate::Transform::default()).id();
-        core.rebuild_plugins(build_counter);
+        core.rebuild_plugins(build_counter).unwrap();
         core.update();
         assert!(core.world.get::<crate::Transform>(entity).is_some());
         assert_eq!(core.world.resource::<Counter>().0, 2);
@@ -175,12 +210,39 @@ mod tests {
         let build = |app: &mut App| {
             app.init_resource::<Counter>().insert_resource(Score(0));
         };
-        core.rebuild_plugins(build);
+        core.rebuild_plugins(build).unwrap();
         core.world.resource_mut::<Counter>().0 = 5;
         core.world.resource_mut::<Score>().0 = 9;
-        core.rebuild_plugins(build);
+        core.rebuild_plugins(build).unwrap();
         assert_eq!(core.world.resource::<Counter>().0, 5);
         assert_eq!(core.world.resource::<Score>().0, 0);
+    }
+
+    #[test]
+    fn changed_layout_compares_registered_layout() {
+        let mut world = World::new();
+        assert!(!changed_layout(
+            &world,
+            TypeId::of::<Marker>(),
+            Layout::new::<u64>()
+        ));
+        world.insert_resource(Marker(1));
+        let id = TypeId::of::<Marker>();
+        assert!(!changed_layout(&world, id, Layout::new::<Marker>()));
+        assert!(changed_layout(&world, id, Layout::new::<u64>()));
+    }
+
+    #[derive(ScheduleLabel, Debug, Clone, PartialEq, Eq, Hash)]
+    struct Custom;
+
+    #[test]
+    fn add_systems_ignores_unknown_label() {
+        let mut core = Core::new();
+        core.rebuild_plugins(|app| {
+            app.add_systems(Custom, |mut c: ResMut<Counter>| c.0 += 1);
+        })
+        .unwrap();
+        assert!(!core.plugin_schedules.contains(Custom));
     }
 
     #[test]

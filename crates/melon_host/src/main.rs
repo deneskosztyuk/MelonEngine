@@ -1,3 +1,5 @@
+#[cfg(feature = "hot-reload")]
+mod game_loader;
 mod pacing;
 
 use std::sync::Arc;
@@ -258,6 +260,8 @@ struct App {
     editor_ui: Option<Editor>,
     /// Offscreen image the scene renders into; the editor shows it in its viewport panel.
     viewport_target: Option<melon_render::ViewportTarget>,
+    /// Shared target for Content Browser thumbnails (`THUMBNAIL_SIZE` square).
+    thumbnail_target: Option<melon_render::ViewportTarget>,
     core: melon_core::Core,
     /// Last `GameInputGate` value applied (input routing and cursor grab).
     game_input: bool,
@@ -272,6 +276,9 @@ struct App {
     frame_period: std::time::Duration,
     /// `MELON_FRAME_STATS=1` timings.
     stats: pacing::FrameStats,
+    /// Dev builds load the game plugin from its dylib and reload it live.
+    #[cfg(feature = "hot-reload")]
+    game: game_loader::GameLoader,
 }
 
 /// Project folder asset paths are relative to.
@@ -322,8 +329,9 @@ impl App {
         core.world.insert_resource(Input::default());
 
         // Asset paths are relative to the project root (the source tree in dev builds).
-        core.world
-            .insert_resource(melon_core::AssetServer::new(PROJECT_ROOT.into()));
+        let mut assets = melon_core::AssetServer::new(PROJECT_ROOT.into());
+        melon_editor::asset_db::reconcile(&mut assets);
+        core.world.insert_resource(assets);
         let map_path = melon_editor::project_settings::mapping_path(PROJECT_ROOT.as_ref());
         let (input_map, outcome) = melon_core::InputMap::load(&map_path);
         let input_map_broken = match outcome {
@@ -351,7 +359,10 @@ impl App {
         let mut physics = PhysicsWorld::new();
         spawn_default_scene(&mut core.world, &mut physics);
         core.world.insert_resource(physics);
+        #[cfg(not(feature = "hot-reload"))]
         core.add_plugin(&melon_game::GamePlugin);
+        #[cfg(feature = "hot-reload")]
+        let game = game_loader::GameLoader::start(&mut core);
         add_physics_systems(&mut core);
         // `--play` skips edit mode, for quick game runs.
         if std::env::args().any(|arg| arg == "--play")
@@ -367,6 +378,7 @@ impl App {
             editor: None,
             editor_ui: None,
             viewport_target: None,
+            thumbnail_target: None,
             core,
             game_input: false,
             input_map_broken,
@@ -375,6 +387,8 @@ impl App {
             pacer: None,
             frame_period: pacing::frame_period(None),
             stats: pacing::FrameStats::from_env(),
+            #[cfg(feature = "hot-reload")]
+            game,
         }
     }
 
@@ -438,6 +452,10 @@ impl ApplicationHandler for App {
         };
 
         let viewport_target = renderer.create_viewport_target(renderer.size());
+        let thumbnail_target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(
+            melon_render::THUMBNAIL_SIZE,
+            melon_render::THUMBNAIL_SIZE,
+        ));
 
         let mut editor = EditorOverlay::new(&window, renderer.device(), renderer.surface_format());
         editor.set_viewport_target(renderer.device(), &viewport_target);
@@ -484,6 +502,7 @@ impl ApplicationHandler for App {
             self.editor_ui = Some(editor_ui);
         }
         self.viewport_target = Some(viewport_target);
+        self.thumbnail_target = Some(thumbnail_target);
         window.focus_window();
         window.request_redraw();
     }
@@ -570,17 +589,19 @@ impl ApplicationHandler for App {
                 }
                 self.stats.frame_start();
                 let now = Instant::now();
+                let dt = self
+                    .last_frame
+                    .map(|t| now.duration_since(t).as_secs_f32())
+                    .unwrap_or(1.0 / 60.0);
                 if let Some(pacer) = self.pacer.as_mut() {
                     pacer.advance(now);
                 }
                 if let Some(mut time) = self.core.world.get_resource_mut::<Time>() {
-                    let dt = self
-                        .last_frame
-                        .map(|t| now.duration_since(t).as_secs_f32())
-                        .unwrap_or(1.0 / 60.0);
                     time.update(dt);
                 }
                 self.last_frame = Some(now);
+                #[cfg(feature = "hot-reload")]
+                self.game.poll(dt, &mut self.core);
 
                 self.core.update();
                 self.stats.lap(pacing::Stage::Update);
@@ -679,6 +700,23 @@ impl ApplicationHandler for App {
                     budget_ms: Some(self.frame_period.as_secs_f32() * 1000.0),
                     ..timings
                 });
+
+                // One Content Browser thumbnail per frame, in its own
+                // submission after this frame's (shared uniforms are written
+                // with `queue.write_buffer`, applied at the next submit).
+                if let Some(target) = self.thumbnail_target.as_mut()
+                    && let Some(request) = editor_ui.thumbnail_request(&mut self.core.world)
+                {
+                    let view = {
+                        let mut server = self.core.world.resource_mut::<melon_core::AssetServer>();
+                        renderer.render_thumbnail(&mut server, request.handle, target)
+                    };
+                    let id = view.map(|view| {
+                        editor.register_thumbnail(renderer.device(), &view, request.existing)
+                    });
+                    editor_ui.thumbnail_done(&request, id);
+                }
+
                 window.request_redraw();
             }
             _ => {}

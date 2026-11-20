@@ -1,69 +1,117 @@
 # MelonEngine Roadmap
 
-State of the engine as of 2026-11-19 (commit `d16cea2`), and what is still
-missing for a core 3D engine. Update this file when an item lands.
+State of the engine as of 2026-11-20 (commit `e7df3e6`), and what is still
+missing for a core 3D engine that can make 3D games. Update this file when
+an item lands.
 
 ## Done
 
 | Crate | What exists |
 |---|---|
-| `melon_core` | `Core` wraps a bevy_ecs `World` + `Schedule`. Components: `Transform`, `Name`, `MeshRef`, `Aabb`, `BodyInfo`, `Spin`, `Bob`, `PendingDelete`. Resources: `Camera` (fly camera, `world_to_screen`, `screen_to_world_ray`), one directional `Light`, `Time`, `SimulationState`, `Input`, `NameCounter`. |
-| `melon_render` | wgpu forward renderer. Frame: sun shadow pass (directional shadow map, 3x3 PCF), SSAO (depth/normal prepass, AO, blur), 3D pass into an HDR target, ACES tonemap pass onto the display. glTF metallic-roughness PBR mesh pipeline (normal maps, emissive, hemisphere and sky ambient), line pipeline (gizmos), depth buffer, instanced draws from a per-instance storage buffer with CPU frustum culling, checkerboard fallback texture, glTF loader (positions, normals, uv0, tangents, indices, metallic-roughness materials), offscreen `ViewportTarget`, surface lost/outdated recovery. |
-| `melon_physics` | rapier3d wrapper: dynamic and fixed cuboids, ECS to rapier sync both ways, `PendingDelete` cleanup. |
-| `melon_editor` | egui editor with dockable panels (Hierarchy, Scene, Inspector, Content Browser, Console), menu bar, toolbar, status bar, Move/Rotate/Scale gizmos with snapping, Play/Pause/Step/Stop, RON scene save/load (versioned, atomic write, validated). |
-| `melon_game` | Hot-reloadable dylib with two demo systems. |
-| `melon_host` | winit event loop that wires all crates together. |
+| `melon_core` | `Core` wraps a bevy_ecs `World` + stage schedules (`PreUpdate`, `FixedUpdate` at 1/60 s, `Update`, `PostUpdate`) with interpolated rendering. Transform hierarchy (`ChildOf` / `Children`, `GlobalTransform`). Assets: `Handle<Model>`, `AssetServer` (GUIDs from `.meta` sidecars, file hot reload). Input: all keys, mouse buttons and wheel, `just_pressed` / `just_released`, action mapping (`Actions` / `InputMap`), editor/game input focus. Plugin API (`App`, `Plugin`) with an ABI fingerprint. One `Camera` resource, one directional `Light`, `Environment` (sky, fog, GI/AO/bloom look), `RenderQuality` (presets, profiles in `config/quality.ron`), `Time`, `SimulationState`. |
+| `melon_render` | wgpu forward renderer. Frame: sun shadow pass (directional shadow map, 3x3 PCF), GI (DDGI voxel probes or SSGI, modular), SSAO (depth/normal prepass), sky, 3D pass into an HDR target (MSAA 1/2/4 from `RenderQuality`), bloom, ACES tonemap, overlay pass (gizmos). glTF metallic-roughness PBR (normal maps, emissive), instanced draws from a storage buffer with CPU frustum culling, GPU pass timings. glTF loading (node tree, multiple meshes, materials), bounds from accessors, model thumbnails (auxiliary views). `extract` → `FrameData`, offscreen `ViewportTarget`. |
+| `melon_physics` | rapier3d: dynamic and fixed cuboids, ECS ↔ rapier sync, delete cleanup. |
+| `melon_editor` | egui + egui_dock editor: dockable panels (Hierarchy, Scene, Inspector, Content Browser, Console) with a saved layout, menu bar, toolbar, status bar, theme. Move / Rotate / Scale gizmos with plane handles and snapping. Play / Pause / Step / Stop with a scene snapshot. RON scenes (version 4, GUID + path references). Project Settings (input mapping). Content Browser: folder tree, tiles/list, search, type filter, favorites, file operations carrying `.meta`, references check, live updates, Asset card in the Inspector, thumbnails, Ctrl+Space Content Drawer. |
+| `melon_game` | Game plugin with two demo systems, live-reloaded in dev builds. |
+| `melon_host` | winit event loop, frame order, game plugin loader (dev) / static plugin (ship). |
 
 Tooling: `just gate` (fmt + clippy `-D warnings` + check), `unsafe_code` denied
-workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
+outside the plugin loader, unit tests, headless egui tests and GPU tests.
 
 ## Known bugs
 
-1. ~~**Play/pause unreachable.**~~ Fixed: Play / Pause / Stop with a scene
-   snapshot.
-2. ~~**Physics speed tied to frame rate.**~~ Fixed: physics runs in
-   `FixedUpdate` at 1/60 s.
-3. ~~**Demo systems ignore `Time`.**~~ Fixed: spin and bob use `Time`, bob no
-   longer drifts.
-4. ~~**1024 entity cap.**~~ Fixed: per-instance records live in a storage
-   buffer that doubles as needed; no model limit.
-5. ~~**No asset system.**~~ Fixed: `Handle<Model>` + `AssetServer`; any glTF
-   in `assets/models` draws whole.
-6. ~~**glTF node tree flattened.**~~ Fixed: a dropped model unpacks into a
-   root entity with one child entity per glTF node (`<file>#mesh<N>` handles).
-7. ~~**`melon_host/src/main.rs` does too much.**~~ Fixed: `melon_render`
-   extracts the world (`extract` → `FrameData`) and records the scene passes
-   (`render_scene`, `ui_pass`); the editor runs File Save / Load / Exit. The
-   host is the winit loop, input mapping and frame order.
-8. **Game systems hardcoded in host.** `melon_game` cannot register its own
-   systems; signatures are duplicated in the host `hot_module` imports.
-9. **README is stale.** Links deleted LICENSE files, says "v0.1 — released",
-   lists only egui as the editor.
-10. ~~**Scene load crashes the engine.**~~ Fixed: `load_scene` despawns scene
-   entities in place instead of swapping in a fresh `World`, so systems and
-   all resources survive a load.
+1. **README is stale.** Says "v0.1 — released" and links `LICENSE-MIT` /
+   `LICENSE-APACHE`, which do not exist.
+
+Fixed earlier: Play/Pause unreachable, physics tied to frame rate, demo
+systems ignoring `Time`, no asset system, flattened glTF tree, host doing too
+much, game systems in the host, scene load crash, 1024 entity cap (instance
+storage buffer).
+
+## Compared with Unreal, Unity and Godot
+
+Core features all three share, and where MelonEngine stands (✅ done,
+🟡 partial, ❌ missing).
+
+| Area | Feature | MelonEngine |
+|---|---|---|
+| Runtime | Scene tree / ECS, transform hierarchy | ✅ |
+| Runtime | Fixed-step game loop, interpolation | ✅ |
+| Runtime | Gameplay code with hot reload | ✅ Rust plugin |
+| Runtime | Input action mapping | ✅ |
+| Runtime | Reflection / component registry | ❌ |
+| Runtime | Scene save / load | 🟡 hand-listed components |
+| Runtime | Prefabs | ❌ |
+| Assets | Stable asset IDs, watched folder | ✅ |
+| Assets | Import pipeline with settings | 🟡 glTF only, no settings |
+| Rendering | PBR materials, normal maps | ✅ |
+| Rendering | Directional, point, spot lights | 🟡 one directional |
+| Rendering | Shadows (cascades, point/spot) | 🟡 one fixed sun map |
+| Rendering | Global illumination / ambient | ✅ DDGI or SSGI, hemisphere sky |
+| Rendering | Sky / environment | ✅ procedural sky, fog |
+| Rendering | Post-processing (bloom, AO, exposure) | 🟡 bloom, SSAO, ACES; no exposure |
+| Rendering | Anti-aliasing | ✅ MSAA 1/2/4 |
+| Rendering | Culling, instancing, LOD | 🟡 no LOD |
+| Rendering | Particles | ❌ |
+| Rendering | Shader hot reload | ❌ |
+| Rendering | Cameras as components, several cameras | ❌ |
+| Animation | Skeletal animation, blending | ❌ |
+| Physics | Rigid bodies | 🟡 cuboids only |
+| Physics | Ray casts, triggers, collision events | ❌ |
+| Physics | Character controller, joints | ❌ |
+| Audio | Playback, 3D sound, mixing | ❌ |
+| UI | In-game UI and text | ❌ |
+| Gameplay | Navigation mesh | ❌ |
+| Gameplay | Networking | ❌ (not core for a first game) |
+| Editor | Viewport, gizmos, snapping | ✅ (no local/world toggle) |
+| Editor | Hierarchy, inspector | 🟡 hand-written inspector |
+| Editor | Content browser | ✅ |
+| Editor | Undo / redo | ❌ |
+| Editor | Play in editor | ✅ |
+| Editor | Game view | ❌ |
+| Editor | Console / log | ✅ |
+| Editor | Profiler | 🟡 GPU pass timings only |
+| Shipping | Release build, asset packaging | 🟡 release build, no packaging |
 
 ## Missing, in priority order
 
-### Tier 0: foundation
+Priorities 1–6 are the minimum to make any 3D game; 7–9 are needed to ship
+one; 10 comes after.
 
-- [x] Fixed-timestep accumulator and stages (`FixedUpdate` / `Update` /
-      `PostUpdate`) with interpolated rendering. Fixes bugs 2–3. `PreUpdate`
-      and `Extract` get added with their first system.
-- [x] Play / Pause / Stop with scene snapshot and restore. Fixes bug 1.
-- [x] Asset handles (`Handle<Model>`) and an `AssetServer`, hot reload,
-      editor drag-in and Inspector mesh field. Fixes bug 5. (`Handle<Texture>` /
-      `Handle<Material>` come with PBR materials.)
-- [x] Transform hierarchy: `ChildOf` / `Children` + `GlobalTransform`
-      propagation, world poses everywhere (render, physics, picking, gizmos),
-      Hierarchy tree with drag reparenting, scene format v3. Fixes bug 6.
-- [x] Render extraction moved from `melon_host` into `melon_render`. Fixes bug 7.
-- [x] Full input: all keys, `just_pressed` / `just_released`, mouse buttons and
-      wheel, action mapping (`Actions` / `InputMap`, Project Settings, Esc / click focus).
-- [ ] Plugin API so `melon_game` registers its own systems. Fixes bug 8.
-- [x] Decide on one editor UI: egui + `egui_dock` (ADR-0001); others removed.
+1. - [ ] **Component reflection / registry.** One registry drives the
+      Inspector, scene files and prefabs (no hand-listed `SceneEntity`); an
+      agent can build levels as RON data. Prefabs follow.
+2. - [ ] **Undo / Redo** (command history), plus entity rename and duplicate.
+3. - [ ] **Rendering:** `Handle<Texture>` / `Handle<Material>` assets; point
+      and spot lights; image-based ambient; cascaded sun shadows, then
+      point/spot shadows; LOD. (PBR, sky, GI, instancing and culling are
+      done, see Graphics tier.)
+4. - [ ] **Physics:** sphere / capsule / trimesh shapes, ray cast and query
+      API, triggers and collision events, character controller, joints.
+5. - [ ] **Animation:** glTF skinning, clips, blending.
+6. - [ ] **Audio:** playback, 3D sound, buses.
+7. - [ ] **In-game UI and text**, plus a debug-draw API.
+8. - [ ] **Cameras as components**, several cameras, and a Game view next to
+      the Scene view.
+9. - [ ] **Asset packaging** for ship builds.
+10. - [ ] **Later:** particles, navigation mesh, profiler integration
+      (tracing spans exist), shader hot reload, exposure, gizmo local/world toggle, networking.
 
-### Tier 1: looks like a 3D game
+### Foundation (done)
+
+- [x] Fixed-timestep stages with interpolated rendering.
+- [x] Play / Pause / Stop with scene snapshot and restore.
+- [x] Asset handles, `AssetServer`, hot reload, GUIDs in `.meta` files.
+- [x] Transform hierarchy with world poses everywhere, scene format v4.
+- [x] Render extraction in `melon_render`.
+- [x] Full input with action mapping and editor/game focus.
+- [x] Plugin API; the game plugin live-reloads in dev builds.
+- [x] One editor UI: egui + `egui_dock` (ADR-0001).
+- [x] Content Browser (`docs/superpowers/specs/2026-11-20-content-browser-design.md`):
+      GUIDs, tree / tiles / search / filter / favorites, file operations,
+      live updates and Inspector, thumbnails, Content Drawer.
+
+### Graphics tier (done)
 
 - [x] PBR metallic-roughness materials, normal maps: glTF factors and
       textures per primitive (base colour, metallic-roughness, normal,
@@ -71,7 +119,6 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
       ambient specular.
 - [x] Directional (sun) shadow map with 3x3 PCF, no culling, slope bias and
       normal-offset sampling (no light leaks at contact seams).
-- [ ] Point and spot lights, their shadows, cascaded sun shadows.
 - [x] Hemisphere ambient: sky and ground colours on `Light`.
 - [x] HDR target + ACES tonemap pass.
 - [x] Bloom: no threshold, 13-tap downsample (Karis average first) and
@@ -79,7 +126,7 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
       levels, mixed into the HDR colour before tonemapping.
       `Environment::bloom_intensity` (default 0.08, 0 skips the passes).
       glTF emissive strength (`KHR_materials_emissive_strength`).
-- [x] MSAA 4x.
+- [x] MSAA 1/2/4 from `RenderQuality::msaa` (default 4).
 - [x] DDGI (dynamic diffuse GI), software voxel tracing: 128x64x128 voxel
       radiance volume (0.3125 m) voxelised each frame in three orthographic
       passes, 16x8x16 probes (2.5 m) tracing 64 rays each per frame (3D
@@ -111,31 +158,12 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
       records; one instanced draw per (model, part) in the prepass, shadow
       and 3D passes. CPU frustum culling (camera planes for the camera
       passes, the shadow box for the shadow pass). `render_scene` returns
-      `RenderStats`. Fixes bug 4.
-- [ ] `Camera` as a component; multiple cameras.
-- [ ] glTF: node tree, multiple meshes, materials, skinning, animation. Fixes bug 6.
-- [ ] Shader hot reload (shaders are compile-time `include_wgsl!` today).
+      `RenderStats`. Fixed the 1024 entity cap.
 
-### Tier 2: gameplay
-
-- [ ] Physics: sphere / capsule / trimesh shapes, raycast and query API,
-      collision events, character controller.
-- [ ] Audio.
-- [ ] Component reflection / registry so scenes and prefabs are not a
-      hand-listed `SceneEntity`.
-- [ ] Text rendering, in-game UI, debug-draw API.
-
-### Tier 3: tooling
-
-- [ ] Profiler integration (tracing spans already exist).
-- [ ] Asset packaging for ship builds.
-
-## Editor
-
-Goal: an editor that looks and works like Unity / Unreal / Godot.
+### Editor rendering and pacing
 
 - [x] Viewport basics: scene renders inside its panel, Unity camera controls,
-      click select, grid + axes + selection box, MSAA 4x, FPS and
+      click select, grid + axes + selection box, MSAA, FPS and
       orientation overlays.
 - [x] Pick the UI library: egui + `egui_dock` (see `docs/adr/0001-editor-ui-library.md`).
 - [x] Layout redesign: dockable tabbed panels (saved layout), menu bar,
@@ -163,10 +191,6 @@ Goal: an editor that looks and works like Unity / Unreal / Godot.
       prints the GPU total; snapshot `--size WxH`, `--ssgi-res`.
 - [ ] Find the 100-330 ms SSGI stalls from a run with the split stats.
 
-- [ ] Undo / Redo (command history), rename, duplicate.
-- [ ] Game view (game camera) next to the Scene view.
-- [ ] Gizmo upgrades: plane handles, local/world toggle.
-
 ## Agent-friendliness
 
 - [x] `AGENTS.md` with architecture, commands and conventions.
@@ -174,5 +198,5 @@ Goal: an editor that looks and works like Unity / Unreal / Godot.
       rendering. `Core` already runs without a window. Partly done: the
       `snapshot` example renders a fixed review scene to a PNG offscreen
       (no world or scene file yet).
-- [ ] Component registry so an agent can build levels as RON data.
+- [ ] Component registry so an agent can build levels as RON data (priority 1).
 - [ ] Runtime console (stdin or socket) to query and edit world state.

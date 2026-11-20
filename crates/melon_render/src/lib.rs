@@ -36,6 +36,71 @@ pub fn gltf_nodes_from_slice(bytes: &[u8]) -> Result<Vec<GltfNode>> {
     nodes_of(&gltf.document)
 }
 
+/// Bounds of a glTF / GLB file's default scene from the POSITION accessors'
+/// min / max and the node transforms (no vertex data is read). `None` if
+/// the scene has no meshes.
+pub fn gltf_bounds(path: &std::path::Path) -> Result<Option<(glam::Vec3, glam::Vec3)>> {
+    let gltf = gltf::Gltf::open(path)
+        .with_context(|| format!("failed to read glTF file: {}", path.display()))?;
+    bounds_of(&gltf.document)
+}
+
+/// `gltf_bounds` for a file already in memory.
+pub fn gltf_bounds_from_slice(bytes: &[u8]) -> Result<Option<(glam::Vec3, glam::Vec3)>> {
+    let gltf = gltf::Gltf::from_slice(bytes).context("failed to read glTF data")?;
+    bounds_of(&gltf.document)
+}
+
+/// Side of a Content Browser thumbnail, in pixels.
+pub const THUMBNAIL_SIZE: u32 = 128;
+
+/// `(view_proj, eye)` for a thumbnail of the box `min..max`: a fixed
+/// three-quarter view from +x+y+z, 45 degree field of view, fitted to the
+/// box's bounding sphere (DirectX depth, like the rest of the renderer).
+pub fn thumbnail_camera(min: glam::Vec3, max: glam::Vec3) -> (glam::Mat4, glam::Vec3) {
+    let fov = 45f32.to_radians();
+    let centre = (min + max) / 2.0;
+    let radius = ((max - min).length() / 2.0).max(0.01);
+    let distance = radius / (fov / 2.0).sin() * 1.1;
+    let eye = centre + glam::Vec3::new(1.0, 0.8, 1.0).normalize() * distance;
+    let view = glam::camera::rh::view::look_at_mat4(eye, centre, glam::Vec3::Y);
+    let near = (distance - radius * 1.5).max(0.001);
+    let proj =
+        glam::camera::rh::proj::directx::perspective(fov, 1.0, near, distance + radius * 1.5);
+    (proj * view, eye)
+}
+
+fn bounds_of(document: &gltf::Document) -> Result<Option<(glam::Vec3, glam::Vec3)>> {
+    let scene = document
+        .default_scene()
+        .or_else(|| document.scenes().next())
+        .context("glTF file has no scene")?;
+    let mut bounds: Option<(glam::Vec3, glam::Vec3)> = None;
+    let mut stack: Vec<(gltf::Node, glam::Mat4)> =
+        scene.nodes().map(|n| (n, glam::Mat4::IDENTITY)).collect();
+    while let Some((node, parent)) = stack.pop() {
+        let world = parent * glam::Mat4::from_cols_array_2d(&node.transform().matrix());
+        for primitive in node.mesh().iter().flat_map(|m| m.primitives()) {
+            let b = primitive.bounding_box();
+            let (lo, hi) = (glam::Vec3::from_array(b.min), glam::Vec3::from_array(b.max));
+            for i in 0..8 {
+                let corner = glam::Vec3::new(
+                    if i & 1 == 0 { lo.x } else { hi.x },
+                    if i & 2 == 0 { lo.y } else { hi.y },
+                    if i & 4 == 0 { lo.z } else { hi.z },
+                );
+                let p = world.transform_point3(corner);
+                bounds = Some(match bounds {
+                    Some((min, max)) => (min.min(p), max.max(p)),
+                    None => (p, p),
+                });
+            }
+        }
+        stack.extend(node.children().map(|c| (c, world)));
+    }
+    Ok(bounds)
+}
+
 fn nodes_of(document: &gltf::Document) -> Result<Vec<GltfNode>> {
     let scene = document
         .default_scene()
@@ -978,6 +1043,103 @@ impl Renderer {
             .as_ref()
             .map(timings::GpuTimer::timings)
             .unwrap_or_default()
+    }
+
+    /// Load `handle` through the model cache (as `render_scene` does) and
+    /// return its bounds; `None` if the file failed to load (the cache would
+    /// draw the built-in cube in its place).
+    pub fn model_bounds(
+        &mut self,
+        server: &mut melon_core::AssetServer,
+        handle: melon_core::Handle<melon_core::Model>,
+    ) -> Option<(glam::Vec3, glam::Vec3)> {
+        self.model_cache.prepare(&self.scene, server, handle);
+        server.bounds(handle)
+    }
+
+    /// `handle`'s model is loaded in the GPU cache.
+    pub fn model_cached(&self, handle: melon_core::Handle<melon_core::Model>) -> bool {
+        self.model_cache.contains(handle)
+    }
+
+    /// Render a thumbnail of one model and return a view egui can sample
+    /// (non-sRGB, like `ViewportTarget::ui_view`). `None` if it fails to load.
+    /// Records and submits its own command buffer: call it after the frame's
+    /// `end_frame`, never between `render_scene` and that frame's submit
+    /// (shared uniforms are written with `queue.write_buffer`).
+    pub fn render_thumbnail(
+        &mut self,
+        server: &mut melon_core::AssetServer,
+        handle: melon_core::Handle<melon_core::Model>,
+        target: &mut ViewportTarget,
+    ) -> Option<wgpu::TextureView> {
+        let texture = self.render_thumbnail_texture(server, handle, target)?;
+        Some(texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(texture.format().remove_srgb_suffix()),
+            ..Default::default()
+        }))
+    }
+
+    /// `render_thumbnail`, returning the texture itself.
+    fn render_thumbnail_texture(
+        &mut self,
+        server: &mut melon_core::AssetServer,
+        handle: melon_core::Handle<melon_core::Model>,
+        target: &mut ViewportTarget,
+    ) -> Option<wgpu::Texture> {
+        debug_assert_eq!(
+            (target.size().width, target.size().height),
+            (THUMBNAIL_SIZE, THUMBNAIL_SIZE)
+        );
+        // A model only the thumbnail needed is freed after the render (a
+        // folder of models would otherwise stay in VRAM); one the scene
+        // already drew stays.
+        let was_cached = self.model_cache.contains(handle);
+        let Some((min, max)) = self.model_bounds(server, handle) else {
+            if !was_cached {
+                self.model_cache.evict(handle);
+            }
+            return None;
+        };
+        let (view_proj, eye) = thumbnail_camera(min, max);
+        let frame = FrameData {
+            view_proj,
+            eye,
+            light: melon_core::Light::default(),
+            environment: melon_core::Environment::default(),
+            quality: melon_core::RenderQuality::default(),
+            models: vec![(glam::Mat4::IDENTITY, handle)],
+        };
+        let mut encoder = self
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("thumbnail"),
+            });
+        self.render_scene(&mut encoder, &frame, server, target, &[], &[]);
+        let source = target.color_texture();
+        let format = source.format();
+        let texture = self.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("thumbnail"),
+            size: source.size(),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[format.remove_srgb_suffix()],
+        });
+        encoder.copy_texture_to_texture(
+            source.as_image_copy(),
+            texture.as_image_copy(),
+            source.size(),
+        );
+        self.queue().submit([encoder.finish()]);
+        if !was_cached {
+            self.model_cache.evict(handle);
+        }
+        Some(texture)
     }
 
     /// Record one view of `frame` into `target`: shadow pass, SSAO passes, 3D
@@ -4619,11 +4781,11 @@ mod tests {
         mut encoder: wgpu::CommandEncoder,
         texture: &wgpu::Texture,
     ) -> Vec<u8> {
-        let row = TEST_SIZE * 4;
+        let row = texture.width() * 4;
         let padded = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("test readback buffer"),
-            size: (padded * TEST_SIZE) as wgpu::BufferAddress,
+            size: (padded * texture.height()) as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -4811,6 +4973,17 @@ mod tests {
         }
     }
 
+    /// An `AssetServer` whose next handle ids are not used by the other GPU
+    /// assertions: they share one renderer, and its `ModelCache` is keyed
+    /// by handle id (one server per app, so ids are unique there).
+    fn fresh_ids_server(root: std::path::PathBuf, offset: u32) -> melon_core::AssetServer {
+        let mut server = melon_core::AssetServer::new(root);
+        for i in 0..offset {
+            let _: melon_core::Handle<melon_core::Model> = server.load(&format!("unused/{i}.glb"));
+        }
+        server
+    }
+
     fn temp_project(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("melon_models_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -4895,6 +5068,42 @@ mod tests {
             }
             event_loop.exit();
         }
+    }
+
+    #[test]
+    fn thumbnail_camera_centres_and_contains_the_box() {
+        let (min, max) = (
+            glam::Vec3::new(-1.0, 0.0, -2.0),
+            glam::Vec3::new(3.0, 2.0, 2.0),
+        );
+        let (view_proj, eye) = thumbnail_camera(min, max);
+        let centre = view_proj.project_point3((min + max) / 2.0);
+        assert!(centre.x.abs() < 1e-4 && centre.y.abs() < 1e-4, "{centre}");
+        for i in 0..8 {
+            let corner = glam::Vec3::new(
+                if i & 1 == 0 { min.x } else { max.x },
+                if i & 2 == 0 { min.y } else { max.y },
+                if i & 4 == 0 { min.z } else { max.z },
+            );
+            let p = view_proj.project_point3(corner);
+            assert!(
+                p.x.abs() <= 1.0 && p.y.abs() <= 1.0 && (0.0..=1.0).contains(&p.z),
+                "{p}"
+            );
+        }
+        assert!(
+            eye.x > max.x && eye.y > max.y && eye.z > max.z,
+            "three-quarter view from +x+y+z"
+        );
+    }
+
+    #[test]
+    fn thumbnail_camera_handles_flat_and_far_bounds() {
+        let p = glam::Vec3::new(1000.0, -50.0, 3.0);
+        let (view_proj, eye) = thumbnail_camera(p, p);
+        assert!(view_proj.is_finite() && eye.is_finite());
+        let centre = view_proj.project_point3(p);
+        assert!(centre.x.abs() < 1e-3 && centre.y.abs() < 1e-3, "{centre}");
     }
 
     #[test]
@@ -5927,6 +6136,131 @@ mod tests {
                 }
             }),
             Box::new(|renderer| {
+                let root = temp_project("thumb_evict");
+                std::fs::write(root.join("assets/models/m.gltf"), TWO_NODE_GLTF).unwrap();
+                std::fs::write(root.join("assets/models/n.gltf"), TWO_NODE_GLTF).unwrap();
+                let mut server = fresh_ids_server(root.clone(), 4000);
+                let only_thumb: melon_core::Handle<melon_core::Model> =
+                    server.load("assets/models/m.gltf");
+                let in_scene: melon_core::Handle<melon_core::Model> =
+                    server.load("assets/models/n.gltf");
+                let mut target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(
+                    THUMBNAIL_SIZE,
+                    THUMBNAIL_SIZE,
+                ));
+                // The scene already draws `in_scene`: its model is cached.
+                renderer.model_bounds(&mut server, in_scene);
+                let a = renderer.render_thumbnail(&mut server, only_thumb, &mut target);
+                let b = renderer.render_thumbnail(&mut server, in_scene, &mut target);
+                let _ = std::fs::remove_dir_all(&root);
+                if a.is_none() || b.is_none() {
+                    return Err("thumbnail_frees_models_only_it_loaded: no thumbnail".into());
+                }
+                match (
+                    renderer.model_cached(only_thumb),
+                    renderer.model_cached(in_scene),
+                ) {
+                    (false, true) => Ok(()),
+                    other => Err(format!(
+                        "thumbnail_frees_models_only_it_loaded: cached (thumb-only, in-scene) = {other:?}"
+                    )),
+                }
+            }),
+            Box::new(|renderer| {
+                let root = temp_project("thumb");
+                std::fs::write(root.join("assets/models/m.gltf"), TWO_NODE_GLTF).unwrap();
+                let mut server = fresh_ids_server(root.clone(), 1000);
+                let h: melon_core::Handle<melon_core::Model> = server.load("assets/models/m.gltf");
+                let mut target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(
+                    THUMBNAIL_SIZE,
+                    THUMBNAIL_SIZE,
+                ));
+                let texture = renderer.render_thumbnail_texture(&mut server, h, &mut target);
+                let _ = std::fs::remove_dir_all(&root);
+                let texture = texture.ok_or("thumbnail_renders_the_model: no thumbnail")?;
+                let encoder = renderer
+                    .device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                let pixels = read_back(renderer.device(), renderer.queue(), encoder, &texture);
+                // The test model is two small meshes either side of the
+                // centre: any pixel other than the background shows it.
+                let background = &pixels[0..3];
+                let drawn = pixels.chunks(4).filter(|p| &p[0..3] != background).count();
+                if drawn > 0 {
+                    Ok(())
+                } else {
+                    Err("thumbnail_renders_the_model: only background pixels".into())
+                }
+            }),
+            Box::new(|renderer| {
+                let root = temp_project("thumb_bad");
+                std::fs::write(root.join("assets/models/bad.glb"), b"not a glb").unwrap();
+                let mut server = fresh_ids_server(root.clone(), 2000);
+                let h: melon_core::Handle<melon_core::Model> = server.load("assets/models/bad.glb");
+                let mut target = renderer.create_viewport_target(winit::dpi::PhysicalSize::new(
+                    THUMBNAIL_SIZE,
+                    THUMBNAIL_SIZE,
+                ));
+                let view = renderer.render_thumbnail(&mut server, h, &mut target);
+                let _ = std::fs::remove_dir_all(&root);
+                if view.is_none() {
+                    Ok(())
+                } else {
+                    Err("thumbnail_of_a_broken_file_is_none: got a thumbnail".into())
+                }
+            }),
+            Box::new(|renderer| {
+                use melon_core::{AssetServer, Handle, Model};
+                let mut server = AssetServer::new(".".into());
+                let cube: Handle<Model> = server.load("builtin:cube");
+                let mut scene_target = renderer
+                    .create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+                let frame = FrameData {
+                    view_proj: melon_core::Camera::default().view_proj(),
+                    eye: melon_core::Camera::default().eye,
+                    light: melon_core::Light::default(),
+                    environment: melon_core::Environment::default(),
+                    quality: melon_core::RenderQuality::default(),
+                    models: vec![(glam::Mat4::from_rotation_y(0.4), cube)],
+                };
+                let mut scene = |renderer: &mut Renderer, server: &mut AssetServer| {
+                    let mut encoder = renderer
+                        .device()
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                    renderer.render_scene(
+                        &mut encoder,
+                        &frame,
+                        server,
+                        &mut scene_target,
+                        &[],
+                        &[],
+                    );
+                    read_back(
+                        renderer.device(),
+                        renderer.queue(),
+                        encoder,
+                        &scene_target.color_texture,
+                    )
+                };
+                let before = scene(renderer, &mut server);
+                let root = temp_project("thumb_disturb");
+                std::fs::write(root.join("assets/models/m.gltf"), TWO_NODE_GLTF).unwrap();
+                let mut thumb_server = fresh_ids_server(root.clone(), 3000);
+                let h: Handle<Model> = thumb_server.load("assets/models/m.gltf");
+                let mut thumb_target = renderer.create_viewport_target(
+                    winit::dpi::PhysicalSize::new(THUMBNAIL_SIZE, THUMBNAIL_SIZE),
+                );
+                let made = renderer.render_thumbnail(&mut thumb_server, h, &mut thumb_target);
+                let _ = std::fs::remove_dir_all(&root);
+                made.ok_or("thumbnail_does_not_disturb_the_next_scene_frame: no thumbnail")?;
+                let after = scene(renderer, &mut server);
+                if before == after {
+                    Ok(())
+                } else {
+                    Err("thumbnail_does_not_disturb_the_next_scene_frame: pixels changed".into())
+                }
+            }),
+            Box::new(|renderer| {
                 let model = renderer
                     .load_gltf_bytes(TWO_NODE_GLTF.as_bytes())
                     .map_err(|e| format!("gltf_two_nodes_load_whole: {e:?}"))?;
@@ -6589,5 +6923,43 @@ mod tests {
             !runner.results.is_empty(),
             "GPU tests did not run (renderer init may have failed)"
         );
+    }
+
+    #[test]
+    fn gltf_bounds_follow_node_transforms() {
+        let json = r#"{
+            "asset": {"version": "2.0"},
+            "scenes": [{"nodes": [0, 1]}],
+            "nodes": [{"mesh": 0, "translation": [10, 0, 0]}, {}],
+            "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
+            "buffers": [{"byteLength": 36,
+                         "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}],
+            "bufferViews": [{"buffer": 0, "byteLength": 36}],
+            "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+                           "min": [-1, -1, -1], "max": [1, 1, 1]}]
+        }"#;
+        let (min, max) = gltf_bounds_from_slice(json.as_bytes()).unwrap().unwrap();
+        assert!(
+            (min - glam::Vec3::new(9.0, -1.0, -1.0)).length() < 1e-5,
+            "{min}"
+        );
+        assert!(
+            (max - glam::Vec3::new(11.0, 1.0, 1.0)).length() < 1e-5,
+            "{max}"
+        );
+    }
+
+    #[test]
+    fn gltf_bounds_none_without_meshes() {
+        let json = r#"{"asset": {"version": "2.0"}, "scenes": [{"nodes": [0]}], "nodes": [{}]}"#;
+        assert!(gltf_bounds_from_slice(json.as_bytes()).unwrap().is_none());
+    }
+
+    #[test]
+    fn gltf_bounds_of_cube_glb() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/models/cube.glb");
+        let (min, max) = gltf_bounds(std::path::Path::new(path)).unwrap().unwrap();
+        assert!(min.is_finite() && max.is_finite());
+        assert!((max - min).min_element() > 0.0);
     }
 }

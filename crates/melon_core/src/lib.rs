@@ -20,7 +20,7 @@ pub mod stages;
 pub use actions::{
     Action, ActionKind, Actions, AxisBinding, InputMap, LoadOutcome, update_actions_system,
 };
-pub use assets::{AssetServer, Handle, Model};
+pub use assets::{AssetGuid, AssetMeta, AssetServer, Handle, META_VERSION, Model, meta_path};
 pub use bevy_ecs;
 pub use bevy_ecs::query::With;
 pub use components::{
@@ -144,20 +144,35 @@ impl Core {
 
     /// Build a plugin into the plugin schedules.
     pub fn add_plugin(&mut self, plugin: &dyn Plugin) {
-        plugin.build(&mut App {
+        let mut app = App {
             world: &mut self.world,
             schedules: &mut self.plugin_schedules,
-        });
+            errors: Vec::new(),
+        };
+        plugin.build(&mut app);
+        for error in app.errors {
+            tracing::error!("Plugin build: {error}");
+        }
     }
 
     /// Drop every plugin system and build again (game hot reload). The world,
-    /// its entities and resources stay.
-    pub fn rebuild_plugins(&mut self, build: impl FnOnce(&mut App)) {
+    /// its entities and resources stay. If a plugin resource changed its
+    /// layout, no plugin system is kept and the error says to restart.
+    pub fn rebuild_plugins(&mut self, build: impl FnOnce(&mut App)) -> Result<(), String> {
         self.plugin_schedules = stage_schedules();
-        build(&mut App {
+        let mut app = App {
             world: &mut self.world,
             schedules: &mut self.plugin_schedules,
-        });
+            errors: Vec::new(),
+        };
+        build(&mut app);
+        if app.errors.is_empty() {
+            return Ok(());
+        }
+        let errors = app.errors.join("; ");
+        // New systems must not run against old-layout storage.
+        self.plugin_schedules = stage_schedules();
+        Err(format!("plugin systems stopped: {errors}"))
     }
 
     /// Run one frame: `PreUpdate`, then `FixedUpdate` once per whole `Time::fixed_delta` of
