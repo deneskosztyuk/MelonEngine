@@ -490,6 +490,12 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         self.stats.window_event();
+        // Event handling time; the redraw's own time is in its stages.
+        let event_start = if matches!(event, WindowEvent::RedrawRequested) {
+            None
+        } else {
+            self.stats.clock()
+        };
         // Whether egui used an event no longer matters: the raw stream records
         // everything and the gate decides what the game gets. While the game has
         // the mouse, egui gets no pointer input (the hidden cursor would click the UI).
@@ -554,11 +560,13 @@ impl ApplicationHandler for App {
                 // events streamed in.
                 if let Some(pacer) = self.pacer.as_ref() {
                     let next = pacer.next();
+                    let slept = self.stats.clock();
                     std::thread::sleep(pacing::sleep_until_deadline(
                         next,
                         Instant::now(),
                         pacer.period(),
                     ));
+                    self.stats.sleep_done(slept);
                 }
                 self.stats.frame_start();
                 let now = Instant::now();
@@ -665,26 +673,31 @@ impl ApplicationHandler for App {
                 self.stats.lap(pacing::Stage::Render);
                 renderer.end_frame(frame);
                 self.stats.lap(pacing::Stage::Submit);
+                let timings = renderer.timings();
+                self.stats.gpu_total(timings.total);
                 self.core.world.insert_resource(RenderTimings {
                     budget_ms: Some(self.frame_period.as_secs_f32() * 1000.0),
-                    ..renderer.timings()
+                    ..timings
                 });
                 window.request_redraw();
             }
             _ => {}
         }
+        self.stats.event_done(event_start);
     }
 
     /// Raw mouse motion (unaccelerated, works with a confined cursor) drives
     /// the game's mouse look.
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
         self.stats.device_event();
+        let start = self.stats.clock();
         if let DeviceEvent::MouseMotion { delta: (x, y) } = event
             && self.game_input
             && let Some(mut input) = self.core.world.get_resource_mut::<Input>()
         {
             input.mouse_delta += Vec2::new(x as f32, y as f32);
         }
+        self.stats.event_done(start);
     }
 }
 

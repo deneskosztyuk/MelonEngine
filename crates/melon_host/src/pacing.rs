@@ -97,10 +97,18 @@ pub struct FrameStats {
     mark: Option<Instant>,
     /// Stage times of the frame in flight, in seconds.
     stages: [f32; 5],
+    /// Seconds of the interval in flight spent in winit callbacks other than
+    /// `RedrawRequested` (event handling) and in the frame cap sleep.
+    events: f32,
+    sleep: f32,
     frames: u32,
     total: f32,
     worst: f32,
     worst_stages: [f32; 5],
+    worst_events: f32,
+    worst_sleep: f32,
+    /// The latest averaged GPU total (`RenderTimings::total`), ms.
+    gpu_total: Option<f32>,
     window_events: u32,
     device_events: u32,
 }
@@ -119,6 +127,34 @@ impl FrameStats {
 
     pub fn device_event(&mut self) {
         self.device_events += u32::from(self.on);
+    }
+
+    /// A clock reading to time a span with, `None` while off.
+    pub fn clock(&self) -> Option<Instant> {
+        self.on.then(Instant::now)
+    }
+
+    /// A winit callback other than `RedrawRequested` (an input or window
+    /// event) that started at `start` (from [`Self::clock`]) ends now.
+    pub fn event_done(&mut self, start: Option<Instant>) {
+        if let Some(start) = start {
+            self.events += start.elapsed().as_secs_f32();
+        }
+    }
+
+    /// The frame cap sleep that started at `start` (from [`Self::clock`])
+    /// ends now. Measured, so an oversleep shows.
+    pub fn sleep_done(&mut self, start: Option<Instant>) {
+        if let Some(start) = start {
+            self.sleep += start.elapsed().as_secs_f32();
+        }
+    }
+
+    /// The renderer's averaged GPU total this frame (`RenderTimings::total`).
+    pub fn gpu_total(&mut self, ms: Option<f32>) {
+        if self.on {
+            self.gpu_total = ms;
+        }
     }
 
     /// A frame starts: the previous frame's interval ends here.
@@ -154,11 +190,15 @@ impl FrameStats {
             if interval > self.worst {
                 self.worst = interval;
                 self.worst_stages = self.stages;
+                self.worst_events = self.events;
+                self.worst_sleep = self.sleep;
             }
         }
         self.frame_start = Some(now);
         self.mark = Some(now);
         self.stages = [0.0; 5];
+        self.events = 0.0;
+        self.sleep = 0.0;
         let window_start = *self.window_start.get_or_insert(now);
         if now - window_start < REPORT_INTERVAL || self.frames == 0 {
             return None;
@@ -169,14 +209,16 @@ impl FrameStats {
             window_start: Some(now),
             frame_start: Some(now),
             mark: Some(now),
+            gpu_total: self.gpu_total,
             ..Self::default()
         };
         Some(line)
     }
 
     /// The window's line: FPS, average and worst interval, the worst frame's
-    /// stages (`other` is the rest of its interval: events and waiting), and
-    /// events per frame.
+    /// stages plus its event handling, cap sleep and `other` (the rest:
+    /// time outside every callback, in winit and the OS), the averaged GPU
+    /// total, and events per frame.
     fn report(&self, seconds: f32) -> String {
         let frames = self.frames as f32;
         let ms = |s: f32| s * 1000.0;
@@ -185,13 +227,21 @@ impl FrameStats {
             .zip(self.worst_stages)
             .map(|(name, s)| format!("{name} {:.2}", ms(s)))
             .collect();
-        let other = self.worst - self.worst_stages.iter().sum::<f32>();
+        let other = self.worst
+            - self.worst_stages.iter().sum::<f32>()
+            - self.worst_events
+            - self.worst_sleep;
+        let gpu = self
+            .gpu_total
+            .map_or("-".into(), |ms| format!("{ms:.2} ms"));
         format!(
-            "frame stats: {:.1} fps, avg {:.2} ms, worst {:.2} ms ({}, other {:.2}), events/frame: window {:.1}, device {:.1}",
+            "frame stats: {:.1} fps, avg {:.2} ms, worst {:.2} ms ({}, events {:.2}, sleep {:.2}, other {:.2}), gpu {gpu}, events/frame: window {:.1}, device {:.1}",
             frames / seconds,
             ms(self.total / frames),
             ms(self.worst),
             stages.join(", "),
+            ms(self.worst_events),
+            ms(self.worst_sleep),
             ms(other),
             self.window_events as f32 / frames,
             self.device_events as f32 / frames,
@@ -269,8 +319,17 @@ mod tests {
         stats.device_event();
         stats.frame_start();
         stats.lap(Stage::Update);
+        let start = stats.clock();
+        assert!(start.is_none(), "no clock read");
+        stats.event_done(start);
+        stats.sleep_done(start);
+        stats.gpu_total(Some(5.0));
         assert_eq!((stats.window_events, stats.device_events), (0, 0));
         assert!(stats.frame_start.is_none() && stats.mark.is_none());
+        assert_eq!(
+            (stats.events, stats.sleep, stats.gpu_total),
+            (0.0, 0.0, None)
+        );
     }
 
     #[test]
@@ -297,10 +356,69 @@ mod tests {
         assert_eq!(
             line,
             "frame stats: 99.5 fps, avg 10.05 ms, worst 20.00 ms (update 0.00, acquire 15.00, \
-             editor 0.00, render 0.00, submit 1.00, other 4.00), events/frame: window 1.0, device 2.0"
+             editor 0.00, render 0.00, submit 1.00, events 0.00, sleep 0.00, other 4.00), gpu -, \
+             events/frame: window 1.0, device 2.0"
         );
         assert_eq!(stats.frames, 0, "a new window starts");
         assert_eq!(stats.window_start, Some(now));
         assert!(stats.on);
+    }
+
+    #[test]
+    fn other_is_split_into_events_sleep_and_the_rest() {
+        let t0 = Instant::now();
+        let mut stats = FrameStats {
+            on: true,
+            ..FrameStats::default()
+        };
+        assert!(stats.frame_start_at(t0).is_none());
+        // A 100 ms frame: render 4, events 30, cap sleep 6, the rest 60.
+        stats.stages[Stage::Render as usize] = 0.004;
+        stats.events = 0.030;
+        stats.sleep = 0.006;
+        stats.gpu_total(Some(5.25));
+        let mut now = t0 + 100 * MS;
+        assert!(stats.frame_start_at(now).is_none());
+        assert_eq!(
+            (stats.events, stats.sleep),
+            (0.0, 0.0),
+            "next interval starts empty"
+        );
+        // Shorter frames with events and sleep do not replace the worst.
+        for _ in 0..200 {
+            stats.events = 0.001;
+            stats.sleep = 0.005;
+            now += 10 * MS;
+            if let Some(line) = stats.frame_start_at(now) {
+                assert!(
+                    line.contains(
+                        "worst 100.00 ms (update 0.00, acquire 0.00, editor 0.00, render 4.00, \
+                         submit 0.00, events 30.00, sleep 6.00, other 60.00), gpu 5.25 ms"
+                    ),
+                    "{line}"
+                );
+                assert_eq!(stats.gpu_total, Some(5.25), "kept for the next window");
+                return;
+            }
+        }
+        panic!("no report line after 2 s");
+    }
+
+    #[test]
+    fn event_and_sleep_spans_add_up() {
+        let mut stats = FrameStats {
+            on: true,
+            ..FrameStats::default()
+        };
+        let start = stats.clock().map(|t| t - 3 * MS);
+        stats.event_done(start);
+        stats.event_done(start);
+        stats.sleep_done(start);
+        assert!(
+            stats.events >= 0.006 && stats.events < 0.1,
+            "{}",
+            stats.events
+        );
+        assert!(stats.sleep >= 0.003 && stats.sleep < 0.1, "{}", stats.sleep);
     }
 }
