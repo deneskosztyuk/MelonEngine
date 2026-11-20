@@ -149,7 +149,18 @@ mod tests {
             .into_iter()
             .map(|c| c.display_name)
             .collect();
-        assert_eq!(names, ["Aabb", "Bob", "Body Info", "Spin", "Transform"]);
+        assert_eq!(
+            names,
+            [
+                "Aabb",
+                "Audio Listener",
+                "Audio Source",
+                "Bob",
+                "Body Info",
+                "Spin",
+                "Transform"
+            ]
+        );
     }
 
     #[test]

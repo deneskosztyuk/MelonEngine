@@ -10,13 +10,14 @@ Current state and planned work: `docs/ROADMAP.md`.
 | `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera. No GPU or window code. |
 | `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache`) records sun shadow pass, depth/normal prepass, SSAO passes, the GI mode's passes (`gi/`: DDGI voxel and probe passes or SSGI), 3D pass into HDR target, bloom passes, tonemap pass; `ui_pass` for the editor. |
 | `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource) and ECS sync systems. |
+| `crates/melon_audio` | kira playback: `Director` (decisions, tested with a mock `Backend`), `KiraBackend` (device, bus tracks), `spatial` (attenuation, pan), `AudioEngine` (host calls `update` once per frame). The game-facing types are in `melon_core::audio`. |
 | `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), Content Drawer (`drawer.rs`), asset `.meta` files (`asset_db.rs`), file operations (`asset_ops.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), Project Settings window (`project_settings.rs`). |
 | `crates/melon_game` | Game logic as an `rlib` + `dylib`, hot-reloaded in dev builds. |
 | `crates/melon_host` | Binary: winit event loop, input mapping, frame order (core update, editor, extract, render_scene, ui pass). No render pass code. |
 | `assets/models` | glTF models. `cube.glb` loads at startup. `review/` holds the snapshot scene's material test models (`grey_cube`, `material_spheres`, `normal_panel`, `emissive_cube`, `red_panel`, `green_panel`), written by `cargo run -p melon_render --example gen_review_assets` from the repo root; commit them when regenerated. |
 | `assets/shaders` | WGSL shaders, compiled in with `wgpu::include_wgsl!` (no runtime reload). Shared pieces are prepended with `concat!(include_str!(..))` (WGSL has no include): `mesh.wgsl` = `gi_common` + `ddgi_common` + `gi_ddgi` + `gi_ssgi` + `mesh`; `ddgi_update.wgsl` = `gi_common` + `ddgi_common` + it; `ssgi.wgsl` = `gi_common` + it. |
 
-Dependency direction: `core` <- `render`, `physics` <- `editor` <- `host`.
+Dependency direction: `core` <- `render`, `physics`, `audio`; `render`, `physics` <- `editor`; `editor`, `audio` <- `host`.
 `melon_game` depends only on `melon_core`. Keep it that way.
 
 ## Commands
@@ -78,6 +79,27 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   features; the running host refuses that reload (fingerprint error). Run
   `just game` again. Plugin `FixedUpdate` systems run after the
   physics chain. Release builds call `core.add_plugin(&GamePlugin)`.
+- **Audio.** Types the game uses live in `melon_core::audio`: `AudioSource`
+  (clip path, linear volume 0..1, pitch, looping, `play_on_start`, spatial,
+  min/max distance, bus) and `AudioListener` (both registered components;
+  without a listener the `Camera` listens), `AudioSettings` (buses, `Master`
+  first; `config/audio.ron`, edited in Edit ▸ Project Settings ▸ Audio,
+  pending until Apply; `gain(bus)` = bus x master, mute = 0) and
+  `AudioRequests` (game systems push `play_one_shot[_at]`, `play`, `pause`,
+  `stop`, `set_volume`; drained once per frame; game requests are dropped
+  unless `Playing`). `melon_audio::Director` reads them: nothing plays in
+  `Editing`; `play_on_start` sources start once per Play session; Pause
+  pauses and Stop stops every game sound; the editor preview
+  (`preview_play`, Content Browser button, `Ui` bus, `AudioPreview` says what
+  plays) works in every state and is left alone by Pause / Stop. Clips are
+  `AssetServer::load::<AudioClip>` (`.wav .ogg .mp3 .flac`, hot reload
+  restarts a playing source). Under 5 s decodes to memory (cached per file
+  version), longer streams from disk (`spatial::STREAM_THRESHOLD`).
+  Attenuation is `min/d` shifted to reach 0 at `max`; pan is the listener's
+  right vector dotted with the direction to the source. No output device:
+  one warning, silent run. Tests use a mock `Backend` or
+  `KiraBackend::silent()`; never open a device in a test. Adding a bus field
+  needs `#[serde(default)]`-style compatibility, as for quality files.
 - **Stages.** Register systems with `core.add_systems(Stage, ...)`:
   `FixedUpdate` (1/60 s, 0..N times per frame, not while paused), `Update`
   (once per frame, read `Time::delta_seconds`), `PostUpdate`. `PreUpdate`
