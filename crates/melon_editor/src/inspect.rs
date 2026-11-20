@@ -38,6 +38,9 @@ pub enum WidgetKind {
         root: PathBuf,
         extensions: &'static [&'static str],
     },
+    /// A `u32` bit mask of collision layers: a dropdown with one checkbox per
+    /// layer (labelled by the given names, `Layer N` when empty).
+    Layers(Vec<String>),
     /// An `f32` slider.
     Slider { min: f32, max: f32 },
 }
@@ -52,6 +55,26 @@ fn choice_label(value: &str, choices: &[String]) -> String {
         value.to_string()
     } else {
         format!("{value} (missing)")
+    }
+}
+
+/// Dropdown text of a layer mask: `Nothing`, `Everything` or the layer names.
+fn layers_summary(mask: u32, names: &[String]) -> String {
+    match mask {
+        0 => "Nothing".to_string(),
+        u32::MAX => "Everything".to_string(),
+        _ => (0..32)
+            .filter(|i| mask & (1 << i) != 0)
+            .map(|i| layer_label(names, i))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
+fn layer_label(names: &[String], i: usize) -> String {
+    match names.get(i) {
+        Some(name) if !name.trim().is_empty() => name.clone(),
+        _ => format!("Layer {i}"),
     }
 }
 
@@ -73,6 +96,26 @@ fn widget_ui(
         WidgetKind::Slider { min, max } => {
             let v = value.try_downcast_mut::<f32>()?;
             Some(ui.add(egui::Slider::new(v, *min..=*max)).changed())
+        }
+        WidgetKind::Layers(names) => {
+            let v = value.try_downcast_mut::<u32>()?;
+            let mut changed = false;
+            egui::ComboBox::from_id_salt(id.with("combo"))
+                .selected_text(layers_summary(*v, names))
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show_ui(ui, |ui| {
+                    for i in 0..32usize {
+                        let mut on = *v & (1 << i) != 0;
+                        let check = ui.checkbox(&mut on, layer_label(names, i));
+                        // Fixed id over the checkbox (widget ids are positional).
+                        ui.interact(check.rect, id.with("layer").with(i), egui::Sense::hover());
+                        if check.changed() {
+                            *v ^= 1 << i;
+                            changed = true;
+                        }
+                    }
+                });
+            Some(changed)
         }
         WidgetKind::Choice(choices) => {
             let v = value.try_downcast_mut::<String>()?;
@@ -621,6 +664,7 @@ mod tests {
         limit: Option<f32>,
         list: Vec<f32>,
         shape: Shape,
+        mask: u32,
     }
 
     #[test]
@@ -668,8 +712,8 @@ mod tests {
         assert!(texts.contains("Speed (linear)"), "label override drawn");
     }
 
-    const FIELDS: [&str; 10] = [
-        "speed", "on", "label", "pos", "rot", "mode", "inner", "limit", "list", "shape",
+    const FIELDS: [&str; 11] = [
+        "speed", "on", "label", "pos", "rot", "mode", "inner", "limit", "list", "shape", "mask",
     ];
 
     fn sample() -> Sample {
@@ -689,6 +733,7 @@ mod tests {
             limit: Some(4.0),
             list: vec![1.0],
             shape: Shape::Ball { radius: 1.0 },
+            mask: 0b101,
         }
     }
 
@@ -700,6 +745,7 @@ mod tests {
         ctx: egui::Context,
         registry: TypeRegistry,
         time: f64,
+        widgets: FieldWidgets,
     }
 
     impl Harness {
@@ -710,6 +756,7 @@ mod tests {
                 ctx: egui::Context::default(),
                 registry,
                 time: 0.0,
+                widgets: FieldWidgets::new(),
             }
         }
 
@@ -721,9 +768,9 @@ mod tests {
                 ..Default::default()
             };
             let mut changed = false;
-            let registry = &self.registry;
+            let (registry, widgets) = (&self.registry, &self.widgets);
             let _ = self.ctx.run_ui(input, |ui| {
-                changed = reflect_ui(ui, root(), value, registry);
+                changed = reflect_ui_with(ui, root(), value, registry, widgets);
             });
             changed
         }
@@ -887,6 +934,54 @@ mod tests {
         }
         assert!(changed);
         assert!(matches!(value.shape, Shape::Ball { radius } if radius > 1.0));
+    }
+
+    fn layer_names() -> Vec<String> {
+        (0..32)
+            .map(|i| match i {
+                0 => "Default".to_string(),
+                2 => "Enemies".to_string(),
+                _ => String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn layer_mask_widget_shows_named_checkboxes_and_keeps_raw_bits() {
+        let mut h = Harness::new();
+        h.widgets.insert(
+            "mask",
+            FieldWidget {
+                label: None,
+                kind: WidgetKind::Layers(layer_names()),
+            },
+        );
+        let mut value = sample();
+        h.frame(&mut value, vec![]);
+        let mask = root().with("mask");
+        // Open the dropdown: bits 0 (Default) and 2 (Enemies) are on.
+        h.click(&mut value, mask);
+        let layer = |i: usize| mask.with("layer").with(i);
+        assert!(
+            h.ctx.read_response(layer(2)).is_some(),
+            "a checkbox per layer"
+        );
+        assert!(h.ctx.read_response(layer(31)).is_some());
+        // Turning layer 1 on sets only that bit.
+        assert!(h.click(&mut value, layer(1)));
+        assert_eq!(value.mask, 0b111);
+        assert!(h.click(&mut value, layer(0)));
+        assert_eq!(value.mask, 0b110);
+        assert_eq!(value.speed, 2.0, "nothing else changed");
+    }
+
+    #[test]
+    fn layer_summary_names_the_layers() {
+        let names = layer_names();
+        assert_eq!(layers_summary(0b101, &names), "Default, Enemies");
+        assert_eq!(layers_summary(0, &names), "Nothing");
+        assert_eq!(layers_summary(u32::MAX, &names), "Everything");
+        assert_eq!(layers_summary(0b1010, &names), "Layer 1, Layer 3");
     }
 
     #[test]

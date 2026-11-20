@@ -16,6 +16,7 @@ pub mod components;
 pub mod hierarchy;
 pub mod input;
 pub mod physics;
+pub mod physics_settings;
 pub mod plugin;
 pub mod quality;
 pub mod reflect;
@@ -46,6 +47,7 @@ pub use physics::{
     JointKind, PhysicsQueries, PhysicsRequest, PhysicsRequests, QueryBackend, QueryFilter, RayHit,
     RigidBody, RigidBodyKind, Velocity,
 };
+pub use physics_settings::{LAYER_COUNT, PhysicsSettings};
 pub use plugin::{App, Plugin, abi_fingerprint};
 pub use quality::{
     GiMode, PresentPreference, QualityPreset, QualitySetting, RenderQuality, RenderTimings,
@@ -156,6 +158,7 @@ impl Core {
         world.init_resource::<bevy_ecs::message::Messages<CollisionEvent>>();
         world.init_resource::<PhysicsQueries>();
         world.init_resource::<PhysicsRequests>();
+        world.init_resource::<PhysicsSettings>();
 
         let mut core = Self {
             world,

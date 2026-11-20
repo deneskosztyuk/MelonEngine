@@ -224,6 +224,8 @@ pub struct PhysicsWorld {
     mesh_colliders: HashSet<Entity>,
     /// Entities already warned about a joint without a body.
     joint_warned: HashSet<Entity>,
+    /// The `PhysicsSettings` gravity last applied (changes apply live).
+    settings_gravity: [f32; 3],
 }
 
 impl Default for PhysicsWorld {
@@ -257,6 +259,7 @@ impl PhysicsWorld {
             forced: Vec::new(),
             mesh_colliders: HashSet::new(),
             joint_warned: HashSet::new(),
+            settings_gravity: melon_core::PhysicsSettings::default().gravity,
         }
     }
 
@@ -557,6 +560,7 @@ pub fn add_physics_systems(core: &mut Core) {
     core.add_systems(
         PhysicsStep,
         (
+            apply_settings_system,
             sync_components_system,
             apply_velocity_system,
             apply_requests_system,
@@ -571,6 +575,7 @@ pub fn add_physics_systems(core: &mut Core) {
         PostUpdate,
         (
             cleanup_deleted_system,
+            apply_settings_system,
             // Edits made in the Inspector or by scripts reach rapier now,
             // also while editing.
             sync_components_system,
@@ -583,6 +588,20 @@ pub fn add_physics_systems(core: &mut Core) {
         )
             .chain(),
     );
+}
+
+/// System: gravity from the project's `PhysicsSettings`, when it changed.
+pub fn apply_settings_system(
+    settings: Option<Res<melon_core::PhysicsSettings>>,
+    mut physics: ResMut<PhysicsWorld>,
+) {
+    let Some(settings) = settings else {
+        return;
+    };
+    if settings.gravity != physics.settings_gravity && settings.validate().is_ok() {
+        physics.settings_gravity = settings.gravity;
+        physics.gravity = Vector::from_array(settings.gravity);
+    }
 }
 
 /// System: apply the game's `PhysicsRequests` (impulses, forces, teleports).
@@ -2646,6 +2665,25 @@ mod tests {
         }
 
         // ---- game control ----
+
+        #[test]
+        fn project_settings_gravity_reaches_the_world_and_edits_apply_live() {
+            let mut c = core();
+            c.world
+                .resource_mut::<melon_core::PhysicsSettings>()
+                .gravity = [0.0, -1.0, 0.0];
+            let e = dynamic(&mut c, at(0.0, 50.0, 0.0), cube());
+            frames(&mut c, 60);
+            // About 0.5 m in a second under 1 m/s^2, not 4.9 m.
+            let fell = 50.0 - height(&c, e);
+            assert!(fell > 0.3 && fell < 0.8, "fell {fell}");
+            c.world
+                .resource_mut::<melon_core::PhysicsSettings>()
+                .gravity = [0.0, -20.0, 0.0];
+            frames(&mut c, 1);
+            let g = c.world.resource::<PhysicsWorld>().gravity;
+            assert_eq!(g.y, -20.0);
+        }
 
         #[test]
         fn velocity_is_read_from_and_written_to_a_dynamic_body() {

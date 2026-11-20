@@ -31,6 +31,7 @@ pub mod gizmo;
 pub mod history;
 pub mod inspect;
 pub mod layout;
+pub mod physics_settings;
 pub mod play;
 pub mod project_settings;
 pub mod quality_settings;
@@ -794,6 +795,11 @@ impl Editor {
         self.project_settings.set_quality_broken(broken);
     }
 
+    /// The host loaded a broken `config/physics.ron`: the first Apply backs it up.
+    pub fn set_physics_broken(&mut self, broken: bool) {
+        self.project_settings.set_physics_broken(broken);
+    }
+
     /// The host loaded a broken `config/audio.ron`: the first Apply backs it up.
     pub fn set_audio_broken(&mut self, broken: bool) {
         self.project_settings.set_audio_broken(broken);
@@ -832,6 +838,21 @@ impl Editor {
                     kind: WidgetKind::Slider { min: 0.0, max: 1.0 },
                 },
             );
+        }
+        if type_path == melon_core::Collider::type_path() {
+            let names = world
+                .get_resource::<melon_core::PhysicsSettings>()
+                .map(|s| s.layer_names.clone())
+                .unwrap_or_default();
+            for (field, label) in [("membership", "Layer"), ("filter", "Collides with")] {
+                widgets.insert(
+                    field,
+                    FieldWidget {
+                        label: Some(label),
+                        kind: WidgetKind::Layers(names.clone()),
+                    },
+                );
+            }
         }
         widgets
     }
@@ -5435,6 +5456,29 @@ mod tests {
         h.click(add_row_id::<melon_core::Collider>());
         let c = h.world.get::<melon_core::Collider>(h.entity).unwrap();
         assert_eq!(c.shape, melon_core::ColliderShape::default());
+    }
+
+    #[test]
+    fn collider_layer_fields_use_the_named_layer_widget() {
+        let mut world = melon_core::Core::new().world;
+        world
+            .resource_mut::<melon_core::PhysicsSettings>()
+            .layer_names[4] = "Enemies".into();
+        let widgets = Editor::new().field_widgets(
+            &world,
+            <melon_core::Collider as melon_core::bevy_reflect::TypePath>::type_path(),
+        );
+        for field in ["membership", "filter"] {
+            let widget = widgets
+                .get(field)
+                .unwrap_or_else(|| panic!("no widget for {field}"));
+            let inspect::WidgetKind::Layers(names) = &widget.kind else {
+                panic!("{field} is not a layer widget");
+            };
+            assert_eq!(names[0], "Default");
+            assert_eq!(names[4], "Enemies");
+        }
+        assert!(widgets["membership"].label.is_some());
     }
 
     #[test]
