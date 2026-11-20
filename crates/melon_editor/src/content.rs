@@ -436,7 +436,7 @@ impl ContentBrowser {
     }
 
     /// Inside the root, with no `..` that could climb out of it.
-    fn inside_root(&self, dir: &Path) -> bool {
+    pub fn inside_root(&self, dir: &Path) -> bool {
         dir.starts_with(&self.root)
             && !dir.strip_prefix(&self.root).is_ok_and(|rel| {
                 rel.components()

@@ -1036,10 +1036,8 @@ impl Editor {
                     );
             });
         self.dock = dock;
-        if std::mem::take(&mut self.focus_content_tab)
-            && let Some(path) = self.dock.find_tab(&layout::EditorTab::ContentBrowser)
-        {
-            let _ = self.dock.set_active_tab(path);
+        if std::mem::take(&mut self.focus_content_tab) {
+            layout::reopen(&mut self.dock, layout::EditorTab::ContentBrowser);
         }
 
         // Written after every focus change of this frame; the host applies it next frame.
@@ -1469,11 +1467,16 @@ impl Editor {
                     let file = (!current.starts_with(melon_core::assets::BUILTIN_PREFIX)
                         && file.is_file())
                     .then_some(file);
+                    let outside = file.as_ref().is_some_and(|f| !self.content.inside_root(f));
                     ui.horizontal(|ui| {
                         let show = ui
-                            .add_enabled(file.is_some(), egui::Button::new("Show"))
+                            .add_enabled(file.is_some() && !outside, egui::Button::new("Show"))
                             .on_hover_text("Show the model in the Content Browser")
-                            .on_disabled_hover_text("No file to show");
+                            .on_disabled_hover_text(if outside {
+                                "The file is outside assets/, which the Content Browser shows"
+                            } else {
+                                "No file to show"
+                            });
                         if show.clicked() {
                             ping = file.clone();
                         }
@@ -4046,50 +4049,120 @@ mod tests {
         assert_eq!(path, "builtin:cube");
     }
 
-    #[test]
-    fn show_brings_content_browser_to_front() {
-        let (mut editor, mut world, root) = browser_project("show_front");
-        let model: Handle<Model> = world
-            .resource_mut::<AssetServer>()
-            .load("assets/models/x.glb");
+    fn full_frame(
+        ctx: &egui::Context,
+        editor: &mut Editor,
+        world: &mut World,
+        events: Vec<egui::Event>,
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| editor.build_ui(world, ui));
+    }
+
+    /// A selected entity drawing `model` (its file at `<root>/<model>`), the
+    /// Console in front of the browser, two frames drawn. Returns the
+    /// position of the Inspector's "Show" button.
+    fn show_setup(
+        name: &str,
+        model: &str,
+    ) -> (Editor, World, std::path::PathBuf, egui::Context, egui::Pos2) {
+        let (mut editor, mut world, root) = browser_project(name);
+        let file = root.join(model);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        let handle: Handle<Model> = world.resource_mut::<AssetServer>().load(model);
         let entity = world
-            .spawn((Name("X".to_string()), Transform::default(), model))
+            .spawn((Name("X".to_string()), Transform::default(), handle))
             .id();
         editor.set_selected(Some(entity));
         if let Some(console) = editor.dock.find_tab(&layout::EditorTab::Console) {
             let _ = editor.dock.set_active_tab(console);
         }
         let ctx = egui::Context::default();
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1600.0, 900.0));
-        let run = |editor: &mut Editor, world: &mut World, events| {
-            let input = egui::RawInput {
-                screen_rect: Some(screen),
-                events,
-                ..Default::default()
-            };
-            let _ = ctx.run_ui(input, |ui| editor.build_ui(world, ui));
-        };
-        run(&mut editor, &mut world, Vec::new());
-        run(&mut editor, &mut world, Vec::new());
-        assert!(!editor.content_shown, "browser starts behind the Console");
+        full_frame(&ctx, &mut editor, &mut world, Vec::new());
+        full_frame(&ctx, &mut editor, &mut world, Vec::new());
         let combo = ctx
             .read_response(egui::Id::new("inspector_mesh_drop"))
             .expect("mesh field drawn")
             .rect;
         // "Show" sits just left of the combo box.
         let pos = egui::pos2(combo.left() - 12.0, combo.center().y);
+        (editor, world, root, ctx, pos)
+    }
+
+    fn click_at(ctx: &egui::Context, editor: &mut Editor, world: &mut World, pos: egui::Pos2) {
         let press = |pressed| egui::Event::PointerButton {
             pos,
             button: egui::PointerButton::Primary,
             pressed,
             modifiers: egui::Modifiers::NONE,
         };
-        run(
-            &mut editor,
-            &mut world,
+        full_frame(
+            ctx,
+            editor,
+            world,
             vec![egui::Event::PointerMoved(pos), press(true), press(false)],
         );
-        run(&mut editor, &mut world, Vec::new());
+        full_frame(ctx, editor, world, Vec::new());
+    }
+
+    /// Whether the topmost clickable widget at `pos` was enabled last frame.
+    fn clickable_enabled_at(ctx: &egui::Context, pos: egui::Pos2) -> Option<bool> {
+        ctx.viewport(|v| {
+            v.prev_pass
+                .widgets
+                .layers()
+                .flat_map(|(_, widgets)| widgets)
+                .filter(|w| w.rect.contains(pos) && w.sense.senses_click())
+                .last()
+                .map(|w| w.enabled)
+        })
+    }
+
+    #[test]
+    fn show_is_disabled_outside_the_browser_root() {
+        let (_editor, _world, root, ctx, pos) = show_setup("show_inside", "assets/models/x.glb");
+        assert_eq!(clickable_enabled_at(&ctx, pos), Some(true));
+        let _ = std::fs::remove_dir_all(&root);
+        let (_editor, _world, root, ctx, pos) = show_setup("show_outside", "other/z.glb");
+        assert_eq!(clickable_enabled_at(&ctx, pos), Some(false));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn show_reopens_a_closed_content_browser() {
+        let (mut editor, mut world, root, ctx, pos) =
+            show_setup("show_reopen", "assets/models/x.glb");
+        let tab = editor
+            .dock
+            .find_tab(&layout::EditorTab::ContentBrowser)
+            .unwrap();
+        editor.dock.remove_tab(tab);
+        full_frame(&ctx, &mut editor, &mut world, Vec::new());
+        click_at(&ctx, &mut editor, &mut world, pos);
+        assert!(
+            editor
+                .dock
+                .find_tab(&layout::EditorTab::ContentBrowser)
+                .is_some()
+        );
+        assert!(editor.content_shown, "Show put the browser back");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn show_brings_content_browser_to_front() {
+        let (mut editor, mut world, root, ctx, pos) =
+            show_setup("show_front", "assets/models/x.glb");
+        assert!(!editor.content_shown, "browser starts behind the Console");
+        click_at(&ctx, &mut editor, &mut world, pos);
         assert_eq!(
             editor.content.selected(),
             Some(root.join("assets/models/x.glb").as_path())
