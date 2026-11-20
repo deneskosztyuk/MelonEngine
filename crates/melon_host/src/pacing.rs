@@ -67,6 +67,14 @@ pub fn sleep_until_deadline(next: Instant, now: Instant, period: Duration) -> Du
     next.saturating_duration_since(now).min(period)
 }
 
+/// Whether a frame is due inside an event callback: a period has passed since
+/// the last frame started at `last`. winit calls `about_to_wait` only once
+/// the message queue is empty, and a 1000 Hz mouse keeps it non-empty for as
+/// long as it moves (frames held back 100+ ms), so callbacks draw too.
+pub fn frame_overdue(last: Option<Instant>, now: Instant, period: Duration) -> bool {
+    last.is_some_and(|last| now.saturating_duration_since(last) >= period)
+}
+
 /// Host frame stages, in frame order.
 #[derive(Clone, Copy)]
 pub enum Stage {
@@ -386,6 +394,16 @@ mod tests {
         assert_eq!(sleep_until_deadline(t0 + 3 * MS, t0, period), 3 * MS);
         assert_eq!(sleep_until_deadline(t0, t0 + MS, period), Duration::ZERO);
         assert_eq!(sleep_until_deadline(t0 + 50 * MS, t0, period), period);
+    }
+
+    #[test]
+    fn a_frame_is_overdue_one_period_after_the_last_started() {
+        let t0 = Instant::now();
+        let period = 8 * MS;
+        assert!(!frame_overdue(None, t0, period), "before the first frame");
+        assert!(!frame_overdue(Some(t0), t0 + 7 * MS, period));
+        assert!(frame_overdue(Some(t0), t0 + 8 * MS, period));
+        assert!(frame_overdue(Some(t0), t0 + 150 * MS, period));
     }
 
     #[test]

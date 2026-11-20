@@ -565,15 +565,20 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
-    fn new_events(&mut self, _: &ActiveEventLoop, _: winit::event::StartCause) {
-        self.stats.mark("new_events");
+impl App {
+    /// Draw from inside an event callback once a frame is a period late
+    /// (`pacing::frame_overdue`): a moving mouse keeps winit's queue full,
+    /// so `about_to_wait` alone would hold frames back until it stops.
+    fn draw_if_overdue(&mut self, event_loop: &ActiveEventLoop) {
+        if pacing::frame_overdue(self.last_frame, Instant::now(), self.frame_period) {
+            self.stats.mark("overdue");
+            self.draw_unless_minimized(event_loop);
+        }
     }
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.stats.mark("about_to_wait");
-        // Minimized: no frames (and no game updates), as when frames waited
-        // for `WM_PAINT`, which a minimized window never gets.
+    /// Minimized: no frames (and no game updates), as when frames waited
+    /// for `WM_PAINT`, which a minimized window never gets.
+    fn draw_unless_minimized(&mut self, event_loop: &ActiveEventLoop) {
         if self
             .window
             .as_ref()
@@ -581,6 +586,17 @@ impl ApplicationHandler for App {
         {
             self.draw_frame(event_loop);
         }
+    }
+}
+
+impl ApplicationHandler for App {
+    fn new_events(&mut self, _: &ActiveEventLoop, _: winit::event::StartCause) {
+        self.stats.mark("new_events");
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.stats.mark("about_to_wait");
+        self.draw_unless_minimized(event_loop);
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -751,11 +767,12 @@ impl ApplicationHandler for App {
         self.stats.event_done(event_start);
         self.stats
             .callback(event_start, name.as_deref().unwrap_or_default());
+        self.draw_if_overdue(event_loop);
     }
 
     /// Raw mouse motion (unaccelerated, works with a confined cursor) drives
     /// the game's mouse look.
-    fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+    fn device_event(&mut self, event_loop: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
         self.stats.device_event();
         let start = self.stats.clock();
         if let DeviceEvent::MouseMotion { delta: (x, y) } = event
@@ -766,6 +783,7 @@ impl ApplicationHandler for App {
         }
         self.stats.event_done(start);
         self.stats.callback(start, "device");
+        self.draw_if_overdue(event_loop);
     }
 }
 
