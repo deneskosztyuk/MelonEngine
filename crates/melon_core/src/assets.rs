@@ -140,6 +140,8 @@ pub struct AssetServer {
     root: PathBuf,
     entries: Vec<AssetEntry>,
     by_path: HashMap<String, u32>,
+    guid_to_path: HashMap<AssetGuid, String>,
+    path_to_guid: HashMap<String, AssetGuid>,
     since_poll: f32,
 }
 
@@ -171,6 +173,8 @@ impl AssetServer {
             root,
             entries: Vec::new(),
             by_path: HashMap::new(),
+            guid_to_path: HashMap::new(),
+            path_to_guid: HashMap::new(),
             since_poll: 0.0,
         }
     }
@@ -234,6 +238,94 @@ impl AssetServer {
         &self.root
     }
 
+    /// Rebuild the GUID index from every `.meta` under `<root>/assets`.
+    /// Read-only. Broken `.meta` files are logged and skipped, as are ones
+    /// whose asset is missing; of two sharing a GUID the first in path order
+    /// wins (the editor's reconcile fixes duplicates before scanning).
+    pub fn scan_metas(&mut self) {
+        self.guid_to_path.clear();
+        self.path_to_guid.clear();
+        for file in asset_dir_files(&self.root) {
+            let Some(asset) = file
+                .to_str()
+                .and_then(|f| f.strip_suffix(".meta"))
+                .map(PathBuf::from)
+            else {
+                continue;
+            };
+            if !asset.is_file() {
+                continue;
+            }
+            let meta = match AssetMeta::read(&file) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    tracing::warn!("skipping {}: {error}", file.display());
+                    continue;
+                }
+            };
+            let Some(path) = project_relative(&self.root, &asset) else {
+                continue;
+            };
+            if self.guid_to_path.contains_key(&meta.guid) {
+                continue;
+            }
+            self.guid_to_path.insert(meta.guid, path.clone());
+            self.path_to_guid.insert(path, meta.guid);
+        }
+    }
+
+    /// GUID of a file-backed asset path (a `#mesh<N>` fragment is ignored).
+    pub fn guid_of(&self, path: &str) -> Option<AssetGuid> {
+        let path = normalise(path);
+        self.path_to_guid.get(split_mesh_fragment(&path).0).copied()
+    }
+
+    /// Current project-relative path of `guid`.
+    pub fn path_of_guid(&self, guid: AssetGuid) -> Option<&str> {
+        self.guid_to_path.get(&guid).map(String::as_str)
+    }
+
+    /// Every indexed GUID and its path.
+    pub fn guid_index(&self) -> impl Iterator<Item = (AssetGuid, &str)> {
+        self.guid_to_path.iter().map(|(g, p)| (*g, p.as_str()))
+    }
+
+    /// Handle for the asset `guid` names (plus `#mesh<N>`), `None` if unknown.
+    pub fn load_guid<T: Send + Sync + 'static>(
+        &mut self,
+        guid: AssetGuid,
+        fragment: Option<usize>,
+    ) -> Option<Handle<T>> {
+        let path = self.path_of_guid(guid)?.to_string();
+        Some(match fragment {
+            Some(n) => self.load(&format!("{path}#mesh{n}")),
+            None => self.load(&path),
+        })
+    }
+
+    /// A file moved from `old` to `new`: its entries (and `#mesh<N>` entries)
+    /// take the new path and keep their handle ids; the GUID index follows.
+    pub fn rename_path(&mut self, old: &str, new: &str) {
+        let (old, new) = (normalise(old), normalise(new));
+        for (id, entry) in self.entries.iter_mut().enumerate() {
+            let (file, fragment) = split_mesh_fragment(&entry.path);
+            if file != old {
+                continue;
+            }
+            let renamed = match fragment {
+                Some(n) => format!("{new}#mesh{n}"),
+                None => new.clone(),
+            };
+            self.by_path.remove(&entry.path);
+            self.by_path.insert(renamed.clone(), id as u32);
+            entry.path = renamed;
+        }
+        if let Some(guid) = self.path_to_guid.remove(&old) {
+            self.guid_to_path.insert(guid, new.clone());
+            self.path_to_guid.insert(new, guid);
+        }
+    }
+
     /// Modified time of a file-backed asset, `None` if built-in or missing.
     fn modified_time(&self, path: &str) -> Option<SystemTime> {
         if path.starts_with(BUILTIN_PREFIX) {
@@ -259,6 +351,42 @@ impl AssetServer {
             }
         }
     }
+}
+
+/// Every file under `<root>/assets`, recursively, `.meta` files included.
+/// Files and folders whose name starts with `.` are skipped. Sorted.
+pub fn asset_dir_files(root: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&root.join("assets"), &mut out);
+    out.sort();
+    out
+}
+
+/// `path` relative to `root` with forward slashes (asset path form).
+pub fn project_relative(root: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(root).ok()?;
+    Some(
+        rel.components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
 }
 
 /// Hot reload: poll asset files every `POLL_INTERVAL` seconds of wall time,
@@ -496,5 +624,77 @@ mod tests {
         let (a, b) = (AssetGuid::new(), AssetGuid::new());
         assert_ne!(a, b);
         assert_eq!(a.to_string().parse::<AssetGuid>().unwrap(), a);
+    }
+
+    fn write_asset_with_meta(root: &Path, rel: &str) -> AssetGuid {
+        let file = root.join(rel);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        let guid = AssetGuid::new();
+        let meta = AssetMeta {
+            version: META_VERSION,
+            guid,
+        };
+        std::fs::write(meta_path(&file), meta.to_ron()).unwrap();
+        guid
+    }
+
+    #[test]
+    fn scan_metas_indexes_guids_both_ways() {
+        let root = temp_root("scan");
+        let g = write_asset_with_meta(&root, "assets/models/sub/a.glb");
+        let mut server = AssetServer::new(root.clone());
+        server.scan_metas();
+        assert_eq!(server.guid_of("assets/models/sub/a.glb"), Some(g));
+        assert_eq!(server.guid_of("assets/models/sub/a.glb#mesh1"), Some(g));
+        assert_eq!(server.path_of_guid(g), Some("assets/models/sub/a.glb"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_metas_skips_broken_meta_and_writes_nothing() {
+        let root = temp_root("scan_broken");
+        let file = root.join("assets/models/a.glb");
+        std::fs::write(&file, b"x").unwrap();
+        std::fs::write(meta_path(&file), "not ron").unwrap();
+        std::fs::write(root.join("assets/models/b.glb"), b"x").unwrap();
+        let mut server = AssetServer::new(root.clone());
+        server.scan_metas();
+        assert_eq!(server.guid_of("assets/models/a.glb"), None);
+        assert_eq!(
+            std::fs::read_to_string(meta_path(&file)).unwrap(),
+            "not ron"
+        );
+        assert!(!meta_path(&root.join("assets/models/b.glb")).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_guid_resolves_current_path_with_fragment() {
+        let root = temp_root("load_guid");
+        let g = write_asset_with_meta(&root, "assets/models/a.glb");
+        let mut server = AssetServer::new(root.clone());
+        server.scan_metas();
+        let h: Handle<Model> = server.load_guid(g, Some(2)).unwrap();
+        assert_eq!(server.path(h), "assets/models/a.glb#mesh2");
+        assert!(server.load_guid::<Model>(AssetGuid::new(), None).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rename_path_moves_fragments_and_keeps_ids() {
+        let root = temp_root("rename");
+        let g = write_asset_with_meta(&root, "assets/models/a.glb");
+        let mut server = AssetServer::new(root.clone());
+        server.scan_metas();
+        let whole: Handle<Model> = server.load("assets/models/a.glb");
+        let part: Handle<Model> = server.load("assets/models/a.glb#mesh1");
+        server.rename_path("assets/models/a.glb", "assets/models/b.glb");
+        assert_eq!(server.path(whole), "assets/models/b.glb");
+        assert_eq!(server.path(part), "assets/models/b.glb#mesh1");
+        assert_eq!(server.load::<Model>("assets/models/b.glb#mesh1"), part);
+        assert_eq!(server.path_of_guid(g), Some("assets/models/b.glb"));
+        assert_eq!(server.guid_of("assets/models/a.glb"), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
