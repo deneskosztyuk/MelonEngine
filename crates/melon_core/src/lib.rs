@@ -1,9 +1,12 @@
 use bevy_ecs::{
+    component::Component,
+    reflect::AppTypeRegistry,
     resource::Resource,
     schedule::{IntoScheduleConfigs, Schedule, ScheduleLabel, Schedules},
     system::{Res, ResMut, ScheduleSystem},
     world::World,
 };
+use bevy_reflect::{GetTypeRegistration, Reflect, TypePath};
 use tracing::instrument;
 
 pub mod actions;
@@ -13,6 +16,7 @@ pub mod hierarchy;
 pub mod input;
 pub mod plugin;
 pub mod quality;
+pub mod reflect;
 pub mod resources;
 mod ron_file;
 pub mod stages;
@@ -23,6 +27,7 @@ pub use actions::{
 pub use assets::{AssetGuid, AssetMeta, AssetServer, Handle, META_VERSION, Model, meta_path};
 pub use bevy_ecs;
 pub use bevy_ecs::query::With;
+pub use bevy_reflect;
 pub use components::{
     Aabb, Bob, BodyInfo, BodyKind, Name, PendingDelete, PreviousTransform, Spin, Transform,
     store_previous_transforms_system,
@@ -35,8 +40,26 @@ pub use quality::{
     GiMode, PresentPreference, QualityPreset, QualitySetting, RenderQuality, RenderTimings,
     SsgiResolution,
 };
+pub use reflect::{
+    ComponentInfo, QuatReflect, RegistryGeneration, Vec2Reflect, Vec3Reflect, Vec4Reflect,
+    display_name, registered_components,
+};
 pub use resources::{Camera, Environment, Light, NameCounter, SimulationState, Time};
 pub use stages::{FixedUpdate, PostUpdate, PreUpdate, Update};
+
+/// What a game crate needs to define and register components:
+/// `use melon_core::prelude::*;` then `#[derive(Component, Reflect)]`.
+pub mod prelude {
+    pub use bevy_ecs::prelude::*;
+    pub use bevy_reflect::prelude::*;
+
+    // Crate names the derive macros expand to.
+    pub use crate::{
+        Aabb, Actions, App, Bob, BodyInfo, BodyKind, Core, FixedUpdate, Name, Plugin, PostUpdate,
+        PreUpdate, SimulationState, Spin, Time, Transform, Update,
+    };
+    pub use crate::{bevy_ecs, bevy_reflect};
+}
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -112,6 +135,8 @@ impl Core {
         world.init_resource::<InputMap>();
         world.init_resource::<Actions>();
         world.init_resource::<RenderQuality>();
+        world.init_resource::<AppTypeRegistry>();
+        world.init_resource::<RegistryGeneration>();
 
         let mut core = Self {
             world,
@@ -128,7 +153,22 @@ impl Core {
             ),
         );
         core.add_systems(Update, assets::hot_reload_system);
+        core.register_component::<Transform>()
+            .register_component::<Aabb>()
+            .register_component::<BodyInfo>()
+            .register_component::<Spin>()
+            .register_component::<Bob>();
         core
+    }
+
+    /// Make an engine component saved and editable (scene files, Inspector).
+    /// Plugins use `App::register_component`, which checks the layout.
+    pub fn register_component<T>(&mut self) -> &mut Self
+    where
+        T: Component + Reflect + TypePath + GetTypeRegistration,
+    {
+        reflect::register::<T>(&mut self.world);
+        self
     }
 
     /// Register systems into a frame stage (`PreUpdate`, `FixedUpdate`,

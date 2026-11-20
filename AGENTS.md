@@ -235,13 +235,18 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   Auxiliary views (thumbnails) go in their own submission after the
   frame's. A second main view (a Game view next to the Scene view) needs
   per-view uniform and instance buffers first.
-- **Scene format.** RON, `SCENE_VERSION = 4` in `melon_editor/src/scene.rs`:
-  `parent` is an index into `entities`, `transform` is local (versions 1 and 2
-  still load, all roots). `model` is the path (`#mesh<N>` included) and
-  `model_guid` the file's GUID; the GUID wins when it resolves, so a scene
-  written by hand may give only `model`. Adding a saved component means changing
-  `SceneEntity`, `scene_to_data` and `spawn_scene_entity`. Bump the version on
-  breaking changes and keep reading the old one.
+- **Scene format.** RON, `SCENE_VERSION = 5` in `melon_editor/src/scene.rs`:
+  each entity has `name`, `parent` (index into `entities`), `model` (path,
+  `#mesh<N>` included), `model_guid` (wins when it resolves, so a scene
+  written by hand may give only `model`) and `components`, a map from type
+  path to the component's RON written through the registry (`Transform` is
+  local to the parent). Adding a saved component = `#[derive(Component,
+  Reflect)]` + `register_component`; no `SceneEntity` edit. Unknown or
+  unreadable components are kept (`KeptComponents`, written back unchanged,
+  inserted once their type registers). Versions 1-4 still load (old fields
+  converted on load). Scene code needs the world's `AppTypeRegistry`: tests
+  use `Core::new().world`, not `World::new()`. Bump the version on breaking
+  changes and keep reading the old one.
 - **Light direction sign.** `Light::direction` is the direction light travels
   (from the light into the scene). Shaders want the opposite; pass
   `Light::to_light()`.

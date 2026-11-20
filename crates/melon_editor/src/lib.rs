@@ -155,6 +155,9 @@ pub struct Editor {
     camera: viewport::EditorCamera,
     /// Focus the Scene viewport saw last frame: Game -> Editor adopts the game's `Camera`.
     last_viewport_focus: InputFocus,
+    /// `RegistryGeneration` seen last frame: on a change, kept scene
+    /// components whose type is now registered are inserted.
+    registry_generation: u64,
     /// The Scene viewport was drawn this frame (reset at the start of `build_ui`).
     viewport_shown: bool,
     /// Grid and selection box, drawn depth-tested in the 3D pass.
@@ -211,6 +214,7 @@ impl Default for Editor {
             viewport_size: winit::dpi::PhysicalSize::new(1, 1),
             camera: viewport::EditorCamera::default(),
             last_viewport_focus: InputFocus::Editor,
+            registry_generation: 0,
             viewport_shown: false,
             world_line_vertices: Vec::new(),
             frame_ms: 16.7,
@@ -1068,6 +1072,16 @@ impl Editor {
             .map_or(1.0 / 60.0, |t| t.delta_seconds);
         self.tick_frame_time(dt);
         self.poll_dialog(world);
+        let generation = world
+            .get_resource::<melon_core::RegistryGeneration>()
+            .map_or(0, |g| g.0);
+        if generation != self.registry_generation {
+            self.registry_generation = generation;
+            let inserted = scene::resolve_kept_components(world);
+            if inserted > 0 {
+                tracing::info!("{inserted} kept scene components are registered now");
+            }
+        }
         // A rebinding capture swallows this frame's keys (Esc cancels it, not ReleaseGame).
         // Read before the capture consumes the press later in the frame.
         self.keys_captured = self.project_settings.capturing();
@@ -2987,7 +3001,7 @@ mod tests {
     fn pending_save_writes_file_and_reports() {
         let dir = pending_dir("save");
         let path = dir.join("scene.ron");
-        let mut world = World::new();
+        let mut world = melon_core::Core::new().world;
         world.spawn((Name("A".into()), Transform::default()));
         let mut editor = Editor::new();
         editor.pending_operation = Some(PendingOperation::Save(path.clone()));
@@ -3395,7 +3409,7 @@ mod tests {
             r#"{"mesh": 0, "translation": [3, 0, 0], "scale": [0, 1, 1]}"#,
         );
         std::fs::write(root_dir.join("assets/models/flat.gltf"), flat).unwrap();
-        let mut world = World::new();
+        let mut world = melon_core::Core::new().world;
         spawn_model(
             &mut world,
             &root_dir,
@@ -3403,7 +3417,7 @@ mod tests {
             glam::Vec3::ZERO,
             None,
         );
-        let data = scene::scene_to_data(&mut world);
+        let data = scene::scene_to_data(&mut world).unwrap();
         let mut physics = melon_physics::PhysicsWorld::new();
         scene::apply_scene(&mut world, &mut physics, &data).unwrap();
         let _ = std::fs::remove_dir_all(&root_dir);
@@ -3700,7 +3714,7 @@ mod tests {
         std::fs::write(root.join("assets/models/x.glb"), b"x").unwrap();
         let mut server = AssetServer::new(root.clone());
         asset_db::reconcile(&mut server);
-        let mut world = World::new();
+        let mut world = melon_core::Core::new().world;
         world.insert_resource(server);
         let mut editor = Editor::new();
         editor.set_project_root(&root);

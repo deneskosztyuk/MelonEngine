@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 bevy_ecs.workspace = true
+bevy_reflect.workspace = true
 glam.workspace = true
 tracing.workspace = true
 serde.workspace = true

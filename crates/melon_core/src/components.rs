@@ -1,12 +1,20 @@
 use bevy_ecs::component::Component;
+use bevy_ecs::reflect::ReflectComponent;
 use bevy_ecs::system::Query;
+use bevy_reflect::{Reflect, std_traits::ReflectDefault};
 use glam::{Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
-#[derive(Component, Debug, Clone, Copy, Serialize, Deserialize)]
+use crate::reflect::{QuatReflect, Vec3Reflect};
+
+#[derive(Component, Reflect, Debug, Clone, Copy, Serialize, Deserialize)]
+#[reflect(Component, Default)]
 pub struct Transform {
+    #[reflect(remote = Vec3Reflect)]
     pub translation: Vec3,
+    #[reflect(remote = QuatReflect)]
     pub rotation: Quat,
+    #[reflect(remote = Vec3Reflect)]
     pub scale: Vec3,
 }
 
@@ -68,21 +76,26 @@ pub fn store_previous_transforms_system(mut query: Query<(&Transform, &mut Previ
 #[derive(Component, Debug, Clone, Serialize, Deserialize)]
 pub struct Name(pub String);
 
-#[derive(Component, Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Component, Reflect, Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[reflect(Component, Default)]
 pub struct Aabb {
+    #[reflect(remote = Vec3Reflect)]
     pub half_extents: Vec3,
 }
 
-#[derive(Component, Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Component, Reflect, Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[reflect(Component, Default)]
 pub struct Spin;
 
-#[derive(Component, Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Component, Reflect, Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[reflect(Component, Default)]
 pub struct Bob;
 
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct PendingDelete;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Reflect, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[reflect(Default)]
 pub enum BodyKind {
     #[default]
     None,
@@ -90,9 +103,11 @@ pub enum BodyKind {
     Fixed,
 }
 
-#[derive(Component, Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Component, Reflect, Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[reflect(Component, Default)]
 pub struct BodyInfo {
     pub body_type: BodyKind,
+    #[reflect(remote = Vec3Reflect)]
     pub half_extents: Vec3,
 }
 

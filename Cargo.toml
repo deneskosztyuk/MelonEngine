@@ -24,6 +24,7 @@ melon_editor = { path = "crates/melon_editor" }
 melon_game = { path = "crates/melon_game" }
 
 bevy_ecs = "0.19"
+bevy_reflect = { version = "0.19", default-features = false, features = ["std"] }
 glam = { version = "0.33", features = ["bytemuck", "serde"] }
 wgpu = "29"
 winit = "0.30"
