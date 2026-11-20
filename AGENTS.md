@@ -147,9 +147,9 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   per-view lighting inputs, created per `ViewportTarget` (rebuilt with it on
   resize): binding 0 = SSAO texture (`R8Unorm`, 1 = open, read with
   `textureLoad` at the fragment position); bindings 1 to 4 = the DDGI
-  irradiance atlas, depth-moment atlas, linear clamp sampler and
-  `GiUniform` (world data: every view's group references the same ones,
-  `Gi::lighting_entries`). `draw_meshes_textured` takes the group; AO off
+  irradiance atlas, depth-moment atlas, linear clamp sampler,
+  `GiUniform` and the voxel buffer (world data: every view's group
+  references the same ones, `Gi::lighting_entries`). `draw_meshes_textured` takes the group; AO off
   binds a 1x1 white AO one (`unoccluded_lighting`, also used by the voxel
   passes).
 - **SSAO.** Before the 3D pass `render_scene` draws the camera's batches once,
@@ -192,14 +192,23 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   thin surface wins); (3) trace + (4) blend: `cs_update`, one workgroup
   per probe (16x8x16, 2.5 m, at cell centres), 64 spherical-Fibonacci
   rays turned by a per-frame random rotation, 3D DDA to the first
-  occupied voxel (miss = sky.wgsl gradient), then every texel of the
+  occupied voxel (a miss reads the sky light: `ambient * sky_color` above
+  the horizon, `ambient * ground_color` below, never the drawn sky, which
+  is several times brighter and washed the scene out; cosine-weighted
+  this equals the GI-off hemisphere, so open surfaces keep their GI-off
+  brightness), then every texel of the
   probe's octahedral tiles (irradiance 8x8, distance mean / mean square
   16x16, each plus a 1-texel border computed in place) blends the rays
   into last frame's value, hysteresis `min(0.97, n / (n + 1))` (a running
   mean for the first updates); the new atlases are copied over the
   sampled ones; (5) shade: mesh.wgsl `gi_irradiance` blends the 8
   surrounding probes (trilinear x backface x Chebyshev, DDGI's
-  normal/view bias) and replaces the hemisphere diffuse (times AO and
+  normal/view bias; Chebyshev allows one voxel of slack, since distances
+  end at the hit voxel's near side; plus a voxel march from the point to
+  each probe that drops probes behind geometry, skipping the point's own
+  voxel and stopping a voxel short of the probe; if every probe is
+  blocked the unmarched weights are used) and replaces the hemisphere
+  diffuse (times AO and
   `1 - metallic`), fading back to it within one probe spacing outside the
   volume. Ambient specular stays sky-based. GI off uses the mesh pipeline
   built with the `GI_ENABLED` override false (a runtime branch alone moved
@@ -209,11 +218,18 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   (`ponytail` note: follow the camera); its corners stick out of the
   sun's shadow box (no sun shadows there, as for direct light); **walls
   must be at least 0.35 m thick** (a voxel plus the 1 cm inward push per
-  face) or both faces share a voxel and the lit one leaks through; room
-  corners leak a little (Chebyshev at probe resolution); each
+  face) or both faces share a voxel and the lit one leaks through; the
+  binary voxel visibility gives hard edges where one probe dominates (an
+  emitter's glow on the floor); each
   `render_scene` call updates the probes once, so several views per frame
-  update them several times. Debug with the snapshot's `--gi-only` (the
-  indirect diffuse term alone, `set_gi_only`) and `--no-gi`.
+  update them several times. Group 3 binding 5 is the voxel buffer
+  (read-only, for the visibility march); the voxel passes bind
+  `voxel_pass_lighting` with a dummy there, since they write the voxels.
+  Debug with the snapshot's `--gi-only` (the indirect diffuse term alone,
+  `set_gi_only`) and `--no-gi`.
+- **No overlapping slabs.** Boxes that overlap share face planes, which
+  z-fight into stripes at oblique views (the first cornell room's wall
+  tops inside the ceiling). Let walls end where the next slab starts.
 - **Sun shadow setup.** The shadow pass culls nothing (front faces of
   closed meshes store depth; single-sided quads cast from both sides) with
   a small slope-scaled bias (`constant: 1, slope_scale: 1.5`), and

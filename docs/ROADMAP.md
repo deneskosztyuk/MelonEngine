@@ -84,12 +84,13 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
       radiance volume (0.3125 m) voxelised each frame in three orthographic
       passes, 16x8x16 probes (2.5 m) tracing 64 rays each per frame (3D
       DDA), octahedral irradiance (8x8) and distance moments (16x16) with
-      hysteresis 0.97, Chebyshev visibility, multi-bounce through the
-      voxels. Replaces the hemisphere diffuse inside the volume.
+      hysteresis 0.97, Chebyshev plus voxel-march visibility, multi-bounce
+      through the voxels; ray misses read the hemisphere sky light, so open
+      surfaces match GI off. Replaces the hemisphere diffuse inside the
+      volume.
       `Environment::gi_intensity` (default 1, 0 skips the passes). Limits:
       fixed 40 x 20 x 40 m volume at the origin; walls under 0.35 m leak;
-      light leaks a little at room corners (probe resolution); about
-      +1.5 to 1.9 ms on the dev GPU.
+      hard edges where one probe dominates; about +2.2 ms on the dev GPU.
 - [x] SSAO: single-sample depth/normal prepass, 16-sample hemisphere AO
       with range check, 4x4 depth-aware blur, full resolution; occludes
       ambient diffuse and specular only. `Environment::ao_strength` /
