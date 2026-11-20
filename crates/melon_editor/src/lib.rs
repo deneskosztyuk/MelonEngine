@@ -126,6 +126,9 @@ pub struct Editor {
     /// When `keep_watching` next checks the watcher; `None` until a
     /// project is set.
     watch_check: Option<std::time::Instant>,
+    /// A new file is waiting for its `.meta` (`asset_watch::META_GRACE`):
+    /// reconcile again at this time.
+    meta_recheck: Option<std::time::Instant>,
     /// glTF mesh counts for the Inspector's Asset card, by file and its
     /// modified time (re-read only when the file changes). Holds only the
     /// browser selection.
@@ -191,6 +194,7 @@ impl Default for Editor {
             content_shown: false,
             watcher: None,
             watch_check: None,
+            meta_recheck: None,
             mesh_counts: std::collections::HashMap::new(),
             focus_content_tab: false,
             status_message: None,
@@ -639,9 +643,9 @@ impl Editor {
     }
 
     /// Once outside changes under `assets/` settle: reconcile `.meta` files
-    /// and refresh the browser.
-    fn follow_asset_changes(&mut self, world: &mut World, ui: &egui::Ui) {
-        let now = std::time::Instant::now();
+    /// and refresh the browser. A file that only just changed waits
+    /// `META_GRACE` for its own `.meta` before getting a new one.
+    fn follow_asset_changes(&mut self, world: &mut World, ui: &egui::Ui, now: std::time::Instant) {
         let restarted = self.keep_watching(now);
         let Some(watcher) = &mut self.watcher else {
             if self.watch_check.is_some() {
@@ -655,13 +659,22 @@ impl Editor {
             // Settle even if the user does not move the mouse.
             ui.ctx().request_repaint_after(asset_watch::QUIET);
         }
-        if !settled {
+        if let Some(at) = self.meta_recheck {
+            ui.ctx()
+                .request_repaint_after(at.saturating_duration_since(now));
+        }
+        let recheck = self.meta_recheck.is_some_and(|at| now >= at);
+        if !settled && !recheck {
             return;
         }
         if !world.contains_resource::<AssetServer>() {
             world.insert_resource(AssetServer::new(self.project_root.clone()));
         }
-        asset_db::reconcile(&mut world.resource_mut::<AssetServer>());
+        let waiting =
+            asset_db::reconcile_except(&mut world.resource_mut::<AssetServer>(), |file| {
+                watcher.touched.recent(file, now)
+            });
+        self.meta_recheck = waiting.then(|| now + asset_watch::META_GRACE);
         self.content.refresh();
     }
 
@@ -1050,7 +1063,7 @@ impl Editor {
             .show(ui, |ui| self.status_bar(world, ui));
         self.about_window(ui);
         self.project_settings_window(world, ui);
-        self.follow_asset_changes(world, ui);
+        self.follow_asset_changes(world, ui, std::time::Instant::now());
         self.delete_dialog(world, ui);
         self.open_scene_dialog(world, ui);
         self.take_dropped_files(ui);
@@ -3993,6 +4006,35 @@ mod tests {
             ctx.read_response(egui::Id::new("inspector_nothing"))
                 .is_some()
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn watcher_waits_before_giving_a_new_file_a_meta() {
+        let (mut editor, mut world, root) = browser_project("meta_grace");
+        let ctx = egui::Context::default();
+        let new = root.join("assets/models/new.glb");
+        std::fs::write(&new, b"x").unwrap();
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Until a settled reconcile ran and left the file waiting.
+        while editor.meta_recheck.is_none() {
+            assert!(std::time::Instant::now() < give_up, "no settle within 5 s");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                editor.follow_asset_changes(&mut world, ui, std::time::Instant::now())
+            });
+        }
+        assert!(
+            !melon_core::meta_path(&new).exists(),
+            "its .meta may still be on the way"
+        );
+        // None arrived: after the grace the file gets one.
+        let later = std::time::Instant::now() + asset_watch::META_GRACE;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            editor.follow_asset_changes(&mut world, ui, later)
+        });
+        assert!(melon_core::meta_path(&new).exists());
+        assert!(editor.meta_recheck.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 

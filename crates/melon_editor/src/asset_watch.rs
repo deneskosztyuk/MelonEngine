@@ -2,7 +2,8 @@
 //! export, git). Events are drained each frame; once they settle the editor
 //! reconciles `.meta` files and refreshes the Content Browser.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,37 @@ pub const QUIET: Duration = Duration::from_millis(300);
 /// How often the editor checks that `assets/` exists and is watched: it
 /// may be missing at startup, or deleted and recreated while running.
 pub const RETRY: Duration = Duration::from_secs(2);
+
+/// How long a file the watcher just saw change waits for its `.meta`
+/// before getting a new GUID. A slow move (another drive) copies `x.glb`
+/// first and `x.glb.meta` seconds later; a fresh `.meta` in between would
+/// break references and clash with the incoming one.
+pub const META_GRACE: Duration = Duration::from_secs(3);
+
+/// When each path last had an event, for `META_GRACE`.
+#[derive(Default)]
+pub struct Touched {
+    at: HashMap<PathBuf, Instant>,
+}
+
+impl Touched {
+    pub fn note(&mut self, path: PathBuf, now: Instant) {
+        self.at.insert(path, now);
+    }
+
+    /// `path` changed less than `META_GRACE` before `now`.
+    pub fn recent(&self, path: &Path, now: Instant) -> bool {
+        self.at
+            .get(path)
+            .is_some_and(|t| now.saturating_duration_since(*t) < META_GRACE)
+    }
+
+    /// Forget paths that are no longer recent.
+    fn prune(&mut self, now: Instant) {
+        self.at
+            .retain(|_, t| now.saturating_duration_since(*t) < META_GRACE);
+    }
+}
 
 /// Fires once after events stop for `QUIET`.
 #[derive(Default)]
@@ -59,6 +91,7 @@ pub struct AssetWatcher {
     _watcher: notify::RecommendedWatcher,
     events: Receiver<notify::Result<notify::Event>>,
     debounce: Debounce,
+    pub touched: Touched,
 }
 
 impl AssetWatcher {
@@ -71,15 +104,21 @@ impl AssetWatcher {
             _watcher: watcher,
             events,
             debounce: Debounce::default(),
+            touched: Touched::default(),
         })
     }
 
     /// Drain events without blocking; true once they have settled.
     pub fn poll(&mut self, now: Instant) -> bool {
+        self.touched.prune(now);
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Ok(event) if !relevant(&event) => continue,
-                Ok(_) => {}
+                Ok(event) => {
+                    for path in event.paths {
+                        self.touched.note(path, now);
+                    }
+                }
                 Err(error) => tracing::warn!("asset watcher: {error}"),
             }
             self.debounce.note(now);
@@ -113,6 +152,20 @@ mod tests {
             !d.ready(t0 + Duration::from_millis(900)),
             "fires once per settle"
         );
+    }
+
+    #[test]
+    fn touched_is_recent_for_the_grace_only() {
+        let t0 = Instant::now();
+        let mut touched = Touched::default();
+        let a = Path::new("assets/a.glb");
+        assert!(!touched.recent(a, t0));
+        touched.note(a.to_path_buf(), t0);
+        assert!(touched.recent(a, t0 + META_GRACE - Duration::from_millis(1)));
+        assert!(!touched.recent(a, t0 + META_GRACE));
+        assert!(!touched.recent(Path::new("assets/b.glb"), t0));
+        touched.prune(t0 + META_GRACE);
+        assert!(touched.at.is_empty(), "old entries are dropped");
     }
 
     #[test]

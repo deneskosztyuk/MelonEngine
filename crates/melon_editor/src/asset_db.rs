@@ -19,6 +19,12 @@ use melon_core::{AssetGuid, AssetMeta, AssetServer, META_VERSION, meta_path};
 /// - an asset with no `.meta` gets one;
 /// - an asset that moved with its `.meta` keeps its handles (`rename_path`).
 pub fn reconcile(server: &mut AssetServer) {
+    reconcile_except(server, |_| false);
+}
+
+/// `reconcile`, but an asset without a `.meta` for which `wait(file)` is
+/// true gets none yet (its own may still be on the way). True if any waits.
+pub fn reconcile_except(server: &mut AssetServer, wait: impl Fn(&Path) -> bool) -> bool {
     let root = server.root().to_path_buf();
     let before: HashMap<AssetGuid, String> = server
         .guid_index()
@@ -72,10 +78,15 @@ pub fn reconcile(server: &mut AssetServer) {
         }
     }
 
+    let mut waiting = false;
     for file in &files {
         let name = file.to_string_lossy();
         if !name.ends_with(".meta") && !name.ends_with(".meta.tmp") && !has_meta.contains(file) {
-            write_meta(file, AssetGuid::new());
+            if wait(file) {
+                waiting = true;
+            } else {
+                write_meta(file, AssetGuid::new());
+            }
         }
     }
 
@@ -90,6 +101,7 @@ pub fn reconcile(server: &mut AssetServer) {
             server.rename_path(&old, &new);
         }
     }
+    waiting
 }
 
 /// Names that differ only in (Unicode) case, as on Windows.
@@ -166,6 +178,20 @@ mod tests {
         assert!(!meta_path(&git).exists());
         assert!(!meta_path(&meta_path(&a)).exists());
         assert!(server.guid_of("assets/models/a.glb").is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reconcile_except_leaves_waiting_files_without_meta() {
+        let root = temp_root("waiting");
+        let a = write(&root, "assets/models/a.glb");
+        let b = write(&root, "assets/models/b.glb");
+        let mut server = AssetServer::new(root.clone());
+        assert!(reconcile_except(&mut server, |f| f == a));
+        assert!(!meta_path(&a).exists());
+        assert!(meta_path(&b).exists());
+        assert!(!reconcile_except(&mut server, |_| false));
+        assert!(meta_path(&a).exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
