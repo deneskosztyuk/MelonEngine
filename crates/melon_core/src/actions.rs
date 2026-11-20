@@ -1,10 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::Path,
     sync::Mutex,
 };
 
-use anyhow::Context;
 use bevy_ecs::{
     resource::Resource,
     system::{Res, ResMut},
@@ -12,6 +11,7 @@ use bevy_ecs::{
 use serde::{Deserialize, Serialize};
 
 use crate::input::{Input, InputButton, KeyCode, MouseButton};
+pub use crate::ron_file::LoadOutcome;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActionKind {
@@ -39,13 +39,6 @@ pub struct Action {
 pub struct InputMap {
     pub version: u32,
     pub actions: Vec<Action>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LoadOutcome {
-    Loaded,
-    Missing,
-    Broken(String),
 }
 
 fn key(code: KeyCode) -> InputButton {
@@ -90,17 +83,10 @@ impl Default for InputMap {
 impl InputMap {
     /// Missing or unreadable files give the defaults; the file is left untouched.
     pub fn load(path: &Path) -> (InputMap, LoadOutcome) {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return (Self::default(), LoadOutcome::Missing);
-            }
-            Err(e) => return (Self::default(), LoadOutcome::Broken(e.to_string())),
-        };
-        let mut map: InputMap = match ron::from_str(&text) {
-            Ok(map) => map,
-            Err(e) => return (Self::default(), LoadOutcome::Broken(e.to_string())),
-        };
+        let (mut map, outcome) = crate::ron_file::load::<InputMap>(path);
+        if outcome != LoadOutcome::Loaded {
+            return (map, outcome);
+        }
         let mut seen = HashSet::new();
         let mut refused = Vec::new();
         map.actions.retain(|a| {
@@ -124,26 +110,8 @@ impl InputMap {
     /// Atomic write (temp file + rename). With `backup_broken`, an existing
     /// file is first copied to `<path>.broken` so a hand edit is never lost.
     pub fn save(&self, path: &Path, backup_broken: bool) -> anyhow::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        }
-        if backup_broken && path.exists() {
-            let backup = with_suffix(path, ".broken");
-            std::fs::copy(path, &backup)
-                .with_context(|| format!("backing up to {}", backup.display()))?;
-        }
-        let text = ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())?;
-        let tmp = with_suffix(path, ".tmp");
-        std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
-        Ok(())
+        crate::ron_file::save(self, path, backup_broken)
     }
-}
-
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut s = path.as_os_str().to_owned();
-    s.push(suffix);
-    s.into()
 }
 
 #[derive(Clone, Copy, Debug, Default)]

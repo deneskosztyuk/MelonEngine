@@ -12,7 +12,9 @@ pub mod components;
 pub mod hierarchy;
 pub mod input;
 pub mod plugin;
+pub mod quality;
 pub mod resources;
+mod ron_file;
 pub mod stages;
 
 pub use actions::{
@@ -29,6 +31,9 @@ pub use glam;
 pub use hierarchy::{ChildOf, Children, GlobalTransform};
 pub use input::{GameInputGate, Input, InputButton, InputFocus, KeyCode, MouseButton, RawPresses};
 pub use plugin::{App, Plugin, abi_fingerprint};
+pub use quality::{
+    GiMode, PresentPreference, QualityPreset, QualitySetting, RenderQuality, RenderTimings,
+};
 pub use resources::{Camera, Environment, Light, NameCounter, SimulationState, Time};
 pub use stages::{FixedUpdate, PostUpdate, PreUpdate, Update};
 
