@@ -6989,6 +6989,34 @@ mod tests {
         (pixels, stats)
     }
 
+    /// A rough floor under a drawn sky six times brighter than the ambient
+    /// the scene is lit with must not turn hazy: its reflection blurs into
+    /// the hemisphere, so it shows about its diffuse ambient.
+    fn check_rough_surface_has_no_sky_haze(r: &mut Renderer) -> Result<(), String> {
+        let light = melon_core::Light {
+            color: glam::Vec3::ZERO,
+            ambient: 0.1,
+            sky_color: glam::Vec3::ONE,
+            ground_color: glam::Vec3::ONE,
+            ..test_light()
+        };
+        let environment = melon_core::Environment {
+            zenith_color: glam::Vec3::splat(6.0),
+            horizon_color: glam::Vec3::splat(6.0),
+            ..plain_environment()
+        };
+        let quality = melon_core::RenderQuality::default();
+        let (pixels, _) = render_floor_under(r, vec![], quality, light, environment, None);
+        let got = i32::from(value_at(&pixels, CENTRE_PX));
+        let want = i32::from(tonemap_value(r, 0.082));
+        if (got - want).abs() > 8 {
+            return Err(format!(
+                "rough floor under a bright sky shows {got}, expected about {want} (sky haze)"
+            ));
+        }
+        Ok(())
+    }
+
     fn check_ibl_uniform_sky(r: &mut Renderer) -> Result<(), String> {
         // A white rough dielectric under a uniform sky of radiance L (no
         // sun): it shows about L times its albedo (diffuse irradiance = L,
@@ -9763,6 +9791,7 @@ mod tests {
             Box::new(check_blend_material_thumbnail),
             Box::new(check_material_bad_texture_refs),
             Box::new(check_ibl_updates_in_place),
+            Box::new(check_rough_surface_has_no_sky_haze),
             Box::new(check_material_cache_evicts),
             Box::new(check_mask_edge_alpha_to_coverage),
             Box::new(check_gi_sun_injection_ignores_the_camera),

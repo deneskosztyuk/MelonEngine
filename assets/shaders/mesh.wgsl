@@ -469,7 +469,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let f_amb = fresnel_schlick_roughness(ndv, f0, roughness);
     // Split sum: the prefiltered environment times the scale and bias of F0.
     let brdf = textureSampleLevel(ibl_brdf, ibl_sampler, vec2f(ndv, roughness), 0.0).rg;
-    let reflected = ibl_prefiltered(reflect(-v, n), roughness) * (f0 * brdf.x + brdf.y);
+    // Rough surfaces blur toward the hemisphere around the normal (the
+    // prefiltered sky alone is far brighter than the ambient the scene is lit
+    // with and washes rough materials out); reflections that point under the
+    // surface's horizon fade out.
+    let mirror = reflect(-v, n);
+    let horizon = clamp(1.0 + dot(mirror, normalize(in.world_normal)), 0.0, 1.0);
+    let environment = mix(ibl_prefiltered(mirror, roughness), hemi, smoothstep(0.25, 0.85, roughness));
+    let reflected = environment * (f0 * brdf.x + brdf.y) * (horizon * horizon);
     var ambient = (1.0 - f_amb) * (1.0 - metallic) * base * hemi * ao
         + reflected * specular_occlusion(ndv, ao, roughness);
     // GI on: the backend's light replaces the hemisphere in the diffuse
