@@ -209,7 +209,7 @@ impl Default for Environment {
             fog_density: 0.01,
             ao_strength: 1.0,
             ao_radius: 0.5,
-            bloom_intensity: 0.15,
+            bloom_intensity: 0.08,
         }
     }
 }
@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn environment_bloom_default() {
-        assert_eq!(Environment::default().bloom_intensity, 0.15);
+        assert_eq!(Environment::default().bloom_intensity, 0.08);
     }
 
     #[test]

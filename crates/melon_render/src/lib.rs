@@ -3501,7 +3501,7 @@ mod tests {
 
     const TEST_SIZE: u32 = 64;
     /// Share of a shadow edge's contrast (percent) that default bloom must keep.
-    const EDGE_KEEP_PERCENT: i32 = 75;
+    const EDGE_KEEP_PERCENT: i32 = 87;
     /// World (-2, 0, 0): on the floor, inside the occluder's shadow.
     const SHADOW_PX: (u32, u32) = (16, 32);
     /// World (2, 0, 0): on the floor, in the open.
@@ -4112,7 +4112,7 @@ mod tests {
         let assertions: Vec<GpuAssertion> = vec![
             Box::new(|renderer| {
                 // The review emissive cube 8 m away on black: about 8 pixels
-                // wide and HDR bright (2.5, 0.25, 0.03). Bloom lights up the black
+                // wide and HDR bright (12, 1.2, 0.14). Bloom lights up the black
                 // pixels beside it.
                 use glam::{Mat4, Vec3};
                 let mut server = melon_core::AssetServer::new(

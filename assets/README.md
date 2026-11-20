@@ -8,7 +8,7 @@ Place game assets here.
     - `grey_cube.glb` — unit cube, base colour 0.6 grey, roughness 0.8, no textures.
     - `material_spheres.glb` — two rows of five UV spheres, roughness 0.05 to 1; top row red dielectric, bottom row gold metal; one node and material each.
     - `normal_panel.glb` — 2x2 m panel with a tiled-bump normal map and no `TANGENT` attribute (the loader generates tangents).
-    - `emissive_cube.glb` — unit cube, dark base, emissive (2.5, 0.25, 0.03) HDR (saturated orange after ACES) via `KHR_materials_emissive_strength`; the bloom test emitter.
+    - `emissive_cube.glb` — unit cube, dark base, emissive (12, 1.2, 0.14) HDR (a lamp: hot core, orange glow) via `KHR_materials_emissive_strength`; the bloom test emitter.
 - `shaders/` — WGSL shader source files, included via `wgpu::include_wgsl!`.
   - `mesh.wgsl` — glTF metallic-roughness PBR: Cook-Torrance sun (GGX, height-correlated Smith, Schlick Fresnel) with 3x3 PCF shadows, hemisphere diffuse ambient plus sky-gradient specular ambient, tangent-space normal maps, emissive, exponential distance fog. SSAO (group 3) occludes the ambient terms only. Group 2 is the material (see `AGENTS.md`). Writes linear HDR colour (`Rgba16Float`).
   - `prepass.wgsl` — SSAO depth/normal prepass: every mesh single-sample, writes the world normal and eye distance (`Rgba16Float`) plus depth.

@@ -5,7 +5,7 @@
 //   top row a red dielectric, bottom row gold metal. One node and material each.
 // - normal_panel.glb: 2x2 m panel facing +Z with a tiled-bump normal map and
 //   no TANGENT attribute, so the loader generates tangents.
-// - emissive_cube.glb: unit cube, dark base, emissive (2.5, 0.25, 0.03) HDR
+// - emissive_cube.glb: unit cube, dark base, emissive (12, 1.2, 0.14) HDR (a lamp, about 10x a sunlit floor)
 //   (emissiveFactor x KHR_materials_emissive_strength), for bloom.
 // Run from the repository root: cargo run -p melon_render --example gen_review_assets
 
@@ -252,7 +252,7 @@ fn emissive_cube(path: &str) {
     glb.write(
         path,
         &format!(
-            r#""extensionsUsed":["KHR_materials_emissive_strength"],"scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0,"name":"EmissiveCube"}}],"meshes":[{{"primitives":[{}]}}],"materials":[{{"name":"Glow","pbrMetallicRoughness":{{"baseColorFactor":[0.05,0.05,0.05,1.0],"metallicFactor":0.0,"roughnessFactor":0.6}},"emissiveFactor":[1.0,0.1,0.012],"extensions":{{"KHR_materials_emissive_strength":{{"emissiveStrength":2.5}}}}}}]"#,
+            r#""extensionsUsed":["KHR_materials_emissive_strength"],"scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0,"name":"EmissiveCube"}}],"meshes":[{{"primitives":[{}]}}],"materials":[{{"name":"Glow","pbrMetallicRoughness":{{"baseColorFactor":[0.05,0.05,0.05,1.0],"metallicFactor":0.0,"roughnessFactor":0.6}},"emissiveFactor":[1.0,0.1,0.012],"extensions":{{"KHR_materials_emissive_strength":{{"emissiveStrength":12.0}}}}}}]"#,
             primitive(&a, 0)
         ),
     );
