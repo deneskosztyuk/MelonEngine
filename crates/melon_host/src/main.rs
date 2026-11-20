@@ -1,13 +1,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use melon_core::bevy_ecs::schedule::IntoScheduleConfigs;
-use melon_core::bevy_ecs::system::Res;
 use melon_core::bevy_ecs::world::{Mut, World};
 use melon_core::glam::{Quat, Vec2, Vec3};
 use melon_core::{
     Aabb, BodyInfo, BodyKind, Camera, FrameCounter, GameInputGate, Input, InputButton, KeyCode,
-    Light, Name, RawPresses, SimulationState, Time, Transform, Update,
+    Light, Name, RawPresses, Time, Transform,
 };
 use melon_editor::Editor;
 use melon_editor::EditorOverlay;
@@ -26,22 +24,6 @@ use winit::{
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     window::{CursorGrabMode, Window, WindowId},
 };
-
-#[cfg(feature = "hot-reload")]
-#[hot_lib_reloader::hot_module(
-    dylib = "melon_game",
-    lib_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/debug")
-)]
-mod hot_game {
-    use melon_core::bevy_ecs::system::{Query, Res};
-    use melon_core::{Bob, Spin, Time, Transform, With};
-    hot_functions_from_file!("crates/melon_game/src/lib.rs");
-}
-
-#[cfg(not(feature = "hot-reload"))]
-mod hot_game {
-    pub use melon_game::*;
-}
 
 fn map_key(code: &WinitKeyCode) -> Option<KeyCode> {
     use WinitKeyCode as W;
@@ -355,12 +337,7 @@ impl App {
         let mut physics = PhysicsWorld::new();
         spawn_default_scene(&mut core.world, &mut physics);
         core.world.insert_resource(physics);
-        // Per-frame game visuals, only while playing. Physics runs in FixedUpdate.
-        let is_playing = |state: Res<SimulationState>| *state == SimulationState::Playing;
-        core.add_systems(
-            Update,
-            (hot_game::rotation_system, hot_game::bob_system).run_if(is_playing),
-        );
+        core.add_plugin(&melon_game::GamePlugin);
         add_physics_systems(&mut core);
         // `--play` skips edit mode, for quick game runs.
         if std::env::args().any(|arg| arg == "--play")
