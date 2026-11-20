@@ -671,6 +671,8 @@ pub struct Renderer {
     surface: wgpu::Surface<'static>,
     size: winit::dpi::PhysicalSize<u32>,
     window: Arc<Window>,
+    /// Chosen once at init (`choose_present_mode`).
+    present_mode: wgpu::PresentMode,
     scene: SceneRenderer,
     /// GPU models per asset handle, used by `render_scene`.
     model_cache: ModelCache,
@@ -702,6 +704,16 @@ impl std::ops::Deref for Renderer {
 impl std::ops::DerefMut for Renderer {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.scene
+    }
+}
+
+/// `Mailbox` when the surface offers it (no vsync wait in the acquire, no
+/// tearing), else `Fifo`. `MELON_PRESENT=fifo` forces `Fifo` (debug A/B).
+fn choose_present_mode(available: &[wgpu::PresentMode], forced: Option<&str>) -> wgpu::PresentMode {
+    if forced != Some("fifo") && available.contains(&wgpu::PresentMode::Mailbox) {
+        wgpu::PresentMode::Mailbox
+    } else {
+        wgpu::PresentMode::Fifo
     }
 }
 
@@ -762,12 +774,16 @@ impl Renderer {
         let surface = instance
             .create_surface(window.clone())
             .context("failed to create wgpu surface from window")?;
-        let surface_format = surface
-            .get_capabilities(&adapter)
+        let caps = surface.get_capabilities(&adapter);
+        let surface_format = caps
             .formats
             .first()
             .copied()
             .context("surface reported no usable formats")?;
+        let present_mode = choose_present_mode(
+            &caps.present_modes,
+            std::env::var("MELON_PRESENT").ok().as_deref(),
+        );
 
         let scene = SceneRenderer::new(device, queue, surface_format);
         let model_cache = ModelCache::new(&scene);
@@ -782,6 +798,7 @@ impl Renderer {
             surface,
             size,
             window,
+            present_mode,
             scene,
             model_cache,
             overlay,
@@ -792,6 +809,11 @@ impl Renderer {
 
     pub fn scene(&self) -> &SceneRenderer {
         &self.scene
+    }
+
+    /// `Mailbox` does not wait for vblank: the host caps the frame rate then.
+    pub fn present_mode(&self) -> wgpu::PresentMode {
+        self.present_mode
     }
 
     /// Record one view of `frame` into `target`: shadow pass, SSAO passes, 3D
@@ -2438,7 +2460,7 @@ impl Renderer {
             width: self.size.width,
             height: self.size.height,
             desired_maximum_frame_latency: 2,
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: self.present_mode,
         };
         self.surface.configure(&self.device, &config);
     }
@@ -3265,6 +3287,18 @@ mod tests {
     #[test]
     fn vertex_size_is_48_bytes() {
         assert_eq!(std::mem::size_of::<Vertex>(), 48);
+    }
+
+    #[test]
+    fn present_mode_prefers_mailbox_unless_fifo_is_forced() {
+        use wgpu::PresentMode::{Fifo, Immediate, Mailbox};
+        assert_eq!(choose_present_mode(&[Fifo, Mailbox], None), Mailbox);
+        assert_eq!(choose_present_mode(&[Fifo, Immediate], None), Fifo);
+        assert_eq!(choose_present_mode(&[Fifo, Mailbox], Some("fifo")), Fifo);
+        assert_eq!(
+            choose_present_mode(&[Fifo, Mailbox], Some("other")),
+            Mailbox
+        );
     }
 
     /// Unit quad in the XY plane facing +Z, UVs given per corner
