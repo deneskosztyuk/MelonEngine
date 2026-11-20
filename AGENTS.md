@@ -369,6 +369,40 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   mesh unbaked (used by unpacked models). Never store handle ids in
   files. `melon_render::ModelCache` turns handles into GPU models; changed
   files hot-reload (poll every 0.5 s); a broken file keeps the last good model.
+- **FBX (`melon_render/src/fbx.rs`, ufbx, safe API only).** `.fbx` loads
+  wherever `.glb` / `.gltf` does: `models.rs` (`Source`) dispatches on the
+  extension, `gltf_nodes` / `gltf_bounds` / `extract_materials` too (an FBX
+  is parsed whole for them). `fbx::import(name, bytes, read)` builds CPU
+  parts (`FbxPart`, mesh space) plus materials and textures; `load_fbx` /
+  `load_fbx_meshes` upload them through the same `push_mesh` and material
+  bind groups as glTF (`MaterialUniform::from_asset`, `Surface::from_asset`
+  turn a `MaterialAsset` into the GPU values, `.mat` files use them too).
+  Units and axes: ufbx converts to metres, right-handed, Y up
+  (`target_unit_meters` 1, `SpaceConversion::ModifyGeometry`, geometry
+  transforms baked, pivots adjusted), so a centimetre Z-up file matches its
+  metre Y-up twin; `#mesh<N>` is the Nth FBX mesh in mesh space. Mirrored
+  nodes flip winding and tangent sign like glTF. V is flipped (FBX's V runs
+  up); missing normals are generated, missing tangents come from
+  `generate_tangents`. Materials use ufbx's PBR mapping (Phong / Lambert too;
+  FBX colours are read as linear): base colour (+ texture), metallic,
+  roughness, emissive, normal map, opacity below 1 = Blend; a material
+  without values is a rough dielectric. Texture lookup order: embedded
+  content, then the file's relative path from the FBX, then its file name
+  next to the FBX (the absolute path in the file is ignored); disk in dev
+  builds, `AssetServer::read` (the pack) in a packaged game. A missing
+  texture logs one warning and binds the default; textures decode as png /
+  jpg only (the `image` features). A texture file change does not reload the
+  model (touch the `.fbx`). Extract Materials copies each texture next to
+  the model by its own file name (kept if the same file is already there,
+  prefixed with the model name if a different one is). Skinning and
+  animation are not imported; the parsed `ufbx` scene is dropped after the
+  load. Tests: hand-written ASCII fixtures (`fbx::fixture::Cube`), the
+  `check_fbx_*` GPU checks (disk and pack, hot reload and a corrupt file, FBX
+  renders like glTF). Manual check: copy `brown horse 3d model_v2.fbx` and its
+  texture file next to it into `assets/models`, see its Content Browser
+  thumbnail, drag it into the scene (it unpacks into a node tree), compare
+  its size and facing with a glTF in the scene (metres, +Y up), run Extract
+  Materials on it and assign the `.mat` files.
 - **Asset `.meta` files.** Every file under `assets/` has a `<file>.meta`
   sidecar holding its GUID (`(version: 1, guid: "…")`); commit it with the
   asset. Rename or move an asset only together with its `.meta` (in the
