@@ -28,6 +28,7 @@ pub mod console;
 pub mod content;
 mod content_view;
 mod drawer;
+mod environment_card;
 pub mod gizmo;
 pub mod history;
 pub mod inspect;
@@ -1564,6 +1565,12 @@ impl Editor {
         }
         // A rebinding capture swallows this frame's keys (Esc cancels it, not ReleaseGame).
         // Read before the capture consumes the press later in the frame.
+        // The Environment card re-sets its live preview each frame while it has an edit.
+        if let Some(mut preview) = world.get_resource_mut::<melon_core::EnvironmentPreview>()
+            && preview.0.is_some()
+        {
+            preview.0 = None;
+        }
         self.keys_captured = self.project_settings.capturing();
         if !self.keys_captured {
             self.handle_shortcuts(world, ui);
@@ -2146,6 +2153,11 @@ impl Editor {
             if details.kind == content::AssetKind::Material {
                 material_card::show(ui, path, world.get_resource::<AssetServer>());
             }
+            if details.kind == content::AssetKind::Environment
+                && let Some(rel) = melon_core::assets::project_relative(&self.project_root, path)
+            {
+                environment_card::show(ui, world, &self.project_root, &rel);
+            }
         }
         let Some(entity) = self.selected else {
             if asset.is_none() {
@@ -2308,6 +2320,24 @@ impl Editor {
             {
                 components_changed = true;
             }
+        }
+        // The card of the .env the entity's World Environment names (GUID wins).
+        let environment = world
+            .get::<melon_core::WorldEnvironment>(entity)
+            .and_then(|w| {
+                let server = world.get_resource::<AssetServer>()?;
+                let by_guid = w
+                    .environment
+                    .guid
+                    .parse::<melon_core::AssetGuid>()
+                    .ok()
+                    .and_then(|g| server.path_of_guid(g));
+                let path = by_guid.unwrap_or(&w.environment.path);
+                (!path.is_empty()).then(|| path.to_string())
+            });
+        if let Some(path) = environment {
+            ui.add_space(theme::sizes::SPACING);
+            environment_card::show(ui, world, &self.project_root, &path);
         }
         if components_changed {
             // Rapier follows the edit now, not at the next frame.

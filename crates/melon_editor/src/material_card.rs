@@ -48,7 +48,7 @@ fn texture_field(
 
 /// Edits wait in memory while a pointer button is down (a drag, an open
 /// colour picker) and the file is written once it is up.
-fn should_write(dirty: bool, pointer_down: bool) -> bool {
+pub(crate) fn should_write(dirty: bool, pointer_down: bool) -> bool {
     dirty && !pointer_down
 }
 
