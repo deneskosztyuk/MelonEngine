@@ -59,8 +59,9 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   cargo (`cargo run` puts it on `PATH`). Game state lives in
   resources added with `init_resource` (`insert_resource` replaces the value
   on every reload). Changing the fields of any game component **or
-  resource** type needs a restart (resources are checked and the plugin
-  stops with an error; components are not checked). `build` must be
+  resource** type needs a restart. Only a size/align change of a resource
+  registered in `build` is detected (the plugin stops with an error); any
+  other field change is not, so always restart. `build` must be
   idempotent: only `add_systems`, `init_resource`, `insert_resource`.
   Spawning entities, observers or component hooks from `build` repeats on
   every reload (a second hook registration panics). `cargo test` / `just test`

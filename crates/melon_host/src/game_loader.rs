@@ -72,7 +72,8 @@ impl GameLoader {
         // runs only its Rust static initialisers.
         let library = unsafe { libloading::Library::new(&copy) }.map_err(|e| {
             format!(
-                "{}: {e} (start dev builds through `cargo run` / `just dev-run`                  so Rust's std dll is on PATH)",
+                "{}: {e} (start dev builds through `cargo run` / `just dev-run` \
+                 so Rust's std dll is on PATH)",
                 copy.display()
             )
         })?;
