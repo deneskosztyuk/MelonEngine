@@ -212,12 +212,13 @@ fn decode_entity(
     Ok(decoded)
 }
 
-/// The world's type registry (scene code needs one: `Core::new` adds it).
-fn registry_of(world: &World) -> AppTypeRegistry {
+/// The world's type registry (`Core::new` adds it). Missing is an error,
+/// not a panic: a save or load fails instead of closing the editor.
+fn registry_of(world: &World) -> Result<AppTypeRegistry> {
     world
         .get_resource::<AppTypeRegistry>()
-        .expect("scene code needs the AppTypeRegistry resource (Core::new adds it)")
-        .clone()
+        .cloned()
+        .context("the world has no AppTypeRegistry (Core::new adds it)")
 }
 
 /// Capture all entities with Name + Transform, except ones marked for deletion
@@ -232,7 +233,7 @@ pub fn scene_to_data(world: &mut World) -> Result<SceneData> {
         .map(|(i, e)| (*e, i as u32))
         .collect();
     let server = world.get_resource::<AssetServer>();
-    let registry = registry_of(world);
+    let registry = registry_of(world)?;
     let registry = registry.read();
 
     let mut entities = Vec::with_capacity(rows.len());
@@ -309,7 +310,7 @@ pub fn apply_scene(world: &mut World, physics: &mut PhysicsWorld, data: &SceneDa
         );
     }
 
-    let registry = registry_of(world);
+    let registry = registry_of(world)?;
     let registry = registry.read();
     let mut warned = HashSet::new();
     let mut decoded = Vec::with_capacity(data.entities.len());
@@ -1577,5 +1578,14 @@ mod tests {
             let text = round_trip(&mut world, &mut physics);
             assert!(text.contains("version: 5"), "{text}");
         }
+    }
+
+    #[test]
+    fn missing_type_registry_is_an_error_not_a_panic() {
+        let mut world = World::new();
+        assert!(scene_to_data(&mut world).is_err());
+        let data = scene_to_data(&mut melon_core::Core::new().world).unwrap();
+        let mut bare = World::new();
+        assert!(apply_scene(&mut bare, &mut PhysicsWorld::new(), &data).is_err());
     }
 }
