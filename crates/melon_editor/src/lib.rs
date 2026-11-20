@@ -5447,9 +5447,10 @@ mod tests {
             .collider_handle
             .unwrap();
         let physics = h.world.resource::<melon_physics::PhysicsWorld>();
-        let co = physics.colliders.get(handle).unwrap();
+        let colliders = physics.colliders();
+        let co = colliders.get(handle).unwrap();
         assert!(co.shared_shape().as_ball().is_some());
-        assert_eq!(physics.colliders.len(), 1);
+        assert_eq!(physics.colliders().len(), 1);
     }
 
     #[test]
@@ -5465,7 +5466,7 @@ mod tests {
         let physics = h.world.resource::<melon_physics::PhysicsWorld>();
         assert_eq!(physics.bodies.len(), 0);
         // The collider stays, as a static one.
-        assert_eq!(physics.colliders.len(), 1);
+        assert_eq!(physics.colliders().len(), 1);
     }
 
     /// A moving, selected entity must not make egui run extra passes (each

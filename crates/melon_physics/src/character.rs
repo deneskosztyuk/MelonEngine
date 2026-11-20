@@ -45,7 +45,8 @@ pub fn character_controller_system(world: &mut World) {
         };
         let (scale, rotation, translation) = world_matrix(world, e).to_scale_rotation_translation();
         let moved = world.resource_scope(|_, physics: bevy_ecs::prelude::Mut<PhysicsWorld>| {
-            let collider = physics.colliders.get(handle)?;
+            let scene = physics.scene_read();
+            let collider = scene.colliders.get(handle)?;
             let shape = collider.shared_shape().clone();
             let groups = collider.collision_groups();
             // Hand-typed numbers rapier panics on (a NaN or negative offset) fall back.
@@ -80,10 +81,10 @@ pub fn character_controller_system(world: &mut World) {
                 .exclude_sensors()
                 .exclude_collider(handle)
                 .groups(groups);
-            let pipeline = physics.broad_phase.as_query_pipeline(
+            let pipeline = scene.broad_phase.as_query_pipeline(
                 physics.narrow_phase.query_dispatcher(),
                 &physics.bodies,
-                &physics.colliders,
+                &scene.colliders,
                 filter,
             );
             // The collider sits at the entity's pose (it is on the entity itself).

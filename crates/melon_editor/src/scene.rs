@@ -1204,7 +1204,7 @@ mod tests {
         load_scene(&mut world, &mut physics, &tmp).unwrap();
 
         assert_eq!(physics.bodies.len(), 1, "should have 1 physics body");
-        assert_eq!(physics.colliders.len(), 1, "should have 1 collider");
+        assert_eq!(physics.colliders().len(), 1, "should have 1 collider");
 
         let has_rb = world.query::<&RigidBodyComponent>().iter(&world).count();
         assert_eq!(has_rb, 1, "entity should have RigidBodyComponent");
@@ -1777,7 +1777,7 @@ mod tests {
                 half_extents: Vec3::new(0.5, 1.0, 1.5)
             }
         );
-        assert_eq!((physics.bodies.len(), physics.colliders.len()), (1, 1));
+        assert_eq!((physics.bodies.len(), physics.colliders().len()), (1, 1));
         assert!(world.get::<RigidBodyComponent>(e).is_some());
         let text = round_trip(&mut world, &mut physics);
         assert!(text.contains("version: 6"), "{text}");
@@ -1787,7 +1787,7 @@ mod tests {
             world.get::<RigidBody>(e).unwrap().kind,
             RigidBodyKind::Dynamic
         );
-        assert_eq!((physics.bodies.len(), physics.colliders.len()), (1, 1));
+        assert_eq!((physics.bodies.len(), physics.colliders().len()), (1, 1));
     }
 
     #[test]
@@ -1822,7 +1822,7 @@ mod tests {
             .collider_handle
             .unwrap();
         let half = physics
-            .colliders
+            .colliders()
             .get(handle)
             .unwrap()
             .shape()
@@ -1843,7 +1843,7 @@ mod tests {
             .collider_handle
             .unwrap();
         let half = physics
-            .colliders
+            .colliders()
             .get(handle)
             .unwrap()
             .shape()

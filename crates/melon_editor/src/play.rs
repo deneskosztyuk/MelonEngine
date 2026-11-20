@@ -191,7 +191,7 @@ mod tests {
             pw.bodies.get(handle).unwrap().linvel().length() < 1e-6,
             "velocity reset"
         );
-        assert_eq!((pw.bodies.len(), pw.colliders.len()), (2, 2));
+        assert_eq!((pw.bodies.len(), pw.colliders().len()), (2, 2));
     }
 
     #[test]

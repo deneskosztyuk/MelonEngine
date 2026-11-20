@@ -3,7 +3,9 @@
 //! into rapier bodies, colliders and joints, `queries` answers ray / shape
 //! queries, and the rapier handles stay internal bookkeeping on the entities.
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::ops::Deref;
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
@@ -12,6 +14,7 @@ use bevy_ecs::query::{With, Without};
 use bevy_ecs::resource::Resource;
 use bevy_ecs::schedule::IntoScheduleConfigs;
 use bevy_ecs::system::{Commands, Query, Res, ResMut};
+use bevy_ecs::world::DeferredWorld;
 use bevy_ecs::world::World;
 use glam::{Quat, Vec3};
 
@@ -25,16 +28,18 @@ use rapier3d::geometry::{
     BroadPhaseBvh, ColliderHandle, ColliderSet, CollisionEvent as RapierEvent, CollisionEventFlags,
     ContactPair, NarrowPhase,
 };
-use rapier3d::math::Vector;
+use rapier3d::math::{Pose, Vector};
 use rapier3d::pipeline::{EventHandler, PhysicsPipeline};
 use rapier3d::prelude::IntegrationParameters;
 use tracing::instrument;
 
-use melon_core::hierarchy::{propagate_transforms_system, safe_inverse, world_matrix};
+use melon_core::hierarchy::{
+    propagate_transforms_system, safe_inverse, set_world_transform, world_matrix,
+};
 use melon_core::{
     ChildOf, CollisionEvent, CollisionEventKind, Core, FixedUpdate, GlobalTransform, PendingDelete,
-    PhysicsQueries, PostUpdate, PreviousTransform, RigidBody, SimulationState, Time, Transform,
-    store_previous_transforms_system,
+    PhysicsQueries, PhysicsRequest, PhysicsRequests, PhysicsStep, PostUpdate, PreviousTransform,
+    RigidBody, SimulationState, Time, Transform, Velocity, store_previous_transforms_system,
 };
 
 mod character;
@@ -48,31 +53,73 @@ pub use sync::{sync_components, sync_components_system};
 /// Gravity vector in m/s^2. Default is Earth gravity pointing down (-Y).
 const GRAVITY: Vector = Vector::new(0.0, -9.81, 0.0);
 
+/// A removal the component hooks queued (the entity lost the component or
+/// was despawned): the rapier object goes at the next sync.
+#[derive(Debug, Clone, Copy)]
+enum Removal {
+    Body(RigidBodyHandle),
+    Collider(ColliderHandle),
+    Joint(ImpulseJointHandle),
+}
+
 /// Bookkeeping: the rapier body of an entity with a `RigidBody`, made and
 /// kept in line with it by `sync_components`. `built` is the `RigidBody` it
 /// was last made from.
 #[derive(Component, Debug, Clone)]
+#[component(on_remove = body_removed)]
 pub struct RigidBodyComponent {
     pub body_handle: RigidBodyHandle,
     pub body_type: RigidBodyType,
     pub(crate) built: RigidBody,
 }
 
+fn body_removed(mut world: DeferredWorld, ctx: bevy_ecs::lifecycle::HookContext) {
+    let handle = world
+        .get::<RigidBodyComponent>(ctx.entity)
+        .map(|c| c.body_handle);
+    if let (Some(h), Some(mut p)) = (handle, world.get_resource_mut::<PhysicsWorld>()) {
+        p.removals.push(Removal::Body(h));
+    }
+}
+
 /// Bookkeeping: the rapier collider of an entity with a `Collider`.
 /// `collider_handle` is `None` when none could be built (a mesh collider
 /// whose model is missing).
 #[derive(Component, Debug, Clone)]
+#[component(on_remove = collider_removed)]
 pub struct ColliderComponent {
     pub collider_handle: Option<ColliderHandle>,
     pub(crate) built: sync::BuiltCollider,
 }
 
+fn collider_removed(mut world: DeferredWorld, ctx: bevy_ecs::lifecycle::HookContext) {
+    let handle = world
+        .get::<ColliderComponent>(ctx.entity)
+        .and_then(|c| c.collider_handle);
+    if let (Some(h), Some(mut p)) = (handle, world.get_resource_mut::<PhysicsWorld>()) {
+        p.removals.push(Removal::Collider(h));
+    }
+}
+
 /// Bookkeeping: the rapier joint of an entity with a `Joint`.
 #[derive(Component, Debug, Clone)]
+#[component(on_remove = joint_removed)]
 pub struct JointComponent {
     pub(crate) handle: ImpulseJointHandle,
     pub(crate) built: sync::BuiltJoint,
 }
+
+fn joint_removed(mut world: DeferredWorld, ctx: bevy_ecs::lifecycle::HookContext) {
+    let handle = world.get::<JointComponent>(ctx.entity).map(|c| c.handle);
+    if let (Some(h), Some(mut p)) = (handle, world.get_resource_mut::<PhysicsWorld>()) {
+        p.removals.push(Removal::Joint(h));
+    }
+}
+
+/// Bookkeeping: `PreviousTransform` was added by physics (for a dynamic
+/// body), so physics takes it away again when the body stops being dynamic.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct PhysicsOwnedPrevious;
 
 /// A collision event as rapier reports it, before it is mapped to entities.
 struct RawEvent {
@@ -118,24 +165,65 @@ impl EventHandler for EventCollector {
     }
 }
 
+/// The part of the physics world scene queries read: shared with
+/// `PhysicsQueries`, so a query sees the colliders as they are now (the
+/// broad phase is updated by each step) without a copy.
+pub struct Scene {
+    pub colliders: ColliderSet,
+    pub broad_phase: BroadPhaseBvh,
+}
+
+/// Read access to the colliders (a lock guard).
+pub struct Colliders<'a>(RwLockReadGuard<'a, Scene>);
+
+impl Deref for Colliders<'_> {
+    type Target = ColliderSet;
+    fn deref(&self) -> &ColliderSet {
+        &self.0.colliders
+    }
+}
+
+/// Counters of what `sync_components` did, for tests and diagnostics.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SyncStats {
+    /// Calls of `sync_components`.
+    pub syncs: u32,
+    /// Entities compared with rapier (the changed ones and below).
+    pub examined: u32,
+    pub body_builds: u32,
+    pub collider_builds: u32,
+    pub joint_builds: u32,
+    /// Colliders moved to a new pose.
+    pub collider_moves: u32,
+}
+
 /// Resource holding the rapier physics world state.
 /// One instance per `Core` world, stepped once per fixed step.
 #[derive(Resource)]
 pub struct PhysicsWorld {
     pub pipeline: PhysicsPipeline,
     pub islands: IslandManager,
-    pub broad_phase: BroadPhaseBvh,
     pub narrow_phase: NarrowPhase,
     pub bodies: RigidBodySet,
-    pub colliders: ColliderSet,
     pub impulse_joints: ImpulseJointSet,
     pub multibody_joints: MultibodyJointSet,
     pub ccd_solver: CCDSolver,
     pub integration_parameters: IntegrationParameters,
     pub gravity: Vector,
+    pub stats: SyncStats,
+    scene: Arc<RwLock<Scene>>,
     events: EventCollector,
+    /// Events made outside the step (a collider removed while touching).
+    ready_events: Vec<CollisionEvent>,
+    removals: Vec<Removal>,
     /// Fixed body at the origin that joints without an ancestor body attach to.
     world_body: Option<RigidBodyHandle>,
+    /// Bodies a force or torque request touched, reset after the step.
+    forced: Vec<RigidBodyHandle>,
+    /// Entities with a mesh collider (their model file may change).
+    mesh_colliders: HashSet<Entity>,
+    /// Entities already warned about a joint without a body.
+    joint_warned: HashSet<Entity>,
 }
 
 impl Default for PhysicsWorld {
@@ -150,30 +238,56 @@ impl PhysicsWorld {
         Self {
             pipeline: PhysicsPipeline::new(),
             islands: IslandManager::new(),
-            broad_phase: BroadPhaseBvh::new(),
             narrow_phase: NarrowPhase::new(),
             bodies: RigidBodySet::new(),
-            colliders: ColliderSet::new(),
             impulse_joints: ImpulseJointSet::new(),
             multibody_joints: MultibodyJointSet::new(),
             ccd_solver: CCDSolver::new(),
             integration_parameters: IntegrationParameters::default(),
             gravity: GRAVITY,
+            stats: SyncStats::default(),
+            scene: Arc::new(RwLock::new(Scene {
+                colliders: ColliderSet::new(),
+                broad_phase: BroadPhaseBvh::new(),
+            })),
             events: EventCollector::default(),
+            ready_events: Vec::new(),
+            removals: Vec::new(),
             world_body: None,
+            forced: Vec::new(),
+            mesh_colliders: HashSet::new(),
+            joint_warned: HashSet::new(),
         }
+    }
+
+    /// The colliders (read lock; do not hold it across a step).
+    pub fn colliders(&self) -> Colliders<'_> {
+        Colliders(self.scene.read().unwrap())
+    }
+
+    pub(crate) fn scene_read(&self) -> RwLockReadGuard<'_, Scene> {
+        self.scene.read().unwrap()
+    }
+
+    fn scene_mut(&self) -> RwLockWriteGuard<'_, Scene> {
+        self.scene.write().unwrap()
     }
 
     /// Step the physics simulation by one fixed timestep (1/60s by default).
     pub fn step(&mut self) {
+        let mut scene = self.scene.write().unwrap();
+        let Scene {
+            colliders,
+            broad_phase,
+        } = &mut *scene;
         self.pipeline.step(
             self.gravity,
             &self.integration_parameters,
             &mut self.islands,
-            &mut self.broad_phase,
+            broad_phase,
             &mut self.narrow_phase,
             &mut self.bodies,
-            &mut self.colliders,
+            colliders,
             &mut self.impulse_joints,
             &mut self.multibody_joints,
             &mut self.ccd_solver,
@@ -199,41 +313,135 @@ impl PhysicsWorld {
     pub fn clear(&mut self) {
         self.pipeline = PhysicsPipeline::new();
         self.islands = IslandManager::new();
-        self.broad_phase = BroadPhaseBvh::new();
         self.narrow_phase = NarrowPhase::new();
         self.bodies = RigidBodySet::new();
-        self.colliders = ColliderSet::new();
+        {
+            let mut scene = self.scene_mut();
+            scene.colliders = ColliderSet::new();
+            scene.broad_phase = BroadPhaseBvh::new();
+        }
         self.impulse_joints = ImpulseJointSet::new();
         self.multibody_joints = MultibodyJointSet::new();
         self.ccd_solver = CCDSolver::new();
         self.events.0.lock().unwrap().clear();
+        self.ready_events.clear();
+        self.removals.clear();
+        self.forced.clear();
+        self.mesh_colliders.clear();
+        self.joint_warned.clear();
         self.world_body = None;
+    }
+
+    /// Remove the rapier objects the component hooks queued.
+    fn flush_removals(&mut self) {
+        for removal in std::mem::take(&mut self.removals) {
+            match removal {
+                Removal::Body(h) => self.remove_body(h),
+                Removal::Collider(h) => self.remove_collider(h),
+                Removal::Joint(h) => self.remove_joint(h),
+            }
+        }
     }
 
     /// Remove a rigid body and all its attached colliders from the physics world.
     /// Uses remove_attached_colliders=true to clean up colliders automatically.
     #[instrument(skip(self), level = "debug")]
     pub fn remove_body(&mut self, handle: RigidBodyHandle) {
+        let attached: Vec<ColliderHandle> = self
+            .bodies
+            .get(handle)
+            .map(|b| b.colliders().to_vec())
+            .unwrap_or_default();
+        for c in attached {
+            self.end_pairs(c);
+        }
+        let mut scene = self.scene.write().unwrap();
         self.bodies.remove(
             handle,
             &mut self.islands,
-            &mut self.colliders,
+            &mut scene.colliders,
             &mut self.impulse_joints,
             &mut self.multibody_joints,
             true,
         );
     }
 
-    /// Remove a collider. Wakes up the parent body if one exists.
+    /// Remove a collider. Wakes up the parent body if one exists. A pair it
+    /// was touching or overlapping ends with an `Ended` / `TriggerExited` event.
     #[instrument(skip(self), level = "debug")]
     pub fn remove_collider(&mut self, handle: ColliderHandle) {
-        self.colliders
+        if !self.colliders().contains(handle) {
+            return;
+        }
+        self.end_pairs(handle);
+        let mut scene = self.scene.write().unwrap();
+        scene
+            .colliders
             .remove(handle, &mut self.islands, &mut self.bodies, true);
+    }
+
+    /// Queue the events that end every active pair of `handle` (about to be removed).
+    fn end_pairs(&mut self, handle: ColliderHandle) {
+        let mut ended = Vec::new();
+        for pair in self.narrow_phase.contact_pairs_with(handle) {
+            if pair.has_any_active_contact() {
+                let other = if pair.collider1 == handle {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                };
+                ended.push((other, CollisionEventKind::Ended));
+            }
+        }
+        for (a, b, intersecting) in self.narrow_phase.intersection_pairs_with(handle) {
+            if intersecting {
+                let other = if a == handle { b } else { a };
+                ended.push((other, CollisionEventKind::TriggerExited));
+            }
+        }
+        let Some(me) = self.collider_entity(handle) else {
+            return;
+        };
+        for (other, kind) in ended {
+            if let Some(other) = self.collider_entity(other) {
+                self.ready_events.push(CollisionEvent {
+                    a: me,
+                    b: other,
+                    kind,
+                });
+            }
+        }
     }
 
     /// Remove a joint.
     pub fn remove_joint(&mut self, handle: ImpulseJointHandle) {
         self.impulse_joints.remove(handle, true);
+    }
+
+    /// Put a collider in the world (attached to `parent` when given).
+    fn insert_collider(
+        &mut self,
+        collider: rapier3d::geometry::Collider,
+        parent: Option<RigidBodyHandle>,
+    ) -> ColliderHandle {
+        let mut scene = self.scene.write().unwrap();
+        match parent {
+            Some(body) => scene
+                .colliders
+                .insert_with_parent(collider, body, &mut self.bodies),
+            None => scene.colliders.insert(collider),
+        }
+    }
+
+    /// Move a collider: in its body's frame when `local`, else in the world.
+    fn set_collider_pose(&mut self, handle: ColliderHandle, pose: Pose, local: bool) {
+        if let Some(co) = self.scene_mut().colliders.get_mut(handle) {
+            if local {
+                co.set_position_wrt_parent(pose);
+            } else {
+                co.set_position(pose);
+            }
+        }
     }
 
     /// The body joints without an ancestor body attach to.
@@ -250,26 +458,33 @@ impl PhysicsWorld {
 
     /// Entity stored in a collider's `user_data`.
     fn collider_entity(&self, handle: ColliderHandle) -> Option<Entity> {
-        let bits = self.colliders.get(handle)?.user_data as u64;
+        let bits = self.colliders().get(handle)?.user_data as u64;
         Entity::try_from_bits(bits)
     }
 }
 
-/// System: step the physics world by one `Time::fixed_delta`, write the
-/// collision events and publish the query snapshot.
+/// System: step the physics world by one `Time::fixed_delta` and write the
+/// collision events.
 pub fn step_system(
     mut world: ResMut<PhysicsWorld>,
     time: Res<Time>,
     mut events: ResMut<Messages<CollisionEvent>>,
-    mut queries: ResMut<PhysicsQueries>,
 ) {
     world.integration_parameters.dt = time.fixed_delta;
     world.step();
+    // Forces last one step.
+    for h in std::mem::take(&mut world.forced) {
+        if let Some(b) = world.bodies.get_mut(h) {
+            b.reset_forces(false);
+            b.reset_torques(false);
+        }
+    }
     // Two buffers: events live for this step and the next one.
     events.update();
     let raw = std::mem::take(&mut *world.events.0.lock().unwrap());
+    events.write_batch(std::mem::take(&mut world.ready_events));
     events.write_batch(raw.into_iter().filter_map(|e| {
-        // A removed collider is gone, and its entity with it.
+        // A removed collider is gone: `end_pairs` reported its pairs.
         if e.removed {
             return None;
         }
@@ -285,12 +500,12 @@ pub fn step_system(
             kind,
         })
     }));
-    queries.set_backend(Arc::new(queries::Snapshot::of(&world)));
 }
 
 /// System: give every dynamic body a `PreviousTransform` (equal to its
-/// current `Transform`, so it never blends from the origin). One system
-/// covers all spawn paths: default scene, scene load, editor.
+/// current `Transform`, so it never blends from the origin) and take it
+/// away again from bodies that stopped being dynamic. One system covers all
+/// spawn paths: default scene, scene load, editor.
 #[allow(clippy::type_complexity)]
 pub fn add_previous_transforms_system(
     mut commands: Commands,
@@ -300,28 +515,51 @@ pub fn add_previous_transforms_system(
         (Entity, &RigidBodyComponent, &Transform),
         (Without<PreviousTransform>, Without<PendingDelete>),
     >,
+    owned: Query<(Entity, Option<&RigidBodyComponent>), With<PhysicsOwnedPrevious>>,
 ) {
     for (entity, rb, transform) in &query {
         if rb.body_type == RigidBodyType::Dynamic {
             commands
                 .entity(entity)
-                .insert(PreviousTransform(*transform));
+                .insert((PreviousTransform(*transform), PhysicsOwnedPrevious));
+        }
+    }
+    for (entity, rb) in &owned {
+        if rb.is_none_or(|rb| rb.body_type != RigidBodyType::Dynamic) {
+            commands
+                .entity(entity)
+                .remove::<(PreviousTransform, PhysicsOwnedPrevious)>();
         }
     }
 }
 
-/// Register the physics systems into their frame stages. Fixed-step order:
-/// remember previous transforms, update world poses, make rapier match the
-/// components, move characters, push ECS edits into rapier, step, pull
-/// results back.
+/// Register the physics systems into their frame stages. Each fixed step:
+/// `FixedUpdate` (game systems, previous transforms, world poses), then
+/// `PhysicsStep`: make rapier match the components, requests and velocity
+/// writes, characters, ECS edits of fixed / kinematic bodies, the step and
+/// the write back.
 pub fn add_physics_systems(core: &mut Core) {
     core.world.init_resource::<PhysicsWorld>();
+    let backend = Arc::new(queries::Shared(
+        core.world.resource::<PhysicsWorld>().scene.clone(),
+    ));
+    core.world
+        .resource_mut::<PhysicsQueries>()
+        .set_backend(backend);
     core.add_systems(
         FixedUpdate,
         (
             store_previous_transforms_system,
             propagate_transforms_system,
+        )
+            .chain(),
+    );
+    core.add_systems(
+        PhysicsStep,
+        (
             sync_components_system,
+            apply_velocity_system,
+            apply_requests_system,
             character_controller_system,
             sync_to_physics_system,
             step_system,
@@ -345,6 +583,90 @@ pub fn add_physics_systems(core: &mut Core) {
         )
             .chain(),
     );
+}
+
+/// System: apply the game's `PhysicsRequests` (impulses, forces, teleports).
+pub fn apply_requests_system(world: &mut World) {
+    let requests = match world.get_resource_mut::<PhysicsRequests>() {
+        Some(mut r) => r.drain(),
+        None => return,
+    };
+    for request in requests {
+        let (PhysicsRequest::Impulse(e, _)
+        | PhysicsRequest::TorqueImpulse(e, _)
+        | PhysicsRequest::Force(e, _)
+        | PhysicsRequest::Torque(e, _)
+        | PhysicsRequest::Teleport(e, ..)) = request;
+        let Some(handle) = world.get::<RigidBodyComponent>(e).map(|c| c.body_handle) else {
+            continue;
+        };
+        if let PhysicsRequest::Teleport(_, position, rotation) = request {
+            if !position.is_finite() || rotation.is_some_and(|r| !r.is_finite()) {
+                continue;
+            }
+            let mut pose = Transform::from_mat4(world_matrix(world, e));
+            pose.translation = position;
+            if let Some(r) = rotation {
+                pose.rotation = r.normalize();
+            }
+            set_world_transform(world, e, pose);
+            let now = *world.get::<Transform>(e).expect("has a body");
+            if let Some(mut p) = world.get_mut::<PreviousTransform>(e) {
+                p.0 = now;
+            }
+            if let Some(mut physics) = world.get_resource_mut::<PhysicsWorld>()
+                && let Some(body) = physics.bodies.get_mut(handle)
+            {
+                body.set_translation(position, true);
+                if let Some(r) = rotation {
+                    body.set_rotation(r.normalize(), true);
+                }
+            }
+            continue;
+        }
+        let Some(mut physics) = world.get_resource_mut::<PhysicsWorld>() else {
+            continue;
+        };
+        let physics = &mut *physics;
+        let Some(body) = physics.bodies.get_mut(handle) else {
+            continue;
+        };
+        match request {
+            PhysicsRequest::Impulse(_, v) if v.is_finite() => body.apply_impulse(v, true),
+            PhysicsRequest::TorqueImpulse(_, v) if v.is_finite() => {
+                body.apply_torque_impulse(v, true)
+            }
+            PhysicsRequest::Force(_, v) if v.is_finite() => {
+                body.add_force(v, true);
+                physics.forced.push(handle);
+            }
+            PhysicsRequest::Torque(_, v) if v.is_finite() => {
+                body.add_torque(v, true);
+                physics.forced.push(handle);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// System: a `Velocity` the game changed goes into the body (one that still
+/// equals the body's is left alone).
+pub fn apply_velocity_system(
+    mut physics: ResMut<PhysicsWorld>,
+    query: Query<(&RigidBodyComponent, &Velocity)>,
+) {
+    for (rb, v) in &query {
+        if rb.body_type != RigidBodyType::Dynamic || !v.linear.is_finite() || !v.angular.is_finite()
+        {
+            continue;
+        }
+        if let Some(body) = physics.bodies.get_mut(rb.body_handle)
+            && (body.linvel() != v.linear || body.angvel() != v.angular)
+        {
+            body.set_linvel(v.linear, true);
+            body.set_angvel(v.angular, true);
+        }
+    }
 }
 
 /// System: sync rapier body poses back into ECS Transform components.
@@ -375,16 +697,29 @@ pub fn sync_from_physics_system(world: &mut World) {
         }
         depth
     };
-    let mut poses: Vec<(usize, Entity, Vec3, Quat)> = dynamic
+    let mut poses: Vec<(usize, Entity, Vec3, Quat, Vec3, Vec3)> = dynamic
         .into_iter()
         .filter_map(|(e, h)| {
             let body = physics.bodies.get(h)?;
-            Some((depth(e), e, body.translation(), *body.rotation()))
+            Some((
+                depth(e),
+                e,
+                body.translation(),
+                *body.rotation(),
+                body.linvel(),
+                body.angvel(),
+            ))
         })
         .collect();
     poses.sort_by_key(|(depth, ..)| *depth);
 
-    for (_, e, translation, rotation) in poses {
+    for (_, e, translation, rotation, linear, angular) in poses {
+        if let Some(mut v) = world.get_mut::<Velocity>(e) {
+            // Not a game write: keep change detection quiet.
+            let v = bevy_ecs::change_detection::DetectChangesMut::bypass_change_detection(&mut v);
+            v.linear = linear;
+            v.angular = angular;
+        }
         let (translation, rotation) = match world.get::<ChildOf>(e).map(ChildOf::parent) {
             Some(parent) => {
                 let local = Transform::from_mat4(
@@ -412,7 +747,8 @@ fn simulating(state: Option<Res<SimulationState>>) -> bool {
 
 /// System: sync ECS world poses into rapier for fixed and kinematic bodies
 /// (they follow their entity and its parent). Dynamic bodies are controlled
-/// by physics, so their ECS transform is NOT written back to rapier.
+/// by physics, so their ECS transform is NOT written back to rapier. A body
+/// already at the pose is left alone.
 pub fn sync_to_physics_system(
     mut physics: ResMut<PhysicsWorld>,
     query: Query<(&RigidBodyComponent, &Transform, Option<&GlobalTransform>)>,
@@ -423,6 +759,11 @@ pub fn sync_to_physics_system(
         }
         let world = global.map_or(*transform, |g| Transform::from_mat4(g.0));
         if let Some(body) = physics.bodies.get_mut(rb.body_handle) {
+            let moved = !sync::close(body.translation(), world.translation);
+            let turned = (body.rotation().dot(world.rotation).abs() - 1.0).abs() > 1e-6;
+            if !(moved || turned) {
+                continue;
+            }
             if rb.body_type == RigidBodyType::KinematicPositionBased {
                 // Moves the body over the step, so it pushes what it touches.
                 body.set_next_kinematic_translation(world.translation);
@@ -554,7 +895,7 @@ mod tests {
     fn physics_world_default_has_no_bodies() {
         let world = PhysicsWorld::new();
         assert!(world.bodies.is_empty());
-        assert!(world.colliders.is_empty());
+        assert!(world.colliders().is_empty());
         assert!((world.gravity.y + 9.81).abs() < 1e-6);
     }
 
@@ -565,9 +906,9 @@ mod tests {
         c.world.resource_mut::<PhysicsWorld>().gravity = Vector::new(1.0, -20.0, 0.0);
         frames(&mut c, 1);
         let mut pw = c.world.resource_mut::<PhysicsWorld>();
-        assert!(!pw.bodies.is_empty() && !pw.colliders.is_empty());
+        assert!(!pw.bodies.is_empty() && !pw.colliders().is_empty());
         pw.clear();
-        assert!(pw.bodies.is_empty() && pw.colliders.is_empty() && pw.impulse_joints.is_empty());
+        assert!(pw.bodies.is_empty() && pw.colliders().is_empty() && pw.impulse_joints.is_empty());
         assert!((pw.gravity.y + 20.0).abs() < 1e-6 && (pw.gravity.x - 1.0).abs() < 1e-6);
     }
 
@@ -578,7 +919,7 @@ mod tests {
         frames(&mut c, 1);
         let pw = c.world.resource::<PhysicsWorld>();
         assert_eq!(pw.bodies.len(), 1);
-        assert_eq!(pw.colliders.len(), 1);
+        assert_eq!(pw.colliders().len(), 1);
         assert!(c.world.get::<RigidBodyComponent>(e).is_some());
         assert!(height(&c, e) < 5.0, "dynamic body should fall");
     }
@@ -669,7 +1010,7 @@ mod tests {
             let h = c.world.get::<ColliderComponent>(e).unwrap().collider_handle;
             c.world
                 .resource::<PhysicsWorld>()
-                .colliders
+                .colliders()
                 .get(h.unwrap())
                 .unwrap()
                 .shared_shape()
@@ -687,7 +1028,7 @@ mod tests {
         }
         frames(&mut c, 1);
         assert_eq!(shape_of(&c).as_ball().unwrap().radius, 0.75);
-        assert_eq!(c.world.resource::<PhysicsWorld>().colliders.len(), 1);
+        assert_eq!(c.world.resource::<PhysicsWorld>().colliders().len(), 1);
     }
 
     #[test]
@@ -742,7 +1083,7 @@ mod tests {
         frames(&mut c, 1);
         c.world.entity_mut(e).remove::<Collider>();
         frames(&mut c, 1);
-        assert_eq!(c.world.resource::<PhysicsWorld>().colliders.len(), 0);
+        assert_eq!(c.world.resource::<PhysicsWorld>().colliders().len(), 0);
         assert!(c.world.get::<ColliderComponent>(e).is_none());
         c.world.entity_mut(e).remove::<RigidBody>();
         frames(&mut c, 1);
@@ -757,7 +1098,7 @@ mod tests {
         c.world.despawn(e);
         frames(&mut c, 1);
         let pw = c.world.resource::<PhysicsWorld>();
-        assert_eq!((pw.bodies.len(), pw.colliders.len()), (0, 0));
+        assert_eq!((pw.bodies.len(), pw.colliders().len()), (0, 0));
     }
 
     #[test]
@@ -768,7 +1109,7 @@ mod tests {
         melon_core::hierarchy::mark_for_delete(&mut c.world, e);
         frames(&mut c, 1);
         let pw = c.world.resource::<PhysicsWorld>();
-        assert_eq!((pw.bodies.len(), pw.colliders.len()), (0, 0));
+        assert_eq!((pw.bodies.len(), pw.colliders().len()), (0, 0));
         assert!(c.world.get_entity(e).is_err());
     }
 
@@ -824,7 +1165,7 @@ mod tests {
         frames(&mut c, 60);
         assert_eq!(height(&c, e), 10.0);
         assert!(c.world.get::<RigidBodyComponent>(e).is_some());
-        assert_eq!(c.world.resource::<PhysicsWorld>().colliders.len(), 1);
+        assert_eq!(c.world.resource::<PhysicsWorld>().colliders().len(), 1);
     }
 
     #[test]
@@ -1092,7 +1433,7 @@ mod tests {
     fn events_core() -> Core {
         let mut c = core();
         c.world.init_resource::<Seen>();
-        c.add_systems(FixedUpdate, collect.after(step_system));
+        c.add_systems(melon_core::FixedPostUpdate, collect);
         c
     }
 
@@ -1187,7 +1528,7 @@ mod tests {
 
     fn character_core() -> Core {
         let mut c = core();
-        c.add_systems(FixedUpdate, walk_east.before(character_controller_system));
+        c.add_systems(FixedUpdate, walk_east);
         c
     }
 
@@ -1401,8 +1742,8 @@ mod tests {
         frames(&mut c, 1);
         let handle = c.world.get::<ColliderComponent>(e).unwrap().collider_handle;
         let pw = c.world.resource::<PhysicsWorld>();
-        let shape = pw
-            .colliders
+        let colliders = pw.colliders();
+        let shape = colliders
             .get(handle.expect("built"))
             .unwrap()
             .shared_shape();
@@ -1414,7 +1755,7 @@ mod tests {
         let mut c = core();
         let e = c.world.spawn((at(0.0, 0.0, 0.0), mesh_collider())).id();
         frames(&mut c, 3);
-        assert_eq!(c.world.resource::<PhysicsWorld>().colliders.len(), 0);
+        assert_eq!(c.world.resource::<PhysicsWorld>().colliders().len(), 0);
         assert!(
             c.world
                 .get::<ColliderComponent>(e)
@@ -1537,7 +1878,8 @@ mod tests {
         fn assert_leaf_pose(c: &Core, leaf: Entity) {
             let h = handle_of(c, leaf).unwrap();
             let pw = c.world.resource::<PhysicsWorld>();
-            let co = pw.colliders.get(h).unwrap();
+            let colliders = pw.colliders();
+            let co = colliders.get(h).unwrap();
             // Local (1,1,0) * 2 = (2,2,0), turned 90 degrees about Y: (0,2,-2), plus the root.
             let p = co.position().translation;
             assert!((p - Vec3::new(10.0, 2.0, -2.0)).length() < 1e-3, "{p}");
@@ -1566,7 +1908,7 @@ mod tests {
             assert!(
                 c.world
                     .resource::<PhysicsWorld>()
-                    .colliders
+                    .colliders()
                     .get(handle_of(&c, leaf).unwrap())
                     .unwrap()
                     .parent()
@@ -1585,9 +1927,12 @@ mod tests {
             let y = height(&c, e);
             frames(&mut c, 60);
             let pw = c.world.resource::<PhysicsWorld>();
-            assert_eq!((pw.bodies.len(), pw.colliders.len()), (0, 1));
-            let co = pw.colliders.get(handle_of(&c, e).unwrap()).unwrap();
-            assert!(co.parent().is_none(), "no body");
+            assert_eq!((pw.bodies.len(), pw.colliders().len()), (0, 1));
+            let handle = handle_of(&c, e).unwrap();
+            assert!(
+                pw.colliders().get(handle).unwrap().parent().is_none(),
+                "no body"
+            );
             assert!((height(&c, e) - y).abs() < 1e-6, "static: never moves");
             // And it is solid: a ball lands on it.
             let ball = dynamic(
@@ -1608,11 +1953,8 @@ mod tests {
             c.world.get_mut::<Transform>(e).unwrap().translation.x = 7.0;
             frames(&mut c, 2);
             let pw = c.world.resource::<PhysicsWorld>();
-            let p = pw
-                .colliders
-                .get(handle_of(&c, e).unwrap())
-                .unwrap()
-                .position();
+            let colliders = pw.colliders();
+            let p = colliders.get(handle_of(&c, e).unwrap()).unwrap().position();
             assert!((p.translation.x - 7.0).abs() < 1e-4);
         }
 
@@ -1718,17 +2060,6 @@ mod tests {
         }
 
         #[test]
-        fn raycast_from_inside_a_collider_hits_it_at_distance_zero() {
-            let (c, f) = queries_core();
-            let hit = queries(&c)
-                .raycast(Vec3::ZERO, Vec3::X, 10.0, &QueryFilter::default())
-                .expect("the ray starts in the floor");
-            assert_eq!(hit.entity, f);
-            assert_eq!(hit.distance, 0.0);
-            assert!(hit.point.is_finite() && hit.normal.is_finite());
-        }
-
-        #[test]
         fn raycast_all_orders_many_hits_by_distance() {
             let (mut c, _) = queries_core();
             // Spawned in a scrambled order, well apart.
@@ -1811,9 +2142,9 @@ mod tests {
             for walking in [false, true] {
                 let mut c = core();
                 if walking {
-                    c.add_systems(FixedUpdate, walk_east.before(character_controller_system));
+                    c.add_systems(FixedUpdate, walk_east);
                 } else {
-                    c.add_systems(FixedUpdate, stand.before(character_controller_system));
+                    c.add_systems(FixedUpdate, stand);
                 }
                 floor(&mut c);
                 // Starts just above the ground; the floor is 40 m wide, walking is 0.1 m a step.
@@ -1827,7 +2158,7 @@ mod tests {
         #[test]
         fn character_stays_grounded_on_a_moving_kinematic_platform() {
             let mut c = core();
-            c.add_systems(FixedUpdate, stand.before(character_controller_system));
+            c.add_systems(FixedUpdate, stand);
             c.add_systems(FixedUpdate, slide.before(sync_to_physics_system));
             c.world.spawn((
                 at(0.0, 0.0, 0.0),
@@ -1930,7 +2261,7 @@ mod tests {
         #[test]
         fn a_nan_move_request_leaves_the_character_where_it_is() {
             let mut c = core();
-            c.add_systems(FixedUpdate, nan_mover.before(character_controller_system));
+            c.add_systems(FixedUpdate, nan_mover);
             floor(&mut c);
             let e = character(&mut c, 1.33);
             frames(&mut c, 10);
@@ -1977,7 +2308,7 @@ mod tests {
             frames(&mut c, 3);
             let pw = c.world.resource::<PhysicsWorld>();
             assert_eq!(pw.impulse_joints.len(), 0);
-            assert!(pw.colliders.is_empty());
+            assert!(pw.colliders().is_empty());
             assert!(c.world.get_entity(child).is_err());
         }
 
@@ -2024,7 +2355,533 @@ mod tests {
             for e in ents {
                 assert!(handle_of(&c, e).is_none());
             }
-            assert_eq!(c.world.resource::<PhysicsWorld>().colliders.len(), 0);
+            assert_eq!(c.world.resource::<PhysicsWorld>().colliders().len(), 0);
+        }
+    }
+
+    /// Fix pass: pair types, joints, mesh colliders, game control, cost.
+    mod fixes {
+        use super::*;
+        use melon_core::{App, Plugin};
+        fn sized(shape: ColliderShape) -> Collider {
+            Collider {
+                shape,
+                ..Default::default()
+            }
+        }
+
+        fn handle_of(c: &Core, e: Entity) -> Option<ColliderHandle> {
+            c.world.get::<ColliderComponent>(e).unwrap().collider_handle
+        }
+
+        fn sensor_box(half: f32, at_: Transform) -> (Transform, Collider) {
+            (
+                at_,
+                Collider {
+                    shape: ColliderShape::Box {
+                        half_extents: Vec3::splat(half),
+                    },
+                    sensor: true,
+                    ..Default::default()
+                },
+            )
+        }
+
+        fn kinematic(c: &mut Core, y: f32) -> Entity {
+            c.world
+                .spawn((
+                    at(0.0, y, 0.0),
+                    RigidBody {
+                        kind: RigidBodyKind::Kinematic,
+                        ..Default::default()
+                    },
+                    cube(),
+                ))
+                .id()
+        }
+
+        #[test]
+        fn kinematic_body_entering_a_static_sensor_fires_trigger_events() {
+            let mut c = events_core();
+            c.world.spawn(sensor_box(1.0, at(0.0, 0.0, 0.0)));
+            let k = kinematic(&mut c, 5.0);
+            for i in 0..90 {
+                c.world.get_mut::<Transform>(k).unwrap().translation.y = 5.0 - i as f32 * 0.1;
+                frames(&mut c, 1);
+            }
+            assert_eq!(kinds(&c, CollisionEventKind::TriggerEntered).len(), 1);
+            assert_eq!(kinds(&c, CollisionEventKind::TriggerExited).len(), 1);
+        }
+
+        #[test]
+        fn static_character_controller_entering_a_static_sensor_fires_trigger_events() {
+            let mut c = events_core();
+            c.add_systems(FixedUpdate, walk_east);
+            floor(&mut c);
+            c.world.spawn(sensor_box(1.0, at(3.0, 1.0, 0.0)));
+            let ch = c
+                .world
+                .spawn((
+                    at(0.0, 2.0, 0.0),
+                    sized(ColliderShape::Capsule {
+                        half_height: 0.5,
+                        radius: 0.3,
+                    }),
+                    CharacterController::default(),
+                ))
+                .id();
+            frames(&mut c, 120);
+            assert!(c.world.get::<RigidBody>(ch).is_none(), "no body");
+            // The sensor does not report the static floor it overlaps, only the character.
+            assert_eq!(kinds(&c, CollisionEventKind::TriggerEntered).len(), 1);
+            assert_eq!(kinds(&c, CollisionEventKind::TriggerExited).len(), 1);
+        }
+
+        #[test]
+        fn kinematic_body_touching_a_static_collider_fires_collision_events() {
+            let mut c = events_core();
+            floor(&mut c);
+            let k = kinematic(&mut c, 3.0);
+            for i in 0..80 {
+                // Down to just inside the floor, then back up.
+                let t = (i as f32 * 0.1).min(7.9 - i as f32 * 0.1);
+                c.world.get_mut::<Transform>(k).unwrap().translation.y = 3.0 - t;
+                frames(&mut c, 1);
+            }
+            assert_eq!(kinds(&c, CollisionEventKind::Started).len(), 1);
+            assert_eq!(kinds(&c, CollisionEventKind::Ended).len(), 1);
+        }
+
+        // ---- joints ----
+
+        fn pair(c: &mut Core, child_t: Transform, joint: Joint) -> (Entity, Entity) {
+            let parent = c
+                .world
+                .spawn((
+                    at(0.0, 5.0, 0.0),
+                    RigidBody {
+                        kind: RigidBodyKind::Fixed,
+                        ..Default::default()
+                    },
+                ))
+                .id();
+            let child = c
+                .world
+                .spawn((
+                    child_t,
+                    RigidBody::default(),
+                    cube(),
+                    joint,
+                    ChildOf(parent),
+                ))
+                .id();
+            (parent, child)
+        }
+
+        #[test]
+        fn joint_with_default_anchors_keeps_the_pair_where_it_is() {
+            let mut c = core();
+            let (_, child) = pair(&mut c, at(3.0, 0.0, 0.0), Joint::default());
+            frames(&mut c, 60);
+            let p = world_pos(&c, child);
+            assert!((p - Vec3::new(3.0, 5.0, 0.0)).length() < 0.02, "{p}");
+        }
+
+        #[test]
+        fn joint_anchors_follow_the_entity_scale() {
+            let mut c = core();
+            let mut t = at(2.0, 0.0, 0.0);
+            t.scale = Vec3::splat(2.0);
+            let joint = Joint {
+                kind: JointKind::Hinge {
+                    axis: Vec3::Z,
+                    limited: false,
+                    min: 0.0,
+                    max: 0.0,
+                },
+                anchor: Vec3::new(-1.0, 0.0, 0.0),
+                auto_anchor: false,
+                ..Default::default()
+            };
+            let (_, child) = pair(&mut c, t, joint);
+            for _ in 0..60 {
+                frames(&mut c, 1);
+                let h = c
+                    .world
+                    .get::<RigidBodyComponent>(child)
+                    .unwrap()
+                    .body_handle;
+                let pw = c.world.resource::<PhysicsWorld>();
+                let b = pw.bodies.get(h).unwrap();
+                // The scaled anchor (-2, 0, 0) stays on the parent's origin.
+                let pivot = b.translation() + *b.rotation() * Vec3::new(-2.0, 0.0, 0.0);
+                assert!(
+                    (pivot - Vec3::new(0.0, 5.0, 0.0)).length() < 0.05,
+                    "{pivot}"
+                );
+            }
+        }
+
+        /// Turns `child` about `axis` at 4 rad/s and returns how far it turned.
+        fn turn_about(axis: Vec3) -> f32 {
+            let mut c = core();
+            gravity_off(&mut c);
+            let mut t = at(0.0, 0.0, 0.0);
+            // Turned a quarter about X from the parent: the joint axis Z in
+            // the child's frame is the world Y axis.
+            t.rotation = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+            let joint = Joint {
+                kind: JointKind::Hinge {
+                    axis: Vec3::Z,
+                    limited: false,
+                    min: 0.0,
+                    max: 0.0,
+                },
+                ..Default::default()
+            };
+            let (_, child) = pair(&mut c, t, joint);
+            frames(&mut c, 2);
+            c.world.get_mut::<Velocity>(child).unwrap().angular = axis * 4.0;
+            frames(&mut c, 15);
+            let q = world_matrix(&c.world, child)
+                .to_scale_rotation_translation()
+                .1;
+            q.angle_between(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+        }
+
+        #[test]
+        fn hinge_axis_follows_the_relative_rotation_of_the_pair() {
+            let free = turn_about(Vec3::Y);
+            let blocked = turn_about(Vec3::Z);
+            assert!(free > 0.5, "free about the hinge axis: {free}");
+            assert!(blocked < 0.1, "blocked about another axis: {blocked}");
+        }
+
+        #[test]
+        fn joint_on_an_entity_without_a_body_is_remembered_as_warned() {
+            let mut c = core();
+            let e = c.world.spawn((at(0.0, 0.0, 0.0), Joint::default())).id();
+            frames(&mut c, 5);
+            let pw = c.world.resource::<PhysicsWorld>();
+            assert!(pw.joint_warned.contains(&e));
+            assert_eq!(pw.impulse_joints.len(), 0);
+            // Giving it a body makes the joint and clears the warning.
+            c.world.entity_mut(e).insert(RigidBody::default());
+            frames(&mut c, 2);
+            let pw = c.world.resource::<PhysicsWorld>();
+            assert!(!pw.joint_warned.contains(&e));
+            assert_eq!(pw.impulse_joints.len(), 1);
+        }
+
+        // ---- mesh colliders ----
+
+        fn temp_project(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!("melon_physics_{name}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("assets")).unwrap();
+            dir
+        }
+
+        #[test]
+        fn mesh_collider_is_rebuilt_when_its_model_file_changes_after_a_failure() {
+            let dir = temp_project("mesh_retry");
+            let file = dir.join("assets/a.glb");
+            std::fs::write(&file, b"not a glb").unwrap();
+            let mut c = core();
+            c.world.insert_resource(melon_core::AssetServer::new(dir));
+            let h: melon_core::Handle<melon_core::Model> = c
+                .world
+                .resource_mut::<melon_core::AssetServer>()
+                .load("assets/a.glb");
+            let e = c.world.spawn((at(0.0, 0.0, 0.0), mesh_collider(), h)).id();
+            frames(&mut c, 3);
+            assert!(handle_of(&c, e).is_none(), "broken file: no collider");
+            let good = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../assets/models/cube.glb");
+            std::fs::copy(good, &file).unwrap();
+            c.world
+                .resource_mut::<melon_core::AssetServer>()
+                .poll_changes();
+            frames(&mut c, 3);
+            assert!(handle_of(&c, e).is_some(), "fixed file: collider built");
+            // And a later edit of the file rebuilds it again.
+            let builds = c.world.resource::<PhysicsWorld>().stats.collider_builds;
+            // (A copy keeps the source time stamp; a write sets a new one.)
+            std::fs::write(&file, std::fs::read(&file).unwrap()).unwrap();
+            c.world
+                .resource_mut::<melon_core::AssetServer>()
+                .poll_changes();
+            frames(&mut c, 3);
+            let after = c.world.resource::<PhysicsWorld>().stats.collider_builds;
+            assert_eq!(after, builds + 1, "hot reload rebuilds the mesh collider");
+        }
+
+        #[test]
+        fn mesh_collider_on_a_dynamic_body_gets_mass_and_falls_onto_the_floor() {
+            let mut c = core();
+            floor(&mut c);
+            let h: melon_core::Handle<melon_core::Model> = c
+                .world
+                .resource_mut::<melon_core::AssetServer>()
+                .load("builtin:cube");
+            let e = c
+                .world
+                .spawn((at(0.0, 3.0, 0.0), RigidBody::default(), mesh_collider(), h))
+                .id();
+            frames(&mut c, 240);
+            let body = c.world.get::<RigidBodyComponent>(e).unwrap().body_handle;
+            let mass = c
+                .world
+                .resource::<PhysicsWorld>()
+                .bodies
+                .get(body)
+                .unwrap()
+                .mass();
+            assert!(mass > 0.5 && mass < 2.0, "mass from the 1 m box: {mass}");
+            assert!(
+                (height(&c, e) - 1.0).abs() < 0.1,
+                "rests on the floor: {}",
+                height(&c, e)
+            );
+        }
+
+        // ---- game control ----
+
+        #[test]
+        fn velocity_is_read_from_and_written_to_a_dynamic_body() {
+            let mut c = core();
+            let e = dynamic(&mut c, at(0.0, 50.0, 0.0), cube());
+            frames(&mut c, 30);
+            let v = *c.world.get::<Velocity>(e).unwrap();
+            assert!(v.linear.y < -2.0, "falling: {v:?}");
+            c.world.get_mut::<Velocity>(e).unwrap().linear = Vec3::new(10.0, 0.0, 0.0);
+            let x0 = c.world.get::<Transform>(e).unwrap().translation.x;
+            frames(&mut c, 30);
+            let x1 = c.world.get::<Transform>(e).unwrap().translation.x;
+            assert!((x1 - x0 - 5.0).abs() < 0.5, "moved sideways: {}", x1 - x0);
+        }
+
+        #[test]
+        fn impulse_changes_the_velocity_once_and_force_lasts_one_step() {
+            let mut c = core();
+            gravity_off(&mut c);
+            let e = dynamic(&mut c, at(0.0, 0.0, 0.0), cube());
+            frames(&mut c, 2);
+            c.world
+                .resource_mut::<melon_core::PhysicsRequests>()
+                .apply_impulse(e, Vec3::new(5.0, 0.0, 0.0));
+            frames(&mut c, 1);
+            let vx = c.world.get::<Velocity>(e).unwrap().linear.x;
+            assert!((vx - 5.0).abs() < 0.05, "unit cube is 1 kg: {vx}");
+            frames(&mut c, 5);
+            assert!((c.world.get::<Velocity>(e).unwrap().linear.x - 5.0).abs() < 0.05);
+            // A force of 60 N for one step of 1/60 s adds 1 m/s, once.
+            c.world
+                .resource_mut::<melon_core::PhysicsRequests>()
+                .apply_force(e, Vec3::new(0.0, 60.0, 0.0));
+            frames(&mut c, 1);
+            frames(&mut c, 5);
+            let vy = c.world.get::<Velocity>(e).unwrap().linear.y;
+            assert!((vy - 1.0).abs() < 0.05, "one step of force: {vy}");
+        }
+
+        #[test]
+        fn teleport_moves_a_dynamic_body_and_keeps_its_velocity() {
+            let mut c = core();
+            gravity_off(&mut c);
+            let e = dynamic(&mut c, at(0.0, 0.0, 0.0), cube());
+            frames(&mut c, 2);
+            c.world.get_mut::<Velocity>(e).unwrap().linear = Vec3::new(0.0, 0.0, 3.0);
+            frames(&mut c, 1);
+            c.world
+                .resource_mut::<melon_core::PhysicsRequests>()
+                .teleport(e, Vec3::new(10.0, 20.0, 0.0), None);
+            frames(&mut c, 1);
+            let p = c.world.get::<Transform>(e).unwrap().translation;
+            assert!(
+                (p.x - 10.0).abs() < 1e-3 && (p.y - 20.0).abs() < 1e-3,
+                "{p}"
+            );
+            assert!((body_pos(&c, e).x - 10.0).abs() < 1e-3);
+            assert!((c.world.get::<Velocity>(e).unwrap().linear.z - 3.0).abs() < 0.1);
+            let prev = c.world.get::<PreviousTransform>(e).unwrap();
+            assert!(
+                (prev.0.translation.x - 10.0).abs() < 0.2,
+                "no blend from the old place"
+            );
+        }
+
+        // ---- ordering ----
+
+        fn move_east(mut q: Query<&mut CharacterController>) {
+            for mut cc in &mut q {
+                cc.move_by(Vec3::new(0.1, 0.0, 0.0));
+            }
+        }
+
+        struct EastPlugin;
+
+        impl Plugin for EastPlugin {
+            fn build(&self, app: &mut App) {
+                app.add_systems(FixedUpdate, move_east);
+            }
+        }
+
+        #[test]
+        fn plugin_system_in_fixed_update_moves_the_character_in_the_same_step() {
+            let mut c = core();
+            c.add_plugin(&EastPlugin);
+            floor(&mut c);
+            let e = character(&mut c, 1.31);
+            frames(&mut c, 1);
+            let x = c.world.get::<Transform>(e).unwrap().translation.x;
+            assert!((x - 0.1).abs() < 1e-3, "moved in the step it asked in: {x}");
+        }
+
+        // ---- cost ----
+
+        #[test]
+        fn idle_scene_of_a_thousand_static_colliders_does_no_rebuild_work() {
+            let mut c = core();
+            for i in 0..1000 {
+                c.world.spawn((
+                    at((i % 40) as f32 * 3.0, 0.0, (i / 40) as f32 * 3.0),
+                    cube(),
+                ));
+            }
+            frames(&mut c, 3);
+            let before = c.world.resource::<PhysicsWorld>().stats;
+            assert_eq!(before.collider_builds, 1000);
+            frames(&mut c, 20);
+            let after = c.world.resource::<PhysicsWorld>().stats;
+            assert!(after.syncs > before.syncs, "the sync still runs");
+            assert_eq!(after.collider_builds, before.collider_builds);
+            assert_eq!(after.examined, before.examined, "nothing was compared");
+            assert_eq!(after.collider_moves, before.collider_moves);
+            // Moving one collider looks at that one only.
+            let first = c
+                .world
+                .query_filtered::<Entity, With<Collider>>()
+                .iter(&c.world)
+                .next()
+                .unwrap();
+            c.world.get_mut::<Transform>(first).unwrap().translation.y = 4.0;
+            frames(&mut c, 1);
+            let moved = c.world.resource::<PhysicsWorld>().stats;
+            assert!(moved.examined - after.examined <= 4, "{moved:?}");
+            assert_eq!(moved.collider_moves, after.collider_moves + 1);
+            assert_eq!(moved.collider_builds, after.collider_builds);
+        }
+
+        #[test]
+        fn pose_tolerance_is_relative_to_the_distance_from_the_origin() {
+            let far = Vec3::new(123_456.7, 0.0, 98_765.4);
+            assert!(super::super::sync::close(
+                far,
+                far + Vec3::new(0.004, 0.0, 0.0)
+            ));
+            assert!(!super::super::sync::close(
+                Vec3::ZERO,
+                Vec3::new(0.004, 0.0, 0.0)
+            ));
+        }
+        #[test]
+        fn a_collider_far_from_the_origin_does_not_resync_every_step() {
+            let mut c = core();
+            let parent = c
+                .world
+                .spawn(Transform {
+                    translation: Vec3::new(123_456.7, 0.0, 98_765.4),
+                    rotation: Quat::from_rotation_y(0.7),
+                    scale: Vec3::new(2.0, 1.0, 3.0),
+                })
+                .id();
+            c.world.spawn((at(1.3, 0.1, 2.2), cube(), ChildOf(parent)));
+            frames(&mut c, 3);
+            let before = c.world.resource::<PhysicsWorld>().stats;
+            for _ in 0..30 {
+                // The same value written again marks the transform changed.
+                let t = *c.world.get::<Transform>(parent).unwrap();
+                *c.world.get_mut::<Transform>(parent).unwrap() = t;
+                frames(&mut c, 1);
+            }
+            let after = c.world.resource::<PhysicsWorld>().stats;
+            assert_eq!(after.collider_moves, before.collider_moves);
+            assert_eq!(after.collider_builds, before.collider_builds);
+        }
+
+        // ---- minor ----
+
+        #[test]
+        fn raycast_from_inside_a_collider_skips_it_unless_asked() {
+            let (c, f) = queries_core();
+            let q = queries(&c);
+            let skip = q.raycast(Vec3::ZERO, Vec3::X, 10.0, &QueryFilter::default());
+            assert!(skip.is_none(), "{skip:?}");
+            let with = QueryFilter {
+                hit_inside: true,
+                ..Default::default()
+            };
+            let hit = q.raycast(Vec3::ZERO, Vec3::X, 10.0, &with).unwrap();
+            assert_eq!((hit.entity, hit.distance), (f, 0.0));
+        }
+
+        #[test]
+        fn removing_a_touching_collider_ends_its_pair() {
+            let mut c = events_core();
+            let f = floor(&mut c);
+            let b = dynamic(&mut c, at(0.0, 1.2, 0.0), cube());
+            frames(&mut c, 90);
+            assert_eq!(kinds(&c, CollisionEventKind::Started).len(), 1);
+            c.world.entity_mut(b).remove::<Collider>();
+            frames(&mut c, 3);
+            let ended = kinds(&c, CollisionEventKind::Ended);
+            assert_eq!(ended.len(), 1, "{ended:?}");
+            assert!(between(&ended[0], f, b));
+        }
+
+        #[test]
+        fn deleting_a_body_inside_a_sensor_exits_the_trigger() {
+            let mut c = events_core();
+            c.world.spawn(sensor_box(2.0, at(0.0, 0.0, 0.0)));
+            gravity_off(&mut c);
+            let b = dynamic(&mut c, at(0.0, 0.0, 0.0), cube());
+            frames(&mut c, 10);
+            assert_eq!(kinds(&c, CollisionEventKind::TriggerEntered).len(), 1);
+            melon_core::hierarchy::mark_for_delete(&mut c.world, b);
+            frames(&mut c, 3);
+            assert_eq!(kinds(&c, CollisionEventKind::TriggerExited).len(), 1);
+            // Despawning the entity directly ends the pair too.
+            let b2 = dynamic(&mut c, at(0.0, 0.0, 0.0), cube());
+            frames(&mut c, 10);
+            c.world.despawn(b2);
+            frames(&mut c, 3);
+            assert_eq!(kinds(&c, CollisionEventKind::TriggerExited).len(), 2);
+        }
+
+        #[test]
+        fn previous_transform_goes_when_the_body_stops_being_dynamic() {
+            let mut c = core();
+            let e = dynamic(&mut c, at(0.0, 5.0, 0.0), cube());
+            let game_owned = c
+                .world
+                .spawn((at(0.0, 0.0, 0.0), PreviousTransform(Transform::default())))
+                .id();
+            frames(&mut c, 2);
+            assert!(c.world.get::<PreviousTransform>(e).is_some());
+            c.world.get_mut::<RigidBody>(e).unwrap().kind = RigidBodyKind::Fixed;
+            frames(&mut c, 2);
+            assert!(c.world.get::<PreviousTransform>(e).is_none(), "fixed body");
+            c.world.get_mut::<RigidBody>(e).unwrap().kind = RigidBodyKind::Dynamic;
+            frames(&mut c, 2);
+            assert!(c.world.get::<PreviousTransform>(e).is_some());
+            c.world.entity_mut(e).remove::<RigidBody>();
+            frames(&mut c, 2);
+            assert!(c.world.get::<PreviousTransform>(e).is_none(), "no body");
+            assert!(
+                c.world.get::<PreviousTransform>(game_owned).is_some(),
+                "an entity the game gave one keeps it"
+            );
         }
     }
 }

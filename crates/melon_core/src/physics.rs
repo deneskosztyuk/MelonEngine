@@ -244,7 +244,7 @@ impl VariantDefaults for JointKind {
 
 /// Connects this entity's body to its nearest ancestor body (or the world
 /// when it has none). Anchors are local to each body.
-#[derive(Component, Reflect, Debug, Clone, PartialEq, Default)]
+#[derive(Component, Reflect, Debug, Clone, PartialEq)]
 #[reflect(Component, Default)]
 pub struct Joint {
     pub kind: JointKind,
@@ -253,6 +253,20 @@ pub struct Joint {
     /// Anchor in the ancestor body's space (world space with no ancestor body).
     #[reflect(remote = Vec3Reflect)]
     pub parent_anchor: Vec3,
+    /// Keep the pair where it is when the joint is made: `anchor` is the pivot on
+    /// this body, and the ancestor side is worked out from the current poses
+    /// (`parent_anchor` is then ignored). Off: both anchors are used as given.
+    pub auto_anchor: bool,
+}
+impl Default for Joint {
+    fn default() -> Self {
+        Self {
+            kind: JointKind::Fixed,
+            anchor: Vec3::ZERO,
+            parent_anchor: Vec3::ZERO,
+            auto_anchor: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,6 +300,9 @@ pub struct QueryFilter {
     pub exclude: Option<Entity>,
     /// Include sensors (triggers).
     pub sensors: bool,
+    /// Count a collider the ray starts inside as hit (at distance 0). Off by
+    /// default, like Unity and Godot.
+    pub hit_inside: bool,
 }
 
 impl Default for QueryFilter {
@@ -294,6 +311,7 @@ impl Default for QueryFilter {
             layers: u32::MAX,
             exclude: None,
             sensors: false,
+            hit_inside: false,
         }
     }
 }
@@ -401,6 +419,67 @@ impl PhysicsQueries {
     }
 }
 
+/// Linear and angular velocity (world space, m/s and rad/s) of a dynamic
+/// body. Physics adds it to every dynamic body and writes it after each step;
+/// a value the game writes (`velocity.linear = ..`) is applied to the body
+/// before the next step.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default)]
+pub struct Velocity {
+    pub linear: Vec3,
+    pub angular: Vec3,
+}
+
+/// One request for a body, applied at the start of the next physics step.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PhysicsRequest {
+    /// Instant change of linear momentum (N s).
+    Impulse(Entity, Vec3),
+    /// Instant change of angular momentum.
+    TorqueImpulse(Entity, Vec3),
+    /// A force (N) for the next step only.
+    Force(Entity, Vec3),
+    /// A torque for the next step only.
+    Torque(Entity, Vec3),
+    /// Put the entity at a world pose, keeping its velocity. This is how
+    /// game code moves a dynamic body: its `Transform` belongs to physics.
+    Teleport(Entity, Vec3, Option<Quat>),
+}
+
+/// Requests from game code to physics (`ResMut<PhysicsRequests>`), drained
+/// every fixed step. Requests for an entity without a body are dropped.
+#[derive(Resource, Default, Debug)]
+pub struct PhysicsRequests {
+    queue: Vec<PhysicsRequest>,
+}
+
+impl PhysicsRequests {
+    pub fn apply_impulse(&mut self, e: Entity, impulse: Vec3) {
+        self.queue.push(PhysicsRequest::Impulse(e, impulse));
+    }
+
+    pub fn apply_torque_impulse(&mut self, e: Entity, impulse: Vec3) {
+        self.queue.push(PhysicsRequest::TorqueImpulse(e, impulse));
+    }
+
+    pub fn apply_force(&mut self, e: Entity, force: Vec3) {
+        self.queue.push(PhysicsRequest::Force(e, force));
+    }
+
+    pub fn apply_torque(&mut self, e: Entity, torque: Vec3) {
+        self.queue.push(PhysicsRequest::Torque(e, torque));
+    }
+
+    /// Move the entity to `position` (and `rotation` when given), in world space.
+    pub fn teleport(&mut self, e: Entity, position: Vec3, rotation: Option<Quat>) {
+        self.queue
+            .push(PhysicsRequest::Teleport(e, position, rotation));
+    }
+
+    /// Take every pending request (the physics step does this).
+    pub fn drain(&mut self) -> Vec<PhysicsRequest> {
+        std::mem::take(&mut self.queue)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
