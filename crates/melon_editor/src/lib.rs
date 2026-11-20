@@ -971,7 +971,7 @@ impl Editor {
             widgets.insert(
                 "volume",
                 FieldWidget {
-                    label: Some("Volume (linear)"),
+                    label: Some("Volume (linear)".into()),
                     kind: WidgetKind::Slider { min: 0.0, max: 1.0 },
                 },
             );
@@ -996,7 +996,7 @@ impl Editor {
                 widgets.insert(
                     field,
                     FieldWidget {
-                        label: Some(label),
+                        label: Some(label.into()),
                         kind: WidgetKind::Degrees {
                             min: 0.0,
                             max: 85.0,
@@ -1009,7 +1009,7 @@ impl Editor {
             widgets.insert(
                 "parts",
                 FieldWidget {
-                    label: Some("Materials"),
+                    label: Some("Materials".into()),
                     kind: WidgetKind::Materials {
                         root: self.project_root.clone(),
                     },
@@ -1020,7 +1020,7 @@ impl Editor {
             widgets.insert(
                 "environment",
                 FieldWidget {
-                    label: Some("Environment"),
+                    label: Some("Environment".into()),
                     kind: WidgetKind::AssetRef {
                         root: self.project_root.clone(),
                         extensions: &["env"],
@@ -1037,7 +1037,7 @@ impl Editor {
                 widgets.insert(
                     field,
                     FieldWidget {
-                        label: Some(label),
+                        label: Some(label.into()),
                         kind: WidgetKind::Layers(names.clone()),
                     },
                 );
@@ -1134,6 +1134,14 @@ impl Editor {
 
     /// Replace the scene with one World Environment on the default `.env`.
     fn new_scene(&mut self, world: &mut World) {
+        // First, so a failure leaves the current scene alone.
+        if let Err(error) = asset_ops::ensure_default_environment(
+            &mut world.resource_mut::<AssetServer>(),
+            &self.project_root,
+        ) {
+            self.set_status_error(format!("World Environment failed: {error:#}"));
+            return;
+        }
         if !world.contains_resource::<melon_physics::PhysicsWorld>() {
             world.insert_resource(melon_physics::PhysicsWorld::new());
         }
@@ -2414,22 +2422,39 @@ impl Editor {
             }
         }
         // The card of the .env the entity's World Environment names (GUID wins).
-        let environment = world
+        if let Some(reference) = world
             .get::<melon_core::WorldEnvironment>(entity)
-            .and_then(|w| {
-                let server = world.get_resource::<AssetServer>()?;
-                let by_guid = w
-                    .environment
+            .map(|w| w.environment.clone())
+        {
+            ui.add_space(theme::sizes::SPACING);
+            let winner = melon_core::world_environment::active_environment(world);
+            if let Some(winner) = winner.filter(|&w| w != entity) {
+                let name = world.get::<Name>(winner).map_or("?", |n| n.0.as_str());
+                ui.colored_label(
+                    theme::colors::WARNING,
+                    format!("Inactive: {name} drives the world"),
+                );
+            }
+            let path = world.get_resource::<AssetServer>().and_then(|server| {
+                let by_guid = reference
                     .guid
                     .parse::<melon_core::AssetGuid>()
                     .ok()
                     .and_then(|g| server.path_of_guid(g));
-                let path = by_guid.unwrap_or(&w.environment.path);
+                let path = by_guid.unwrap_or(&reference.path);
                 (!path.is_empty()).then(|| path.to_string())
             });
-        if let Some(path) = environment {
-            ui.add_space(theme::sizes::SPACING);
-            environment_card::show(ui, world, &self.project_root, &path);
+            match path {
+                Some(path) => environment_card::show(ui, world, &self.project_root, &path),
+                None => {
+                    // Written back to the component; History::track records it.
+                    if let Some(new) = environment_card::show_empty(ui, world, &self.project_root)
+                        && let Some(mut w) = world.get_mut::<melon_core::WorldEnvironment>(entity)
+                    {
+                        w.environment = new;
+                    }
+                }
+            }
         }
         if components_changed {
             // Rapier follows the edit now, not at the next frame.
@@ -4638,6 +4663,19 @@ mod tests {
             !environments[0].environment.guid.is_empty(),
             "GUID from the .meta"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn new_scene_keeps_the_scene_when_the_default_environment_cannot_be_written() {
+        let (mut editor, mut world, root) = browser_project("new_scene_blocked");
+        create_cube(&mut world);
+        // A file where the environments folder should be.
+        std::fs::write(root.join("assets/environments"), "x").unwrap();
+        editor.pending_operation = Some(PendingOperation::NewScene);
+        editor.run_pending_operation(&mut world);
+        assert_eq!(transform_count(&mut world), 1, "the cube is still there");
+        assert!(world_environments(&mut world).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

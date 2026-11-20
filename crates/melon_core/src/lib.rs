@@ -54,8 +54,8 @@ pub use components::{
 };
 pub use cursor::{AppExit, Cursor, CursorMode};
 pub use environment_asset::{
-    AmbientSection, AoSection, AssetRef, BloomSection, ENVIRONMENT_EXTENSION, EnvironmentAsset,
-    FogSection, GiSection, SkySection, SunSection,
+    AmbientSection, AoSection, AssetRef, BloomSection, ENVIRONMENT_EXTENSION, EditHint,
+    EnvironmentAsset, FogSection, GiSection, SkySection, SunSection,
 };
 pub use glam;
 pub use hierarchy::{ChildOf, Children, GlobalTransform};

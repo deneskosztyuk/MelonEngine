@@ -53,14 +53,27 @@ impl AssetRef {
     }
 }
 
+/// How the editor draws a number field: a drag value with this range, speed,
+/// unit suffix and decimals. Set with `#[reflect(@EditHint { .. })]`.
+#[derive(Reflect, Clone, Copy, Debug)]
+pub struct EditHint {
+    pub min: f32,
+    pub max: f32,
+    pub speed: f32,
+    pub suffix: &'static str,
+    pub decimals: usize,
+}
+
 /// Sun direction (degrees) and colour.
 #[derive(Reflect, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[reflect(Default)]
 #[serde(default)]
 pub struct SunSection {
     /// Height above the horizon (90 = straight overhead).
+    #[reflect(@EditHint { min: -90.0, max: 90.0, speed: 0.5, suffix: "°", decimals: 1 })]
     pub elevation: f32,
     /// Compass direction of the sun around +Y (0 = toward +Z, 90 = toward +X).
+    #[reflect(@EditHint { min: -180.0, max: 180.0, speed: 0.5, suffix: "°", decimals: 1 })]
     pub azimuth: f32,
     /// Colour and strength (linear RGB).
     #[reflect(remote = Vec3Reflect)]
@@ -73,6 +86,7 @@ pub struct SunSection {
 #[serde(default)]
 pub struct AmbientSection {
     /// Share of light that is ambient (0..1); the sun gets the rest.
+    #[reflect(@EditHint { min: 0.0, max: 1.0, speed: 0.005, suffix: "", decimals: 3 })]
     pub share: f32,
     /// From above (linear RGB).
     #[reflect(remote = Vec3Reflect)]
@@ -95,6 +109,7 @@ pub struct SkySection {
     pub horizon: Vec3,
     /// HDR equirect replacing the procedural sky; empty = procedural.
     pub texture: AssetRef,
+    #[reflect(@EditHint { min: 0.0, max: 20.0, speed: 0.01, suffix: "", decimals: 2 })]
     pub texture_intensity: f32,
 }
 
@@ -103,6 +118,7 @@ pub struct SkySection {
 #[serde(default)]
 pub struct FogSection {
     /// Exponential density per metre; 0 = no fog.
+    #[reflect(@EditHint { min: 0.0, max: 0.2, speed: 0.0001, suffix: " /m", decimals: 4 })]
     pub density: f32,
 }
 
@@ -110,8 +126,10 @@ pub struct FogSection {
 #[reflect(Default)]
 #[serde(default)]
 pub struct AoSection {
+    #[reflect(@EditHint { min: 0.0, max: 2.0, speed: 0.01, suffix: "", decimals: 2 })]
     pub strength: f32,
     /// Metres.
+    #[reflect(@EditHint { min: 0.0, max: 5.0, speed: 0.01, suffix: " m", decimals: 2 })]
     pub radius: f32,
 }
 
@@ -119,6 +137,7 @@ pub struct AoSection {
 #[reflect(Default)]
 #[serde(default)]
 pub struct GiSection {
+    #[reflect(@EditHint { min: 0.0, max: 4.0, speed: 0.01, suffix: "", decimals: 3 })]
     pub intensity: f32,
 }
 
@@ -126,6 +145,7 @@ pub struct GiSection {
 #[reflect(Default)]
 #[serde(default)]
 pub struct BloomSection {
+    #[reflect(@EditHint { min: 0.0, max: 1.0, speed: 0.005, suffix: "", decimals: 3 })]
     pub intensity: f32,
 }
 

@@ -93,6 +93,10 @@ pub const DEFAULT_ENVIRONMENT: &str = "assets/environments/default.env";
 pub fn ensure_default_environment(server: &mut AssetServer, root: &Path) -> anyhow::Result<()> {
     let file = root.join(DEFAULT_ENVIRONMENT);
     if file.is_file() {
+        // A hand-copied file has no `.meta`; give the ref a GUID.
+        if !melon_core::meta_path(&file).is_file() {
+            reconcile(server);
+        }
         return Ok(());
     }
     if let Some(dir) = file.parent() {
@@ -557,6 +561,18 @@ mod tests {
             melon_core::MaterialAsset::new_default()
         );
         assert!(melon_core::meta_path(&first).is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensure_default_environment_gives_an_existing_file_its_meta() {
+        let (root, mut server) = project("ensure_meta");
+        let file = root.join(DEFAULT_ENVIRONMENT);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, melon_core::EnvironmentAsset::default().to_ron()).unwrap();
+        assert!(!melon_core::meta_path(&file).exists());
+        ensure_default_environment(&mut server, &root).unwrap();
+        assert!(melon_core::meta_path(&file).is_file());
         let _ = std::fs::remove_dir_all(&root);
     }
 
