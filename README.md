@@ -57,6 +57,9 @@ Viewport (Unity-style, pointer over the viewport):
 Simulation:
 
 - **F5** — Play / resume, **F6** — Pause, **Shift+F5** — Stop (restores the scene)
+- While playing, the game owns keyboard and mouse (cursor hidden). **Esc**
+  hands them back to the editor (the game keeps running); **left click** on
+  the Scene viewport gives them to the game again
 - **Step** (toolbar, while paused) — advance one fixed step
 
 Editor:
@@ -72,6 +75,11 @@ Editor:
 - **Hierarchy:** drag an entity onto another to make it a child (it keeps its
   place in the world), or onto the empty space below to make it a root.
   Deleting an entity deletes its children.
+- **Edit ▸ Project Settings…** — Input Mapping: game actions (Button or
+  Axis) and their keys / mouse buttons. **+ binding** (or **+ pair** for an
+  axis: positive, then negative) waits for the next key; **Esc** cancels.
+  Changes apply live and save to `config/input.ron`; a broken file falls
+  back to the defaults and is kept as `config/input.ron.broken` on the first save.
 - Panels (Hierarchy, Scene, Inspector, Content Browser, Console) dock and tab
   by dragging their tabs; the arrangement is saved to `.melon/editor_layout.ron`.
   **Window** reopens closed panels; **Window ▸ Reset Layout** restores the default.

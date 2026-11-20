@@ -58,8 +58,8 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
       propagation, world poses everywhere (render, physics, picking, gizmos),
       Hierarchy tree with drag reparenting, scene format v3. Fixes bug 6.
 - [x] Render extraction moved from `melon_host` into `melon_render`. Fixes bug 7.
-- [ ] Full input: all keys, `just_pressed` / `just_released`, mouse buttons and
-      wheel, action mapping.
+- [x] Full input: all keys, `just_pressed` / `just_released`, mouse buttons and
+      wheel, action mapping (`Actions` / `InputMap`, Project Settings, Esc / click focus).
 - [ ] Plugin API so `melon_game` registers its own systems. Fixes bug 8.
 - [x] Decide on one editor UI: egui + `egui_dock` (ADR-0001); others removed.
 

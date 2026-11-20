@@ -10,7 +10,7 @@ Current state and planned work: `docs/ROADMAP.md`.
 | `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera. No GPU or window code. |
 | `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache`) records sun shadow pass, 3D pass into HDR target, tonemap pass; `ui_pass` for the editor. |
 | `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource) and ECS sync systems. |
-| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`). |
+| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), Project Settings window (`project_settings.rs`). |
 | `crates/melon_game` | Game logic as an `rlib` + `dylib`, hot-reloaded in dev builds. |
 | `crates/melon_host` | Binary: winit event loop, input mapping, frame order (core update, editor, extract, render_scene, ui pass). No render pass code. |
 | `assets/models` | glTF models. `cube.glb` loads at startup. |
@@ -51,7 +51,15 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   `App::new`.
 - **Stages.** Register systems with `core.add_systems(Stage, ...)`:
   `FixedUpdate` (1/60 s, 0..N times per frame, not while paused), `Update`
-  (once per frame, read `Time::delta_seconds`), `PostUpdate`.
+  (once per frame, read `Time::delta_seconds`), `PostUpdate`. `PreUpdate`
+  runs first each frame and fills `Actions`.
+- **Input.** Game code reads `Actions` (`pressed` / `just_pressed` /
+  `just_released` / `axis` by action name), not raw keys; names and bindings
+  live in `InputMap` (`config/input.ron`, edited in Edit ▸ Project Settings).
+  The host feeds `Input` only while `GameInputGate` is true (the editor writes
+  it from `InputFocus`: `Game` while playing, Esc gives it back to `Editor`).
+  `RawPresses` sees every press whatever the focus and is cleared after the
+  editor UI (rebinding capture).
 - **Never replace `core.world` after the first frame.** bevy systems are bound
   to the first `World` they run on and panic on another one. To reset a
   scene, despawn its entities (`load_scene` despawns entities with a
