@@ -14,14 +14,15 @@ pub struct ContentEntry {
     pub size: u64,
 }
 
-/// Folders first, then files, each sorted case-insensitively.
-/// A missing or unreadable folder lists as empty.
+/// Folders first, then files, each sorted case-insensitively. `.meta`
+/// sidecars are hidden. A missing or unreadable folder lists as empty.
 pub fn list_dir(path: &Path) -> Vec<ContentEntry> {
     let Ok(read) = std::fs::read_dir(path) else {
         return Vec::new();
     };
     let mut entries: Vec<ContentEntry> = read
         .filter_map(Result::ok)
+        .filter(|entry| !entry.file_name().to_string_lossy().ends_with(".meta"))
         .map(|entry| {
             let meta = entry.metadata().ok();
             ContentEntry {
@@ -277,6 +278,16 @@ mod tests {
         assert_eq!(browser.current(), dir);
         browser.up();
         assert_eq!(browser.current(), dir, "cannot leave the root");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_dir_hides_meta_files() {
+        let dir = temp_dir("meta");
+        std::fs::write(dir.join("a.glb"), "a").unwrap();
+        std::fs::write(dir.join("a.glb.meta"), "m").unwrap();
+        let names: Vec<String> = list_dir(&dir).into_iter().map(|e| e.name).collect();
+        assert_eq!(names, ["a.glb"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

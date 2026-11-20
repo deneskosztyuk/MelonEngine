@@ -10,7 +10,8 @@ use melon_core::{AssetGuid, AssetMeta, AssetServer, META_VERSION, meta_path};
 
 /// Bring the `.meta` files under `<root>/assets` in line with the asset
 /// files, then rescan the server's GUID index:
-/// - a `.meta` whose asset is gone is deleted;
+/// - a valid `.meta` whose asset is gone is deleted (anything else ending
+///   in `.meta` is left alone);
 /// - a broken `.meta` is left alone (its asset gets no GUID until fixed);
 /// - of several `.meta` files sharing a GUID, one keeps it (the path the
 ///   server already knew, else the oldest-created asset, else path order)
@@ -36,6 +37,11 @@ pub fn reconcile(server: &mut AssetServer) {
             continue;
         };
         if !asset.is_file() {
+            // Only delete sidecars we wrote; a user file that happens to end
+            // in `.meta` stays.
+            if AssetMeta::read(file).is_err() {
+                continue;
+            }
             match std::fs::remove_file(file) {
                 Ok(()) => tracing::info!("removed orphan {}", file.display()),
                 Err(error) => tracing::warn!("could not remove {}: {error}", file.display()),
@@ -245,6 +251,19 @@ mod tests {
         reconcile(&mut server);
         assert_eq!(server.path(h), "assets/models/sub/b.glb#mesh0");
         assert_eq!(server.path_of_guid(g), Some("assets/models/sub/b.glb"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reconcile_keeps_a_user_file_named_meta() {
+        let root = temp_root("user_meta");
+        let notes = write(&root, "assets/notes.meta");
+        let mut server = AssetServer::new(root.clone());
+        reconcile(&mut server);
+        assert!(
+            notes.exists(),
+            "a .meta that is not ours must not be deleted"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
