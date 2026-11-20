@@ -109,6 +109,8 @@ Goal: an editor that looks and works like Unity / Unreal / Godot.
 
 - [x] `AGENTS.md` with architecture, commands and conventions.
 - [ ] Headless runner + screenshot capture command, so an agent can verify
-      rendering. `Core` already runs without a window.
+      rendering. `Core` already runs without a window. Partly done: the
+      `snapshot` example renders a fixed review scene to a PNG offscreen
+      (no world or scene file yet).
 - [ ] Component registry so an agent can build levels as RON data.
 - [ ] Runtime console (stdin or socket) to query and edit world state.

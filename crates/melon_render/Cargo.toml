@@ -18,3 +18,8 @@ gltf.workspace = true
 
 [lints]
 workspace = true
+
+# Run the snapshot example's unit tests with `cargo test`.
+[[example]]
+name = "snapshot"
+test = true

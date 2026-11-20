@@ -30,6 +30,10 @@ gate: fmt-check clippy check
 test: gate
     cargo test --workspace
 
+# Render the review scene offscreen to target/review/snapshot.png (no window).
+snapshot view="overview":
+    cargo run -p melon_render --example snapshot -- target/review/snapshot.png {{view}}
+
 # Run the engine in release mode (optimized glam, no hot-reload overhead).
 # Runs the gate first; only launches if gate passes.
 run: gate

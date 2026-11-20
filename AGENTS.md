@@ -26,6 +26,7 @@ just gate        # fmt-check + clippy -D warnings + check. Run before every comm
 just test        # gate, then cargo test --workspace
 just dev-run     # debug build with melon_game hot reload
 just fast-run    # release run, no gate, no hot reload
+just snapshot    # render the review scene offscreen to target/review/snapshot.png
 ```
 
 First build is slow (wgpu, rapier, egui). Run long builds in the background.
@@ -114,4 +115,7 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   `Light::to_light()`.
 - **Camera conventions.** Right-handed, DirectX depth (near = 0, far = 1).
   Screen helpers take logical points.
+- **Checking rendering.** Agents verify rendering with the snapshot example
+  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low]`),
+  never by opening the editor or game window.
 - **GPU tests** open a window, so they need a display and adapter.
