@@ -17,7 +17,9 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 
-use crate::assets::{AssetGuid, AssetMeta, asset_dir_files, meta_path, project_relative};
+use crate::assets::{
+    AssetGuid, AssetMeta, ImportSettings, asset_dir_files, meta_path, project_relative,
+};
 
 pub const MAGIC: &[u8; 8] = b"MELONPAK";
 pub const PACK_VERSION: u32 = 1;
@@ -97,7 +99,12 @@ pub fn project_files(root: &Path, excludes: &[String]) -> Vec<PackFile> {
         let Some(rel) = project_relative(root, &file) else {
             continue;
         };
-        if rel.ends_with(".meta") || skip(&rel) {
+        // A `.meta` ships only when it carries import settings (the GUIDs go
+        // into the index).
+        let plain_meta = rel.ends_with(".meta")
+            && std::fs::read_to_string(&file)
+                .is_ok_and(|t| ImportSettings::from_meta_text(&t) == ImportSettings::default());
+        if plain_meta || skip(&rel) {
             continue;
         }
         let guid = AssetMeta::read(&meta_path(&file)).ok().map(|m| m.guid);
@@ -290,6 +297,29 @@ mod tests {
         };
         std::fs::write(meta_path(&root.join(rel)), meta.to_ron()).unwrap();
         meta.guid
+    }
+
+    #[test]
+    fn a_meta_with_import_settings_ships_and_serves_them() {
+        let root = temp_project("import_meta");
+        asset(&root, "assets/models/a.fbx", b"fbx");
+        asset(&root, "assets/models/b.fbx", b"fbx");
+        let settings = crate::ImportSettings {
+            scale: 3.0,
+            ..Default::default()
+        };
+        settings.write(&root.join("assets/models/a.fbx")).unwrap();
+        let out = root.join("game.pak");
+        build_pack(&root, &[], &out).unwrap();
+        let mut server = crate::AssetServer::new(root.clone());
+        server.set_pack(std::sync::Arc::new(Pack::open(&out).unwrap()));
+        assert_eq!(server.import_settings("assets/models/a.fbx"), settings);
+        assert_eq!(
+            server.import_settings("assets/models/b.fbx"),
+            crate::ImportSettings::default()
+        );
+        assert!(server.read("assets/models/b.fbx.meta").is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

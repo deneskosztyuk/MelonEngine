@@ -36,7 +36,8 @@ pub use actions::{
     Action, ActionKind, Actions, AxisBinding, InputMap, LoadOutcome, update_actions_system,
 };
 pub use assets::{
-    AssetGuid, AssetMeta, AssetServer, Handle, META_VERSION, Material, Model, Texture, meta_path,
+    AssetGuid, AssetMeta, AssetServer, Handle, ImportSettings, META_VERSION, Material, Model,
+    Texture, meta_path,
 };
 pub use audio::{
     AudioBus, AudioClip, AudioListener, AudioPreview, AudioRequest, AudioRequests, AudioSettings,
