@@ -25,6 +25,7 @@ pub mod content;
 mod content_view;
 mod drawer;
 pub mod gizmo;
+pub mod inspect;
 pub mod layout;
 pub mod play;
 pub mod project_settings;
