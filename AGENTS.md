@@ -32,6 +32,14 @@ just snapshot    # render the review scene offscreen to target/review/snapshot.p
 
 First build is slow (wgpu, rapier, egui). Run long builds in the background.
 
+## Logs
+
+A running editor writes every line the Console captures (INFO and above) to
+`.melon/logs/editor.log`, truncated at each start and written line by line:
+`HH:MM:SS.mmm LEVEL target: message` (time since start; continuation lines
+of a multi-line message are indented by four spaces). Read it to see what the
+user sees in the Console. The terminal output still follows `RUST_LOG`.
+
 ## Conventions
 
 - Edition 2024. Add dependencies to `[workspace.dependencies]` in the root

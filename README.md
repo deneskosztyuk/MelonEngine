@@ -134,6 +134,15 @@ Editor:
 - Panels (Hierarchy, Scene, Inspector, Content Browser, Console) dock and tab
   by dragging their tabs; the arrangement is saved to `.melon/editor_layout.ron`.
   **Window** reopens closed panels; **Window ▸ Reset Layout** restores the default.
+- **Console** — one row per entry (time, level, target, message); **Wrap**
+  shows full text, **Collapse** merges identical consecutive lines into one
+  row with a ×N count, the search box filters message and target. Click a row
+  to select it and see its details (full text, file:line), Shift+click a range,
+  Ctrl+A all shown rows; **Ctrl+C** / **Copy** copy the selection, **Copy all**
+  every shown row. It follows new lines at the bottom; scrolled up, a
+  "Jump to latest" button counts new lines. **Home** / **End** scroll.
+  Every captured line is also written to `.melon/logs/editor.log`
+  (truncated at each start).
 
 The editor opens in edit mode. Pass `--play` to start playing right away:
 

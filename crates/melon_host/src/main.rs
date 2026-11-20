@@ -742,6 +742,13 @@ impl ApplicationHandler for App {
 fn main() {
     use tracing_subscriber::prelude::*;
     let console = melon_editor::console::ConsoleLog::default();
+    // The Console's lines also go to a file that tools (and agents) can read.
+    let log_path = std::path::Path::new(PROJECT_ROOT).join(".melon/logs/editor.log");
+    let log_file = melon_editor::console::file_layer(&log_path);
+    let (log_file, log_file_error) = match log_file {
+        Ok(layer) => (Some(layer), None),
+        Err(error) => (None, Some(error)),
+    };
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_filter(EnvFilter::from_default_env()))
         .with(
@@ -749,8 +756,12 @@ fn main() {
                 .layer()
                 .with_filter(melon_editor::console::capture_filter()),
         )
+        .with(log_file.with_filter(melon_editor::console::capture_filter()))
         .init();
     tracing_log::LogTracer::init().ok();
+    if let Some(error) = log_file_error {
+        tracing::warn!(%error, path = %log_path.display(), "log file not opened");
+    }
     tracing::info!("MelonEngine v{} starting up", melon_core::version());
 
     let event_loop = EventLoop::new().expect("failed to create event loop");

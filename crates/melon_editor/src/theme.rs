@@ -93,6 +93,12 @@ pub mod sizes {
     pub const CONTENT_SEARCH: f32 = 160.0;
     /// Height of the name line under a tile.
     pub const TILE_LABEL: f32 = 18.0;
+    /// Console: search box width, details strip default height, row text
+    /// inset (horizontal) and padding (vertical, split above and below).
+    pub const CONSOLE_SEARCH: f32 = 180.0;
+    pub const CONSOLE_DETAILS: f32 = 90.0;
+    pub const CONSOLE_ROW_INSET: f32 = 4.0;
+    pub const CONSOLE_ROW_PAD: f32 = 4.0;
 }
 
 /// Apply the editor theme (dark) to every egui style.
