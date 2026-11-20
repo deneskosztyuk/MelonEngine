@@ -1250,6 +1250,8 @@ impl Editor {
                     world_matrix(world, e),
                     viewport::model_bounds(world, e),
                 ));
+            self.world_line_vertices
+                .extend(viewport::collider_lines(world, e));
         }
 
         let painter = ui.painter_at(rect);

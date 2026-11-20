@@ -6,7 +6,7 @@ use bevy_ecs::entity::Entity;
 use bevy_ecs::world::World;
 use melon_core::glam::{Mat4, Vec2, Vec3};
 use melon_core::hierarchy::world_matrix;
-use melon_core::{AssetServer, Camera, Handle, Model, Transform};
+use melon_core::{AssetServer, Camera, Collider, ColliderShape, Handle, Model, Transform};
 use melon_render::LineVertex;
 
 /// Radians of look/orbit per point of pointer movement.
@@ -42,6 +42,8 @@ const GRID_MAJOR_COLOR: [f32; 3] = [0.45, 0.45, 0.45];
 pub const AXIS_X_COLOR: [f32; 3] = [0.9, 0.15, 0.15];
 pub const AXIS_Z_COLOR: [f32; 3] = [0.15, 0.35, 0.9];
 const SELECTION_COLOR: [f32; 3] = [1.0, 0.55, 0.0];
+/// Collider outlines, green like Unity and Godot.
+const COLLIDER_COLOR: [f32; 3] = [0.2, 0.9, 0.3];
 
 /// Pressed fly-mode keys (only used while the right button is held).
 #[derive(Default, Clone, Copy, Debug)]
@@ -353,6 +355,91 @@ pub fn selection_box_lines(m: Mat4, (min, max): (Vec3, Vec3)) -> Vec<LineVertex>
         }
     }
     vertices
+}
+
+/// Green wire outlines of the colliders on `entity` and its descendants,
+/// following the shape numbers and world pose (scale included) the physics
+/// sync uses, so an Inspector edit shows at once. A mesh collider is drawn as
+/// its model bounds.
+pub fn collider_lines(world: &World, entity: Entity) -> Vec<LineVertex> {
+    let mut vertices = Vec::new();
+    let mut stack = vec![entity];
+    while let Some(e) = stack.pop() {
+        if let Some(children) = world.get::<melon_core::Children>(e) {
+            stack.extend(children.iter());
+        }
+        let Some(c) = world.get::<Collider>(e) else {
+            continue;
+        };
+        let (scale, rotation, translation) = world_matrix(world, e).to_scale_rotation_translation();
+        let m = Mat4::from_rotation_translation(rotation, translation);
+        let s = scale.abs();
+        match c.shape {
+            ColliderShape::Box => {
+                vertices.extend(box_lines(m, -c.half_extents * s, c.half_extents * s))
+            }
+            ColliderShape::Sphere => {
+                let r = c.radius * s.max_element();
+                for (a, b) in [(Vec3::X, Vec3::Y), (Vec3::X, Vec3::Z), (Vec3::Y, Vec3::Z)] {
+                    vertices.extend(arc(m, Vec3::ZERO, a * r, b * r, 0.0, std::f32::consts::TAU));
+                }
+            }
+            ColliderShape::Capsule => {
+                let r = c.radius * s.x.max(s.z);
+                let h = Vec3::Y * c.half_height * s.y;
+                // Rings where the cylinder meets the caps, the side lines, the cap arcs.
+                for end in [h, -h] {
+                    vertices.extend(arc(
+                        m,
+                        end,
+                        Vec3::X * r,
+                        Vec3::Z * r,
+                        0.0,
+                        std::f32::consts::TAU,
+                    ));
+                }
+                for side in [Vec3::X, -Vec3::X, Vec3::Z, -Vec3::Z] {
+                    vertices.extend(line(
+                        m.transform_point3(h + side * r),
+                        m.transform_point3(-h + side * r),
+                        COLLIDER_COLOR,
+                    ));
+                }
+                let pi = std::f32::consts::PI;
+                for side in [Vec3::X, Vec3::Z] {
+                    vertices.extend(arc(m, h, side * r, Vec3::Y * r, 0.0, pi));
+                    vertices.extend(arc(m, -h, side * r, -Vec3::Y * r, 0.0, pi));
+                }
+            }
+            ColliderShape::Mesh => {
+                let (min, max) = model_bounds(world, e);
+                vertices.extend(box_lines(m, min * s, max * s));
+            }
+        }
+    }
+    vertices
+}
+
+/// Wire box of `min..max` under `m`, in the collider colour.
+fn box_lines(m: Mat4, min: Vec3, max: Vec3) -> Vec<LineVertex> {
+    let mut vertices = selection_box_lines(m, (min, max));
+    for v in &mut vertices {
+        v.color = COLLIDER_COLOR;
+    }
+    vertices
+}
+
+/// An arc of the ellipse `center + cos(t) * a + sin(t) * b` for `t` in
+/// `from..to`, as line segments under `m`.
+fn arc(m: Mat4, center: Vec3, a: Vec3, b: Vec3, from: f32, to: f32) -> Vec<LineVertex> {
+    const SEGMENTS: usize = 24;
+    let point = |i: usize| {
+        let t = from + (to - from) * i as f32 / SEGMENTS as f32;
+        m.transform_point3(center + a * t.cos() + b * t.sin())
+    };
+    (0..SEGMENTS)
+        .flat_map(|i| line(point(i), point(i + 1), COLLIDER_COLOR))
+        .collect()
 }
 
 #[cfg(test)]
@@ -710,6 +797,82 @@ mod tests {
         );
     }
 
+    fn collider_world(collider: Collider, transform: Transform) -> (World, Entity) {
+        let mut world = World::new();
+        let e = world.spawn((transform, collider)).id();
+        (world, e)
+    }
+
+    #[test]
+    fn box_collider_outline_is_a_green_wire_box_at_the_scaled_size() {
+        let (world, e) = collider_world(
+            Collider {
+                half_extents: Vec3::new(1.0, 2.0, 3.0),
+                ..Default::default()
+            },
+            Transform {
+                translation: Vec3::new(5.0, 0.0, 0.0),
+                scale: Vec3::splat(2.0),
+                ..Default::default()
+            },
+        );
+        let lines = collider_lines(&world, e);
+        assert_eq!(lines.len(), 24);
+        assert!(lines.iter().all(|v| v.color == COLLIDER_COLOR));
+        let max_x = lines.iter().map(|v| v.position[0]).fold(f32::MIN, f32::max);
+        let max_z = lines.iter().map(|v| v.position[2]).fold(f32::MIN, f32::max);
+        assert!((max_x - 7.0).abs() < 1e-4 && (max_z - 6.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn sphere_and_capsule_outlines_stay_on_their_surface() {
+        let (world, e) = collider_world(
+            Collider {
+                shape: ColliderShape::Sphere,
+                radius: 2.0,
+                ..Default::default()
+            },
+            Transform::default(),
+        );
+        let lines = collider_lines(&world, e);
+        assert!(!lines.is_empty());
+        assert!(
+            lines
+                .iter()
+                .all(|v| (Vec3::from_array(v.position).length() - 2.0).abs() < 1e-4)
+        );
+        let (world, e) = collider_world(
+            Collider {
+                shape: ColliderShape::Capsule,
+                radius: 0.5,
+                half_height: 1.0,
+                ..Default::default()
+            },
+            Transform::default(),
+        );
+        let top = collider_lines(&world, e)
+            .iter()
+            .map(|v| v.position[1])
+            .fold(f32::MIN, f32::max);
+        assert!((top - 1.5).abs() < 1e-4, "top {top}");
+    }
+
+    #[test]
+    fn collider_outline_follows_an_edit_and_includes_children() {
+        let (mut world, e) = collider_world(Collider::default(), Transform::default());
+        let before = collider_lines(&world, e).len();
+        world.get_mut::<Collider>(e).unwrap().shape = ColliderShape::Sphere;
+        let sphere = collider_lines(&world, e).len();
+        assert_ne!(sphere, before);
+        world.spawn((
+            Transform::default(),
+            Collider::default(),
+            melon_core::ChildOf(e),
+        ));
+        let with_child = collider_lines(&world, e).len();
+        assert_eq!(with_child, sphere + before);
+        assert!(collider_lines(&World::new(), e).is_empty());
+    }
     #[test]
     fn grid_lines_count_and_axis_colors() {
         let lines = grid_lines();
