@@ -89,6 +89,32 @@ struct VsOut {
 @group(2) @binding(5) var<uniform> material: MaterialUniform;
 // Ambient occlusion per screen pixel (R, 1 = open); 1x1 white when off.
 @group(3) @binding(0) var ao_tex: texture_2d<f32>;
+// Point and spot lights, clustered forward (see lights.rs): the lights, the
+// (offset, count) of each cluster's list, the lists, and the cluster grid.
+struct LocalLight {
+    // xyz position, w range.
+    position_range: vec4f,
+    // Linear colour times intensity.
+    color: vec4f,
+    // xyz spot axis.
+    direction: vec4f,
+    // x spot scale, y spot offset, z 1 for a spot, w shadow slot.
+    spot: vec4f,
+};
+
+struct ClusterUniform {
+    screen: vec2f,
+    near: f32,
+    depth_scale: f32,
+    dims: vec4u,
+    forward: vec4f,
+};
+
+@group(3) @binding(9) var<storage, read> local_lights: array<LocalLight>;
+@group(3) @binding(10) var<storage, read> cluster_ranges: array<vec2u>;
+@group(3) @binding(11) var<storage, read> cluster_indices: array<u32>;
+@group(3) @binding(12) var<uniform> cluster: ClusterUniform;
+
 // Voxel passes only (their own group 0): the voxel radiance volume (see
 // VOXEL_SCALE) and the projection axis (x: 0 = X, 1 = Y, 2 = Z).
 @group(0) @binding(5) var<storage, read_write> voxels: array<atomic<u32>>;
@@ -216,6 +242,45 @@ fn gi_only() -> bool {
     return gi.gi_only != 0u;
 }
 
+// Light from the point and spot lights in this fragment's cluster: the same
+// Cook-Torrance as the sun, with radiance color / d^2 windowed to reach 0 at
+// the light's range (Karis) and, for spots, a squared smooth cone.
+fn local_light_radiance(
+    frag: vec2f, world_pos: vec3f, n: vec3f, v: vec3f,
+    base: vec3f, metallic: f32, alpha: f32, f0: vec3f,
+) -> vec3f {
+    let depth = max(dot(world_pos - camera.eye, cluster.forward.xyz), cluster.near);
+    let z = min(u32(log(depth / cluster.near) * cluster.depth_scale), cluster.dims.z - 1u);
+    let tile = min(vec2u(frag / cluster.screen * vec2f(cluster.dims.xy)), cluster.dims.xy - 1u);
+    let range = cluster_ranges[tile.x + cluster.dims.x * (tile.y + cluster.dims.y * z)];
+    let ndv = max(dot(n, v), 1e-4);
+    var sum = vec3f(0.0);
+    for (var i = 0u; i < range.y; i++) {
+        let light = local_lights[cluster_indices[range.x + i]];
+        let to_light = light.position_range.xyz - world_pos;
+        let d2 = max(dot(to_light, to_light), 1e-4);
+        let r = light.position_range.w;
+        let l = to_light * inverseSqrt(d2);
+        let q = d2 / (r * r);
+        let window = clamp(1.0 - q * q, 0.0, 1.0);
+        var atten = window * window / d2;
+        if (light.spot.z > 0.5) {
+            let cone = clamp(dot(-l, light.direction.xyz) * light.spot.x + light.spot.y, 0.0, 1.0);
+            atten *= cone * cone;
+        }
+        let ndl = max(dot(n, l), 0.0);
+        if (atten <= 0.0 || ndl <= 0.0) {
+            continue;
+        }
+        let h = normalize(l + v);
+        let f = fresnel_schlick(max(dot(h, v), 0.0), f0);
+        let spec = distribution_ggx(max(dot(n, h), 0.0), alpha) * visibility_smith_ggx(ndv, ndl, alpha) * f;
+        let diff = (1.0 - f) * (1.0 - metallic) * base / PI;
+        sum += (diff + spec) * light.color.rgb * atten * ndl;
+    }
+    return sum;
+}
+
 // World normal: the vertex normal bent by the tangent-space normal map.
 fn surface_normal(in: VsOut) -> vec3f {
     let n = normalize(in.world_normal);
@@ -281,8 +346,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
         ambient = diffuse + f_amb * reflected * specular_occlusion(ndv, ao, roughness);
     }
 
+    let locals = local_light_radiance(in.clip_pos.xy, in.world_pos, n, v, base, metallic, alpha, f0);
     let emissive = emissive_texel * material.emissive;
-    let color = sun + ambient + emissive;
+    let color = sun + locals + ambient + emissive;
 
     let fog = 1.0 - exp(-env.fog_density * distance(in.world_pos, camera.eye));
     return vec4f(mix(color, env.horizon_color, fog), select(1.0, base_rgba.a, ALPHA_BLEND));

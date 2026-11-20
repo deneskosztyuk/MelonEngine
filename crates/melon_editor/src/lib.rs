@@ -121,6 +121,8 @@ pub struct Editor {
     hovered: Option<GizmoHandle>,
     /// The gizmo's shapes this frame (drawn by the overlay pass).
     overlay_draws: Vec<melon_render::OverlayDraw>,
+    /// Icons of the point and spot lights (drawn with the gizmo).
+    light_icons: Vec<melon_render::OverlayDraw>,
     pending_dialog: Option<DialogChannel>,
     pending_operation: Option<PendingOperation>,
     /// A Content Browser delete waiting for Delete / Cancel.
@@ -243,6 +245,7 @@ impl Default for Editor {
             gizmo_drag: None,
             hovered: None,
             overlay_draws: Vec::new(),
+            light_icons: Vec::new(),
             pending_dialog: None,
             pending_operation: None,
             delete_confirm: None,
@@ -345,6 +348,15 @@ impl Editor {
         self.history
             .record_created(world, cube, label, self.selected);
         self.selected = Some(cube);
+    }
+
+    /// Spawn a light, select it and record it as a step.
+    fn create_light_step(&mut self, world: &mut World, kind: LightKind) {
+        let light = create_light(world, kind);
+        let label = format!("Create {}", history::name_of(world, light));
+        self.history
+            .record_created(world, light, label, self.selected);
+        self.selected = Some(light);
     }
 
     /// Spawn a model (see `spawn_model`), select it and record it as a step.
@@ -657,6 +669,16 @@ impl Editor {
                 if ui.button("Create Cube").clicked() {
                     self.create_cube_step(world);
                 }
+                ui.menu_button("Light", |ui| {
+                    if ui.button("Point Light").clicked() {
+                        self.create_light_step(world, LightKind::Point);
+                        ui.close();
+                    }
+                    if ui.button("Spot Light").clicked() {
+                        self.create_light_step(world, LightKind::Spot);
+                        ui.close();
+                    }
+                });
             });
             ui.menu_button("Window", |ui| {
                 for tab in layout::EditorTab::ALL {
@@ -888,7 +910,9 @@ impl Editor {
     }
 
     pub fn take_overlay_draws(&mut self) -> Vec<melon_render::OverlayDraw> {
-        std::mem::take(&mut self.overlay_draws)
+        let mut draws = std::mem::take(&mut self.light_icons);
+        draws.append(&mut self.overlay_draws);
+        draws
     }
 
     pub fn take_pending_operation(&mut self) -> Option<PendingOperation> {
@@ -1531,6 +1555,7 @@ impl Editor {
         }
 
         self.world_line_vertices = viewport::grid_lines();
+        self.light_icons = viewport::light_icons(world);
         if let Some(e) = self.selected
             && world.get::<Transform>(e).is_some()
         {
@@ -1541,6 +1566,8 @@ impl Editor {
                 ));
             self.world_line_vertices
                 .extend(viewport::collider_lines(world, e));
+            self.world_line_vertices
+                .extend(viewport::light_lines(world, e));
         }
 
         let painter = ui.painter_at(rect);
@@ -2639,6 +2666,37 @@ pub fn create_cube_in(world: &mut World, parent: Option<Entity>) -> Entity {
         world.entity_mut(id).insert(melon_core::ChildOf(p));
     }
     id
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LightKind {
+    Point,
+    Spot,
+}
+
+/// Spawn a point or spot light 3 m up at the origin, named "Point Light" /
+/// "Spot Light" (a spot light points straight down).
+fn create_light(world: &mut World, kind: LightKind) -> Entity {
+    let name = history::unused_name(
+        world,
+        None,
+        match kind {
+            LightKind::Point => "Point Light",
+            LightKind::Spot => "Spot Light",
+        },
+        true,
+    );
+    let mut transform = melon_core::Transform::from_translation(glam::Vec3::new(0.0, 3.0, 0.0));
+    let mut entity = world.spawn_empty();
+    match kind {
+        LightKind::Point => entity.insert(melon_core::PointLight::default()),
+        LightKind::Spot => {
+            transform.rotation = glam::Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+            entity.insert(melon_core::SpotLight::default())
+        }
+    };
+    entity.insert((Name(name), transform));
+    entity.id()
 }
 
 /// Registered components Add Component offers for `entity`: addable, not on
@@ -4117,6 +4175,19 @@ mod tests {
             world.resource::<AssetServer>().path(h),
             "assets/models/sub/Barrel.glb"
         );
+    }
+
+    #[test]
+    fn create_light_spawns_a_named_light_pointing_down_for_spots() {
+        let mut world = World::new();
+        let point = create_light(&mut world, LightKind::Point);
+        assert_eq!(world.get::<Name>(point).unwrap().0, "Point Light");
+        assert!(world.get::<melon_core::PointLight>(point).is_some());
+        let spot = create_light(&mut world, LightKind::Spot);
+        assert_eq!(world.get::<Name>(spot).unwrap().0, "Spot Light");
+        let t = world.get::<melon_core::Transform>(spot).unwrap();
+        let axis = t.rotation * glam::Vec3::NEG_Z;
+        assert!((axis - glam::Vec3::NEG_Y).length() < 1e-5, "{axis}");
     }
 
     #[test]

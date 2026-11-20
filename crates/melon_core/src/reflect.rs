@@ -190,8 +190,10 @@ mod tests {
                 "Collider",
                 "Joint",
                 "Mesh Materials",
+                "Point Light",
                 "Rigid Body",
                 "Spin",
+                "Spot Light",
                 "Transform"
             ]
         );

@@ -2,7 +2,10 @@
 // Run: cargo run -p melon_render --example snapshot -- <out.png> [view] [flag]
 // Views: overview (default), low, sun, materials, corner, crowd (overview
 // plus about 10,000 grey cubes and spheres), cornell (the review scene plus
-// a red/green open-front room at (-13, 0, -13), seen through its opening).
+// a red/green open-front room at (-13, 0, -13), seen through its opening),
+// lights (the overview with 32 point and spot lights, 4 flagged to cast
+// shadows; --no-lights draws the same scene without them, to measure their
+// cost).
 // Prints the backend and present mode, the mean frame time and the `RenderStats`. The timed frames run
 // before the capture, so the GI probes have converged.
 // Debug flags (any order): --quality low|medium|high|max starts from that
@@ -27,7 +30,7 @@ use melon_core::{
     AssetServer, Camera, Environment, GiMode, Handle, Light, Model, QualityPreset, RenderQuality,
     SsgiResolution,
 };
-use melon_render::{FrameData, RenderStats, Renderer};
+use melon_render::{FrameData, LocalLight, RenderStats, Renderer};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -166,10 +169,34 @@ fn cornell(server: &mut AssetServer) -> Vec<(Mat4, Handle<Model>)> {
 }
 
 /// Named camera presets.
+/// 32 coloured lights over the review floor: a 4 x 8 grid, every third one a
+/// spot pointing down, the first four flagged as shadow casters.
+fn lights_scene() -> Vec<LocalLight> {
+    (0..32)
+        .map(|i| {
+            let (column, row) = ((i % 8) as f32, (i / 8) as f32);
+            let hue = i as f32 / 32.0 * std::f32::consts::TAU;
+            let colour = Vec3::new(
+                0.6 + 0.4 * hue.cos(),
+                0.6 + 0.4 * (hue + 2.1).cos(),
+                0.6 + 0.4 * (hue + 4.2).cos(),
+            );
+            LocalLight {
+                position: Vec3::new(-8.75 + column * 2.5, 1.4, -5.0 + row * 3.3),
+                direction: Vec3::NEG_Y,
+                color: colour * 12.0,
+                range: 4.5,
+                spot: (i % 3 == 0).then_some((0.4, 0.8)),
+                cast_shadows: i < 4,
+            }
+        })
+        .collect()
+}
+
 fn camera(view: &str) -> Result<Camera> {
     let (eye, center) = match view {
         // Three-quarter view from above.
-        "overview" | "crowd" => (Vec3::new(-11.0, 9.0, 12.0), Vec3::new(0.5, 0.5, -1.0)),
+        "overview" | "crowd" | "lights" => (Vec3::new(-11.0, 9.0, 12.0), Vec3::new(0.5, 0.5, -1.0)),
         // Near the floor, looking toward the horizon.
         "low" => (Vec3::new(-9.0, 0.6, 9.0), Vec3::new(9.0, 1.2, -9.0)),
         // From the +x +z side, up toward the default sun (disc near the top
@@ -192,7 +219,7 @@ fn camera(view: &str) -> Result<Camera> {
         "cornell" => (Vec3::new(-13.0, 2.0, -21.5), Vec3::new(-13.0, 1.9, -12.0)),
         _ => {
             bail!(
-                "unknown view {view:?}; expected overview, low, sun, materials, corner, crowd or cornell"
+                "unknown view {view:?}; expected overview, low, sun, materials, corner, crowd, cornell or lights"
             )
         }
     };
@@ -288,7 +315,8 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
     let mut ssgi_res = None;
     let mut args = flags.iter();
     while let Some(flag) = args.next() {
-        const FLAGS: [&str; 11] = [
+        const FLAGS: [&str; 12] = [
+            "--no-lights",
             "--quality",
             "--ao-only",
             "--no-ao",
@@ -348,12 +376,16 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
         quality,
         models: review_scene(&mut server),
         overrides: Default::default(),
+        lights: Default::default(),
     };
     if view == "crowd" {
         frame.models.extend(crowd(&mut server));
     }
     if view == "cornell" {
         frame.models.extend(cornell(&mut server));
+    }
+    if view == "lights" && !has("--no-lights") {
+        frame.lights = lights_scene();
     }
     for (matrix, _) in &mut frame.models {
         *matrix = Mat4::from_translation(offset) * *matrix;
@@ -466,7 +498,7 @@ impl ApplicationHandler for App {
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let out = args.next().context(
-        "usage: snapshot <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only] [--ssgi-res half|quarter] [--size WxH]",
+        "usage: snapshot <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only] [--ssgi-res half|quarter] [--size WxH] [--no-lights]",
     )?;
     let view = args.next().unwrap_or_else(|| "overview".into());
     let flags = args.collect();
@@ -555,6 +587,7 @@ mod tests {
             "corner",
             "crowd",
             "cornell",
+            "lights",
         ] {
             assert!(camera(view).is_ok(), "{view}");
         }

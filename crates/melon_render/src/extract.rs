@@ -2,12 +2,13 @@
 
 use std::collections::HashMap;
 
-use glam::Mat4;
+use crate::lights::LocalLight;
+use glam::{Mat4, Vec3};
 use melon_core::bevy_ecs::world::World;
 use melon_core::hierarchy::render_matrices;
 use melon_core::{
-    AssetServer, Camera, Environment, Handle, Light, Material, MeshMaterials, Model, RenderQuality,
-    SimulationState, Time,
+    AssetServer, Camera, Environment, Handle, Light, Material, MeshMaterials, Model, PointLight,
+    RenderQuality, SimulationState, SpotLight, Time,
 };
 
 /// Everything one view needs to draw a frame.
@@ -27,6 +28,8 @@ pub struct FrameData {
     /// Material per mesh part for the `models` entries (by index) that have
     /// `MeshMaterials`; `None` keeps the part's glTF material.
     pub overrides: HashMap<usize, Vec<Option<Handle<Material>>>>,
+    /// Every point and spot light, in world space.
+    pub lights: Vec<LocalLight>,
 }
 
 /// Blend fixed-step entities while Playing and Paused (alpha is frozen while
@@ -82,6 +85,33 @@ pub fn extract(world: &mut World) -> FrameData {
             overrides.insert(index, handles.collect());
         }
     }
+    let mut lights = Vec::new();
+    let mut points = world.query::<(melon_core::bevy_ecs::entity::Entity, &PointLight)>();
+    for (e, light) in points.iter(world) {
+        if let Some(m) = matrices.get(&e) {
+            lights.push(LocalLight {
+                position: m.w_axis.truncate(),
+                direction: Vec3::NEG_Z,
+                color: light.color * light.intensity,
+                range: light.range,
+                spot: None,
+                cast_shadows: light.cast_shadows,
+            });
+        }
+    }
+    let mut spots = world.query::<(melon_core::bevy_ecs::entity::Entity, &SpotLight)>();
+    for (e, light) in spots.iter(world) {
+        if let Some(m) = matrices.get(&e) {
+            lights.push(LocalLight {
+                position: m.w_axis.truncate(),
+                direction: (-m.z_axis.truncate()).normalize_or(Vec3::NEG_Y),
+                color: light.color * light.intensity,
+                range: light.range,
+                spot: Some((light.inner_angle, light.outer_angle.max(light.inner_angle))),
+                cast_shadows: light.cast_shadows,
+            });
+        }
+    }
     FrameData {
         view_proj,
         eye,
@@ -90,6 +120,7 @@ pub fn extract(world: &mut World) -> FrameData {
         quality,
         models,
         overrides,
+        lights,
     }
 }
 

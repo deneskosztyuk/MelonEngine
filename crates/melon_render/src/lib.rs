@@ -2,12 +2,14 @@ use std::sync::Arc;
 
 mod extract;
 pub mod gi;
+mod lights;
 mod materials;
 mod models;
 mod overlay;
 mod timings;
 
 pub use extract::{FrameData, blends, extract};
+pub use lights::LocalLight;
 pub use overlay::{OverlayDepth, OverlayDraw, OverlayShape, TORUS_TUBE};
 
 /// One node of a glTF file's scene, as the editor spawns it.
@@ -293,6 +295,10 @@ pub struct RenderStats {
     pub shadow_draw_calls: u32,
     /// Entities outside the shadow box.
     pub shadow_culled: u32,
+    /// Point / spot lights shaded, and visible ones dropped for
+    /// `RenderQuality::max_lights`.
+    pub lights: u32,
+    pub lights_dropped: u32,
 }
 
 #[repr(C)]
@@ -843,6 +849,9 @@ pub struct SceneRenderer {
     ssao_buffer: wgpu::Buffer,
     /// Group 3 of the mesh pipeline: per-view lighting inputs.
     lighting_layout: wgpu::BindGroupLayout,
+    /// The main view's point / spot lights and cluster lists (group 3
+    /// bindings 9 to 12), written each frame.
+    frame_lights: lights::LightBuffers,
     /// Group 3 with a 1x1 white AO texture: no occlusion (AO off).
     unoccluded_lighting: wgpu::BindGroup,
     /// Group 3 of the GI voxel passes: `unoccluded_lighting` without the
@@ -1201,6 +1210,7 @@ impl Renderer {
             quality: melon_core::RenderQuality::default(),
             models: vec![(glam::Mat4::IDENTITY, handle)],
             overrides: Default::default(),
+            lights: Default::default(),
         };
         let mut encoder = self
             .device()
@@ -1305,6 +1315,27 @@ impl Renderer {
         scene.update_camera(frame.view_proj, frame.eye);
         scene.update_environment(&frame.environment);
         scene.update_ssao(&frame.environment);
+        // The lights and their cluster lists of this view; other views draw
+        // without local lights.
+        let (cluster, cluster_data) = if main {
+            let size = target.size();
+            let grid = lights::ClusterGrid::new(
+                frame.view_proj,
+                frame.eye,
+                [size.width as f32, size.height as f32],
+            );
+            let data = lights::build(&grid, &frame.lights, quality.max_lights as usize);
+            (grid.uniform(), data)
+        } else {
+            (lights::ClusterUniform::empty(), Default::default())
+        };
+        scene
+            .frame_lights
+            .write(&scene.queue, &cluster, &cluster_data);
+        let stats_lights = (
+            cluster_data.lights.len() as u32,
+            cluster_data.dropped as u32,
+        );
         if main {
             scene.gi.update(
                 &scene.queue,
@@ -1335,6 +1366,8 @@ impl Renderer {
         let camera = Frustum::from_view_proj(frame.view_proj);
         let shadow_box = Frustum::from_view_proj(light_view_proj);
         let mut stats = RenderStats::default();
+        stats.lights = stats_lights.0;
+        stats.lights_dropped = stats_lights.1;
         let (mut seen, mut casters, mut voxelized) = (Vec::new(), Vec::new(), Vec::new());
         // Entities with the same material overrides share a set id (0 = none),
         // so they batch together.
@@ -1698,6 +1731,7 @@ impl SceneRenderer {
         // every GI backend's bindings (gi/mod.rs).
         let mut lighting_entries = vec![texture_entry(0)];
         lighting_entries.extend(gi::Gi::layout_entries());
+        lighting_entries.extend(lights::LightBuffers::layout_entries());
         let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("lighting bind group layout"),
             entries: &lighting_entries,
@@ -1926,9 +1960,12 @@ impl SceneRenderer {
             binding: 0,
             resource: wgpu::BindingResource::TextureView(&default_textures.white),
         };
+        let empty_lights = lights::LightBuffers::new(&device);
+        let frame_lights = lights::LightBuffers::new(&device);
         let lighting = |label, voxels| {
             let mut entries = vec![white_ao.clone()];
             entries.extend(gi.entries(None, voxels));
+            entries.extend(empty_lights.entries());
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
                 layout: &lighting_layout,
@@ -1982,6 +2019,7 @@ impl SceneRenderer {
             ssao_blur_layout,
             ssao_buffer,
             lighting_layout,
+            frame_lights,
             unoccluded_lighting,
             voxel_pass_lighting,
             gi,
@@ -2124,6 +2162,7 @@ impl SceneRenderer {
                 resource: wgpu::BindingResource::TextureView(ao),
             }];
             entries.extend(self.gi.entries(Some(&gi), true));
+            entries.extend(self.frame_lights.entries());
             self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
                 layout: &self.lighting_layout,
@@ -4781,6 +4820,7 @@ mod tests {
             quality: melon_core::RenderQuality::default(),
             models,
             overrides: Default::default(),
+            lights: Default::default(),
         };
         let mut encoder = r
             .device()
@@ -4883,6 +4923,7 @@ mod tests {
                 quality,
                 models: models.to_vec(),
                 overrides: Default::default(),
+                lights: Default::default(),
             };
             let mut encoder = r
                 .device()
@@ -4930,6 +4971,7 @@ mod tests {
                 quality,
                 models: models.to_vec(),
                 overrides: Default::default(),
+                lights: Default::default(),
             };
             let mut encoder = r
                 .device()
@@ -5307,6 +5349,7 @@ mod tests {
                 vec![]
             },
             overrides: Default::default(),
+            lights: Default::default(),
         };
         let mut target =
             renderer.create_viewport_target(winit::dpi::PhysicalSize::new(size.0, size.1));
@@ -5502,6 +5545,7 @@ mod tests {
             quality,
             models: models.clone(),
             overrides: Default::default(),
+            lights: Default::default(),
         };
         let reset = frame(melon_core::RenderQuality {
             gi_mode: GiMode::Off,
@@ -5806,6 +5850,121 @@ mod tests {
         {
             return Err(format!(
                 "Blend should mix the slab with what is behind: {blended:?} between {ground:?} and {opaque:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// A white floor lit only by `lights` (no sun, no ambient), seen from
+    /// above; returns the display pixels and the frame's stats.
+    fn render_lit(
+        r: &mut Renderer,
+        lights: Vec<lights::LocalLight>,
+        quality: melon_core::RenderQuality,
+    ) -> (Vec<u8>, RenderStats) {
+        let root = material_project("lit_floor");
+        write_mat(
+            &root,
+            "white",
+            "(base_color: (0.8, 0.8, 0.8, 1.0), metallic: 0.0, roughness: 0.8)",
+        );
+        let mut server = fresh_ids_server(root.clone(), 7300);
+        r.materials = Default::default();
+        r.model_cache = ModelCache::new(&r.scene);
+        let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+        let material = server.load("assets/materials/white.mat");
+        let mut frame = FrameData {
+            view_proj: top_down_camera().view_proj(),
+            eye: top_down_camera().eye,
+            light: melon_core::Light {
+                color: glam::Vec3::ZERO,
+                ambient: 0.0,
+                ..test_light()
+            },
+            environment: plain_environment(),
+            quality,
+            lights,
+            ..Default::default()
+        };
+        frame.models.push((
+            glam::Mat4::from_scale_rotation_translation(
+                glam::Vec3::new(12.0, 0.2, 12.0),
+                glam::Quat::IDENTITY,
+                glam::Vec3::new(0.0, -0.1, 0.0),
+            ),
+            cube,
+        ));
+        frame.overrides.insert(0, vec![Some(material)]);
+        let mut target =
+            r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let mut encoder = r
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let stats = r.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
+        let pixels = read_back(r.device(), r.queue(), encoder, &target.color_texture);
+        let _ = std::fs::remove_dir_all(&root);
+        (pixels, stats)
+    }
+
+    fn point_light(at: glam::Vec3, intensity: f32, range: f32) -> lights::LocalLight {
+        lights::LocalLight {
+            position: at,
+            direction: glam::Vec3::NEG_Y,
+            color: glam::Vec3::splat(intensity),
+            range,
+            spot: None,
+            cast_shadows: false,
+        }
+    }
+
+    fn check_local_lights(r: &mut Renderer) -> Result<(), String> {
+        let quality = melon_core::RenderQuality::default();
+        let corner = (4, 4);
+        let (dark, _) = render_lit(r, vec![], quality);
+        let dark_centre = value_at(&dark, CENTRE_PX);
+        // Only the sky reflection is left without lights (a few steps).
+        let dark_far = value_at(&dark, corner);
+        if dark_centre > 12 {
+            return Err(format!("no light, no sun: nearly black ({dark_centre})"));
+        }
+        // Above the floor, in range: the floor under it lights up, the far
+        // corner (about 4 m away, past the 3 m range) does not.
+        let lit_at = glam::Vec3::new(0.0, 2.0, 0.0);
+        let (lit, stats) = render_lit(r, vec![point_light(lit_at, 20.0, 3.0)], quality);
+        let (centre, far) = (value_at(&lit, CENTRE_PX), value_at(&lit, corner));
+        if stats.lights != 1 || centre < dark_centre + 50 || far > dark_far + 2 {
+            return Err(format!(
+                "point light: {} lights, floor under it {centre} (want > 60), past its range {far} (want black)",
+                stats.lights
+            ));
+        }
+        // Out of range (2 m up, range 1.5): adds nothing at all.
+        let (out, _) = render_lit(r, vec![point_light(lit_at, 20.0, 1.5)], quality);
+        if differing(&out, &dark) > 0 {
+            return Err("a light out of range changed the image".into());
+        }
+        // A spot pointing down lights its cone only.
+        let spot = lights::LocalLight {
+            spot: Some((0.2, 0.5)),
+            ..point_light(glam::Vec3::new(0.0, 3.0, 0.0), 40.0, 8.0)
+        };
+        let (cone, _) = render_lit(r, vec![spot], quality);
+        let (inside, outside) = (value_at(&cone, CENTRE_PX), value_at(&cone, corner));
+        if inside < dark_centre + 40 || outside > dark_far + 2 {
+            return Err(format!("spot cone: centre {inside}, outside {outside}"));
+        }
+        // 300 lights on a grid: the cap keeps `max_lights`, the rest drop.
+        let many: Vec<_> = (0..300)
+            .map(|i| {
+                let (x, z) = ((i % 20) as f32 - 9.5, (i / 20) as f32 - 7.0);
+                point_light(glam::Vec3::new(x * 0.4, 1.0, z * 0.4), 2.0, 2.0)
+            })
+            .collect();
+        let (_, stats) = render_lit(r, many, quality);
+        if stats.lights != quality.max_lights || stats.lights_dropped != 300 - quality.max_lights {
+            return Err(format!(
+                "light cap: {} shaded, {} dropped (max_lights {})",
+                stats.lights, stats.lights_dropped, quality.max_lights
             ));
         }
         Ok(())
@@ -7146,6 +7305,7 @@ mod tests {
                         quality: melon_core::RenderQuality::default(),
                         models,
                         overrides: Default::default(),
+                        lights: Default::default(),
                     };
                     let mut encoder = renderer
                         .device()
@@ -7583,6 +7743,7 @@ mod tests {
             Box::new(check_material_missing_texture),
             Box::new(check_texture_hot_reload),
             Box::new(check_alpha_mask_and_blend),
+            Box::new(check_local_lights),
         ];
 
         #[cfg(target_os = "windows")]
