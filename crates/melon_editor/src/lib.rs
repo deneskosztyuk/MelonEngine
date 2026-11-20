@@ -22,6 +22,7 @@ pub mod content;
 pub mod gizmo;
 pub mod layout;
 pub mod play;
+pub mod project_settings;
 pub mod scene;
 pub mod theme;
 mod toolbar_icon;
@@ -123,6 +124,7 @@ pub struct Editor {
     /// Right mouse held over the viewport (fly mode): W/E/R are fly keys then.
     flying: bool,
     show_about: bool,
+    project_settings: project_settings::ProjectSettings,
     logo: Option<egui::TextureHandle>,
 }
 
@@ -155,6 +157,7 @@ impl Default for Editor {
             current_scene: None,
             flying: false,
             show_about: false,
+            project_settings: project_settings::ProjectSettings::default(),
             logo: None,
         }
     }
@@ -342,6 +345,10 @@ impl Editor {
                 {
                     self.delete_selected(world);
                 }
+                ui.separator();
+                if ui.button("Project Settings…").clicked() {
+                    self.project_settings.open = true;
+                }
             });
             ui.menu_button("GameObject", |ui| {
                 if ui.button("Create Cube").clicked() {
@@ -455,6 +462,23 @@ impl Editor {
                 ui.label("A Rust 3D game engine.");
                 ui.weak("bevy_ecs · wgpu · rapier3d · egui");
             });
+    }
+
+    fn project_settings_window(&mut self, world: &mut World, ui: &egui::Ui) {
+        match self
+            .project_settings
+            .ui(ui.ctx(), world, &self.project_root)
+        {
+            Some((StatusKind::Success, message)) => self.set_status(message),
+            Some((StatusKind::Warning, message)) => self.set_status_warning(message),
+            Some((StatusKind::Error, message)) => self.set_status_error(message),
+            None => {}
+        }
+    }
+
+    /// The host loaded a broken `config/input.ron`: the first mapping save backs it up.
+    pub fn set_input_map_broken(&mut self, broken: bool) {
+        self.project_settings.set_broken_on_load(broken);
     }
 
     pub fn selected_entity(&self) -> Option<Entity> {
@@ -577,7 +601,10 @@ impl Editor {
             .map_or(1.0 / 60.0, |t| t.delta_seconds);
         self.tick_frame_time(dt);
         self.poll_dialog(world);
-        self.handle_shortcuts(world, ui);
+        // A rebinding capture swallows this frame's keys (Esc cancels it, not ReleaseGame).
+        if !self.project_settings.capturing() {
+            self.handle_shortcuts(world, ui);
+        }
         self.viewport_shown = false;
 
         egui::Panel::top("menu_bar")
@@ -605,6 +632,7 @@ impl Editor {
             )
             .show(ui, |ui| self.status_bar(world, ui));
         self.about_window(ui);
+        self.project_settings_window(world, ui);
 
         // Dockable panels fill the rest of the window.
         self.overlay_draws.clear();

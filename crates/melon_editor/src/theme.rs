@@ -51,6 +51,9 @@ pub mod sizes {
     pub const LEFT_PANE: f32 = 220.0;
     pub const RIGHT_PANE: f32 = 260.0;
     pub const BOTTOM_PANE: f32 = 200.0;
+    pub const SETTINGS_WINDOW: egui::Vec2 = egui::vec2(720.0, 420.0);
+    pub const SETTINGS_SECTIONS: f32 = 140.0;
+    pub const SETTINGS_NAME: f32 = 140.0;
 }
 
 /// Apply the editor theme (dark) to every egui style.

@@ -269,6 +269,8 @@ struct App {
     core: melon_core::Core,
     /// Last `GameInputGate` value applied (input routing and cursor grab).
     game_input: bool,
+    /// `config/input.ron` failed to load: the editor backs it up before its first save.
+    input_map_broken: bool,
     last_frame: Option<Instant>,
 }
 
@@ -322,6 +324,26 @@ impl App {
         // Asset paths are relative to the project root (the source tree in dev builds).
         core.world
             .insert_resource(melon_core::AssetServer::new(PROJECT_ROOT.into()));
+        let map_path = melon_editor::project_settings::mapping_path(PROJECT_ROOT.as_ref());
+        let (input_map, outcome) = melon_core::InputMap::load(&map_path);
+        let input_map_broken = match outcome {
+            melon_core::LoadOutcome::Loaded => false,
+            melon_core::LoadOutcome::Missing => {
+                tracing::info!(
+                    "{} not found; using the default input mapping",
+                    map_path.display()
+                );
+                false
+            }
+            melon_core::LoadOutcome::Broken(message) => {
+                tracing::error!(
+                    "{} is broken ({message}); using the default input mapping",
+                    map_path.display()
+                );
+                true
+            }
+        };
+        core.world.insert_resource(input_map);
         let mut physics = PhysicsWorld::new();
         spawn_default_scene(&mut core.world, &mut physics);
         core.world.insert_resource(physics);
@@ -348,6 +370,7 @@ impl App {
             viewport_target: None,
             core,
             game_input: false,
+            input_map_broken,
             last_frame: None,
         }
     }
@@ -420,6 +443,7 @@ impl ApplicationHandler for App {
         // shortcut: the project root is the source tree, fixed at compile time;
         // ship builds need a real project path (CLI argument or project file).
         editor_ui.set_project_root(std::path::Path::new(PROJECT_ROOT));
+        editor_ui.set_input_map_broken(self.input_map_broken);
 
         let size = renderer.size();
         let aspect = size.width as f32 / size.height.max(1) as f32;
