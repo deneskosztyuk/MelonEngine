@@ -131,3 +131,41 @@ impl Snapshot {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rapier3d::dynamics::RigidBodyBuilder;
+    use rapier3d::geometry::ColliderBuilder;
+    use std::time::Instant;
+
+    /// Prints the per-step cost of the snapshot copy with 1,000 bodies.
+    #[test]
+    fn snapshot_copy_of_a_thousand_bodies_is_cheap() {
+        let mut world = PhysicsWorld::new();
+        for i in 0..1000 {
+            let p = Vec3::new(
+                (i % 10) as f32 * 2.0,
+                (i / 100) as f32 * 2.0,
+                (i / 10 % 10) as f32 * 2.0,
+            );
+            let body = world
+                .bodies
+                .insert(RigidBodyBuilder::dynamic().translation(p).build());
+            world.colliders.insert_with_parent(
+                ColliderBuilder::cuboid(0.5, 0.5, 0.5).build(),
+                body,
+                &mut world.bodies,
+            );
+        }
+        world.step();
+        let n = 50;
+        let start = Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(Snapshot::of(&world));
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        println!("snapshot copy, 1000 bodies: {ms:.3} ms per step");
+        assert!(ms < 16.0, "{ms} ms is a whole frame");
+    }
+}

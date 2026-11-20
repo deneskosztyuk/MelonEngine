@@ -34,13 +34,35 @@ pub fn character_controller_system(world: &mut World) {
         let (cc, desired) = {
             let mut cc = world.get_mut::<CharacterController>(e).expect("queried");
             let desired = cc.take_desired();
-            (cc.clone(), desired)
+            (
+                cc.clone(),
+                if desired.is_finite() {
+                    desired
+                } else {
+                    Vec3::ZERO
+                },
+            )
         };
         let (scale, rotation, translation) = world_matrix(world, e).to_scale_rotation_translation();
         let moved = world.resource_scope(|_, physics: bevy_ecs::prelude::Mut<PhysicsWorld>| {
             let collider = physics.colliders.get(handle)?;
             let shape = collider.shared_shape().clone();
             let groups = collider.collision_groups();
+            // Hand-typed numbers rapier panics on (a NaN or negative offset) fall back.
+            let ok = |v: f32, fallback: f32| {
+                if v.is_finite() && v >= 0.0 {
+                    v
+                } else {
+                    fallback
+                }
+            };
+            let cc = CharacterController {
+                offset: ok(cc.offset, 0.01),
+                max_slope: ok(cc.max_slope, 45.0),
+                max_step_height: ok(cc.max_step_height, 0.0),
+                snap_to_ground: ok(cc.snap_to_ground, 0.0),
+                ..cc
+            };
             let controller = KinematicCharacterController {
                 offset: CharacterLength::Absolute(cc.offset),
                 max_slope_climb_angle: cc.max_slope.to_radians(),

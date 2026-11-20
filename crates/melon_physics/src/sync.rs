@@ -49,6 +49,75 @@ pub(crate) struct BuiltJoint {
     parent: RigidBodyHandle,
 }
 
+/// Smallest size a collider shape gets (metres).
+const MIN_SIZE: f32 = 1e-3;
+
+/// A size rapier can take: finite and at least `MIN_SIZE`.
+fn size(v: f32) -> f32 {
+    if v.is_finite() {
+        v.max(MIN_SIZE)
+    } else {
+        MIN_SIZE
+    }
+}
+
+/// `v` if finite and not below `floor`, else `fallback`.
+fn at_least(v: f32, floor: f32, fallback: f32, dirty: &mut bool) -> f32 {
+    if v.is_finite() && v >= floor {
+        v
+    } else {
+        *dirty = true;
+        fallback
+    }
+}
+
+/// The collider with every number rapier cannot take (zero, negative or
+/// non-finite sizes, non-finite friction) replaced, and whether any was.
+/// Comparing the cleaned copy also stops a NaN from rebuilding every frame.
+fn clean_collider(c: &Collider) -> (Collider, bool) {
+    let mut dirty = false;
+    let mut out = c.clone();
+    let mut fix = |v: f32| {
+        let s = size(v);
+        dirty |= s != v;
+        s
+    };
+    out.shape = match c.shape {
+        ColliderShape::Box { half_extents: h } => ColliderShape::Box {
+            half_extents: Vec3::new(fix(h.x), fix(h.y), fix(h.z)),
+        },
+        ColliderShape::Sphere { radius } => ColliderShape::Sphere {
+            radius: fix(radius),
+        },
+        ColliderShape::Capsule {
+            half_height,
+            radius,
+        } => ColliderShape::Capsule {
+            half_height: fix(half_height),
+            radius: fix(radius),
+        },
+        ColliderShape::Mesh => ColliderShape::Mesh,
+    };
+    out.friction = at_least(c.friction, 0.0, 0.5, &mut dirty);
+    out.restitution = at_least(c.restitution, 0.0, 0.0, &mut dirty);
+    (out, dirty)
+}
+
+/// The body with mass, damping and gravity scale rapier can take, and
+/// whether any was replaced.
+fn clean_body(rb: &RigidBody) -> (RigidBody, bool) {
+    let mut dirty = false;
+    let mut out = rb.clone();
+    out.mass = at_least(rb.mass, 0.0, 0.0, &mut dirty);
+    out.linear_damping = at_least(rb.linear_damping, 0.0, 0.0, &mut dirty);
+    out.angular_damping = at_least(rb.angular_damping, 0.0, 0.0, &mut dirty);
+    if !rb.gravity_scale.is_finite() {
+        dirty = true;
+        out.gravity_scale = 1.0;
+    }
+    (out, dirty)
+}
+
 fn body_type(kind: RigidBodyKind) -> RigidBodyType {
     match kind {
         RigidBodyKind::Dynamic => RigidBodyType::Dynamic,
@@ -183,6 +252,7 @@ fn sync_bodies(world: &mut World, physics: &mut PhysicsWorld) {
         .map(|(e, rb)| (e, rb.clone()))
         .collect();
     for (e, rb) in items {
+        let (rb, dirty) = clean_body(&rb);
         let existing = world
             .get::<RigidBodyComponent>(e)
             .filter(|c| physics.bodies.contains(c.body_handle))
@@ -190,6 +260,11 @@ fn sync_bodies(world: &mut World, physics: &mut PhysicsWorld) {
         match existing {
             Some((_, built)) if built == rb => {}
             Some((handle, built)) => {
+                if dirty {
+                    tracing::warn!(
+                        "rigid body of entity {e}: invalid mass, damping or gravity scale replaced"
+                    );
+                }
                 let body = physics.bodies.get_mut(handle).expect("checked above");
                 if built.kind != rb.kind {
                     body.set_body_type(body_type(rb.kind), true);
@@ -209,6 +284,11 @@ fn sync_bodies(world: &mut World, physics: &mut PhysicsWorld) {
                 c.built = rb;
             }
             None => {
+                if dirty {
+                    tracing::warn!(
+                        "rigid body of entity {e}: invalid mass, damping or gravity scale replaced"
+                    );
+                }
                 let (translation, rotation, _) = world_pose(world, e);
                 let builder = match rb.kind {
                     RigidBodyKind::Dynamic => RigidBodyBuilder::dynamic(),
@@ -267,8 +347,12 @@ fn build_collider(
     mass: f32,
     pose: Pose,
 ) -> Option<rapier3d::geometry::Collider> {
-    let s = scale.abs().max(Vec3::splat(1e-3));
-    let min = |v: f32| v.max(1e-3);
+    let s = Vec3::new(
+        size(scale.x.abs()),
+        size(scale.y.abs()),
+        size(scale.z.abs()),
+    );
+    let min = size;
     let builder = match c.shape {
         ColliderShape::Box { half_extents } => ColliderBuilder::cuboid(
             min(half_extents.x * s.x),
@@ -328,6 +412,7 @@ fn sync_colliders(world: &mut World, physics: &mut PhysicsWorld) {
         }
     }
     for ((e, c), owner) in items.into_iter().zip(owners) {
+        let (c, dirty) = clean_collider(&c);
         let (translation, rotation, scale) = collider_pose(world, e, owner);
         let mass = owner
             .filter(|_| !c.sensor)
@@ -373,6 +458,9 @@ fn sync_colliders(world: &mut World, physics: &mut PhysicsWorld) {
             if let Some(h) = handle.filter(|h| physics.colliders.contains(*h)) {
                 physics.remove_collider(h);
             }
+        }
+        if dirty {
+            tracing::warn!("collider of entity {e}: size or friction out of range, replaced");
         }
         let handle = build_collider(world, e, &c, scale, mass, pose).map(|co| match owner {
             Some(o) => {

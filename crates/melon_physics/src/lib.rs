@@ -1423,4 +1423,608 @@ mod tests {
                 .is_none()
         );
     }
+
+    // ---- edge cases ----
+
+    mod edge {
+        use super::*;
+
+        fn handle_of(c: &Core, e: Entity) -> Option<ColliderHandle> {
+            c.world.get::<ColliderComponent>(e).unwrap().collider_handle
+        }
+
+        fn sized(shape: ColliderShape) -> Collider {
+            Collider {
+                shape,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn zero_negative_nan_and_infinite_sizes_never_panic() {
+            let bad = [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+            for v in bad {
+                let mut c = core();
+                floor(&mut c);
+                let shapes = [
+                    ColliderShape::Box {
+                        half_extents: Vec3::new(v, v, v),
+                    },
+                    ColliderShape::Sphere { radius: v },
+                    ColliderShape::Capsule {
+                        half_height: v,
+                        radius: v,
+                    },
+                ];
+                let ents: Vec<Entity> = shapes
+                    .into_iter()
+                    .map(|s| dynamic(&mut c, at(0.0, 3.0, 0.0), sized(s)))
+                    .collect();
+                frames(&mut c, 30);
+                for e in ents {
+                    assert!(handle_of(&c, e).is_some(), "size {v} built nothing");
+                    let y = height(&c, e);
+                    assert!(y.is_finite(), "size {v} gave y {y}");
+                }
+            }
+        }
+
+        #[test]
+        fn nan_size_does_not_rebuild_the_collider_every_frame() {
+            let mut c = core();
+            let e = c
+                .world
+                .spawn((
+                    at(0.0, 0.0, 0.0),
+                    sized(ColliderShape::Sphere { radius: f32::NAN }),
+                ))
+                .id();
+            frames(&mut c, 2);
+            let first = handle_of(&c, e);
+            frames(&mut c, 5);
+            assert_eq!(handle_of(&c, e), first, "rebuilt although nothing changed");
+        }
+
+        #[test]
+        fn bad_mass_damping_and_friction_never_panic() {
+            let bad = [0.0, -5.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+            for v in bad {
+                let mut c = core();
+                floor(&mut c);
+                let e = c
+                    .world
+                    .spawn((
+                        at(0.0, 3.0, 0.0),
+                        RigidBody {
+                            mass: v,
+                            linear_damping: v,
+                            angular_damping: v,
+                            ..Default::default()
+                        },
+                        Collider {
+                            friction: v,
+                            restitution: v,
+                            ..Default::default()
+                        },
+                    ))
+                    .id();
+                frames(&mut c, 60);
+                // Edited live too: the update path must not panic either.
+                c.world.get_mut::<RigidBody>(e).unwrap().mass = v;
+                c.world.get_mut::<RigidBody>(e).unwrap().gravity_scale = v;
+                frames(&mut c, 5);
+                let y = height(&c, e);
+                assert!(y.is_finite(), "value {v} gave y {y}");
+            }
+        }
+
+        fn turned_scaled_root() -> Transform {
+            let mut t = at(10.0, 0.0, 0.0);
+            t.scale = Vec3::splat(2.0);
+            t.rotation = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+            t
+        }
+
+        /// root (scale 2, turned 90 degrees about Y) > mid > leaf with a collider.
+        fn deep_leaf(c: &mut Core, root_extra: impl bevy_ecs::bundle::Bundle) -> Entity {
+            let root = c.world.spawn((turned_scaled_root(), root_extra)).id();
+            let mid = c.world.spawn((at(0.0, 1.0, 0.0), ChildOf(root))).id();
+            c.world
+                .spawn((at(1.0, 0.0, 0.0), cube(), ChildOf(mid)))
+                .id()
+        }
+
+        fn assert_leaf_pose(c: &Core, leaf: Entity) {
+            let h = handle_of(c, leaf).unwrap();
+            let pw = c.world.resource::<PhysicsWorld>();
+            let co = pw.colliders.get(h).unwrap();
+            // Local (1,1,0) * 2 = (2,2,0), turned 90 degrees about Y: (0,2,-2), plus the root.
+            let p = co.position().translation;
+            assert!((p - Vec3::new(10.0, 2.0, -2.0)).length() < 1e-3, "{p}");
+            let he = co.shape().as_cuboid().unwrap().half_extents;
+            assert!((he - Vec3::splat(1.0)).length() < 1e-3, "{he}");
+            // World pose, also when the collider hangs on a body.
+            let r = co.position().rotation;
+            let want = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+            assert!(r.angle_between(want) < 1e-3, "{r}");
+        }
+
+        #[test]
+        fn static_collider_on_a_deep_child_of_a_scaled_rotated_parent() {
+            let mut c = core();
+            let leaf = deep_leaf(&mut c, ());
+            frames(&mut c, 2);
+            assert_leaf_pose(&c, leaf);
+        }
+
+        #[test]
+        fn body_collider_on_a_deep_child_of_a_scaled_rotated_body() {
+            let mut c = core();
+            gravity_off(&mut c);
+            let leaf = deep_leaf(&mut c, RigidBody::default());
+            frames(&mut c, 2);
+            assert!(
+                c.world
+                    .resource::<PhysicsWorld>()
+                    .colliders
+                    .get(handle_of(&c, leaf).unwrap())
+                    .unwrap()
+                    .parent()
+                    .is_some(),
+                "attached to the ancestor body"
+            );
+            assert_leaf_pose(&c, leaf);
+        }
+
+        #[test]
+        fn removing_the_body_keeps_the_collider_as_a_static_one() {
+            let mut c = core();
+            let e = dynamic(&mut c, at(0.0, 3.0, 0.0), cube());
+            frames(&mut c, 3);
+            c.world.entity_mut(e).remove::<RigidBody>();
+            let y = height(&c, e);
+            frames(&mut c, 60);
+            let pw = c.world.resource::<PhysicsWorld>();
+            assert_eq!((pw.bodies.len(), pw.colliders.len()), (0, 1));
+            let co = pw.colliders.get(handle_of(&c, e).unwrap()).unwrap();
+            assert!(co.parent().is_none(), "no body");
+            assert!((height(&c, e) - y).abs() < 1e-6, "static: never moves");
+            // And it is solid: a ball lands on it.
+            let ball = dynamic(
+                &mut c,
+                at(0.0, y + 4.0, 0.0),
+                sized(ColliderShape::Sphere { radius: 0.5 }),
+            );
+            frames(&mut c, 240);
+            let ball_y = height(&c, ball);
+            assert!((ball_y - (y + 1.0)).abs() < 0.05, "{ball_y}");
+        }
+
+        #[test]
+        fn moving_a_static_collider_moves_it_in_rapier() {
+            let mut c = core();
+            let e = c.world.spawn((at(0.0, 0.0, 0.0), cube())).id();
+            frames(&mut c, 2);
+            c.world.get_mut::<Transform>(e).unwrap().translation.x = 7.0;
+            frames(&mut c, 2);
+            let pw = c.world.resource::<PhysicsWorld>();
+            let p = pw
+                .colliders
+                .get(handle_of(&c, e).unwrap())
+                .unwrap()
+                .position();
+            assert!((p.translation.x - 7.0).abs() < 1e-4);
+        }
+
+        #[derive(Component)]
+        struct Slider;
+
+        fn slide(mut q: Query<&mut Transform, With<Slider>>) {
+            for mut t in &mut q {
+                t.translation.x += 0.05;
+            }
+        }
+
+        #[test]
+        fn kinematic_body_moved_in_fixed_update_pushes_dynamic_bodies() {
+            let mut c = core();
+            gravity_off(&mut c);
+            c.add_systems(FixedUpdate, slide.before(sync_to_physics_system));
+            c.world.spawn((
+                at(0.0, 0.0, 0.0),
+                RigidBody {
+                    kind: RigidBodyKind::Kinematic,
+                    ..Default::default()
+                },
+                cube(),
+                Slider,
+            ));
+            let pushed = dynamic(&mut c, at(1.2, 0.0, 0.0), cube());
+            frames(&mut c, 120);
+            // The wall travelled 6 m; the box is ahead of it.
+            let x = c.world.get::<Transform>(pushed).unwrap().translation.x;
+            assert!(x > 4.0, "box was not pushed: x {x}");
+        }
+
+        #[test]
+        fn sensors_report_only_trigger_events() {
+            let mut c = events_core();
+            c.world.spawn((
+                at(0.0, 0.0, 0.0),
+                Collider {
+                    shape: ColliderShape::Box {
+                        half_extents: Vec3::splat(1.0),
+                    },
+                    sensor: true,
+                    ..Default::default()
+                },
+            ));
+            dynamic(&mut c, at(0.0, 4.0, 0.0), cube());
+            frames(&mut c, 120);
+            assert!(kinds(&c, CollisionEventKind::Started).is_empty());
+            assert!(kinds(&c, CollisionEventKind::Ended).is_empty());
+            assert!(!kinds(&c, CollisionEventKind::TriggerEntered).is_empty());
+        }
+
+        #[test]
+        fn events_of_a_pair_are_not_duplicated_across_substeps() {
+            let mut c = events_core();
+            let f = floor(&mut c);
+            let body = dynamic(&mut c, at(0.0, 1.2, 0.0), cube());
+            // Three fixed steps per frame.
+            run_frames(&mut c, 3.0 / 60.0, 60);
+            let started = kinds(&c, CollisionEventKind::Started);
+            assert_eq!(started.len(), 1, "{started:?}");
+            assert!(between(&started[0], f, body));
+            // Resting for a long time adds nothing.
+            run_frames(&mut c, 3.0 / 60.0, 200);
+            assert_eq!(kinds(&c, CollisionEventKind::Started).len(), 1);
+            assert!(kinds(&c, CollisionEventKind::Ended).is_empty());
+        }
+
+        fn layered(membership: u32, filter: u32) -> Collider {
+            Collider {
+                membership,
+                filter,
+                ..Default::default()
+            }
+        }
+
+        /// Height a box ends at over a floor, with the two (membership, filter) masks.
+        fn rest_height(floor_mask: (u32, u32), body_mask: (u32, u32)) -> f32 {
+            let mut c = core();
+            c.world.spawn((
+                at(0.0, 0.0, 0.0),
+                Collider {
+                    shape: ColliderShape::Box {
+                        half_extents: Vec3::new(20.0, 0.5, 20.0),
+                    },
+                    ..layered(floor_mask.0, floor_mask.1)
+                },
+            ));
+            let e = dynamic(&mut c, at(0.0, 3.0, 0.0), layered(body_mask.0, body_mask.1));
+            frames(&mut c, 120);
+            height(&c, e)
+        }
+
+        #[test]
+        fn collision_layers_filter_in_both_directions() {
+            // Control: both accept each other.
+            assert!((rest_height((1, 2), (2, 1)) - 1.0).abs() < 0.05);
+            // The floor does not accept the body's layer.
+            assert!(rest_height((1, 4), (2, u32::MAX)) < 0.0);
+            // The body does not accept the floor's layer.
+            assert!(rest_height((1, u32::MAX), (2, 4)) < 0.0);
+        }
+
+        #[test]
+        fn raycast_from_inside_a_collider_hits_it_at_distance_zero() {
+            let (c, f) = queries_core();
+            let hit = queries(&c)
+                .raycast(Vec3::ZERO, Vec3::X, 10.0, &QueryFilter::default())
+                .expect("the ray starts in the floor");
+            assert_eq!(hit.entity, f);
+            assert_eq!(hit.distance, 0.0);
+            assert!(hit.point.is_finite() && hit.normal.is_finite());
+        }
+
+        #[test]
+        fn raycast_all_orders_many_hits_by_distance() {
+            let (mut c, _) = queries_core();
+            // Spawned in a scrambled order, well apart.
+            let spawned: Vec<(f32, Entity)> = [6.0, 2.0, 8.0, 4.0]
+                .iter()
+                .map(|y| (*y, c.world.spawn((at(0.0, *y, 0.0), cube())).id()))
+                .collect();
+            frames(&mut c, 1);
+            let hits = queries(&c).raycast_all(
+                Vec3::new(0.0, 20.0, 0.0),
+                -Vec3::Y,
+                100.0,
+                &QueryFilter::default(),
+            );
+            assert_eq!(hits.len(), 5);
+            assert!(hits.windows(2).all(|w| w[0].distance <= w[1].distance));
+            let mut by_height = spawned;
+            by_height.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let expected: Vec<Entity> = by_height.into_iter().map(|(_, e)| e).collect();
+            let got: Vec<Entity> = hits.iter().take(4).map(|h| h.entity).collect();
+            assert_eq!(got, expected);
+        }
+
+        #[test]
+        fn queries_find_nothing_before_the_first_step() {
+            let mut c = core();
+            floor(&mut c);
+            // The collider exists after a sync, but no fixed step has run yet.
+            sync_components_system(&mut c.world);
+            let f = QueryFilter::default();
+            let from = Vec3::new(0.0, 5.0, 0.0);
+            let q = queries(&c);
+            assert!(q.raycast(from, -Vec3::Y, 50.0, &f).is_none());
+            assert!(q.overlap_sphere(Vec3::ZERO, 5.0, &f).is_empty());
+            assert!(q.sphere_cast(from, 0.5, -Vec3::Y, 50.0, &f).is_none());
+            assert!(
+                q.overlap_box(Vec3::ZERO, Vec3::ONE, Quat::IDENTITY, &f)
+                    .is_empty()
+            );
+            // After one step the floor is visible.
+            frames(&mut c, 1);
+            assert!(queries(&c).raycast(from, -Vec3::Y, 50.0, &f).is_some());
+        }
+
+        #[test]
+        fn degenerate_query_arguments_do_not_panic() {
+            let (c, _) = queries_core();
+            let q = queries(&c);
+            let f = QueryFilter::default();
+            let o = Vec3::new(0.0, 5.0, 0.0);
+            assert!(q.raycast(o, Vec3::ZERO, 10.0, &f).is_none());
+            assert!(q.raycast(o, Vec3::splat(f32::NAN), 10.0, &f).is_none());
+            let _ = q.raycast(o, -Vec3::Y, f32::NAN, &f);
+            let _ = q.sphere_cast(o, 0.0, -Vec3::Y, 10.0, &f);
+            let _ = q.sphere_cast(o, -1.0, -Vec3::Y, 10.0, &f);
+            let _ = q.overlap_sphere(o, -1.0, &f);
+            let _ = q.overlap_sphere(o, f32::NAN, &f);
+            let _ = q.overlap_box(o, Vec3::splat(-1.0), Quat::IDENTITY, &f);
+        }
+
+        // ---- character controller ----
+
+        fn grounded_run(c: &mut Core, e: Entity, n: u32) -> Vec<bool> {
+            (0..n)
+                .map(|_| {
+                    frames(c, 1);
+                    controller(c, e).grounded
+                })
+                .collect()
+        }
+
+        fn stand(mut q: Query<&mut CharacterController>) {
+            for mut cc in &mut q {
+                cc.move_by(Vec3::new(0.0, -0.02, 0.0));
+            }
+        }
+
+        #[test]
+        fn grounded_does_not_flicker_while_standing_or_walking_on_flat_ground() {
+            for walking in [false, true] {
+                let mut c = core();
+                if walking {
+                    c.add_systems(FixedUpdate, walk_east.before(character_controller_system));
+                } else {
+                    c.add_systems(FixedUpdate, stand.before(character_controller_system));
+                }
+                floor(&mut c);
+                // Starts just above the ground; the floor is 40 m wide, walking is 0.1 m a step.
+                let e = character(&mut c, 1.33);
+                frames(&mut c, 20);
+                let g = grounded_run(&mut c, e, 150);
+                assert!(g.iter().all(|g| *g), "walking {walking}: flickered {g:?}");
+            }
+        }
+
+        #[test]
+        fn character_stays_grounded_on_a_moving_kinematic_platform() {
+            let mut c = core();
+            c.add_systems(FixedUpdate, stand.before(character_controller_system));
+            c.add_systems(FixedUpdate, slide.before(sync_to_physics_system));
+            c.world.spawn((
+                at(0.0, 0.0, 0.0),
+                RigidBody {
+                    kind: RigidBodyKind::Kinematic,
+                    ..Default::default()
+                },
+                Collider {
+                    shape: ColliderShape::Box {
+                        half_extents: Vec3::new(30.0, 0.5, 5.0),
+                    },
+                    ..Default::default()
+                },
+                Slider,
+            ));
+            let e = character(&mut c, 2.0);
+            frames(&mut c, 60);
+            let g = grounded_run(&mut c, e, 120);
+            assert!(g.iter().all(|g| *g), "lost the platform: {g:?}");
+            let t = c.world.get::<Transform>(e).unwrap().translation;
+            assert!(t.is_finite() && (t.y - 1.31).abs() < 0.1, "{t}");
+        }
+
+        #[test]
+        fn character_walking_off_a_ledge_stops_being_grounded_and_falls() {
+            let mut c = character_core();
+            c.world.spawn((
+                at(0.0, 0.0, 0.0),
+                Collider {
+                    shape: ColliderShape::Box {
+                        half_extents: Vec3::new(4.0, 0.5, 5.0),
+                    },
+                    ..Default::default()
+                },
+            ));
+            let e = character(&mut c, 1.33);
+            frames(&mut c, 10);
+            assert!(controller(&c, e).grounded);
+            frames(&mut c, 200);
+            assert!(!controller(&c, e).grounded, "still grounded past the edge");
+            assert!(height(&c, e) < 1.3, "did not fall: {}", height(&c, e));
+        }
+
+        #[test]
+        fn nan_joint_and_character_parameters_never_panic_or_poison_the_transform() {
+            let n = f32::NAN;
+            let mut c = character_core();
+            floor(&mut c);
+            let (parent, child) = jointed_pair(&mut c);
+            for kind in [
+                JointKind::Hinge {
+                    axis: Vec3::splat(n),
+                    limited: true,
+                    min: n,
+                    max: n,
+                },
+                JointKind::Slider {
+                    axis: Vec3::ZERO,
+                    limited: true,
+                    min: 1.0,
+                    max: -1.0,
+                },
+                JointKind::Ball {
+                    limited: true,
+                    cone_limit: n,
+                },
+            ] {
+                c.world.get_mut::<Joint>(child).unwrap().kind = kind;
+                c.world.get_mut::<Joint>(child).unwrap().anchor = Vec3::splat(n);
+                frames(&mut c, 5);
+            }
+            let _ = parent;
+            let e = character(&mut c, 1.33);
+            {
+                let mut cc = c.world.get_mut::<CharacterController>(e).unwrap();
+                cc.max_slope = n;
+                cc.offset = n;
+                cc.max_step_height = n;
+                cc.snap_to_ground = n;
+            }
+            frames(&mut c, 10);
+            {
+                let mut cc = c.world.get_mut::<CharacterController>(e).unwrap();
+                cc.max_slope = -5.0;
+                cc.offset = -1.0;
+                cc.max_step_height = -1.0;
+                cc.snap_to_ground = -1.0;
+            }
+            frames(&mut c, 10);
+            let t = c.world.get::<Transform>(e).unwrap().translation;
+            assert!(t.is_finite(), "{t}");
+        }
+
+        fn nan_mover(mut q: Query<&mut CharacterController>) {
+            for mut cc in &mut q {
+                cc.move_by(Vec3::splat(f32::NAN));
+            }
+        }
+
+        #[test]
+        fn a_nan_move_request_leaves_the_character_where_it_is() {
+            let mut c = core();
+            c.add_systems(FixedUpdate, nan_mover.before(character_controller_system));
+            floor(&mut c);
+            let e = character(&mut c, 1.33);
+            frames(&mut c, 10);
+            let t = c.world.get::<Transform>(e).unwrap().translation;
+            assert!(t.is_finite(), "{t}");
+        }
+
+        // ---- joints ----
+
+        fn jointed_pair(c: &mut Core) -> (Entity, Entity) {
+            let parent = c
+                .world
+                .spawn((
+                    at(0.0, 5.0, 0.0),
+                    RigidBody {
+                        kind: RigidBodyKind::Fixed,
+                        ..Default::default()
+                    },
+                ))
+                .id();
+            let child = c
+                .world
+                .spawn((
+                    at(0.0, -1.0, 0.0),
+                    RigidBody::default(),
+                    cube(),
+                    Joint {
+                        anchor: Vec3::new(0.0, 1.0, 0.0),
+                        ..Default::default()
+                    },
+                    ChildOf(parent),
+                ))
+                .id();
+            (parent, child)
+        }
+
+        #[test]
+        fn deleting_the_ancestor_body_of_a_joint_removes_it_without_panic() {
+            let mut c = core();
+            let (parent, child) = jointed_pair(&mut c);
+            frames(&mut c, 5);
+            assert_eq!(c.world.resource::<PhysicsWorld>().impulse_joints.len(), 1);
+            melon_core::hierarchy::mark_for_delete(&mut c.world, parent);
+            frames(&mut c, 3);
+            let pw = c.world.resource::<PhysicsWorld>();
+            assert_eq!(pw.impulse_joints.len(), 0);
+            assert!(pw.colliders.is_empty());
+            assert!(c.world.get_entity(child).is_err());
+        }
+
+        #[test]
+        fn removing_only_the_ancestor_body_reattaches_the_joint_to_the_world() {
+            let mut c = core();
+            let (parent, child) = jointed_pair(&mut c);
+            frames(&mut c, 5);
+            c.world.entity_mut(parent).remove::<RigidBody>();
+            frames(&mut c, 3);
+            assert_eq!(c.world.resource::<PhysicsWorld>().impulse_joints.len(), 1);
+            assert!(c.world.get::<JointComponent>(child).is_some());
+            frames(&mut c, 60);
+            assert!(height(&c, child).is_finite());
+        }
+
+        #[test]
+        fn despawning_a_jointed_body_without_the_marker_removes_its_joint() {
+            let mut c = core();
+            let (_, child) = jointed_pair(&mut c);
+            frames(&mut c, 5);
+            c.world.despawn(child);
+            frames(&mut c, 3);
+            assert_eq!(c.world.resource::<PhysicsWorld>().impulse_joints.len(), 0);
+        }
+
+        // ---- mesh colliders ----
+
+        #[test]
+        fn mesh_collider_with_a_missing_or_broken_file_builds_nothing() {
+            let dir = std::env::temp_dir().join("melon_physics_broken_mesh");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("broken.glb"), b"glTF this is not a model").unwrap();
+            std::fs::write(dir.join("empty.glb"), b"").unwrap();
+            let mut c = core();
+            c.world.insert_resource(melon_core::AssetServer::new(dir));
+            let mut ents = Vec::new();
+            for path in ["missing.glb", "broken.glb", "empty.glb", "broken.glb#mesh9"] {
+                let h: melon_core::Handle<melon_core::Model> =
+                    c.world.resource_mut::<melon_core::AssetServer>().load(path);
+                ents.push(c.world.spawn((at(0.0, 0.0, 0.0), mesh_collider(), h)).id());
+            }
+            frames(&mut c, 5);
+            for e in ents {
+                assert!(handle_of(&c, e).is_none());
+            }
+            assert_eq!(c.world.resource::<PhysicsWorld>().colliders.len(), 0);
+        }
+    }
 }
