@@ -2409,9 +2409,11 @@ name = "melon_render"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bevy_ecs",
  "bytemuck",
  "glam 0.33.2",
  "gltf",
+ "half",
  "image",
  "melon_core",
  "pollster 0.4.0",

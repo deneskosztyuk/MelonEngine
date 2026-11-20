@@ -16,6 +16,9 @@ pub mod components;
 pub mod cursor;
 pub mod hierarchy;
 pub mod input;
+pub mod local_lights;
+pub mod lod;
+pub mod material;
 pub mod pack;
 pub mod package;
 pub mod physics;
@@ -32,7 +35,9 @@ pub mod stages;
 pub use actions::{
     Action, ActionKind, Actions, AxisBinding, InputMap, LoadOutcome, update_actions_system,
 };
-pub use assets::{AssetGuid, AssetMeta, AssetServer, Handle, META_VERSION, Model, meta_path};
+pub use assets::{
+    AssetGuid, AssetMeta, AssetServer, Handle, META_VERSION, Material, Model, Texture, meta_path,
+};
 pub use audio::{
     AudioBus, AudioClip, AudioListener, AudioPreview, AudioRequest, AudioRequests, AudioSettings,
     AudioSource,
@@ -48,6 +53,9 @@ pub use cursor::{AppExit, Cursor, CursorMode};
 pub use glam;
 pub use hierarchy::{ChildOf, Children, GlobalTransform};
 pub use input::{GameInputGate, Input, InputButton, InputFocus, KeyCode, MouseButton, RawPresses};
+pub use local_lights::{PointLight, SpotLight};
+pub use lod::{Lod, LodLevel, LodState};
+pub use material::{AlphaMode, MaterialAsset, MaterialSlot, MeshMaterials, TextureRef};
 pub use physics::{
     CharacterController, Collider, ColliderShape, CollisionEvent, CollisionEventKind, Joint,
     JointKind, PhysicsQueries, PhysicsRequest, PhysicsRequests, QueryBackend, QueryFilter, RayHit,
@@ -202,7 +210,11 @@ impl Core {
             .register_component::<Spin>()
             .register_component::<Bob>()
             .register_component::<AudioSource>()
-            .register_component::<AudioListener>();
+            .register_component::<AudioListener>()
+            .register_component::<MeshMaterials>()
+            .register_component::<PointLight>()
+            .register_component::<SpotLight>()
+            .register_component::<Lod>();
         core
     }
 

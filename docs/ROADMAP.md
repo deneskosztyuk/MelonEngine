@@ -84,10 +84,13 @@ one; 10 comes after.
       no hand-listed `SceneEntity`); an agent can build levels as RON data.
       Next step: prefabs, built on the same registry.
 2. - [x] **Undo / Redo** (snapshot history, `history.rs`), plus entity rename and duplicate.
-3. - [ ] **Rendering:** `Handle<Texture>` / `Handle<Material>` assets; point
-      and spot lights; image-based ambient; cascaded sun shadows, then
-      point/spot shadows; LOD. (PBR, sky, GI, instancing and culling are
-      done, see Graphics tier.)
+3. - [x] **Rendering:** `Handle<Texture>` / `Handle<Material>` assets (`.mat`
+      files, `MeshMaterials` per part, alpha mask / blend); point and spot
+      lights (clustered forward); image-based ambient (procedural or HDR
+      sky); cascaded sun shadows; point/spot shadows (atlas, DDGI
+      injection); `Lod` component. Editor: material-on-sphere thumbnails,
+      drag-drop assignment, glTF "Extract Materials". (Done; see AGENTS.md
+      "Rendering" notes.)
 4. - [x] **Physics:** sphere / capsule / trimesh shapes, ray cast and query
       API, triggers and collision events, character controller, joints.
       (Done; see AGENTS.md "Physics".)
@@ -186,7 +189,7 @@ one; 10 comes after.
       live; shadow map 1024/2048/4096 and MSAA 1/2/4 rebuilt in place,
       pipelines cached per sample count; present mode Vsync / Mailbox +
       cap); `Environment` is the look only; SSGI textures allocated only
-      while SSGI runs; default = High, snapshots byte-identical.
+      while SSGI runs; default = High.
 - [x] GPU timings: timestamp queries between the passes, async readback
       ring, 1 s averages into `RenderTimings` (Quality panel cost bar).
 - [x] Frame cap sleeps at the frame start instead of `WaitUntil` (drag

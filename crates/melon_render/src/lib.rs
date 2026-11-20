@@ -1,7 +1,13 @@
 use std::sync::Arc;
 
+mod cascades;
 mod extract;
 pub mod gi;
+mod gltf_materials;
+mod ibl;
+mod lights;
+mod local_shadows;
+mod materials;
 mod models;
 mod overlay;
 mod packed_gltf;
@@ -9,6 +15,8 @@ mod present;
 mod timings;
 
 pub use extract::{FrameData, blends, extract};
+pub use gltf_materials::extract_materials;
+pub use lights::LocalLight;
 pub use overlay::{OverlayDepth, OverlayDraw, OverlayShape, TORUS_TUBE};
 
 /// One node of a glTF file's scene, as the editor spawns it.
@@ -132,6 +140,8 @@ pub use models::ModelCache;
 
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
+use materials::sort_back_to_front;
+use melon_core::{Handle, Model};
 use tracing::instrument;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -292,6 +302,23 @@ pub struct RenderStats {
     pub shadow_draw_calls: u32,
     /// Entities outside the shadow box.
     pub shadow_culled: u32,
+    /// Point / spot lights shaded, and visible ones dropped for
+    /// `RenderQuality::max_lights`.
+    pub lights: u32,
+    pub lights_dropped: u32,
+    /// Lights with shadows this frame, and the shadow views (atlas tiles)
+    /// they drew.
+    pub shadowed_lights: u32,
+    pub shadow_views: u32,
+    /// Shadow-casting lights (beyond `RenderQuality::shadowed_lights`'s
+    /// nearest) that did not fit the shadow atlas and drew unshadowed.
+    pub shadowed_lights_dropped: u32,
+    /// Instances left out of a point / spot shadow view because it already
+    /// holds `MAX_LOCAL_CASTERS` (each tile draws at most that many).
+    pub local_casters_dropped: u32,
+    /// Light-in-cluster entries over the shared index list's capacity; the
+    /// clusters at its end miss lights. 0 when everything fits.
+    pub light_index_overflow: u32,
 }
 
 #[repr(C)]
@@ -306,6 +333,12 @@ struct LightUniform {
     ground_color: [f32; 3],
     _pad2: f32,
     light_view_proj: [[f32; 4]; 4],
+    /// Every shadow cascade's matrix (`cascades::CascadeSet`).
+    cascade_view_proj: [[[f32; 4]; 4]; cascades::MAX_CASCADES],
+    cascade_far: [f32; 4],
+    /// x cascade count, y shadow distance.
+    cascade_info: [f32; 4],
+    cascade_forward: [f32; 4],
 }
 
 #[repr(C)]
@@ -373,7 +406,10 @@ pub struct MaterialUniform {
     pub roughness: f32,
     /// Scales the tangent-space normal map's X and Y.
     pub normal_scale: f32,
-    pub _pad: [f32; 2],
+    /// Alpha-mask cutoff: fragments with alpha below it are discarded;
+    /// 0 = no mask.
+    pub alpha_cutoff: f32,
+    pub _pad: f32,
 }
 
 impl MaterialUniform {
@@ -388,7 +424,11 @@ impl MaterialUniform {
             metallic: pbr.metallic_factor(),
             roughness: pbr.roughness_factor(),
             normal_scale: material.normal_texture().map_or(1.0, |n| n.scale()),
-            _pad: [0.0; 2],
+            alpha_cutoff: match material.alpha_mode() {
+                gltf::material::AlphaMode::Mask => material.alpha_cutoff().unwrap_or(0.5),
+                _ => 0.0,
+            },
+            _pad: 0.0,
         }
     }
 }
@@ -398,6 +438,27 @@ impl MaterialUniform {
 pub struct LineVertex {
     pub position: [f32; 3],
     pub color: [f32; 3],
+}
+
+/// How a material is drawn besides its factors and textures.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Surface {
+    /// Alpha blended: drawn sorted back to front after the opaque pass.
+    pub blend: bool,
+    /// Back faces drawn too.
+    pub double_sided: bool,
+    /// Alpha masked: the prepass and shadow pass discard below the cutoff.
+    pub masked: bool,
+}
+
+impl Surface {
+    pub fn from_gltf(material: &gltf::Material) -> Self {
+        Self {
+            blend: material.alpha_mode() == gltf::material::AlphaMode::Blend,
+            double_sided: material.double_sided(),
+            masked: material.alpha_mode() == gltf::material::AlphaMode::Mask,
+        }
+    }
 }
 
 /// 1x1 textures bound where a material has none.
@@ -417,7 +478,8 @@ const CHECKER_MATERIAL: MaterialUniform = MaterialUniform {
     metallic: 0.0,
     roughness: 0.8,
     normal_scale: 1.0,
-    _pad: [0.0; 2],
+    alpha_cutoff: 0.0,
+    _pad: 0.0,
 };
 
 /// A group 2 bind group: `textures` are base colour, metallic-roughness,
@@ -476,6 +538,10 @@ pub struct LoadedModel {
     pub meshes: Vec<Mesh>,
     /// Per-primitive material (see [`SceneRenderer::create_material_bind_group`]).
     pub material_bind_groups: Vec<wgpu::BindGroup>,
+    /// `Surface` of each material (same order).
+    pub surfaces: Vec<Surface>,
+    /// Local-space bounds of each part (same order).
+    pub part_bounds: Vec<(glam::Vec3, glam::Vec3)>,
     /// Local-space bounds (min, max) of every part, node transforms included.
     pub bounds: (glam::Vec3, glam::Vec3),
 }
@@ -570,6 +636,8 @@ pub const MSAA_SAMPLES: u32 = 4;
 /// Default width and height of the sun's shadow map, in texels;
 /// `RenderQuality::shadow_map_size` sets it per frame.
 pub const SHADOW_MAP_SIZE: u32 = 2048;
+/// Edge of the fixed shadow map the DDGI voxel passes inject the sun with.
+const GI_SHADOW_SIZE: u32 = 2048;
 
 /// Sample counts the pipeline cache has a slot for (1, 2, 4).
 const MSAA_SLOTS: usize = 3;
@@ -599,6 +667,133 @@ struct MsaaPipelines {
     world_lines: wgpu::RenderPipeline,
 }
 
+/// What draws batch by: the model and the id of its material override set
+/// (0 = none).
+type DrawKey = (Handle<Model>, u32);
+
+type MaterialHandle = melon_core::Handle<melon_core::Material>;
+
+/// One view's mesh draws by kind. The prepass lists (`plain`, `masked`)
+/// hold every non-blend draw once; `single` and `two_sided` split the same
+/// draws by culling for the 3D pass (a masked draw is in both).
+#[derive(Default)]
+struct Calls<'a> {
+    plain: Vec<(&'a Mesh, std::ops::Range<u32>)>,
+    masked: Vec<DrawCall<'a>>,
+    single: Vec<DrawCall<'a>>,
+    two_sided: Vec<DrawCall<'a>>,
+    /// Alpha-masked parts drawn with alpha to coverage (MSAA > 1 only).
+    mask: Vec<DrawCall<'a>>,
+    mask_two_sided: Vec<DrawCall<'a>>,
+    /// Far to near, one instance each, with the instance's world position.
+    blend: Vec<(glam::Vec3, DrawCall<'a>)>,
+}
+
+/// One shadow view's draws: plain casters and alpha-masked ones.
+type ShadowDraws<'a> = (Vec<(&'a Mesh, std::ops::Range<u32>)>, Vec<DrawCall<'a>>);
+
+type DrawCall<'a> = (&'a Mesh, &'a wgpu::BindGroup, std::ops::Range<u32>);
+
+/// A mesh pipeline for surfaces the opaque, back-face-culled one does not fit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Variant {
+    /// Opaque, back faces drawn too.
+    TwoSided,
+    /// Alpha blended (back to front, no depth write, back faces drawn).
+    Blend,
+    /// Alpha-masked, alpha to coverage (MSAA > 1 only), back faces culled.
+    Mask,
+    /// `Mask` with back faces drawn too.
+    MaskTwoSided,
+}
+
+impl Variant {
+    fn alpha_to_coverage(self) -> bool {
+        matches!(self, Self::Mask | Self::MaskTwoSided)
+    }
+}
+
+/// The mip levels below the base of an RGBA8 image, each a 2x2 box average
+/// (colour in sRGB is averaged in linear light); `(size, pixels)` per level
+/// down to 1x1.
+fn mip_chain(pixels: &[u8], width: u32, height: u32, srgb: bool) -> Vec<((u32, u32), Vec<u8>)> {
+    let to_linear = |c: u8| {
+        let c = f32::from(c) / 255.0;
+        if !srgb {
+            c
+        } else if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let from_linear = |v: f32| {
+        let v = if !srgb {
+            v
+        } else if v <= 0.003_130_8 {
+            v * 12.92
+        } else {
+            1.055 * v.powf(1.0 / 2.4) - 0.055
+        };
+        (v * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+    };
+    let mut levels = Vec::new();
+    let (mut w, mut h) = (width, height);
+    let mut prev = pixels.to_vec();
+    while w > 1 || h > 1 {
+        let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+        let mut next = Vec::with_capacity((nw * nh * 4) as usize);
+        for y in 0..nh {
+            for x in 0..nw {
+                let at = |sx: u32, sy: u32| ((sy.min(h - 1) * w + sx.min(w - 1)) * 4) as usize;
+                let taps = [
+                    at(2 * x, 2 * y),
+                    at(2 * x + 1, 2 * y),
+                    at(2 * x, 2 * y + 1),
+                    at(2 * x + 1, 2 * y + 1),
+                ];
+                for c in 0..4 {
+                    next.push(if c == 3 {
+                        // Alpha is linear in either colour space.
+                        let sum: f32 = taps.iter().map(|&i| f32::from(prev[i + 3])).sum();
+                        (sum / 4.0 + 0.5) as u8
+                    } else {
+                        let sum: f32 = taps.iter().map(|&i| to_linear(prev[i + c])).sum();
+                        from_linear(sum / 4.0)
+                    });
+                }
+            }
+        }
+        levels.push(((nw, nh), next.clone()));
+        (w, h, prev) = (nw, nh, next);
+    }
+    levels
+}
+
+/// Mip levels of a `width` x `height` texture.
+fn mip_count(width: u32, height: u32) -> u32 {
+    32 - width.max(height).max(1).leading_zeros()
+}
+
+/// The material sampler: trilinear, anisotropic when the device supports it
+/// (`anisotropy` 1 = off).
+fn material_sampler_descriptor(anisotropy: u16) -> wgpu::SamplerDescriptor<'static> {
+    wgpu::SamplerDescriptor {
+        label: Some("material sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        anisotropy_clamp: anisotropy,
+        ..Default::default()
+    }
+}
+
+/// Anisotropy the renderer asks for where the device can do it.
+const MATERIAL_ANISOTROPY: u16 = 8;
+
 /// Most levels in a view's bloom mip chain.
 pub const BLOOM_LEVELS: usize = 6;
 
@@ -612,6 +807,13 @@ pub fn bloom_mip_sizes(width: u32, height: u32) -> Vec<(u32, u32)> {
     .take_while(|&(w, h)| w >= 1 && h >= 1)
     .take(BLOOM_LEVELS)
     .collect()
+}
+
+/// World -> shadow clip space of the sun for the DDGI volume: an orthographic
+/// box around the volume's bounding sphere, so it never depends on the camera.
+fn gi_shadow_matrix(to_light: glam::Vec3) -> glam::Mat4 {
+    let (min, max) = gi::ddgi::volume_bounds();
+    directional_light_view_proj(to_light, (min + max) * 0.5, (max - min).length() * 0.5)
 }
 
 /// World -> shadow clip space for a directional light. An orthographic box of
@@ -729,6 +931,10 @@ pub struct SceneRenderer {
     msaa: u32,
     /// The 3D pass pipelines per sample count (`msaa_slot`), built on first use.
     msaa_pipelines: [Option<MsaaPipelines>; MSAA_SLOTS],
+    /// Mesh pipelines for double-sided and alpha-blended materials, per
+    /// (sample count slot, GI mode index), built on first use
+    /// (`ensure_variant`).
+    variants: std::collections::HashMap<(usize, usize, Variant), wgpu::RenderPipeline>,
     tonemap_pipeline: wgpu::RenderPipeline,
     tonemap_bind_group_layout: wgpu::BindGroupLayout,
     /// Bloom: one source texture + sampler per pass, the first (Karis)
@@ -752,20 +958,61 @@ pub struct SceneRenderer {
     /// Group 0: per-frame data shared by every pipeline (camera, light,
     /// shadow map, environment).
     frame_bind_group: wgpu::BindGroup,
+    /// Image-based ambient (group 0, bindings 7 to 10).
+    ibl: ibl::IblGpu,
+    /// The sky colours and hemisphere ambient the IBL was last asked for.
+    ibl_sky: ibl::SkyParams,
+    ibl_hdr: Option<(std::sync::Arc<ibl::HdrImage>, f32)>,
+    /// What the IBL data was built for (`refresh_ibl`).
+    ibl_built: Option<(ibl::SkyParams, Option<(usize, u32)>)>,
+    /// Auxiliary views (thumbnails) leave the IBL as the main view built it.
+    ibl_frozen: bool,
+    /// Times the IBL data was recomputed, and the shadow map / atlas
+    /// reallocated (tests count them; a thumbnail must not add any).
+    ibl_rebuilds: u32,
+    shadow_rebuilds: u32,
+    /// Last shadow-atlas / index-list overflow that was reported (log once
+    /// per change).
+    warned_shadow_cap: u32,
+    warned_index_overflow: u32,
     shadow_pipeline: wgpu::RenderPipeline,
-    /// Light view-proj for the shadow pass (group 0 of `shadow_pipeline`).
-    shadow_camera_buffer: wgpu::Buffer,
-    shadow_bind_group: wgpu::BindGroup,
-    /// The sun's shadow map (`set_shadow_map_size` recreates it).
+    /// Shadow pass for alpha-masked casters (reads the material, group 2).
+    shadow_mask_pipeline: wgpu::RenderPipeline,
+    /// Light view-proj per cascade for the shadow pass (group 0 of
+    /// `shadow_pipeline`): separate buffers, since writes apply at submit.
+    shadow_camera_buffers: Vec<wgpu::Buffer>,
+    shadow_bind_groups: Vec<wgpu::BindGroup>,
+    /// Point / spot shadows: the depth atlas (4 x 4 while no light casts
+    /// shadows), the tile records the shaders read, and a camera uniform
+    /// per drawn tile (`ensure_local_cameras`).
+    local_atlas: wgpu::Texture,
+    local_atlas_view: wgpu::TextureView,
+    local_views_buffer: wgpu::Buffer,
+    shadow_camera_layout: wgpu::BindGroupLayout,
+    local_shadow_cameras: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    /// The sun's shadow map, one layer per cascade
+    /// (`set_shadow_map_size` / `set_cascades` recreate it), its array view
+    /// for sampling and a view per layer to render into.
     shadow_texture: wgpu::Texture,
     shadow_view: wgpu::TextureView,
+    shadow_layers: Vec<wgpu::TextureView>,
     shadow_sampler: wgpu::Sampler,
+    /// The DDGI voxel passes' sun shadow: one fixed cascade fitted to the GI
+    /// volume (not to the camera), so injection does not depend on where
+    /// the camera looks. Its light uniform, map, and camera.
+    gi_light_buffer: wgpu::Buffer,
+    _gi_shadow_texture: wgpu::Texture,
+    gi_shadow_view: wgpu::TextureView,
+    gi_shadow_layer: wgpu::TextureView,
+    gi_shadow_camera: (wgpu::Buffer, wgpu::BindGroup),
     /// `builtin:cube`'s material: the checkerboard as base colour.
     checker_material: wgpu::BindGroup,
 
     /// SSAO: depth/normal prepass, AO and blur pipelines, their group 1
     /// layouts and the shared kernel/settings uniform.
     prepass_pipeline: wgpu::RenderPipeline,
+    /// Prepass for alpha-masked meshes (reads the material, group 2).
+    prepass_mask_pipeline: wgpu::RenderPipeline,
     ssao_pipeline: wgpu::RenderPipeline,
     ssao_blur_pipeline: wgpu::RenderPipeline,
     ssao_layout: wgpu::BindGroupLayout,
@@ -773,6 +1020,9 @@ pub struct SceneRenderer {
     ssao_buffer: wgpu::Buffer,
     /// Group 3 of the mesh pipeline: per-view lighting inputs.
     lighting_layout: wgpu::BindGroupLayout,
+    /// The main view's point / spot lights and cluster lists (group 3
+    /// bindings 9 to 12), written each frame.
+    frame_lights: lights::LightBuffers,
     /// Group 3 with a 1x1 white AO texture: no occlusion (AO off).
     unoccluded_lighting: wgpu::BindGroup,
     /// Group 3 of the GI voxel passes: `unoccluded_lighting` without the
@@ -805,6 +1055,10 @@ pub struct Renderer {
     scene: SceneRenderer,
     /// GPU models per asset handle, used by `render_scene`.
     model_cache: ModelCache,
+    /// GPU materials (`.mat` files) and their textures.
+    materials: materials::MaterialCache,
+    /// The decoded HDR sky image: (handle id, file version, image).
+    sky_cache: Option<(u32, u32, Option<std::sync::Arc<ibl::HdrImage>>)>,
     /// Solid editor shapes drawn after tonemapping.
     overlay: overlay::OverlayRenderer,
     /// Copies a viewport image onto the swapchain (a game without the editor UI).
@@ -1009,7 +1263,16 @@ impl Renderer {
         );
 
         let timer = timings::GpuTimer::new(&device, &queue);
-        let scene = SceneRenderer::new(device, queue, surface_format, msaa_counts);
+        let anisotropy = if adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::ANISOTROPIC_FILTERING)
+        {
+            MATERIAL_ANISOTROPY
+        } else {
+            1
+        };
+        let scene = SceneRenderer::new(device, queue, surface_format, msaa_counts, anisotropy);
         let model_cache = ModelCache::new(&scene);
         let overlay =
             overlay::OverlayRenderer::new(&scene.device, surface_format.add_srgb_suffix());
@@ -1031,6 +1294,8 @@ impl Renderer {
             backend,
             scene,
             model_cache,
+            materials: Default::default(),
+            sky_cache: None,
             overlay,
             present,
             timer,
@@ -1142,17 +1407,71 @@ impl Renderer {
         let frame = FrameData {
             view_proj,
             eye,
-            light: melon_core::Light::default(),
-            environment: melon_core::Environment::default(),
-            quality: melon_core::RenderQuality::default(),
             models: vec![(glam::Mat4::IDENTITY, handle)],
+            ..Default::default()
         };
+        let texture = self.thumbnail_of(&frame, server, target);
+        if !was_cached {
+            self.model_cache.evict(handle);
+        }
+        Some(texture)
+    }
+
+    /// A material on a sphere (`builtin:sphere`), for the Content Browser:
+    /// the same auxiliary view and own submission as a model thumbnail.
+    pub fn render_material_thumbnail(
+        &mut self,
+        server: &mut melon_core::AssetServer,
+        material: melon_core::Handle<melon_core::Material>,
+        target: &mut ViewportTarget,
+    ) -> Option<wgpu::TextureView> {
+        let texture = self.render_material_thumbnail_texture(server, material, target)?;
+        Some(texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(texture.format().remove_srgb_suffix()),
+            ..Default::default()
+        }))
+    }
+
+    fn render_material_thumbnail_texture(
+        &mut self,
+        server: &mut melon_core::AssetServer,
+        material: melon_core::Handle<melon_core::Material>,
+        target: &mut ViewportTarget,
+    ) -> Option<wgpu::Texture> {
+        let was_cached = self.materials.contains(material);
+        let sphere: melon_core::Handle<melon_core::Model> = server.load("builtin:sphere");
+        self.model_cache.prepare(&self.scene, server, sphere);
+        let (min, max) = server.bounds(sphere)?;
+        let (view_proj, eye) = thumbnail_camera(min, max);
+        let mut frame = FrameData {
+            view_proj,
+            eye,
+            models: vec![(glam::Mat4::IDENTITY, sphere)],
+            ..Default::default()
+        };
+        frame.overrides.insert(0, vec![Some(material)]);
+        let texture = self.thumbnail_of(&frame, server, target);
+        // A material only the thumbnail needed is freed with its textures.
+        if !was_cached {
+            self.materials.evict(material);
+        }
+        Some(texture)
+    }
+
+    /// Record `frame` as an auxiliary view into `target`, copy the result
+    /// and submit it on its own.
+    fn thumbnail_of(
+        &mut self,
+        frame: &FrameData,
+        server: &mut melon_core::AssetServer,
+        target: &mut ViewportTarget,
+    ) -> wgpu::Texture {
         let mut encoder = self
             .device()
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("thumbnail"),
             });
-        self.record_view(&mut encoder, &frame, server, target, View::Auxiliary);
+        self.record_view(&mut encoder, frame, server, target, View::Auxiliary);
         let source = target.color_texture();
         let format = source.format();
         let texture = self.device().create_texture(&wgpu::TextureDescriptor {
@@ -1173,10 +1492,7 @@ impl Renderer {
             source.size(),
         );
         self.queue().submit([encoder.finish()]);
-        if !was_cached {
-            self.model_cache.evict(handle);
-        }
-        Some(texture)
+        texture
     }
 
     /// Record one view of `frame` into `target`: shadow pass, SSAO passes, 3D
@@ -1210,6 +1526,38 @@ impl Renderer {
         )
     }
 
+    /// The decoded image of `Environment::sky_texture`, reloaded when its
+    /// file changes; a broken file is reported once and leaves the
+    /// procedural sky.
+    fn sky_image(
+        &mut self,
+        server: &melon_core::AssetServer,
+        texture: Option<Handle<melon_core::Texture>>,
+    ) -> Option<std::sync::Arc<ibl::HdrImage>> {
+        let handle = texture?;
+        let version = server.version(handle);
+        if let Some((id, v, image)) = &self.sky_cache
+            && *id == handle.id()
+            && *v == version
+        {
+            return image.clone();
+        }
+        let path = server.path(handle).to_string();
+        let image = match server
+            .read(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| ibl::HdrImage::from_bytes(&bytes))
+        {
+            Ok(image) => Some(std::sync::Arc::new(image)),
+            Err(error) => {
+                tracing::warn!("could not load sky {path}: {error:#}");
+                None
+            }
+        };
+        self.sky_cache = Some((handle.id(), version, image.clone()));
+        image
+    }
+
     /// `render_scene` for a `View::Main`; a `View::Auxiliary` (thumbnail)
     /// leaves the world state alone: GI shaded as Off without updating it,
     /// the current shadow map size and sample count (its quality's are
@@ -1231,8 +1579,15 @@ impl Renderer {
             View::Auxiliary => (&[][..], &[][..]),
         };
         let quality = &frame.quality;
+        // An auxiliary view keeps the sky, IBL and atlas the last main view
+        // built (a thumbnail must not reallocate shared textures).
+        let sky = main
+            .then(|| self.sky_image(server, frame.environment.sky_texture))
+            .flatten();
         let scene = &mut self.scene;
+        scene.ibl_frozen = !main;
         if main {
+            scene.set_sky_texture(sky.map(|image| (image, frame.environment.sky_intensity)));
             scene.set_shadow_map_size(quality.shadow_map_size);
             scene.set_msaa(quality.msaa);
         }
@@ -1250,6 +1605,91 @@ impl Renderer {
         scene.update_camera(frame.view_proj, frame.eye);
         scene.update_environment(&frame.environment);
         scene.update_ssao(&frame.environment);
+        // The lights and their cluster lists of this view; other views draw
+        // without local lights.
+        // The shadow atlas exists at full size only while a light casts shadows.
+        if main {
+            let wants_atlas =
+                quality.shadowed_lights > 0 && frame.lights.iter().any(|l| l.cast_shadows);
+            scene.set_local_shadow_atlas(if wants_atlas {
+                quality.local_shadow_size
+            } else {
+                4
+            });
+        }
+        let (mut cluster, mut cluster_data) = if main {
+            let size = target.size();
+            let grid = lights::ClusterGrid::new(
+                frame.view_proj,
+                frame.eye,
+                [size.width as f32, size.height as f32],
+            );
+            let data = lights::build(
+                &grid,
+                &frame.lights,
+                quality.max_lights as usize,
+                quality.shadowed_lights as usize,
+                (gi_mode == melon_core::GiMode::Ddgi).then(gi::ddgi::volume_bounds),
+            );
+            (grid.uniform(), data)
+        } else {
+            (lights::ClusterUniform::empty(), Default::default())
+        };
+        // Point / spot shadows: a tile per spot light, six per point light.
+        let mut local_views: Vec<glam::Mat4> = Vec::new();
+        let mut local_layout = (4, 1);
+        let mut shadowed_dropped = 0;
+        if cluster_data.shadowed > 0 {
+            let mut tans = Vec::new();
+            // The atlas holds a limited number of tiles; the farthest
+            // shadowed lights beyond that draw without shadows.
+            let fits = local_shadows::lights_that_fit(
+                scene.local_atlas.width(),
+                (0..cluster_data.shadowed).map(|slot| {
+                    local_shadows::view_count(&frame.lights[cluster_data.source[slot]])
+                }),
+            );
+            shadowed_dropped = cluster_data.shadowed - fits;
+            scene.warn_shadow_cap(shadowed_dropped);
+            cluster_data.shadowed = fits;
+            for slot in 0..cluster_data.shadowed {
+                let light = &frame.lights[cluster_data.source[slot]];
+                let (views, tan_half) = local_shadows::views_for(light);
+                cluster_data.lights[slot].spot[3] = local_views.len() as f32;
+                tans.extend(std::iter::repeat_n(tan_half, views.len()));
+                local_views.extend(views);
+            }
+            let atlas = scene.local_atlas.width();
+            local_layout = local_shadows::tile_layout(atlas, local_views.len());
+            let (tile, grid) = local_layout;
+            let records: Vec<local_shadows::ShadowViewGpu> = local_views
+                .iter()
+                .zip(&tans)
+                .enumerate()
+                .map(|(i, (m, tan_half))| {
+                    let (x, y) = local_shadows::tile_origin(i, tile, grid);
+                    let a = atlas as f32;
+                    local_shadows::ShadowViewGpu {
+                        view_proj: m.to_cols_array_2d(),
+                        rect: [x as f32 / a, y as f32 / a, tile as f32 / a, tile as f32 / a],
+                        params: [2.0 * tan_half / tile as f32, 0.0, 0.0, 0.0],
+                    }
+                })
+                .collect();
+            scene
+                .queue
+                .write_buffer(&scene.local_views_buffer, 0, bytemuck::cast_slice(&records));
+        }
+        cluster.dims[3] = cluster_data.shadowed as u32;
+        scene
+            .frame_lights
+            .write(&scene.queue, &cluster, &cluster_data);
+        scene.warn_index_overflow(cluster_data.overflow);
+        let stats_lights = (
+            cluster_data.lights.len() as u32,
+            cluster_data.dropped as u32,
+            cluster_data.shadowed as u32,
+        );
         if main {
             scene.gi.update(
                 &scene.queue,
@@ -1264,65 +1704,225 @@ impl Renderer {
             // and its uniform stay as the last main view left them.
             scene.gi.mode = melon_core::GiMode::Off;
         }
-        let light_view_proj =
-            directional_light_view_proj(frame.light.to_light(), SHADOW_CENTER, SHADOW_RADIUS);
-        scene.update_light(&frame.light, light_view_proj);
+        // Auxiliary views (thumbnails) keep the shadow map as it is and use
+        // one cascade.
+        let cascade_count = if main {
+            scene.set_cascades(quality.cascades);
+            scene.cascade_count() as usize
+        } else {
+            1
+        };
+        let cascade_set = cascades::fit(
+            frame.view_proj,
+            frame.eye,
+            frame.light.to_light(),
+            cascade_count,
+            quality.shadow_distance as f32,
+            scene.shadow_map_size(),
+        );
+        scene.update_light_cascades(&frame.light, &cascade_set);
+        let gi_shadow = (gi_mode == melon_core::GiMode::Ddgi).then(|| {
+            let matrix = gi_shadow_matrix(frame.light.to_light());
+            scene.update_gi_light(&frame.light, matrix);
+            Frustum::from_view_proj(matrix)
+        });
         for (_, handle) in &frame.models {
             self.model_cache.prepare(&self.scene, server, *handle);
+        }
+        for handle in frame.overrides.values().flatten().flatten() {
+            self.materials.prepare(&self.scene, server, *handle);
+        }
+        if main {
+            // The scene is the owner: what it no longer references is freed.
+            let used = frame.overrides.values().flatten().flatten();
+            self.materials.retain_used(used.map(|h| h.id()).collect());
         }
 
         // Cull per view (the shadow pass against the shadow box, so casters
         // off screen still shade the view), then batch by model: every part
         // of a model draws its instances in one call.
         let camera = Frustum::from_view_proj(frame.view_proj);
-        let shadow_box = Frustum::from_view_proj(light_view_proj);
-        let mut stats = RenderStats::default();
-        let (mut seen, mut casters, mut voxelized) = (Vec::new(), Vec::new(), Vec::new());
-        for (matrix, handle) in &frame.models {
+        let shadow_boxes: Vec<Frustum> = cascade_set
+            .view_proj
+            .iter()
+            .map(|m| Frustum::from_view_proj(*m))
+            .collect();
+        let mut stats = RenderStats {
+            lights: stats_lights.0,
+            lights_dropped: stats_lights.1,
+            shadowed_lights: stats_lights.2,
+            shadow_views: local_views.len() as u32,
+            shadowed_lights_dropped: shadowed_dropped as u32,
+            light_index_overflow: cluster_data.overflow as u32,
+            ..Default::default()
+        };
+        let (mut seen, mut voxelized, mut gi_casters) = (Vec::new(), Vec::new(), Vec::new());
+        let mut casters: Vec<Vec<_>> = vec![Vec::new(); shadow_boxes.len()];
+        let local_boxes: Vec<Frustum> = local_views
+            .iter()
+            .map(|m| Frustum::from_view_proj(*m))
+            .collect();
+        let mut local_casters: Vec<Vec<_>> = vec![Vec::new(); local_boxes.len()];
+        // Entities with the same material overrides share a set id (0 = none),
+        // so they batch together.
+        let mut set_ids: std::collections::HashMap<&[Option<MaterialHandle>], u32> =
+            Default::default();
+        let mut sets: Vec<&[Option<MaterialHandle>]> = Vec::new();
+        for (i, (matrix, handle)) in frame.models.iter().enumerate() {
+            let set = frame.overrides.get(&i).map_or(0, |parts| {
+                *set_ids.entry(parts.as_slice()).or_insert_with(|| {
+                    sets.push(parts);
+                    sets.len() as u32
+                })
+            });
+            let key = (*handle, set);
             let (min, max) = world_aabb(*matrix, self.model_cache.model(server, *handle).bounds);
             if gi_mode == melon_core::GiMode::Ddgi && gi::ddgi::in_volume(min, max) {
-                voxelized.push((*handle, *matrix));
+                voxelized.push((key, *matrix));
             }
             if camera.intersects_aabb(min, max) {
-                seen.push((*handle, *matrix));
+                seen.push((key, *matrix));
             } else {
                 stats.culled += 1;
             }
-            if shadow_box.intersects_aabb(min, max) {
-                casters.push((*handle, *matrix));
-            } else {
+            if gi_shadow
+                .as_ref()
+                .is_some_and(|gi_box| gi_box.intersects_aabb(min, max))
+            {
+                gi_casters.push((key, *matrix));
+            }
+            let mut cast = false;
+            for (list, shadow_box) in casters.iter_mut().zip(&shadow_boxes) {
+                if shadow_box.intersects_aabb(min, max) {
+                    list.push((key, *matrix));
+                    cast = true;
+                }
+            }
+            if !cast {
                 stats.shadow_culled += 1;
             }
-        }
-        let mut matrices = Vec::with_capacity(seen.len() + casters.len());
-        let seen = batch(seen, &mut matrices);
-        let casters = batch(casters, &mut matrices);
-        let voxelized = batch(voxelized, &mut matrices);
-        self.scene.update_instances(&matrices);
-
-        let (cache, assets) = (&self.model_cache, &*server);
-        let textured =
-            move |batches: &[(melon_core::Handle<melon_core::Model>, std::ops::Range<u32>)]| {
-                let mut calls: Vec<(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)> = Vec::new();
-                for (handle, instances) in batches {
-                    let model = cache.model(assets, *handle);
-                    for (mesh, material) in model.meshes.iter().zip(&model.material_bind_groups) {
-                        calls.push((mesh, material, instances.clone()));
+            for (list, view_box) in local_casters.iter_mut().zip(&local_boxes) {
+                if view_box.intersects_aabb(min, max) {
+                    if list.len() < local_shadows::MAX_CASTERS {
+                        list.push((key, *matrix));
+                    } else {
+                        stats.local_casters_dropped += 1;
                     }
                 }
-                calls
-            };
-        let draw_calls = textured(&seen);
-        let voxel_draw_calls = textured(&voxelized);
-        let mut shadow_draw_calls: Vec<(&Mesh, std::ops::Range<u32>)> = Vec::new();
-        for (handle, instances) in &casters {
-            for mesh in &self.model_cache.model(server, *handle).meshes {
-                shadow_draw_calls.push((mesh, instances.clone()));
             }
         }
-        stats.draw_calls = draw_calls.len() as u32;
-        stats.instances_drawn = draw_calls.iter().map(|(_, _, r)| r.len() as u32).sum();
-        stats.shadow_draw_calls = shadow_draw_calls.len() as u32;
+        let mut matrices = Vec::with_capacity(seen.len() * 2);
+        let seen = batch(seen, &mut matrices);
+        let casters: Vec<_> = casters
+            .into_iter()
+            .map(|list| batch(list, &mut matrices))
+            .collect();
+        let local_casters: Vec<_> = local_casters
+            .into_iter()
+            .map(|list| batch(list, &mut matrices))
+            .collect();
+        let voxelized = batch(voxelized, &mut matrices);
+        let gi_casters = batch(gi_casters, &mut matrices);
+        self.scene.update_instances(&matrices);
+
+        let (cache, materials, assets) = (&self.model_cache, &self.materials, &*server);
+        let part_material = |key: DrawKey, part: usize| {
+            let model = cache.model(assets, key.0);
+            let own = key.1.checked_sub(1).and_then(|set| {
+                let handle = sets[set as usize].get(part).copied().flatten()?;
+                materials.get(handle)
+            });
+            own.unwrap_or_else(|| {
+                (
+                    &model.material_bind_groups[part],
+                    model.surfaces.get(part).copied().unwrap_or_default(),
+                )
+            })
+        };
+        let eye = frame.eye;
+        let main_coverage = self.scene.msaa() > 1;
+        let textured = |batches: &[(DrawKey, std::ops::Range<u32>)], coverage: bool| {
+            let mut calls = Calls::default();
+            for (key, instances) in batches {
+                let model = cache.model(assets, key.0);
+                for (part, mesh) in model.meshes.iter().enumerate() {
+                    let (group, surface) = part_material(*key, part);
+                    if surface.blend {
+                        let centre = (model.bounds.0 + model.bounds.1) * 0.5;
+                        for i in instances.clone() {
+                            let at = matrices[i as usize].transform_point3(centre);
+                            calls.blend.push((at, (mesh, group, i..i + 1)));
+                        }
+                        continue;
+                    }
+                    let call = (mesh, group, instances.clone());
+                    if surface.masked {
+                        calls.masked.push(call.clone());
+                    } else {
+                        calls.plain.push((mesh, instances.clone()));
+                    }
+                    match (surface.masked && coverage, surface.double_sided) {
+                        (true, true) => calls.mask_two_sided.push(call),
+                        (true, false) => calls.mask.push(call),
+                        (false, true) => calls.two_sided.push(call),
+                        (false, false) => calls.single.push(call),
+                    }
+                }
+            }
+            sort_back_to_front(eye, &mut calls.blend);
+            calls
+        };
+        let calls = textured(&seen, main_coverage);
+        let voxel_calls = textured(&voxelized, false);
+        let draw_calls = &calls.single;
+        let voxel_draw_calls: Vec<_> = voxel_calls
+            .single
+            .iter()
+            .chain(&voxel_calls.two_sided)
+            .cloned()
+            .collect();
+        let blend_calls: Vec<_> = calls.blend.iter().map(|(_, call)| call.clone()).collect();
+        // Per shadow view (cascade or point / spot tile): the plain casters
+        // and the alpha-masked ones.
+        let casters_of = |view: &Vec<(DrawKey, std::ops::Range<u32>)>| {
+            let (mut plain, mut masked) = (Vec::new(), Vec::new());
+            for (key, instances) in view {
+                let model = self.model_cache.model(server, key.0);
+                for (part, mesh) in model.meshes.iter().enumerate() {
+                    let (group, surface) = part_material(*key, part);
+                    if surface.blend {
+                        continue;
+                    }
+                    if surface.masked {
+                        masked.push((mesh, group, instances.clone()));
+                    } else {
+                        plain.push((mesh, instances.clone()));
+                    }
+                }
+            }
+            (plain, masked)
+        };
+        let shadow_calls: Vec<ShadowDraws> = casters.iter().map(casters_of).collect();
+        let local_calls: Vec<ShadowDraws> = local_casters.iter().map(casters_of).collect();
+        let gi_calls = casters_of(&gi_casters);
+        let all_draws = [
+            draw_calls,
+            &calls.two_sided,
+            &calls.mask,
+            &calls.mask_two_sided,
+            &blend_calls,
+        ];
+        stats.draw_calls = all_draws.iter().map(|c| c.len() as u32).sum();
+        stats.instances_drawn = all_draws
+            .iter()
+            .flat_map(|c| c.iter())
+            .map(|(_, _, r)| r.len() as u32)
+            .sum();
+        stats.shadow_draw_calls = shadow_calls
+            .iter()
+            .chain(&local_calls)
+            .map(|(plain, masked)| (plain.len() + masked.len()) as u32)
+            .sum();
 
         // The draw lists borrow the model cache; the scene is a separate field.
         let scene = &mut self.scene;
@@ -1336,7 +1936,27 @@ impl Renderer {
         if let Some(timer) = timer.as_mut() {
             timer.begin(encoder);
         }
-        scene.render_shadow_pass(encoder, &shadow_draw_calls);
+        if !calls.two_sided.is_empty() {
+            scene.ensure_variant(Variant::TwoSided);
+        }
+        if !blend_calls.is_empty() {
+            scene.ensure_variant(Variant::Blend);
+        }
+        if !calls.mask.is_empty() {
+            scene.ensure_variant(Variant::Mask);
+        }
+        if !calls.mask_two_sided.is_empty() {
+            scene.ensure_variant(Variant::MaskTwoSided);
+        }
+        for (layer, (plain, masked)) in shadow_calls.iter().enumerate() {
+            scene.render_cascade(encoder, layer, plain, masked);
+        }
+        if !local_views.is_empty() {
+            scene.render_local_shadows(encoder, &local_views, local_layout, &local_calls);
+        }
+        if gi_shadow.is_some() {
+            scene.render_gi_shadow(encoder, &gi_calls.0, &gi_calls.1);
+        }
         mark(encoder, timer, timings::Mark::Shadows);
         // The depth/normal prepass feeds SSAO and SSGI. AO off (quality or
         // strength 0): skip the SSAO passes and bind white, so the image
@@ -1344,11 +1964,7 @@ impl Renderer {
         let ao_on = quality.ao && frame.environment.ao_strength > 0.0;
         let ssgi_on = gi_mode == melon_core::GiMode::Ssgi;
         if ao_on || ssgi_on {
-            let prepass_draws: Vec<(&Mesh, std::ops::Range<u32>)> = draw_calls
-                .iter()
-                .map(|(mesh, _, instances)| (*mesh, instances.clone()))
-                .collect();
-            scene.render_prepass(encoder, &prepass_draws, &target.ssao);
+            scene.render_prepass(encoder, &calls.plain, &calls.masked, &target.ssao);
         }
         if ao_on {
             scene.render_ssao(encoder, &target.ssao);
@@ -1398,8 +2014,22 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            scene.draw_meshes_textured(&mut pass, &draw_calls, lighting);
+            scene.draw_meshes_textured(&mut pass, draw_calls, lighting);
+            if !calls.two_sided.is_empty() {
+                scene.draw_meshes_variant(&mut pass, &calls.two_sided, lighting, Variant::TwoSided);
+            }
+            for (variant, group) in [
+                (Variant::Mask, &calls.mask),
+                (Variant::MaskTwoSided, &calls.mask_two_sided),
+            ] {
+                if !group.is_empty() {
+                    scene.draw_meshes_variant(&mut pass, group, lighting, variant);
+                }
+            }
             scene.draw_sky(&mut pass);
+            if !blend_calls.is_empty() {
+                scene.draw_meshes_variant(&mut pass, &blend_calls, lighting, Variant::Blend);
+            }
             scene.draw_world_lines(&mut pass, world_lines, frame.view_proj);
         }
         mark(encoder, timer, timings::Mark::Scene);
@@ -1491,6 +2121,7 @@ impl SceneRenderer {
         queue: wgpu::Queue,
         surface_format: wgpu::TextureFormat,
         msaa_counts: Vec<u32>,
+        anisotropy: u16,
     ) -> Self {
         let uniform_entry = |binding, visibility| wgpu::BindGroupLayoutEntry {
             binding,
@@ -1504,6 +2135,16 @@ impl SceneRenderer {
         };
         // Group 0 holds everything that changes once per frame; group 3
         // holds per-view lighting inputs (SSAO, later GI).
+        let ibl_texture_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
         let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame bind group layout"),
             entries: &[
@@ -1514,7 +2155,7 @@ impl SceneRenderer {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
                         multisampled: false,
                     },
                     count: None,
@@ -1526,6 +2167,38 @@ impl SceneRenderer {
                     count: None,
                 },
                 uniform_entry(4, wgpu::ShaderStages::FRAGMENT),
+                // Image-based ambient: SH uniform, prefiltered environment,
+                // its sampler, the BRDF lookup.
+                uniform_entry(7, wgpu::ShaderStages::FRAGMENT),
+                ibl_texture_entry(8),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                ibl_texture_entry(10),
+                // Point / spot shadows: the depth atlas and the tile records.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let model_layout = instance_buffer_layout(&device);
@@ -1534,7 +2207,7 @@ impl SceneRenderer {
             entries: &[uniform_entry(0, wgpu::ShaderStages::VERTEX)],
         });
         let shadow_pipeline =
-            Renderer::build_shadow_pipeline(&device, &shadow_layout, &model_layout);
+            Renderer::build_shadow_pipeline(&device, &shadow_layout, &model_layout, None);
         let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -1564,10 +2237,17 @@ impl SceneRenderer {
             ],
         });
 
+        let shadow_mask_pipeline = Renderer::build_shadow_pipeline(
+            &device,
+            &shadow_layout,
+            &model_layout,
+            Some(&material_layout),
+        );
         // Group 3: per-view lighting inputs: AO (R, 1 = unoccluded), then
         // every GI backend's bindings (gi/mod.rs).
         let mut lighting_entries = vec![texture_entry(0)];
         lighting_entries.extend(gi::Gi::layout_entries());
+        lighting_entries.extend(lights::LightBuffers::layout_entries());
         let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("lighting bind group layout"),
             entries: &lighting_entries,
@@ -1609,7 +2289,13 @@ impl SceneRenderer {
             ],
         });
         let prepass_pipeline =
-            Renderer::build_prepass_pipeline(&device, &frame_layout, &model_layout);
+            Renderer::build_prepass_pipeline(&device, &frame_layout, &model_layout, None);
+        let prepass_mask_pipeline = Renderer::build_prepass_pipeline(
+            &device,
+            &frame_layout,
+            &model_layout,
+            Some(&material_layout),
+        );
         let ssao_pipeline =
             Renderer::build_ssao_pipeline(&device, &frame_layout, &ssao_layout, "fs_ssao");
         let ssao_blur_pipeline =
@@ -1692,7 +2378,8 @@ impl SceneRenderer {
             mapped_at_creation: false,
         });
 
-        let (shadow_texture, shadow_view) = create_shadow_map(&device, SHADOW_MAP_SIZE);
+        let (shadow_texture, shadow_view, shadow_layers) =
+            create_shadow_map(&device, SHADOW_MAP_SIZE, 1);
         // Linear filtering on a comparison sampler gives 2x2 hardware PCF per tap.
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("shadow comparison sampler"),
@@ -1703,27 +2390,69 @@ impl SceneRenderer {
             compare: Some(wgpu::CompareFunction::LessEqual),
             ..Default::default()
         });
-        let shadow_camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("shadow camera uniform buffer"),
+        let shadow_camera_buffers: Vec<wgpu::Buffer> = (0..cascades::MAX_CASCADES)
+            .map(|_| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("shadow camera uniform buffer"),
+                    size: std::mem::size_of::<CameraUniform>() as wgpu::BufferAddress,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
+        let shadow_bind_groups: Vec<wgpu::BindGroup> = shadow_camera_buffers
+            .iter()
+            .map(|buffer| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("shadow camera bind group"),
+                    layout: &shadow_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buffer.as_entire_binding(),
+                    }],
+                })
+            })
+            .collect();
+
+        let (gi_shadow_texture, gi_shadow_view, mut gi_shadow_layers) =
+            create_shadow_map(&device, GI_SHADOW_SIZE, 1);
+        let gi_light_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gi light uniform buffer"),
+            size: std::mem::size_of::<LightUniform>() as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let gi_camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gi shadow camera uniform buffer"),
             size: std::mem::size_of::<CameraUniform>() as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let shadow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("shadow camera bind group"),
+        let gi_camera_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gi shadow camera bind group"),
             layout: &shadow_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: shadow_camera_buffer.as_entire_binding(),
+                resource: gi_camera_buffer.as_entire_binding(),
             }],
         });
-
+        let (local_atlas, local_atlas_view) = create_local_atlas(&device, 4);
+        let local_views_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("local shadow views"),
+            size: (local_shadows::MAX_VIEWS * size_of::<local_shadows::ShadowViewGpu>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ibl_sky = ibl::SkyParams::default();
+        let ibl = ibl::IblGpu::new(&device, &queue, &ibl::Source::Procedural(ibl_sky));
         let frame_bind_group = frame_bind_group(
             &device,
             &frame_layout,
             [&camera_buffer, &light_buffer, &environment_buffer],
             &shadow_view,
             &shadow_sampler,
+            &ibl,
+            (&local_atlas_view, &local_views_buffer),
         );
 
         let texture_1x1 = |label, rgba: [u8; 4]| {
@@ -1753,16 +2482,7 @@ impl SceneRenderer {
             flat_normal: texture_1x1("default flat normal texture", [128, 128, 255, 255]),
             black: texture_1x1("default black texture", [0, 0, 0, 255]),
         };
-        let material_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("material sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
+        let material_sampler = device.create_sampler(&material_sampler_descriptor(anisotropy));
         let checker = Renderer::create_checkerboard_texture(&device, &queue)
             .create_view(&wgpu::TextureViewDescriptor::default());
         let checker_material = material_bind_group(
@@ -1779,8 +2499,11 @@ impl SceneRenderer {
             &gi::GiInputs {
                 frame_layout: &frame_layout,
                 light: &light_buffer,
-                shadow_view: &shadow_view,
+                gi_light: &gi_light_buffer,
+                gi_shadow_view: &gi_shadow_view,
                 shadow_sampler: &shadow_sampler,
+                local_atlas: &local_atlas_view,
+                local_views: &local_views_buffer,
                 model_layout: &model_layout,
                 material_layout: &material_layout,
                 lighting_layout: &lighting_layout,
@@ -1790,17 +2513,22 @@ impl SceneRenderer {
             binding: 0,
             resource: wgpu::BindingResource::TextureView(&default_textures.white),
         };
-        let lighting = |label, voxels| {
+        let empty_lights = lights::LightBuffers::new(&device);
+        let frame_lights = lights::LightBuffers::new(&device);
+        let lighting = |label, voxels, lights: &lights::LightBuffers| {
             let mut entries = vec![white_ao.clone()];
             entries.extend(gi.entries(None, voxels));
+            entries.extend(lights.entries());
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
                 layout: &lighting_layout,
                 entries: &entries,
             })
         };
-        let unoccluded_lighting = lighting("unoccluded lighting bind group", true);
-        let voxel_pass_lighting = lighting("gi voxel pass lighting bind group", false);
+        let unoccluded_lighting = lighting("unoccluded lighting bind group", true, &empty_lights);
+        // The voxel passes see the frame's lights (the shadowed ones inject).
+        let voxel_pass_lighting =
+            lighting("gi voxel pass lighting bind group", false, &frame_lights);
 
         let (instance_buffer, instance_bind_group) =
             create_instance_buffer(&device, &model_layout, INITIAL_INSTANCE_CAPACITY);
@@ -1813,6 +2541,7 @@ impl SceneRenderer {
             msaa_counts,
             msaa: 0,
             msaa_pipelines: Default::default(),
+            variants: Default::default(),
             tonemap_pipeline,
             tonemap_bind_group_layout: tonemap_layout,
             bloom_layout,
@@ -1827,22 +2556,45 @@ impl SceneRenderer {
             default_textures,
             camera_buffer,
             light_buffer,
+            gi_light_buffer,
+            _gi_shadow_texture: gi_shadow_texture,
+            gi_shadow_view,
+            gi_shadow_layer: gi_shadow_layers.remove(0),
+            gi_shadow_camera: (gi_camera_buffer, gi_camera_group),
             environment_buffer,
             frame_bind_group,
+            ibl,
+            ibl_sky,
+            ibl_hdr: None,
+            ibl_built: Some((ibl_sky, None)),
+            ibl_frozen: false,
+            ibl_rebuilds: 0,
+            shadow_rebuilds: 0,
+            warned_shadow_cap: 0,
+            warned_index_overflow: 0,
             shadow_pipeline,
-            shadow_camera_buffer,
-            shadow_bind_group,
+            shadow_mask_pipeline,
+            shadow_camera_buffers,
+            shadow_bind_groups,
+            local_atlas,
+            local_atlas_view,
+            local_views_buffer,
+            shadow_camera_layout: shadow_layout,
+            local_shadow_cameras: Vec::new(),
             shadow_texture,
             shadow_view,
+            shadow_layers,
             shadow_sampler,
             checker_material,
             prepass_pipeline,
+            prepass_mask_pipeline,
             ssao_pipeline,
             ssao_blur_pipeline,
             ssao_layout,
             ssao_blur_layout,
             ssao_buffer,
             lighting_layout,
+            frame_lights,
             unoccluded_lighting,
             voxel_pass_lighting,
             gi,
@@ -1862,10 +2614,171 @@ impl SceneRenderer {
     /// texture.
     pub fn set_shadow_map_size(&mut self, size: u32) {
         let size = size.clamp(256, self.device.limits().max_texture_dimension_2d);
-        if self.shadow_texture.width() == size {
+        self.rebuild_shadow_map(size, self.shadow_layers.len() as u32);
+    }
+
+    /// Sets the number of sun shadow cascades (1 to 4), recreating the
+    /// shadow map when it changes.
+    pub fn set_cascades(&mut self, count: u32) {
+        let count = count.clamp(1, cascades::MAX_CASCADES as u32);
+        self.rebuild_shadow_map(self.shadow_texture.width(), count);
+    }
+
+    /// Number of cascade layers the shadow map has.
+    pub fn cascade_count(&self) -> u32 {
+        self.shadow_layers.len() as u32
+    }
+
+    fn rebuild_shadow_map(&mut self, size: u32, layers: u32) {
+        if self.shadow_texture.width() == size && self.shadow_layers.len() as u32 == layers {
             return;
         }
-        (self.shadow_texture, self.shadow_view) = create_shadow_map(&self.device, size);
+        (self.shadow_texture, self.shadow_view, self.shadow_layers) =
+            create_shadow_map(&self.device, size, layers);
+        self.shadow_bindings_changed();
+        self.shadow_rebuilds += 1;
+        tracing::debug!(size, layers, "shadow map recreated");
+    }
+
+    /// Edge of the point / spot shadow atlas, recreated when it changes
+    /// (a 4 x 4 stand-in while nothing casts shadows).
+    pub fn set_local_shadow_atlas(&mut self, size: u32) {
+        let size = size.clamp(4, self.device.limits().max_texture_dimension_2d);
+        if self.local_atlas.width() == size {
+            return;
+        }
+        (self.local_atlas, self.local_atlas_view) = create_local_atlas(&self.device, size);
+        self.shadow_bindings_changed();
+        self.shadow_rebuilds += 1;
+        tracing::debug!(size, "local shadow atlas recreated");
+    }
+
+    /// Warn when shadow-casting lights did not fit the atlas (once per
+    /// change of the count).
+    fn warn_shadow_cap(&mut self, dropped: usize) {
+        if dropped as u32 != self.warned_shadow_cap && dropped > 0 {
+            tracing::warn!(
+                dropped,
+                "{dropped} shadow-casting lights do not fit the local shadow atlas and draw without shadows; raise its size or lower the shadowed lights"
+            );
+        }
+        self.warned_shadow_cap = dropped as u32;
+    }
+
+    /// Warn when the cluster light index list overflowed (once per change).
+    fn warn_index_overflow(&mut self, overflow: usize) {
+        if overflow as u32 != self.warned_index_overflow && overflow > 0 {
+            tracing::warn!(
+                overflow,
+                "cluster light index list is full: {overflow} light entries dropped, some screen areas miss lights"
+            );
+        }
+        self.warned_index_overflow = overflow as u32;
+    }
+
+    /// Rebind everything that reads the shadow textures (group 0, the GI
+    /// voxel passes).
+    fn shadow_bindings_changed(&mut self) {
+        self.rebuild_frame_bind_group();
+        self.gi.set_shadow_map(
+            &self.device,
+            &gi::GiInputs {
+                frame_layout: &self.frame_layout,
+                light: &self.light_buffer,
+                gi_light: &self.gi_light_buffer,
+                gi_shadow_view: &self.gi_shadow_view,
+                shadow_sampler: &self.shadow_sampler,
+                local_atlas: &self.local_atlas_view,
+                local_views: &self.local_views_buffer,
+                model_layout: &self.model_bind_group_layout,
+                material_layout: &self.material_bind_group_layout,
+                lighting_layout: &self.lighting_layout,
+            },
+        );
+    }
+
+    /// Camera uniforms and bind groups for at least `count` local shadow tiles.
+    fn ensure_local_cameras(&mut self, count: usize) {
+        while self.local_shadow_cameras.len() < count {
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("local shadow camera uniform"),
+                size: std::mem::size_of::<CameraUniform>() as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("local shadow camera bind group"),
+                layout: &self.shadow_camera_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+            });
+            self.local_shadow_cameras.push((buffer, group));
+        }
+    }
+
+    /// Draw every point / spot shadow tile into the atlas in one pass: tile
+    /// `i` renders `tiles[i]` with its view-projection into its square of
+    /// the atlas (`tile` texels, `grid` tiles per row).
+    fn render_local_shadows(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        views: &[glam::Mat4],
+        layout: (u32, u32),
+        draws: &[ShadowDraws],
+    ) {
+        self.ensure_local_cameras(views.len());
+        for ((buffer, _), m) in self.local_shadow_cameras.iter().zip(views) {
+            let camera = CameraUniform {
+                view_proj: m.to_cols_array_2d(),
+                ..Zeroable::zeroed()
+            };
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(&[camera]));
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("melon_render local shadow pass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.local_atlas_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        let (tile, grid) = layout;
+        for (i, (plain, masked)) in draws.iter().enumerate() {
+            let (x, y) = local_shadows::tile_origin(i, tile, grid);
+            pass.set_viewport(x as f32, y as f32, tile as f32, tile as f32, 0.0, 1.0);
+            pass.set_scissor_rect(x, y, tile, tile);
+            pass.set_bind_group(0, &self.local_shadow_cameras[i].1, &[]);
+            pass.set_bind_group(1, &self.instance_bind_group, &[]);
+            pass.set_pipeline(&self.shadow_pipeline);
+            for (mesh, instances) in plain {
+                pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.draw_indexed(0..mesh.index_count, 0, instances.clone());
+            }
+            if !masked.is_empty() {
+                pass.set_pipeline(&self.shadow_mask_pipeline);
+                for (mesh, material, instances) in masked {
+                    pass.set_bind_group(2, *material, &[]);
+                    pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
+                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    pass.draw_indexed(0..mesh.index_count, 0, instances.clone());
+                }
+            }
+        }
+    }
+
+    /// Group 0 over the current buffers, shadow map and IBL textures.
+    fn rebuild_frame_bind_group(&mut self) {
         self.frame_bind_group = frame_bind_group(
             &self.device,
             &self.frame_layout,
@@ -1876,20 +2789,40 @@ impl SceneRenderer {
             ],
             &self.shadow_view,
             &self.shadow_sampler,
+            &self.ibl,
+            (&self.local_atlas_view, &self.local_views_buffer),
         );
-        self.gi.set_shadow_map(
-            &self.device,
-            &gi::GiInputs {
-                frame_layout: &self.frame_layout,
-                light: &self.light_buffer,
-                shadow_view: &self.shadow_view,
-                shadow_sampler: &self.shadow_sampler,
-                model_layout: &self.model_bind_group_layout,
-                material_layout: &self.material_bind_group_layout,
-                lighting_layout: &self.lighting_layout,
-            },
+    }
+
+    /// Use `hdr` (an equirect image and its intensity) as the sky and the
+    /// image-based ambient from the next `update_environment` /
+    /// `update_light`; `None` = the procedural sky.
+    pub fn set_sky_texture(&mut self, hdr: Option<(std::sync::Arc<ibl::HdrImage>, f32)>) {
+        self.ibl_hdr = hdr;
+    }
+
+    /// Recompute the IBL data when its inputs (sky colours, hemisphere
+    /// ambient, HDR image) changed since the last build.
+    fn refresh_ibl(&mut self) {
+        if self.ibl_frozen {
+            return;
+        }
+        let key = (
+            self.ibl_sky,
+            self.ibl_hdr.as_ref().map(|(image, intensity)| {
+                (std::sync::Arc::as_ptr(image) as usize, intensity.to_bits())
+            }),
         );
-        tracing::debug!(size, "shadow map recreated");
+        if self.ibl_built == Some(key) {
+            return;
+        }
+        let source = match &self.ibl_hdr {
+            Some((image, intensity)) => ibl::Source::Hdr(image, *intensity),
+            None => ibl::Source::Procedural(self.ibl_sky),
+        };
+        self.ibl.rebuild(&self.queue, &source);
+        self.ibl_rebuilds += 1;
+        self.ibl_built = Some(key);
     }
 
     /// Edge of the sun shadow map in texels.
@@ -1911,7 +2844,8 @@ impl SceneRenderer {
                 &self.material_bind_group_layout,
                 &self.lighting_layout,
             ];
-            let mesh = |mode| Renderer::build_mesh_pipeline(&self.device, &layouts, mode, samples);
+            let mesh =
+                |mode| Renderer::build_mesh_pipeline(&self.device, &layouts, mode, samples, None);
             use melon_core::GiMode::{Ddgi, Off, Ssgi};
             *slot = Some(MsaaPipelines {
                 mesh: [mesh(Off), mesh(Ssgi), mesh(Ddgi)],
@@ -1984,6 +2918,7 @@ impl SceneRenderer {
                 resource: wgpu::BindingResource::TextureView(ao),
             }];
             entries.extend(self.gi.entries(Some(&gi), true));
+            entries.extend(self.frame_lights.entries());
             self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
                 layout: &self.lighting_layout,
@@ -1998,14 +2933,19 @@ impl SceneRenderer {
     }
 }
 
-/// A `Depth32Float` sun shadow map of `size` x `size` texels and its view.
-fn create_shadow_map(device: &wgpu::Device, size: u32) -> (wgpu::Texture, wgpu::TextureView) {
+/// A `Depth32Float` sun shadow map of `layers` layers of `size` x `size`
+/// texels: the array view to sample and a view per layer to render into.
+fn create_shadow_map(
+    device: &wgpu::Device,
+    size: u32,
+    layers: u32,
+) -> (wgpu::Texture, wgpu::TextureView, Vec<wgpu::TextureView>) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("shadow map"),
         size: wgpu::Extent3d {
             width: size,
             height: size,
-            depth_or_array_layers: 1,
+            depth_or_array_layers: layers,
         },
         mip_level_count: 1,
         sample_count: 1,
@@ -2014,8 +2954,21 @@ fn create_shadow_map(device: &wgpu::Device, size: u32) -> (wgpu::Texture, wgpu::
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    (texture, view)
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    let layer_views = (0..layers)
+        .map(|layer| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: layer,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        })
+        .collect();
+    (texture, view, layer_views)
 }
 
 /// Group 0: camera, light, the shadow map + comparison sampler, environment
@@ -2026,6 +2979,8 @@ fn frame_bind_group(
     [camera, light, environment]: [&wgpu::Buffer; 3],
     shadow_view: &wgpu::TextureView,
     shadow_sampler: &wgpu::Sampler,
+    ibl: &ibl::IblGpu,
+    (local_atlas, local_views): (&wgpu::TextureView, &wgpu::Buffer),
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("frame bind group"),
@@ -2051,8 +3006,52 @@ fn frame_bind_group(
                 binding: 4,
                 resource: environment.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: ibl.uniform.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::TextureView(&ibl.specular),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::Sampler(&ibl.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(&ibl.brdf),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: wgpu::BindingResource::TextureView(local_atlas),
+            },
+            wgpu::BindGroupEntry {
+                binding: 12,
+                resource: local_views.as_entire_binding(),
+            },
         ],
     })
+}
+
+/// A `Depth32Float` atlas of `size` x `size` texels for point / spot shadows.
+fn create_local_atlas(device: &wgpu::Device, size: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("local shadow atlas"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
 }
 
 impl Renderer {
@@ -2063,8 +3062,15 @@ impl Renderer {
         layouts: &[&wgpu::BindGroupLayout; 4],
         gi: melon_core::GiMode,
         samples: u32,
+        variant: Option<Variant>,
     ) -> wgpu::RenderPipeline {
-        let constants = [("GI_MODE", gi::shader_mode(gi))];
+        let blend = variant == Some(Variant::Blend);
+        let a2c = variant.is_some_and(Variant::alpha_to_coverage);
+        let constants = [
+            ("GI_MODE", gi::shader_mode(gi)),
+            ("ALPHA_BLEND", f64::from(blend)),
+            ("ALPHA_TO_COVERAGE", f64::from(a2c)),
+        ];
         let compilation_options = wgpu::PipelineCompilationOptions {
             constants: &constants,
             ..Default::default()
@@ -2099,18 +3105,20 @@ impl Renderer {
                 }],
             },
             primitive: wgpu::PrimitiveState {
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: matches!(variant, None | Some(Variant::Mask))
+                    .then_some(wgpu::Face::Back),
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
+                depth_write_enabled: Some(!blend),
                 depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
                 count: samples,
+                alpha_to_coverage_enabled: a2c,
                 ..Default::default()
             },
             fragment: Some(wgpu::FragmentState {
@@ -2119,7 +3127,11 @@ impl Renderer {
                 compilation_options: compilation_options.clone(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: HDR_FORMAT,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    blend: Some(if blend {
+                        wgpu::BlendState::ALPHA_BLENDING
+                    } else {
+                        wgpu::BlendState::REPLACE
+                    }),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -2130,16 +3142,25 @@ impl Renderer {
 
     /// SSAO depth/normal prepass: single-sample, depth-writing, back faces
     /// culled like the mesh pipeline.
+    /// With `masked` (the material layout, group 2) the alpha-masked
+    /// variant: reads the base colour alpha and discards below the cutoff.
     fn build_prepass_pipeline(
         device: &wgpu::Device,
         frame_layout: &wgpu::BindGroupLayout,
         model_layout: &wgpu::BindGroupLayout,
+        masked: Option<&wgpu::BindGroupLayout>,
     ) -> wgpu::RenderPipeline {
         let shader = device
             .create_shader_module(wgpu::include_wgsl!("../../../assets/shaders/prepass.wgsl"));
+        let (vs, fs) = if masked.is_some() {
+            ("vs_mask", "fs_mask")
+        } else {
+            ("vs_main", "fs_main")
+        };
+        let layouts = [Some(frame_layout), Some(model_layout), masked];
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("prepass pipeline layout"),
-            bind_group_layouts: &[Some(frame_layout), Some(model_layout)],
+            bind_group_layouts: &layouts[..if masked.is_some() { 3 } else { 2 }],
             immediate_size: 0,
         });
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2147,12 +3168,12 @@ impl Renderer {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: Some("vs_main"),
+                entry_point: Some(vs),
                 compilation_options: Default::default(),
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
                 }],
             },
             primitive: wgpu::PrimitiveState {
@@ -2169,7 +3190,7 @@ impl Renderer {
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_main"),
+                entry_point: Some(fs),
                 compilation_options: Default::default(),
                 targets: &[Some(PREPASS_NORMAL_FORMAT.into())],
             }),
@@ -2296,16 +3317,25 @@ impl Renderer {
         })
     }
 
+    /// With `masked` (the material layout, group 2) the alpha-masked
+    /// variant: reads the base colour alpha and discards below the cutoff.
     fn build_shadow_pipeline(
         device: &wgpu::Device,
         shadow_layout: &wgpu::BindGroupLayout,
         model_layout: &wgpu::BindGroupLayout,
+        masked: Option<&wgpu::BindGroupLayout>,
     ) -> wgpu::RenderPipeline {
         let shader =
             device.create_shader_module(wgpu::include_wgsl!("../../../assets/shaders/shadow.wgsl"));
+        let (vs, fs) = if masked.is_some() {
+            ("vs_mask", Some("fs_mask"))
+        } else {
+            ("vs_main", None)
+        };
+        let layouts = [Some(shadow_layout), Some(model_layout), masked];
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("shadow pipeline layout"),
-            bind_group_layouts: &[Some(shadow_layout), Some(model_layout)],
+            bind_group_layouts: &layouts[..if masked.is_some() { 3 } else { 2 }],
             immediate_size: 0,
         });
 
@@ -2314,12 +3344,12 @@ impl Renderer {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: Some("vs_main"),
+                entry_point: Some(vs),
                 compilation_options: Default::default(),
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
                 }],
             },
             primitive: wgpu::PrimitiveState {
@@ -2344,7 +3374,12 @@ impl Renderer {
                 },
             }),
             multisample: wgpu::MultisampleState::default(),
-            fragment: None,
+            fragment: fs.map(|entry_point| wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some(entry_point),
+                compilation_options: Default::default(),
+                targets: &[],
+            }),
             multiview_mask: None,
             cache: None,
         })
@@ -3140,7 +4175,12 @@ impl SceneRenderer {
     }
 
     /// Sky colours and fog density for the mesh and sky shaders.
-    pub fn update_environment(&self, environment: &melon_core::Environment) {
+    pub fn update_environment(&mut self, environment: &melon_core::Environment) {
+        if !self.ibl_frozen {
+            self.ibl_sky.zenith = environment.zenith_color;
+            self.ibl_sky.horizon = environment.horizon_color;
+        }
+        self.refresh_ibl();
         let uniform = EnvironmentUniform {
             zenith_color: environment.zenith_color.to_array(),
             fog_density: environment.fog_density,
@@ -3155,30 +4195,77 @@ impl SceneRenderer {
     }
 
     /// `light_view_proj` is the shadow box, see [`directional_light_view_proj`].
-    pub fn update_light(&self, light: &melon_core::Light, light_view_proj: glam::Mat4) {
-        let uniform = LightUniform {
+    pub fn update_light(&mut self, light: &melon_core::Light, light_view_proj: glam::Mat4) {
+        self.update_light_cascades(light, &cascades::CascadeSet::single(light_view_proj));
+    }
+
+    /// `update_light` with the sun's shadow cascades.
+    fn update_light_cascades(&mut self, light: &melon_core::Light, set: &cascades::CascadeSet) {
+        if !self.ibl_frozen {
+            self.ibl_sky.ambient = light.ambient;
+            self.ibl_sky.sky_color = light.sky_color;
+            self.ibl_sky.ground_color = light.ground_color;
+        }
+        self.refresh_ibl();
+        let uniform = self.light_uniform(light, set);
+        self.queue
+            .write_buffer(&self.light_buffer, 0, bytemuck::cast_slice(&[uniform]));
+        // The shadow shader reads only `view_proj`.
+        for (buffer, m) in self.shadow_camera_buffers.iter().zip(&set.view_proj) {
+            let shadow_camera = CameraUniform {
+                view_proj: m.to_cols_array_2d(),
+                ..Zeroable::zeroed()
+            };
+            self.queue
+                .write_buffer(buffer, 0, bytemuck::cast_slice(&[shadow_camera]));
+        }
+    }
+
+    /// The light uniform for `light` with the shadow cascades `set`.
+    fn light_uniform(&self, light: &melon_core::Light, set: &cascades::CascadeSet) -> LightUniform {
+        // With an HDR sky the hemisphere colours (read by GI misses and the
+        // GI-off fallbacks) follow the mean radiance of the image above and
+        // below the horizon.
+        let (sky_color, ground_color) = if self.ibl_hdr.is_some() {
+            let scale = 1.0 / light.ambient.max(1e-3);
+            (self.ibl.mean_up * scale, self.ibl.mean_down * scale)
+        } else {
+            (light.sky_color, light.ground_color)
+        };
+        LightUniform {
             direction: light.to_light().to_array(),
             ambient: light.ambient,
             color: light.color.to_array(),
             _pad: 0.0,
-            sky_color: light.sky_color.to_array(),
+            sky_color: sky_color.to_array(),
             _pad1: 0.0,
-            ground_color: light.ground_color.to_array(),
+            ground_color: ground_color.to_array(),
             _pad2: 0.0,
-            light_view_proj: light_view_proj.to_cols_array_2d(),
-        };
+            light_view_proj: set.view_proj[0].to_cols_array_2d(),
+            cascade_view_proj: std::array::from_fn(|i| {
+                set.view_proj
+                    .get(i)
+                    .unwrap_or(&set.view_proj[0])
+                    .to_cols_array_2d()
+            }),
+            cascade_far: set.far,
+            cascade_info: [set.view_proj.len() as f32, set.distance, 0.0, 0.0],
+            cascade_forward: set.forward.extend(0.0).to_array(),
+        }
+    }
+
+    /// The sun for the DDGI voxel passes: one cascade fitted to the GI
+    /// volume (`gi_shadow_matrix`), whatever the camera sees.
+    fn update_gi_light(&self, light: &melon_core::Light, view_proj: glam::Mat4) {
+        let uniform = self.light_uniform(light, &cascades::CascadeSet::single(view_proj));
         self.queue
-            .write_buffer(&self.light_buffer, 0, bytemuck::cast_slice(&[uniform]));
-        // The shadow shader reads only `view_proj`.
-        let shadow_camera = CameraUniform {
-            view_proj: light_view_proj.to_cols_array_2d(),
+            .write_buffer(&self.gi_light_buffer, 0, bytemuck::cast_slice(&[uniform]));
+        let camera = CameraUniform {
+            view_proj: view_proj.to_cols_array_2d(),
             ..Zeroable::zeroed()
         };
-        self.queue.write_buffer(
-            &self.shadow_camera_buffer,
-            0,
-            bytemuck::cast_slice(&[shadow_camera]),
-        );
+        self.queue
+            .write_buffer(&self.gi_shadow_camera.0, 0, bytemuck::cast_slice(&[camera]));
     }
 
     /// SSAO kernel, radius and strength for the SSAO passes.
@@ -3200,6 +4287,7 @@ impl SceneRenderer {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         draw_calls: &[(&Mesh, std::ops::Range<u32>)],
+        masked: &[(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)],
         ssao: &SsaoTargets,
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3232,6 +4320,15 @@ impl SceneRenderer {
             pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.draw_indexed(0..mesh.index_count, 0, instances.clone());
+        }
+        if !masked.is_empty() {
+            pass.set_pipeline(&self.prepass_mask_pipeline);
+            for (mesh, material, instances) in masked {
+                pass.set_bind_group(2, *material, &[]);
+                pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.draw_indexed(0..mesh.index_count, 0, instances.clone());
+            }
         }
     }
 
@@ -3283,11 +4380,67 @@ impl SceneRenderer {
         encoder: &mut wgpu::CommandEncoder,
         draw_calls: &[(&Mesh, std::ops::Range<u32>)],
     ) {
+        self.render_shadow_pass_masked(encoder, draw_calls, &[]);
+    }
+
+    /// `render_shadow_pass` plus alpha-masked casters (each with its
+    /// material, which discards below its cutoff).
+    pub fn render_shadow_pass_masked(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        draw_calls: &[(&Mesh, std::ops::Range<u32>)],
+        masked: &[(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)],
+    ) {
+        self.render_cascade(encoder, 0, draw_calls, masked);
+    }
+
+    /// One shadow cascade: the casters into layer `layer` with the matrix
+    /// of `update_light_cascades`.
+    fn render_cascade(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        layer: usize,
+        draw_calls: &[(&Mesh, std::ops::Range<u32>)],
+        masked: &[(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)],
+    ) {
+        self.render_shadow_into(
+            encoder,
+            &self.shadow_layers[layer],
+            &self.shadow_bind_groups[layer],
+            draw_calls,
+            masked,
+        );
+    }
+
+    /// The casters of the DDGI sun shadow map.
+    fn render_gi_shadow(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        draw_calls: &[(&Mesh, std::ops::Range<u32>)],
+        masked: &[(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)],
+    ) {
+        self.render_shadow_into(
+            encoder,
+            &self.gi_shadow_layer,
+            &self.gi_shadow_camera.1,
+            draw_calls,
+            masked,
+        );
+    }
+
+    fn render_shadow_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        camera: &wgpu::BindGroup,
+        draw_calls: &[(&Mesh, std::ops::Range<u32>)],
+        masked: &[(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)],
+    ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("melon_render shadow pass"),
             color_attachments: &[],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &self.shadow_view,
+                view: target,
                 depth_ops: Some(wgpu::Operations {
                     load: wgpu::LoadOp::Clear(1.0),
                     store: wgpu::StoreOp::Store,
@@ -3299,12 +4452,21 @@ impl SceneRenderer {
             multiview_mask: None,
         });
         pass.set_pipeline(&self.shadow_pipeline);
-        pass.set_bind_group(0, &self.shadow_bind_group, &[]);
+        pass.set_bind_group(0, camera, &[]);
         pass.set_bind_group(1, &self.instance_bind_group, &[]);
         for (mesh, instances) in draw_calls {
             pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.draw_indexed(0..mesh.index_count, 0, instances.clone());
+        }
+        if !masked.is_empty() {
+            pass.set_pipeline(&self.shadow_mask_pipeline);
+            for (mesh, material, instances) in masked {
+                pass.set_bind_group(2, *material, &[]);
+                pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.draw_indexed(0..mesh.index_count, 0, instances.clone());
+            }
         }
     }
 
@@ -3325,13 +4487,37 @@ impl SceneRenderer {
                 height,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1,
+            mip_level_count: mip_count(width, height),
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        for (level, ((w, h), data)) in mip_chain(pixels, width, height, format.is_srgb())
+            .iter()
+            .enumerate()
+        {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: level as u32 + 1,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(*h),
+                },
+                wgpu::Extent3d {
+                    width: *w,
+                    height: *h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -3352,6 +4538,23 @@ impl SceneRenderer {
             },
         );
         texture
+    }
+
+    /// `create_texture_from_image` as sRGB colour data or as linear data
+    /// (metallic-roughness, normals).
+    pub fn create_texture_from_image_as(
+        &self,
+        img: &image::DynamicImage,
+        srgb: bool,
+    ) -> wgpu::Texture {
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        let format = if srgb {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        };
+        self.create_texture_from_bytes(&rgba, width, height, format)
     }
 
     /// Convert an `image::DynamicImage` to RGBA8 and upload it as a texture.
@@ -3432,6 +4635,8 @@ impl SceneRenderer {
                 let mut model = LoadedModel {
                     meshes: Vec::new(),
                     material_bind_groups: Vec::new(),
+                    surfaces: Vec::new(),
+                    part_bounds: Vec::new(),
                     bounds: (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)),
                 };
                 for primitive in gltf_mesh.primitives() {
@@ -3466,6 +4671,68 @@ impl SceneRenderer {
         self.build_model(&document, &buffers, &images)
     }
 
+    /// A UV sphere of radius 0.5 (`builtin:sphere`, material thumbnails),
+    /// in the checkerboard material.
+    pub fn builtin_sphere_model(&self) -> LoadedModel {
+        const SEGMENTS: u32 = 32;
+        const RINGS: u32 = 16;
+        let mut vertices = Vec::new();
+        for ring in 0..=RINGS {
+            let v = ring as f32 / RINGS as f32;
+            let theta = v * std::f32::consts::PI;
+            for seg in 0..=SEGMENTS {
+                let u = seg as f32 / SEGMENTS as f32;
+                let phi = u * std::f32::consts::TAU;
+                let normal = glam::Vec3::new(
+                    theta.sin() * phi.cos(),
+                    theta.cos(),
+                    theta.sin() * phi.sin(),
+                );
+                let tangent = glam::Vec3::new(-phi.sin(), 0.0, phi.cos());
+                vertices.push(Vertex {
+                    position: (normal * 0.5).to_array(),
+                    normal: normal.to_array(),
+                    uv: [u, v],
+                    tangent: tangent.extend(1.0).to_array(),
+                });
+            }
+        }
+        let mut indices: Vec<u32> = Vec::new();
+        for ring in 0..RINGS {
+            for seg in 0..SEGMENTS {
+                let a = ring * (SEGMENTS + 1) + seg;
+                let b = a + SEGMENTS + 1;
+                indices.extend([a, a + 1, b, a + 1, b + 1, b]);
+            }
+        }
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("sphere vertex buffer"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("sphere index buffer"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        LoadedModel {
+            meshes: vec![Mesh {
+                vertex_buffer,
+                index_buffer,
+                index_count: indices.len() as u32,
+                index_format: wgpu::IndexFormat::Uint32,
+            }],
+            material_bind_groups: vec![self.checker_material.clone()],
+            surfaces: vec![Surface::default()],
+            part_bounds: vec![(glam::Vec3::splat(-0.5), glam::Vec3::splat(0.5))],
+            bounds: (glam::Vec3::splat(-0.5), glam::Vec3::splat(0.5)),
+        }
+    }
+
     /// Load a glTF from the pack: `name` is its pack path, `files` its external
     /// buffers and images (`packed_gltf::external_files`).
     pub fn load_gltf_packed(
@@ -3483,6 +4750,8 @@ impl SceneRenderer {
         LoadedModel {
             meshes: vec![self.cube_mesh()],
             material_bind_groups: vec![self.checker_material.clone()],
+            surfaces: vec![Surface::default()],
+            part_bounds: vec![(glam::Vec3::splat(-0.5), glam::Vec3::splat(0.5))],
             bounds: (glam::Vec3::splat(-0.5), glam::Vec3::splat(0.5)),
         }
     }
@@ -3496,6 +4765,8 @@ impl SceneRenderer {
         let mut model = LoadedModel {
             meshes: Vec::new(),
             material_bind_groups: Vec::new(),
+            surfaces: Vec::new(),
+            part_bounds: Vec::new(),
             bounds: (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)),
         };
         let scene = document
@@ -3635,6 +4906,12 @@ impl SceneRenderer {
                 contents: bytemuck::cast_slice(&indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
+        let (mut lo, mut hi) = (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN));
+        for v in &vertices {
+            lo = lo.min(glam::Vec3::from_array(v.position));
+            hi = hi.max(glam::Vec3::from_array(v.position));
+        }
+        model.part_bounds.push((lo, hi));
         model.meshes.push(Mesh {
             vertex_buffer,
             index_buffer,
@@ -3668,6 +4945,7 @@ impl SceneRenderer {
                 &MaterialUniform::from_gltf(&material),
                 [0, 1, 2, 3].map(|i| textures[i].as_ref()),
             ));
+        model.surfaces.push(Surface::from_gltf(&material));
         Ok(())
     }
 }
@@ -3761,6 +5039,52 @@ impl SceneRenderer {
             melon_core::GiMode::Ssgi => &mesh[1],
             melon_core::GiMode::Ddgi => &mesh[2],
         });
+        pass.set_bind_group(0, &self.frame_bind_group, &[]);
+        pass.set_bind_group(1, &self.instance_bind_group, &[]);
+        pass.set_bind_group(3, lighting, &[]);
+        for (mesh, material, instances) in draw_calls {
+            pass.set_bind_group(2, *material, &[]);
+            pass.set_index_buffer(mesh.index_buffer.slice(..), mesh.index_format);
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.draw_indexed(0..mesh.index_count, 0, instances.clone());
+        }
+    }
+
+    /// Builds the double-sided / blend mesh pipeline for the current sample
+    /// count and GI mode if it does not exist yet.
+    fn ensure_variant(&mut self, variant: Variant) {
+        let key = (msaa_slot(self.msaa), self.gi.mode as usize, variant);
+        if self.variants.contains_key(&key) {
+            return;
+        }
+        let layouts = [
+            &self.frame_layout,
+            &self.model_bind_group_layout,
+            &self.material_bind_group_layout,
+            &self.lighting_layout,
+        ];
+        let pipeline = Renderer::build_mesh_pipeline(
+            &self.device,
+            &layouts,
+            self.gi.mode,
+            self.msaa,
+            Some(variant),
+        );
+        self.variants.insert(key, pipeline);
+    }
+
+    /// `draw_meshes_textured` with a variant pipeline
+    /// (`ensure_variant` first).
+    fn draw_meshes_variant(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        draw_calls: &[(&Mesh, &wgpu::BindGroup, std::ops::Range<u32>)],
+        lighting: &wgpu::BindGroup,
+        variant: Variant,
+    ) {
+        let key = (msaa_slot(self.msaa), self.gi.mode as usize, variant);
+        let pipeline = self.variants.get(&key).expect("ensure_variant built it");
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.frame_bind_group, &[]);
         pass.set_bind_group(1, &self.instance_bind_group, &[]);
         pass.set_bind_group(3, lighting, &[]);
@@ -4307,8 +5631,8 @@ mod tests {
     }
 
     #[test]
-    fn light_uniform_size_is_128() {
-        assert_eq!(std::mem::size_of::<LightUniform>(), 128);
+    fn light_uniform_size_is_432() {
+        assert_eq!(std::mem::size_of::<LightUniform>(), 432);
     }
 
     #[test]
@@ -4361,7 +5685,7 @@ mod tests {
 
     const TEST_SIZE: u32 = 64;
     /// Share of a shadow edge's contrast (percent) that default bloom must keep.
-    const EDGE_KEEP_PERCENT: i32 = 87;
+    const EDGE_KEEP_PERCENT: i32 = 85;
     /// World (-2, 0, 0): on the floor, inside the occluder's shadow.
     const SHADOW_PX: (u32, u32) = (16, 32);
     /// World (2, 0, 0): on the floor, in the open.
@@ -4546,6 +5870,8 @@ mod tests {
             environment,
             quality: melon_core::RenderQuality::default(),
             models,
+            overrides: Default::default(),
+            lights: Default::default(),
         };
         let mut encoder = r
             .device()
@@ -4647,6 +5973,8 @@ mod tests {
                 environment,
                 quality,
                 models: models.to_vec(),
+                overrides: Default::default(),
+                lights: Default::default(),
             };
             let mut encoder = r
                 .device()
@@ -4693,6 +6021,8 @@ mod tests {
                 environment,
                 quality,
                 models: models.to_vec(),
+                overrides: Default::default(),
+                lights: Default::default(),
             };
             let mut encoder = r
                 .device()
@@ -5069,6 +6399,8 @@ mod tests {
             } else {
                 vec![]
             },
+            overrides: Default::default(),
+            lights: Default::default(),
         };
         let mut target =
             renderer.create_viewport_target(winit::dpi::PhysicalSize::new(size.0, size.1));
@@ -5263,6 +6595,8 @@ mod tests {
             environment: melon_core::Environment::default(),
             quality,
             models: models.clone(),
+            overrides: Default::default(),
+            lights: Default::default(),
         };
         let reset = frame(melon_core::RenderQuality {
             gi_mode: GiMode::Off,
@@ -5286,8 +6620,10 @@ mod tests {
             )
         };
         let mut run = |renderer: &mut Renderer, thumbnails: bool| -> Result<Vec<u8>, String> {
+            let mut counts = None;
             for (i, frame) in [&reset, &main, &main].into_iter().enumerate() {
                 if i == 2 && thumbnails {
+                    counts = Some((renderer.scene.ibl_rebuilds, renderer.scene.shadow_rebuilds));
                     let before = identity(renderer, &scene_target);
                     for _ in 0..2 {
                         renderer
@@ -5309,6 +6645,13 @@ mod tests {
                     &[],
                     &[],
                 );
+                // The thumbnails and the main frame after them rebuild
+                // neither the IBL nor the shadow textures.
+                if let Some(counts) = counts
+                    && counts != (renderer.scene.ibl_rebuilds, renderer.scene.shadow_rebuilds)
+                {
+                    return Err(format!("{name}: a thumbnail rebuilt the IBL or atlas"));
+                }
                 if i < 2 {
                     renderer.queue().submit([encoder.finish()]);
                 } else {
@@ -5345,6 +6688,1350 @@ mod tests {
         } else {
             Err(format!("{name}: the next frame's pixels changed"))
         }
+    }
+
+    /// A project folder with `assets/materials` and `assets/textures`.
+    fn material_project(name: &str) -> std::path::PathBuf {
+        let dir = temp_project(name);
+        std::fs::create_dir_all(dir.join("assets/materials")).unwrap();
+        std::fs::create_dir_all(dir.join("assets/textures")).unwrap();
+        dir
+    }
+
+    fn write_mat(root: &std::path::Path, name: &str, ron: &str) {
+        std::fs::write(root.join(format!("assets/materials/{name}.mat")), ron).unwrap();
+    }
+
+    /// Slabs of `builtin:cube` seen from above, each with its material (or
+    /// the checkerboard); returns the display pixels. Caches are reset: the
+    /// GPU checks share one renderer and handle ids repeat across servers.
+    fn render_slabs(
+        r: &mut Renderer,
+        server: &mut melon_core::AssetServer,
+        slabs: &[(glam::Vec3, glam::Vec3, Option<&str>)],
+    ) -> Vec<u8> {
+        render_slabs_in(r, server, slabs, plain_environment())
+    }
+
+    fn render_slabs_in(
+        r: &mut Renderer,
+        server: &mut melon_core::AssetServer,
+        slabs: &[(glam::Vec3, glam::Vec3, Option<&str>)],
+        environment: melon_core::Environment,
+    ) -> Vec<u8> {
+        r.materials = Default::default();
+        r.model_cache = ModelCache::new(&r.scene);
+        let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+        let mut frame = FrameData {
+            view_proj: top_down_camera().view_proj(),
+            eye: top_down_camera().eye,
+            light: test_light(),
+            environment,
+            ..Default::default()
+        };
+        for (i, (size, at, material)) in slabs.iter().enumerate() {
+            frame.models.push((
+                glam::Mat4::from_scale_rotation_translation(*size, glam::Quat::IDENTITY, *at),
+                cube,
+            ));
+            if let Some(path) = material {
+                frame.overrides.insert(
+                    i,
+                    vec![Some(server.load(&format!("assets/materials/{path}.mat")))],
+                );
+            }
+        }
+        let mut target =
+            r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let mut encoder = r
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        r.render_scene(&mut encoder, &frame, server, &mut target, &[], &[]);
+        read_back(r.device(), r.queue(), encoder, &target.color_texture)
+    }
+
+    const CENTRE_PX: (u32, u32) = (TEST_SIZE / 2, TEST_SIZE / 2);
+
+    fn floor_slab(material: &'static str) -> [(glam::Vec3, glam::Vec3, Option<&'static str>); 1] {
+        [(
+            glam::Vec3::new(8.0, 0.2, 8.0),
+            glam::Vec3::new(0.0, -0.1, 0.0),
+            Some(material),
+        )]
+    }
+
+    fn check_material_missing_texture(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("mat_missing_texture");
+        let plain = "(base_color: (0.2, 0.6, 0.2, 1.0), metallic: 0.0, roughness: 0.8";
+        write_mat(&root, "plain", &format!("{plain})"));
+        write_mat(
+            &root,
+            "missing",
+            &format!(
+                "{plain}, base_color_texture: Some((guid: None, path: \"assets/textures/none.png\")))"
+            ),
+        );
+        let mut server = fresh_ids_server(root.clone(), 7000);
+        let a = render_slabs(r, &mut server, &floor_slab("plain"));
+        let b = render_slabs(r, &mut server, &floor_slab("missing"));
+        let built = r.materials.builds;
+        if built != 1 {
+            return Err(format!("the .mat should have loaded (builds {built})"));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let (pa, pb) = (pixel_at(r, &a, CENTRE_PX), pixel_at(r, &b, CENTRE_PX));
+        if pa != pb {
+            return Err(format!(
+                "missing texture should bind the 1x1 fallback: {pa:?} vs {pb:?}"
+            ));
+        }
+        if pa[1] <= pa[0].saturating_add(20) {
+            return Err(format!("the material colour should show (green): {pa:?}"));
+        }
+        Ok(())
+    }
+
+    fn check_texture_hot_reload(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("mat_hot_reload");
+        write_mat(
+            &root,
+            "tex",
+            "(metallic: 0.0, roughness: 0.8, base_color_texture: Some((guid: None, path: \"assets/textures/t.png\")))",
+        );
+        let png = root.join("assets/textures/t.png");
+        let write = |rgb: [u8; 3], later: u64| {
+            image::RgbaImage::from_pixel(2, 2, image::Rgba([rgb[0], rgb[1], rgb[2], 255]))
+                .save(&png)
+                .unwrap();
+            let file = std::fs::OpenOptions::new().write(true).open(&png).unwrap();
+            file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(later))
+                .unwrap();
+        };
+        let mut server = fresh_ids_server(root.clone(), 7100);
+        write([255, 0, 0], 2);
+        let before = render_slabs(r, &mut server, &floor_slab("tex"));
+        let before = pixel_at(r, &before, CENTRE_PX);
+        write([0, 0, 255], 5);
+        server.poll_changes();
+        // Same renderer caches: only the texture version changed.
+        let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+        let material: melon_core::Handle<melon_core::Material> =
+            server.load("assets/materials/tex.mat");
+        let builds = r.materials.builds;
+        let mut frame = FrameData {
+            view_proj: top_down_camera().view_proj(),
+            eye: top_down_camera().eye,
+            light: test_light(),
+            environment: plain_environment(),
+            ..Default::default()
+        };
+        frame.models.push((
+            glam::Mat4::from_scale_rotation_translation(
+                glam::Vec3::new(8.0, 0.2, 8.0),
+                glam::Quat::IDENTITY,
+                glam::Vec3::new(0.0, -0.1, 0.0),
+            ),
+            cube,
+        ));
+        frame.overrides.insert(0, vec![Some(material)]);
+        let mut target =
+            r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let mut encoder = r
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        r.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
+        let after = read_back(r.device(), r.queue(), encoder, &target.color_texture);
+        let after = pixel_at(r, &after, CENTRE_PX);
+        let rebuilt = r.materials.builds - builds;
+        let _ = std::fs::remove_dir_all(&root);
+        if before[0] <= before[2].saturating_add(40) {
+            return Err(format!("first texture is red: {before:?}"));
+        }
+        if rebuilt != 1 || after[2] <= after[0].saturating_add(40) {
+            return Err(format!(
+                "texture hot reload: {rebuilt} rebuilds, now {after:?} (want blue)"
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_alpha_mask_and_blend(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("mat_alpha");
+        let colour = |rgb: &str, alpha: f32, mode: &str| {
+            format!(
+                "(base_color: ({rgb}, {alpha:?}), metallic: 0.0, roughness: 0.8, alpha_mode: {mode})"
+            )
+        };
+        write_mat(&root, "green", &colour("0.0, 0.8, 0.0", 1.0, "Opaque"));
+        write_mat(&root, "red", &colour("0.8, 0.0, 0.0", 1.0, "Opaque"));
+        write_mat(
+            &root,
+            "cut_low",
+            &colour("0.8, 0.0, 0.0", 0.3, "Mask(cutoff: 0.5)"),
+        );
+        write_mat(
+            &root,
+            "cut_high",
+            &colour("0.8, 0.0, 0.0", 0.8, "Mask(cutoff: 0.5)"),
+        );
+        write_mat(&root, "glass", &colour("0.8, 0.0, 0.0", 0.5, "Blend"));
+        let mut server = fresh_ids_server(root.clone(), 7200);
+        let floor = (
+            glam::Vec3::new(8.0, 0.2, 8.0),
+            glam::Vec3::new(0.0, -0.1, 0.0),
+            Some("green"),
+        );
+        let slab = |material| {
+            (
+                glam::Vec3::new(3.0, 0.1, 3.0),
+                glam::Vec3::new(0.0, 0.5, 0.0),
+                Some(material),
+            )
+        };
+        let mut px = |slabs: &[_]| {
+            let pixels = render_slabs(r, &mut server, slabs);
+            pixel_at(r, &pixels, CENTRE_PX)
+        };
+        let ground = px(&[floor]);
+        let opaque = px(&[floor, slab("red")]);
+        let masked_out = px(&[floor, slab("cut_low")]);
+        let masked_in = px(&[floor, slab("cut_high")]);
+        let blended = px(&[floor, slab("glass")]);
+        let built = r.materials.builds;
+        if built != 2 {
+            return Err(format!(
+                "the .mat files should have loaded (builds {built})"
+            ));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        if masked_out != ground {
+            return Err(format!(
+                "Mask below the cutoff should vanish: {masked_out:?} vs {ground:?}"
+            ));
+        }
+        if masked_in != opaque {
+            return Err(format!(
+                "Mask above the cutoff should draw: {masked_in:?} vs {opaque:?}"
+            ));
+        }
+        let between = |v: u8, a: u8, b: u8| v > a.min(b) && v < a.max(b);
+        if !between(blended[0], ground[0], opaque[0]) || !between(blended[1], ground[1], opaque[1])
+        {
+            return Err(format!(
+                "Blend should mix the slab with what is behind: {blended:?} between {ground:?} and {opaque:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// A white floor lit only by `lights` (no sun, no ambient), seen from
+    /// above; returns the display pixels and the frame's stats.
+    fn render_lit(
+        r: &mut Renderer,
+        lights: Vec<lights::LocalLight>,
+        quality: melon_core::RenderQuality,
+    ) -> (Vec<u8>, RenderStats) {
+        let sun = melon_core::Light {
+            color: glam::Vec3::ZERO,
+            ambient: 0.0,
+            ..test_light()
+        };
+        render_floor_under(r, lights, quality, sun, plain_environment(), None)
+    }
+
+    /// `render_lit` under the given sun / ambient and sky.
+    fn render_floor_under(
+        r: &mut Renderer,
+        lights: Vec<lights::LocalLight>,
+        quality: melon_core::RenderQuality,
+        light: melon_core::Light,
+        environment: melon_core::Environment,
+        sky_png: Option<[u8; 3]>,
+    ) -> (Vec<u8>, RenderStats) {
+        let root = material_project("lit_floor");
+        write_mat(
+            &root,
+            "white",
+            "(base_color: (0.8, 0.8, 0.8, 1.0), metallic: 0.0, roughness: 0.8)",
+        );
+        let mut server = fresh_ids_server(root.clone(), 7300);
+        r.materials = Default::default();
+        r.model_cache = ModelCache::new(&r.scene);
+        let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+        let material = server.load("assets/materials/white.mat");
+        let mut environment = environment;
+        if let Some(rgb) = sky_png {
+            let file = root.join("assets/textures/sky.png");
+            image::RgbaImage::from_pixel(8, 4, image::Rgba([rgb[0], rgb[1], rgb[2], 255]))
+                .save(&file)
+                .unwrap();
+            environment.sky_texture = Some(server.load("assets/textures/sky.png"));
+        }
+        let mut frame = FrameData {
+            view_proj: top_down_camera().view_proj(),
+            eye: top_down_camera().eye,
+            light,
+            environment,
+            quality,
+            lights,
+            ..Default::default()
+        };
+        frame.models.push((
+            glam::Mat4::from_scale_rotation_translation(
+                glam::Vec3::new(12.0, 0.2, 12.0),
+                glam::Quat::IDENTITY,
+                glam::Vec3::new(0.0, -0.1, 0.0),
+            ),
+            cube,
+        ));
+        frame.overrides.insert(0, vec![Some(material)]);
+        let mut target =
+            r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let mut encoder = r
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let stats = r.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
+        let pixels = read_back(r.device(), r.queue(), encoder, &target.color_texture);
+        let _ = std::fs::remove_dir_all(&root);
+        (pixels, stats)
+    }
+
+    /// A rough floor under a drawn sky six times brighter than the ambient
+    /// the scene is lit with must not turn hazy: its reflection blurs into
+    /// the hemisphere, so it shows about its diffuse ambient.
+    fn check_rough_surface_has_no_sky_haze(r: &mut Renderer) -> Result<(), String> {
+        let light = melon_core::Light {
+            color: glam::Vec3::ZERO,
+            ambient: 0.1,
+            sky_color: glam::Vec3::ONE,
+            ground_color: glam::Vec3::ONE,
+            ..test_light()
+        };
+        let environment = melon_core::Environment {
+            zenith_color: glam::Vec3::splat(6.0),
+            horizon_color: glam::Vec3::splat(6.0),
+            ..plain_environment()
+        };
+        let quality = melon_core::RenderQuality::default();
+        let (pixels, _) = render_floor_under(r, vec![], quality, light, environment, None);
+        let got = i32::from(value_at(&pixels, CENTRE_PX));
+        let want = i32::from(tonemap_value(r, 0.082));
+        if (got - want).abs() > 8 {
+            return Err(format!(
+                "rough floor under a bright sky shows {got}, expected about {want} (sky haze)"
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_ibl_uniform_sky(r: &mut Renderer) -> Result<(), String> {
+        // A white rough dielectric under a uniform sky of radiance L (no
+        // sun): it shows about L times its albedo (diffuse irradiance = L,
+        // plus a little reflection).
+        let l = 0.5f32;
+        let light = melon_core::Light {
+            color: glam::Vec3::ZERO,
+            ambient: 1.0,
+            sky_color: glam::Vec3::splat(l),
+            ground_color: glam::Vec3::splat(l),
+            ..test_light()
+        };
+        let environment = melon_core::Environment {
+            zenith_color: glam::Vec3::splat(l),
+            horizon_color: glam::Vec3::splat(l),
+            ..plain_environment()
+        };
+        let quality = melon_core::RenderQuality::default();
+        let (pixels, _) = render_floor_under(r, vec![], quality, light, environment, None);
+        let got = i32::from(value_at(&pixels, CENTRE_PX));
+        let want = i32::from(tonemap_value(r, f64::from(l) * 0.8));
+        if (got - want).abs() > 12 {
+            return Err(format!(
+                "uniform sky: floor shows {got}, expected about {want}"
+            ));
+        }
+        // Doubling the sky doubles the light: brighter, never darker.
+        let bright = melon_core::Light {
+            sky_color: glam::Vec3::splat(2.0 * l),
+            ground_color: glam::Vec3::splat(2.0 * l),
+            ..light
+        };
+        let (pixels, _) = render_floor_under(r, vec![], quality, bright, environment, None);
+        if i32::from(value_at(&pixels, CENTRE_PX)) <= got {
+            return Err("a brighter sky should brighten the floor".into());
+        }
+        Ok(())
+    }
+
+    fn point_light(at: glam::Vec3, intensity: f32, range: f32) -> lights::LocalLight {
+        lights::LocalLight {
+            position: at,
+            direction: glam::Vec3::NEG_Y,
+            color: glam::Vec3::splat(intensity),
+            range,
+            spot: None,
+            cast_shadows: false,
+        }
+    }
+
+    fn check_local_lights(r: &mut Renderer) -> Result<(), String> {
+        let quality = melon_core::RenderQuality::default();
+        let corner = (4, 4);
+        let (dark, _) = render_lit(r, vec![], quality);
+        let dark_centre = value_at(&dark, CENTRE_PX);
+        // Only the sky reflection (IBL specular) is left without lights.
+        let dark_far = value_at(&dark, corner);
+        if dark_centre > 90 {
+            return Err(format!("no light, no sun: nearly black ({dark_centre})"));
+        }
+        // Above the floor, in range: the floor under it lights up, the far
+        // corner (about 4 m away, past the 3 m range) does not.
+        let lit_at = glam::Vec3::new(0.0, 2.0, 0.0);
+        let (lit, stats) = render_lit(r, vec![point_light(lit_at, 20.0, 3.0)], quality);
+        let (centre, far) = (value_at(&lit, CENTRE_PX), value_at(&lit, corner));
+        if stats.lights != 1 || centre < dark_centre + 50 || far > dark_far + 2 {
+            return Err(format!(
+                "point light: {} lights, floor under it {centre} (want > 60), past its range {far} (want black)",
+                stats.lights
+            ));
+        }
+        // Out of range (2 m up, range 1.5): adds nothing at all.
+        let (out, _) = render_lit(r, vec![point_light(lit_at, 20.0, 1.5)], quality);
+        if differing(&out, &dark) > 0 {
+            return Err("a light out of range changed the image".into());
+        }
+        // A spot pointing down lights its cone only.
+        let spot = lights::LocalLight {
+            spot: Some((0.2, 0.5)),
+            ..point_light(glam::Vec3::new(0.0, 3.0, 0.0), 40.0, 8.0)
+        };
+        let (cone, _) = render_lit(r, vec![spot], quality);
+        let (inside, outside) = (value_at(&cone, CENTRE_PX), value_at(&cone, corner));
+        if inside < dark_centre + 40 || outside > dark_far + 2 {
+            return Err(format!("spot cone: centre {inside}, outside {outside}"));
+        }
+        // 300 lights on a grid: the cap keeps `max_lights`, the rest drop.
+        let many: Vec<_> = (0..300)
+            .map(|i| {
+                let (x, z) = ((i % 20) as f32 - 9.5, (i / 20) as f32 - 7.0);
+                point_light(glam::Vec3::new(x * 0.4, 1.0, z * 0.4), 2.0, 2.0)
+            })
+            .collect();
+        let (_, stats) = render_lit(r, many, quality);
+        if stats.lights != quality.max_lights || stats.lights_dropped != 300 - quality.max_lights {
+            return Err(format!(
+                "light cap: {} shaded, {} dropped (max_lights {})",
+                stats.lights, stats.lights_dropped, quality.max_lights
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_far_cascade_shadow(r: &mut Renderer) -> Result<(), String> {
+        use glam::Vec3;
+        // A 4 m cube 30 m from the camera casts onto the floor: that depth
+        // is in the third cascade (splits about 10, 27 and 100 m).
+        let mut server = repo_server();
+        let grey = server.load("assets/models/review/grey_cube.glb");
+        let models = vec![
+            slab(
+                grey,
+                Vec3::new(120.0, 0.2, 120.0),
+                Vec3::new(0.0, -0.1, -30.0),
+            ),
+            slab(grey, Vec3::splat(4.0), Vec3::new(0.0, 2.0, -30.0)),
+        ];
+        let camera = melon_core::Camera {
+            eye: Vec3::new(0.0, 6.0, 0.0),
+            center: Vec3::new(0.0, 0.0, -30.0),
+            aspect: 1.0,
+            ..Default::default()
+        };
+        let light = melon_core::Light {
+            direction: Vec3::new(-1.0, -1.0, 0.0).normalize(),
+            ambient: 0.1,
+            sky_color: Vec3::ONE,
+            ground_color: Vec3::ONE,
+            ..Default::default()
+        };
+        let pixels = render_frame(r, camera, light, plain_environment(), models, &mut server);
+        let view_proj = camera.view_proj();
+        let shadowed = value_at(&pixels, screen_px(view_proj, Vec3::new(-4.0, 0.0, -30.0)));
+        let lit = value_at(&pixels, screen_px(view_proj, Vec3::new(4.0, 0.0, -30.0)));
+        if shadowed + 30 > lit {
+            return Err(format!(
+                "far cascade: floor in the cube's shadow {shadowed}, lit floor {lit} (want a gap over 30)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// `render_lit`'s white floor plus, when `occluder`, a 2 m slab one metre
+    /// up; returns the pixels and stats. Light `lights`, no sun.
+    fn render_with_occluder(
+        r: &mut Renderer,
+        lights: Vec<lights::LocalLight>,
+        quality: melon_core::RenderQuality,
+        occluder: bool,
+        gi_intensity: f32,
+    ) -> (Vec<u8>, RenderStats) {
+        let root = material_project("lit_occluder");
+        write_mat(
+            &root,
+            "white",
+            "(base_color: (0.8, 0.8, 0.8, 1.0), metallic: 0.0, roughness: 0.8)",
+        );
+        let mut server = fresh_ids_server(root.clone(), 7400);
+        r.materials = Default::default();
+        r.model_cache = ModelCache::new(&r.scene);
+        let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+        let material = server.load("assets/materials/white.mat");
+        let mut frame = FrameData {
+            view_proj: top_down_camera().view_proj(),
+            eye: top_down_camera().eye,
+            light: melon_core::Light {
+                color: glam::Vec3::ZERO,
+                ambient: 0.0,
+                ..test_light()
+            },
+            environment: melon_core::Environment {
+                gi_intensity,
+                ..plain_environment()
+            },
+            quality,
+            lights,
+            ..Default::default()
+        };
+        let slab = |size: glam::Vec3, at: glam::Vec3| {
+            glam::Mat4::from_scale_rotation_translation(size, glam::Quat::IDENTITY, at)
+        };
+        frame.models.push((
+            slab(
+                glam::Vec3::new(12.0, 0.2, 12.0),
+                glam::Vec3::new(0.0, -0.1, 0.0),
+            ),
+            cube,
+        ));
+        frame.overrides.insert(0, vec![Some(material)]);
+        if occluder {
+            frame.models.push((
+                slab(
+                    glam::Vec3::new(2.0, 0.2, 2.0),
+                    glam::Vec3::new(0.0, 1.0, 0.0),
+                ),
+                cube,
+            ));
+            frame.overrides.insert(1, vec![Some(material)]);
+        }
+        let mut target =
+            r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let mut encoder = r
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let stats = r.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
+        let pixels = read_back(r.device(), r.queue(), encoder, &target.color_texture);
+        let _ = std::fs::remove_dir_all(&root);
+        (pixels, stats)
+    }
+
+    fn check_local_light_shadows(r: &mut Renderer) -> Result<(), String> {
+        let quality = melon_core::RenderQuality::default();
+        let at = glam::Vec3::new(0.0, 3.0, 0.0);
+        // On the floor, 1.25 m from the centre: in the slab's shadow (its
+        // edge casts out to 1.5 m) yet visible from above (the slab hides
+        // 1 m).
+        let probe = screen_px(
+            top_down_camera().view_proj(),
+            glam::Vec3::new(1.25, 0.0, 0.0),
+        );
+        let point = lights::LocalLight {
+            cast_shadows: true,
+            ..point_light(at, 30.0, 8.0)
+        };
+        let spot = lights::LocalLight {
+            spot: Some((0.5, 0.9)),
+            ..point
+        };
+        for (name, light) in [("point", point), ("spot", spot)] {
+            let (open, stats) = render_with_occluder(r, vec![light], quality, false, 0.0);
+            let (shaded, _) = render_with_occluder(r, vec![light], quality, true, 0.0);
+            let (lit, dark) = (value_at(&open, probe), value_at(&shaded, probe));
+            let expected_views = if name == "point" { 6 } else { 1 };
+            if stats.shadowed_lights != 1 || stats.shadow_views != expected_views {
+                return Err(format!(
+                    "{name}: {} shadowed lights, {} views (want 1 and {expected_views})",
+                    stats.shadowed_lights, stats.shadow_views
+                ));
+            }
+            if dark + 25 > lit {
+                return Err(format!(
+                    "{name} light shadow: floor in the shadow {dark}, unshadowed {lit} (want a gap over 25)"
+                ));
+            }
+            // Without the flag the same slab casts nothing.
+            let plain = lights::LocalLight {
+                cast_shadows: false,
+                ..light
+            };
+            let (unshadowed, _) = render_with_occluder(r, vec![plain], quality, true, 0.0);
+            if value_at(&unshadowed, probe) + 5 < lit {
+                return Err(format!("{name}: an unshadowed light cast a shadow"));
+            }
+        }
+        // The cap: five shadow-casting lights, two allowed.
+        let capped = melon_core::RenderQuality {
+            shadowed_lights: 2,
+            ..quality
+        };
+        let many: Vec<_> = (0..5)
+            .map(|i| lights::LocalLight {
+                position: glam::Vec3::new(i as f32 - 2.0, 3.0, 2.0),
+                ..point
+            })
+            .collect();
+        let (_, stats) = render_with_occluder(r, many.clone(), capped, true, 0.0);
+        if stats.shadowed_lights != 2 || stats.shadow_views != 12 {
+            return Err(format!(
+                "cap: {} shadowed lights, {} views (want 2 and 12)",
+                stats.shadowed_lights, stats.shadow_views
+            ));
+        }
+        // With DDGI on, a shadowed light injects into the voxels: the frame renders.
+        let (_, stats) = render_with_occluder(r, many, quality, true, 1.0);
+        if stats.shadowed_lights != 5 {
+            return Err(format!(
+                "ddgi frame: {} shadowed lights",
+                stats.shadowed_lights
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_hdr_sky_is_drawn(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("hdr_sky");
+        image::RgbaImage::from_pixel(8, 4, image::Rgba([255, 0, 0, 255]))
+            .save(root.join("assets/textures/sky.png"))
+            .unwrap();
+        let mut server = fresh_ids_server(root.clone(), 7500);
+        let camera = melon_core::Camera {
+            eye: glam::Vec3::ZERO,
+            center: glam::Vec3::new(0.0, 0.0, -10.0),
+            aspect: 1.0,
+            ..Default::default()
+        };
+        let frame = FrameData {
+            view_proj: camera.view_proj(),
+            eye: camera.eye,
+            light: test_light(),
+            environment: melon_core::Environment {
+                sky_texture: true.then(|| server.load("assets/textures/sky.png")),
+                ..plain_environment()
+            },
+            ..Default::default()
+        };
+        let mut target =
+            r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let mut encoder = r
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        r.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
+        let pixels = read_back(r.device(), r.queue(), encoder, &target.color_texture);
+        let _ = std::fs::remove_dir_all(&root);
+        let sky = pixel_at(r, &pixels, CENTRE_PX);
+        if sky[0] < sky[2].saturating_add(100) {
+            return Err(format!("the image sky should be drawn red: {sky:?}"));
+        }
+        Ok(())
+    }
+
+    fn check_material_thumbnail(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("mat_thumb");
+        write_mat(
+            &root,
+            "red",
+            "(base_color: (0.9, 0.05, 0.05, 1.0), metallic: 0.0, roughness: 0.5)",
+        );
+        let mut server = fresh_ids_server(root.clone(), 7600);
+        r.materials = Default::default();
+        r.model_cache = ModelCache::new(&r.scene);
+        let handle: melon_core::Handle<melon_core::Material> =
+            server.load("assets/materials/red.mat");
+        let mut target = r.create_viewport_target(winit::dpi::PhysicalSize::new(
+            THUMBNAIL_SIZE,
+            THUMBNAIL_SIZE,
+        ));
+        let texture = r
+            .render_material_thumbnail_texture(&mut server, handle, &mut target)
+            .ok_or("no material thumbnail")?;
+        let encoder = r
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let pixels = read_back(r.device(), r.queue(), encoder, &texture);
+        let _ = std::fs::remove_dir_all(&root);
+        let at = |x: u32, y: u32| {
+            let i = ((y * THUMBNAIL_SIZE + x) * 4) as usize;
+            if r.surface_format().remove_srgb_suffix() == wgpu::TextureFormat::Bgra8Unorm {
+                [pixels[i + 2], pixels[i + 1], pixels[i]]
+            } else {
+                [pixels[i], pixels[i + 1], pixels[i + 2]]
+            }
+        };
+        let centre = at(THUMBNAIL_SIZE / 2, THUMBNAIL_SIZE / 2);
+        let corner = at(2, 2);
+        let sphere: melon_core::Handle<melon_core::Model> = server.load("builtin:sphere");
+        if server.part_bounds(sphere).len() != 1 {
+            return Err("the sphere should publish its one part's bounds".into());
+        }
+        if centre[0] < centre[1].saturating_add(60) {
+            return Err(format!("the sphere should be red: {centre:?}"));
+        }
+        if corner[0] > corner[1].saturating_add(30) {
+            return Err(format!("the corner should be background: {corner:?}"));
+        }
+        Ok(())
+    }
+
+    fn check_packed_materials_textures_and_sky(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("packed_mat");
+        write_mat(
+            &root,
+            "m",
+            "(metallic: 0.0, base_color_texture: Some((guid: None, path: \"assets/textures/t.png\")))",
+        );
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .save(root.join("assets/textures/t.png"))
+            .unwrap();
+        let pak = root.join("game.pak");
+        melon_core::pack::build_pack(&root, &[], &pak).unwrap();
+        // Only the pack may serve them now.
+        std::fs::remove_file(root.join("assets/materials/m.mat")).unwrap();
+        std::fs::remove_file(root.join("assets/textures/t.png")).unwrap();
+        let mut server = fresh_ids_server(root.clone(), 7700);
+        server.set_pack(Arc::new(melon_core::pack::Pack::open(&pak).unwrap()));
+        r.materials = Default::default();
+        let material: melon_core::Handle<melon_core::Material> =
+            server.load("assets/materials/m.mat");
+        let texture: melon_core::Handle<melon_core::Texture> = server.load("assets/textures/t.png");
+        r.materials.prepare(&r.scene, &mut server, material);
+        let built = r.materials.get(material).is_some();
+        let loaded = r.materials.texture(texture, true).is_some();
+        let sky = r.sky_image(&server, Some(texture)).is_some();
+        let _ = std::fs::remove_dir_all(&root);
+        if !built || !loaded || !sky {
+            return Err(format!(
+                "packed assets: material {built}, texture {loaded}, sky {sky} (want all true)"
+            ));
+        }
+        Ok(())
+    }
+
+    /// A masked-out slab must also vanish from the prepass: with AO on it
+    /// would otherwise darken the floor beside it.
+    fn check_masked_out_leaves_no_ao(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("mat_mask_ao");
+        write_mat(
+            &root,
+            "green",
+            "(base_color: (0.0, 0.8, 0.0, 1.0), metallic: 0.0, roughness: 0.8)",
+        );
+        write_mat(
+            &root,
+            "cut",
+            "(base_color: (0.8, 0.0, 0.0, 0.3), metallic: 0.0, roughness: 0.8, alpha_mode: Mask(cutoff: 0.5))",
+        );
+        let mut server = fresh_ids_server(root.clone(), 7800);
+        let floor = (
+            glam::Vec3::new(8.0, 0.2, 8.0),
+            glam::Vec3::new(0.0, -0.1, 0.0),
+            Some("green"),
+        );
+        let slab = (
+            glam::Vec3::new(3.0, 0.1, 3.0),
+            glam::Vec3::new(0.0, 0.3, 0.0),
+            Some("cut"),
+        );
+        let environment = melon_core::Environment {
+            ao_strength: 1.0,
+            ..plain_environment()
+        };
+        let probe = screen_px(
+            top_down_camera().view_proj(),
+            glam::Vec3::new(1.7, 0.0, 0.0),
+        );
+        let mut px = |slabs: &[_]| {
+            let pixels = render_slabs_in(r, &mut server, slabs, environment);
+            pixel_at(r, &pixels, probe)
+        };
+        let (ground, masked) = (px(&[floor]), px(&[floor, slab]));
+        let _ = std::fs::remove_dir_all(&root);
+        if ground != masked {
+            return Err(format!(
+                "a masked-out slab darkened the floor beside it: {ground:?} vs {masked:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Two blend panels submitted near first: the sort draws the far one
+    /// first, so the near (blue) one dominates the mix.
+    fn check_blend_sorted_far_to_near(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("mat_blend_sort");
+        let glass = |rgb: &str| {
+            format!("(base_color: ({rgb}, 0.5), metallic: 0.0, roughness: 0.8, alpha_mode: Blend)")
+        };
+        write_mat(&root, "blue", &glass("0.0, 0.0, 0.8"));
+        write_mat(&root, "red", &glass("0.8, 0.0, 0.0"));
+        let mut server = fresh_ids_server(root.clone(), 7900);
+        let panel = |height: f32, material| {
+            (
+                glam::Vec3::new(3.0, 0.1, 3.0),
+                glam::Vec3::new(0.0, height, 0.0),
+                Some(material),
+            )
+        };
+        let pixels = render_slabs(r, &mut server, &[panel(2.0, "blue"), panel(1.0, "red")]);
+        let [red, _, blue, _] = pixel_at(r, &pixels, CENTRE_PX);
+        let _ = std::fs::remove_dir_all(&root);
+        if blue <= red {
+            return Err(format!(
+                "the near blue panel should dominate: red {red}, blue {blue}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// A light off the view centre lights the floor under it, not its
+    /// mirror image (cluster tile rows and columns match the shader's).
+    fn check_off_centre_light_lights_its_own_floor(r: &mut Renderer) -> Result<(), String> {
+        let quality = melon_core::RenderQuality::default();
+        let view_proj = top_down_camera().view_proj();
+        let under = glam::Vec3::new(3.0, 0.0, -3.0);
+        let light = point_light(glam::Vec3::new(3.0, 1.5, -3.0), 20.0, 3.0);
+        let (pixels, _) = render_lit(r, vec![light], quality);
+        let lit = value_at(&pixels, screen_px(view_proj, under));
+        for (name, mirror) in [
+            ("x", glam::Vec3::new(-3.0, 0.0, -3.0)),
+            ("z", glam::Vec3::new(3.0, 0.0, 3.0)),
+        ] {
+            let other = value_at(&pixels, screen_px(view_proj, mirror));
+            if lit < other.saturating_add(50) {
+                return Err(format!(
+                    "light at (3, -3): floor under it {lit}, mirrored in {name} {other}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Edge frames in one target: cascade count, shadow distance, light caps
+    /// switched live, a shadow-casting light inside a mesh, a NaN light and
+    /// a zero-range one. No validation error, and the scene still draws.
+    fn check_edge_quality_and_lights(r: &mut Renderer) -> Result<(), String> {
+        let mut server = repo_server();
+        let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+        r.model_cache = ModelCache::new(&r.scene);
+        let slab = |size: glam::Vec3, at: glam::Vec3| {
+            glam::Mat4::from_scale_rotation_translation(size, glam::Quat::IDENTITY, at)
+        };
+        let models = vec![
+            (
+                slab(
+                    glam::Vec3::new(12.0, 0.2, 12.0),
+                    glam::Vec3::new(0.0, -0.1, 0.0),
+                ),
+                cube,
+            ),
+            (
+                slab(glam::Vec3::splat(2.0), glam::Vec3::new(0.0, 1.0, 0.0)),
+                cube,
+            ),
+        ];
+        let mut nan = point_light(glam::Vec3::new(2.0, 1.0, 2.0), 5.0, 4.0);
+        nan.color = glam::Vec3::splat(f32::NAN);
+        let lights = vec![
+            // Inside the 2 m cube, shadowed.
+            lights::LocalLight {
+                cast_shadows: true,
+                ..point_light(glam::Vec3::new(0.0, 1.0, 0.0), 20.0, 6.0)
+            },
+            nan,
+            point_light(glam::Vec3::new(-2.0, 1.0, 2.0), 5.0, 0.0),
+        ];
+        let base = melon_core::RenderQuality::default();
+        let scope = r.device().push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut target =
+            r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let mut centres = Vec::new();
+        for (cascades, distance, shadowed, max) in [
+            (1, 1, 1, 256),
+            (4, 200, 4, 256),
+            (2, 1, 0, 0),
+            (3, 50, 8, 1),
+            (4, 200, 4, 256),
+        ] {
+            let frame = FrameData {
+                view_proj: top_down_camera().view_proj(),
+                eye: top_down_camera().eye,
+                light: test_light(),
+                environment: plain_environment(),
+                quality: melon_core::RenderQuality {
+                    cascades,
+                    shadow_distance: distance,
+                    shadowed_lights: shadowed,
+                    max_lights: max,
+                    ..base
+                },
+                models: models.clone(),
+                overrides: Default::default(),
+                lights: lights.clone(),
+            };
+            let mut encoder = r
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            r.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
+            let pixels = read_back(r.device(), r.queue(), encoder, &target.color_texture);
+            centres.push(value_at(&pixels, CENTRE_PX));
+        }
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            return Err(format!("wgpu validation error: {e}"));
+        }
+        if centres.contains(&0) {
+            return Err(format!("the cube top went black: {centres:?}"));
+        }
+        Ok(())
+    }
+
+    /// A Blend material still gives a thumbnail.
+    fn check_blend_material_thumbnail(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("mat_thumb_blend");
+        write_mat(
+            &root,
+            "glass",
+            "(base_color: (0.9, 0.05, 0.05, 0.5), metallic: 0.0, roughness: 0.5, alpha_mode: Blend)",
+        );
+        let mut server = fresh_ids_server(root.clone(), 8000);
+        r.materials = Default::default();
+        r.model_cache = ModelCache::new(&r.scene);
+        let handle: melon_core::Handle<melon_core::Material> =
+            server.load("assets/materials/glass.mat");
+        let mut target = r.create_viewport_target(winit::dpi::PhysicalSize::new(
+            THUMBNAIL_SIZE,
+            THUMBNAIL_SIZE,
+        ));
+        let texture = r
+            .render_material_thumbnail_texture(&mut server, handle, &mut target)
+            .ok_or("no thumbnail for a Blend material")?;
+        let encoder = r
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let pixels = read_back(r.device(), r.queue(), encoder, &texture);
+        let _ = std::fs::remove_dir_all(&root);
+        let i = (((THUMBNAIL_SIZE / 2) * THUMBNAIL_SIZE + THUMBNAIL_SIZE / 2) * 4) as usize;
+        let bgra = r.surface_format().remove_srgb_suffix() == wgpu::TextureFormat::Bgra8Unorm;
+        let (red, green) = (pixels[i + if bgra { 2 } else { 0 }], pixels[i + 1]);
+        if red < green.saturating_add(12) {
+            return Err(format!(
+                "the Blend sphere should show its red: {:?}",
+                &pixels[i..i + 4]
+            ));
+        }
+        Ok(())
+    }
+
+    /// A texture slot naming an unknown GUID with no path, or a file that is
+    /// not an image, behaves like a missing texture: the factors alone.
+    fn check_material_bad_texture_refs(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("mat_bad_refs");
+        std::fs::write(root.join("assets/textures/notimage.png"), b"not a png").unwrap();
+        let plain = "(base_color: (0.2, 0.6, 0.2, 1.0), metallic: 0.0, roughness: 0.8";
+        write_mat(&root, "plain", &format!("{plain})"));
+        let refs = [
+            (
+                "guid_only",
+                "(guid: Some(\"00000000-0000-0000-0000-000000000000\"), path: \"\")",
+            ),
+            (
+                "garbage",
+                "(guid: None, path: \"assets/textures/notimage.png\")",
+            ),
+            (
+                "normal_slot",
+                "(guid: None, path: \"assets/materials/plain.mat\")",
+            ),
+        ];
+        for (name, tex) in refs {
+            write_mat(
+                &root,
+                name,
+                &format!("{plain}, base_color_texture: Some({tex}), normal_texture: Some({tex}))"),
+            );
+        }
+        let mut server = fresh_ids_server(root.clone(), 8100);
+        let base = render_slabs(r, &mut server, &floor_slab("plain"));
+        let base = pixel_at(r, &base, CENTRE_PX);
+        for (name, _) in refs {
+            let pixels = render_slabs(r, &mut server, &floor_slab(name));
+            let got = pixel_at(r, &pixels, CENTRE_PX);
+            if got != base {
+                let _ = std::fs::remove_dir_all(&root);
+                return Err(format!(
+                    "{name}: {got:?} differs from the factors alone {base:?}"
+                ));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// Dragging a sky slider changes the IBL every frame: the prefiltered
+    /// texture is rewritten in place, never reallocated.
+    /// A shadow tile draws at most `MAX_CASTERS` instances; more are counted
+    /// as dropped, fewer are all drawn.
+    fn check_local_shadow_casters_are_capped(r: &mut Renderer) -> Result<(), String> {
+        let mut dropped = |count: usize| {
+            let mut server = repo_server();
+            r.model_cache = ModelCache::new(&r.scene);
+            let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+            let side = (count as f32).sqrt().ceil() as usize;
+            let models = (0..count)
+                .map(|i| {
+                    let (x, z) = ((i % side) as f32, (i / side) as f32);
+                    let at = glam::Vec3::new(x * 0.3 - 4.0, 1.0, z * 0.3 - 4.0);
+                    (
+                        glam::Mat4::from_scale_rotation_translation(
+                            glam::Vec3::splat(0.2),
+                            glam::Quat::IDENTITY,
+                            at,
+                        ),
+                        cube,
+                    )
+                })
+                .collect();
+            let frame = FrameData {
+                view_proj: top_down_camera().view_proj(),
+                eye: top_down_camera().eye,
+                light: test_light(),
+                environment: plain_environment(),
+                models,
+                lights: vec![lights::LocalLight {
+                    cast_shadows: true,
+                    ..point_light(glam::Vec3::new(0.0, 7.0, 0.0), 20.0, 12.0)
+                }],
+                ..Default::default()
+            };
+            let mut target =
+                r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+            let mut encoder = r
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let stats = r.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
+            r.queue().submit([encoder.finish()]);
+            stats.local_casters_dropped
+        };
+        let (few, many) = (dropped(100), dropped(1600));
+        if few != 0 || many == 0 {
+            return Err(format!(
+                "local shadow casters dropped: {few} for 100 instances (want 0), {many} for 1600 (want some)"
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_ibl_updates_in_place(r: &mut Renderer) -> Result<(), String> {
+        let before = r.scene.ibl.specular_texture().clone();
+        let rebuilds = r.scene.ibl_rebuilds;
+        for i in 1..6 {
+            r.update_environment(&melon_core::Environment {
+                zenith_color: glam::Vec3::splat(0.1 * i as f32),
+                ..Default::default()
+            });
+        }
+        if r.scene.ibl_rebuilds < rebuilds + 5 {
+            return Err("the sky change did not rebuild the IBL".into());
+        }
+        if r.scene.ibl.specular_texture() != &before {
+            return Err("the IBL texture was reallocated".into());
+        }
+        Ok(())
+    }
+
+    /// The camera decides which sun cascades exist, but the GI volume is
+    /// fixed: an open-fronted box with a roof stands far from the camera;
+    /// converging GI while looking away from it (no cascade covers the box)
+    /// must give the same indirect light as converging while looking at it.
+    fn check_gi_sun_injection_ignores_the_camera(r: &mut Renderer) -> Result<(), String> {
+        use glam::Vec3;
+        let mut server = repo_server();
+        let grey = server.load("assets/models/review/grey_cube.glb");
+        let models = vec![
+            slab(grey, Vec3::new(6.0, 0.4, 6.0), Vec3::new(0.0, -0.2, 10.0)),
+            slab(grey, Vec3::new(5.2, 4.0, 0.4), Vec3::new(0.0, 2.0, 12.8)),
+            slab(grey, Vec3::new(0.4, 4.0, 5.6), Vec3::new(2.8, 2.0, 9.8)),
+            slab(grey, Vec3::new(0.4, 4.0, 5.6), Vec3::new(-2.8, 2.0, 9.8)),
+            slab(grey, Vec3::new(6.0, 0.4, 6.0), Vec3::new(0.0, 4.2, 10.0)),
+        ];
+        let toward = melon_core::Camera {
+            eye: Vec3::new(0.0, 2.0, 3.0),
+            center: Vec3::new(0.0, 1.5, 10.0),
+            aspect: 1.0,
+            ..Default::default()
+        };
+        let away = melon_core::Camera {
+            center: Vec3::new(0.0, 2.0, -30.0),
+            ..toward
+        };
+        let light = melon_core::Light {
+            direction: Vec3::new(0.15, -1.0, 0.1).normalize(),
+            sky_color: Vec3::splat(0.05),
+            ground_color: Vec3::splat(0.05),
+            ..Default::default()
+        };
+        let quality = melon_core::RenderQuality::default();
+        let mut run = |cameras: &[melon_core::Camera]| {
+            r.model_cache = ModelCache::new(&r.scene);
+            let mut target =
+                r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+            for (i, camera) in cameras.iter().enumerate() {
+                // A GI-off frame first restarts DDGI's convergence.
+                let environment = if i == 0 {
+                    plain_environment()
+                } else {
+                    gi_environment()
+                };
+                let frame = FrameData {
+                    view_proj: camera.view_proj(),
+                    eye: camera.eye,
+                    light,
+                    environment,
+                    quality,
+                    models: models.clone(),
+                    overrides: Default::default(),
+                    lights: Default::default(),
+                };
+                let mut encoder = r
+                    .device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                r.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
+                if i + 1 == cameras.len() {
+                    return read_back(r.device(), r.queue(), encoder, &target.color_texture);
+                }
+                r.queue().submit([encoder.finish()]);
+            }
+            unreachable!()
+        };
+        let steady = run(&[toward; GI_FRAMES as usize + 1]);
+        let mut looked_away = vec![away; GI_FRAMES as usize];
+        looked_away.push(toward);
+        let after_away = run(&looked_away);
+        // End on a GI-off frame, like the other GI checks.
+        render_frame(
+            r,
+            toward,
+            light,
+            plain_environment(),
+            models.clone(),
+            &mut server,
+        );
+        let diff: u32 = steady
+            .iter()
+            .zip(&after_away)
+            .map(|(a, b)| u32::from(a.abs_diff(*b)))
+            .sum();
+        let mean = diff as f32 / steady.len() as f32;
+        if mean > 0.1 {
+            return Err(format!(
+                "GI follows the camera: mean difference {mean:.2} per channel between looking at the box and looking away first"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mip_chain_halves_down_to_one_texel() {
+        assert_eq!(mip_count(1, 1), 1);
+        assert_eq!(mip_count(2, 2), 2);
+        assert_eq!(mip_count(256, 64), 9);
+        assert_eq!(mip_count(5, 3), 3);
+        // Black and white texels average to mid grey in linear light.
+        let pixels = [0, 0, 0, 255, 255, 255, 255, 255];
+        let chain = mip_chain(&pixels, 2, 1, false);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].0, (1, 1));
+        assert_eq!(chain[0].1, [128, 128, 128, 255]);
+        // sRGB averages in linear light: brighter than the gamma-space mean.
+        let srgb = mip_chain(&pixels, 2, 1, true);
+        assert!(srgb[0].1[0] > 180, "{:?}", srgb[0].1);
+        let big = vec![200u8; 8 * 4 * 4];
+        let levels: Vec<_> = mip_chain(&big, 8, 4, false).iter().map(|l| l.0).collect();
+        assert_eq!(levels, [(4, 2), (2, 1), (1, 1)]);
+    }
+
+    #[test]
+    fn material_sampler_is_trilinear_and_anisotropic() {
+        let d = material_sampler_descriptor(8);
+        assert_eq!(d.anisotropy_clamp, 8);
+        assert_eq!(d.mipmap_filter, wgpu::MipmapFilterMode::Linear);
+        assert_eq!(d.min_filter, wgpu::FilterMode::Linear);
+        // No support: plain trilinear.
+        assert_eq!(material_sampler_descriptor(1).anisotropy_clamp, 1);
+    }
+
+    /// With MSAA, Mask materials use alpha to coverage: the edge of an
+    /// alpha texture gets in-between pixels; at 1 sample it stays a
+    /// hard cut.
+    fn check_mask_edge_alpha_to_coverage(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("mat_a2c");
+        write_mat(
+            &root,
+            "edge",
+            "(metallic: 0.0, roughness: 0.8, alpha_mode: Mask(cutoff: 0.5), base_color_texture: Some((guid: None, path: \"assets/textures/edge.png\")))",
+        );
+        // Two texels: transparent, then opaque red; bilinear across the face.
+        let mut img = image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 0, 0, 255]));
+        img.put_pixel(0, 0, image::Rgba([255, 0, 0, 0]));
+        img.save(root.join("assets/textures/edge.png")).unwrap();
+        let mut server = fresh_ids_server(root.clone(), 9200);
+        r.model_cache = ModelCache::new(&r.scene);
+        r.materials = Default::default();
+        let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+        let material: melon_core::Handle<melon_core::Material> =
+            server.load("assets/materials/edge.mat");
+        let mut partial = |r: &mut Renderer, msaa: u32, shift: f32| {
+            let mut frame = FrameData {
+                view_proj: top_down_camera().view_proj(),
+                eye: top_down_camera().eye,
+                light: test_light(),
+                environment: plain_environment(),
+                quality: melon_core::RenderQuality {
+                    msaa,
+                    ..Default::default()
+                },
+                // Wider than the view: only the alpha edge remains.
+                models: vec![(
+                    glam::Mat4::from_scale_rotation_translation(
+                        glam::Vec3::new(14.0, 0.2, 14.0),
+                        glam::Quat::IDENTITY,
+                        glam::Vec3::new(shift, -0.1, shift),
+                    ),
+                    cube,
+                )],
+                ..Default::default()
+            };
+            frame.overrides.insert(0, vec![Some(material)]);
+            let mut target =
+                r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+            let mut encoder = r
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            r.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
+            let pixels = read_back(r.device(), r.queue(), encoder, &target.color_texture);
+            // Across the line that crosses the alpha edge: the biggest single
+            // step between neighbours as a share of the whole transition.
+            let step_share = |at: &dyn Fn(u32) -> (u32, u32)| {
+                let line: Vec<f32> = (0..TEST_SIZE)
+                    .map(|i| rgb_sum(pixel_at(r, &pixels, at(i))) as f32)
+                    .collect();
+                let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+                let whole = (mean(&line[..8]) - mean(&line[line.len() - 8..])).abs();
+                let jump = line
+                    .windows(2)
+                    .map(|w| (w[1] - w[0]).abs())
+                    .fold(0.0, f32::max);
+                (whole, jump / whole.max(1.0))
+            };
+            let (a, b) = (
+                step_share(&|x| (x, TEST_SIZE / 2)),
+                step_share(&|y| (TEST_SIZE / 2, y)),
+            );
+            if a.0 > b.0 { a } else { b }
+        };
+        // The edge moves a quarter pixel at a time (a pixel is about 0.125
+        // m): one position puts it mid-pixel.
+        let shifts = [0.0, 0.03, 0.06, 0.09];
+        let hard: Vec<_> = shifts.iter().map(|&d| partial(r, 1, d)).collect();
+        let soft: Vec<_> = shifts.iter().map(|&d| partial(r, 4, d)).collect();
+        let hard = (
+            hard.iter().map(|h| h.0).fold(f32::MAX, f32::min),
+            hard.iter().map(|h| h.1).fold(f32::MAX, f32::min),
+        );
+        let soft = (
+            soft.iter().map(|h| h.0).fold(f32::MAX, f32::min),
+            soft.iter().map(|h| h.1).fold(f32::MAX, f32::min),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        if r.msaa() != 4 {
+            return Err(format!("MSAA 4x not active ({})", r.msaa()));
+        }
+        let mips = r
+            .create_texture_from_bytes(&[0; 16 * 8 * 4], 16, 8, wgpu::TextureFormat::Rgba8Unorm)
+            .mip_level_count();
+        if mips != 5 {
+            return Err(format!("a 16x8 texture has {mips} mips, want 5"));
+        }
+        if hard.0 < 100.0 || hard.1 < 0.9 || soft.1 > 0.8 {
+            return Err(format!(
+                "Mask edge: the largest step is {:.2} of the edge at 1x (want a hard cut, over 0.9) and {:.2} at 4x (want under 0.8); contrast {:.0}",
+                hard.1, soft.1, hard.0
+            ));
+        }
+        Ok(())
+    }
+
+    /// Materials and textures the scene no longer references are freed, and
+    /// a material only a thumbnail needed is freed after it.
+    fn check_material_cache_evicts(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("mat_evict");
+        write_mat(
+            &root,
+            "tex",
+            "(metallic: 0.0, roughness: 0.8, base_color_texture: Some((guid: None, path: \"assets/textures/t.png\")))",
+        );
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
+            .save(root.join("assets/textures/t.png"))
+            .unwrap();
+        let mut server = fresh_ids_server(root.clone(), 9100);
+        r.materials = Default::default();
+        r.model_cache = ModelCache::new(&r.scene);
+        let material: melon_core::Handle<melon_core::Material> =
+            server.load("assets/materials/tex.mat");
+        let mut thumb = r.create_viewport_target(winit::dpi::PhysicalSize::new(
+            THUMBNAIL_SIZE,
+            THUMBNAIL_SIZE,
+        ));
+        r.render_material_thumbnail_texture(&mut server, material, &mut thumb)
+            .ok_or("no thumbnail")?;
+        let after_thumbnail = r.materials.counts();
+        let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+        let mut frame = FrameData {
+            view_proj: top_down_camera().view_proj(),
+            eye: top_down_camera().eye,
+            light: test_light(),
+            environment: plain_environment(),
+            models: vec![(glam::Mat4::IDENTITY, cube)],
+            ..Default::default()
+        };
+        let mut target =
+            r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let mut draw = |r: &mut Renderer, frame: &FrameData| {
+            let mut encoder = r
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            r.render_scene(&mut encoder, frame, &mut server, &mut target, &[], &[]);
+            r.queue().submit([encoder.finish()]);
+        };
+        frame.overrides.insert(0, vec![Some(material)]);
+        draw(r, &frame);
+        let in_use = r.materials.counts();
+        frame.overrides.clear();
+        draw(r, &frame);
+        let unused = r.materials.counts();
+        let _ = std::fs::remove_dir_all(&root);
+        if (after_thumbnail, in_use, unused) != ((0, 0), (1, 1), (0, 0)) {
+            return Err(format!(
+                "(materials, textures) after a thumbnail {after_thumbnail:?}, in use {in_use:?}, unused {unused:?}; want (0, 0), (1, 1), (0, 0)"
+            ));
+        }
+        Ok(())
     }
 
     #[test]
@@ -6681,6 +9368,8 @@ mod tests {
                         },
                         quality: melon_core::RenderQuality::default(),
                         models,
+                        overrides: Default::default(),
+                        lights: Default::default(),
                     };
                     let mut encoder = renderer
                         .device()
@@ -7115,6 +9804,15 @@ mod tests {
                 }
                 Ok(())
             }),
+            Box::new(check_material_missing_texture),
+            Box::new(check_texture_hot_reload),
+            Box::new(check_alpha_mask_and_blend),
+            Box::new(check_local_lights),
+            Box::new(check_ibl_uniform_sky),
+            Box::new(check_far_cascade_shadow),
+            Box::new(check_local_light_shadows),
+            Box::new(check_hdr_sky_is_drawn),
+            Box::new(check_material_thumbnail),
             Box::new(|renderer| {
                 // A packed `.gltf` whose buffer is a separate `.bin` loads
                 // through the AssetServer (`packed_gltf`), not a placeholder cube.
@@ -7144,6 +9842,19 @@ mod tests {
                     Err(format!("placeholder cube instead of the model: {bounds:?}"))
                 }
             }),
+            Box::new(check_packed_materials_textures_and_sky),
+            Box::new(check_masked_out_leaves_no_ao),
+            Box::new(check_blend_sorted_far_to_near),
+            Box::new(check_off_centre_light_lights_its_own_floor),
+            Box::new(check_edge_quality_and_lights),
+            Box::new(check_blend_material_thumbnail),
+            Box::new(check_material_bad_texture_refs),
+            Box::new(check_ibl_updates_in_place),
+            Box::new(check_local_shadow_casters_are_capped),
+            Box::new(check_rough_surface_has_no_sky_haze),
+            Box::new(check_material_cache_evicts),
+            Box::new(check_mask_edge_alpha_to_coverage),
+            Box::new(check_gi_sun_injection_ignores_the_camera),
         ];
 
         #[cfg(target_os = "windows")]

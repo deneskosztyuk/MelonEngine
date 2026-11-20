@@ -43,6 +43,80 @@ pub enum WidgetKind {
     Layers(Vec<String>),
     /// An `f32` slider.
     Slider { min: f32, max: f32 },
+    /// A `Vec<MaterialSlot>`: one picker per mesh part (`.mat` files under
+    /// `<root>/assets`), each a drop target for Content Browser drags.
+    Materials { root: PathBuf },
+    /// An `f32` angle stored in radians, shown and edited in degrees.
+    Degrees { min: f32, max: f32 },
+    /// A linear `Vec3` colour edited with a colour picker.
+    Color,
+}
+
+/// An angle stored in radians as a drag value in degrees. The stored value
+/// is only touched when the user edits it, so drawing never drifts it.
+pub(crate) fn degrees_field(ui: &mut egui::Ui, radians: &mut f32, min: f32, max: f32) -> bool {
+    let mut degrees = radians.to_degrees();
+    let changed = ui
+        .add(
+            egui::DragValue::new(&mut degrees)
+                .speed(0.5)
+                .range(min..=max)
+                .suffix("\u{b0}")
+                .max_decimals(1),
+        )
+        .changed();
+    if changed {
+        *radians = degrees.to_radians();
+    }
+    changed
+}
+
+/// A picker of the files under `<root>/assets` with one of `extensions`,
+/// and a drop target for Content Browser drags. An empty path shows `None`,
+/// a path that is not a file is flagged missing.
+pub(crate) fn asset_field(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    v: &mut String,
+    root: &Path,
+    extensions: &[&str],
+) -> bool {
+    let mut changed = false;
+    let missing = !v.is_empty() && !root.join(&*v).is_file();
+    let text = if missing {
+        format!("{v} (missing)")
+    } else {
+        choice_label(v, std::slice::from_ref(v))
+    };
+    let combo = egui::ComboBox::from_id_salt(id)
+        .selected_text(text)
+        .width(ui.available_width())
+        .show_ui(ui, |ui| {
+            // Listed only while the dropdown is open.
+            if ui.selectable_label(v.is_empty(), "None").clicked() {
+                v.clear();
+                changed = true;
+            }
+            for path in content::asset_list(root, extensions) {
+                if ui
+                    .selectable_label(*v == path, &path)
+                    .on_hover_text(&path)
+                    .clicked()
+                {
+                    *v = path;
+                    changed = true;
+                }
+            }
+        });
+    // A file dragged from the Content Browser replaces it.
+    let drop = ui.interact(combo.response.rect, id.with("drop"), egui::Sense::hover());
+    if let Some(drag) = drop.dnd_release_payload::<AssetDrag>()
+        && let Some(path) = dropped_asset(root, &drag.path, extensions)
+    {
+        *v = path;
+        changed = true;
+    }
+    changed
 }
 
 pub type FieldWidgets = HashMap<&'static str, FieldWidget>;
@@ -82,6 +156,25 @@ fn layer_label(names: &[String], i: usize) -> String {
 fn dropped_asset(root: &Path, dragged: &Path, extensions: &[&str]) -> Option<String> {
     let rel = melon_core::assets::project_relative(root, dragged)?;
     content::has_extension(&rel, extensions).then_some(rel)
+}
+
+/// Put the `.mat` file `dragged` on slot `index` (or add a slot for
+/// `None`); false when it is not a project material.
+fn drop_material(
+    root: &Path,
+    slots: &mut Vec<melon_core::MaterialSlot>,
+    index: Option<usize>,
+    dragged: &Path,
+) -> bool {
+    let Some(rel) = dropped_asset(root, dragged, &["mat"]) else {
+        return false;
+    };
+    let slot = crate::material_assign::slot_for(root, &rel);
+    match index {
+        Some(i) if i < slots.len() => slots[i] = slot,
+        _ => slots.push(slot),
+    }
+    true
 }
 
 /// The editor for a field with a `FieldWidget`; `None` when the value is not
@@ -132,42 +225,74 @@ fn widget_ui(
                 });
             Some(changed)
         }
-        WidgetKind::Asset { root, extensions } => {
-            let v = value.try_downcast_mut::<String>()?;
+        WidgetKind::Materials { root } => {
+            let slots = value.try_downcast_mut::<Vec<melon_core::MaterialSlot>>()?;
             let mut changed = false;
-            let missing = !v.is_empty() && !root.join(&*v).is_file();
-            let text = if missing {
-                format!("{v} (missing)")
-            } else {
-                choice_label(v, std::slice::from_ref(v))
-            };
-            let combo = egui::ComboBox::from_id_salt(id)
-                .selected_text(text)
-                .width(ui.available_width())
-                .show_ui(ui, |ui| {
-                    // Listed only while the dropdown is open.
-                    if ui.selectable_label(v.is_empty(), "None").clicked() {
-                        v.clear();
-                        changed = true;
-                    }
-                    for path in content::asset_list(root, extensions) {
-                        if ui
-                            .selectable_label(*v == path, &path)
-                            .on_hover_text(&path)
-                            .clicked()
-                        {
-                            *v = path;
-                            changed = true;
-                        }
+            for i in 0..slots.len() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Part {i}"));
+                    let current = slots[i].path.clone();
+                    let text = if current.is_empty() {
+                        "Keep glTF material".to_string()
+                    } else {
+                        current.clone()
+                    };
+                    let combo = egui::ComboBox::from_id_salt(id.with(i))
+                        .selected_text(text)
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(current.is_empty(), "Keep glTF material")
+                                .clicked()
+                            {
+                                slots[i] = melon_core::MaterialSlot::default();
+                                changed = true;
+                            }
+                            for path in content::asset_list(root, &["mat"]) {
+                                if ui.selectable_label(current == path, &path).clicked() {
+                                    slots[i] = crate::material_assign::slot_for(root, &path);
+                                    changed = true;
+                                }
+                            }
+                        });
+                    let drop = ui.interact(
+                        combo.response.rect,
+                        id.with(("drop", i)),
+                        egui::Sense::hover(),
+                    );
+                    if let Some(drag) = drop.dnd_release_payload::<AssetDrag>() {
+                        changed |= drop_material(root, slots, Some(i), &drag.path);
                     }
                 });
-            // A file dragged from the Content Browser replaces it.
-            let drop = ui.interact(combo.response.rect, id.with("drop"), egui::Sense::hover());
-            if let Some(drag) = drop.dnd_release_payload::<AssetDrag>()
-                && let Some(path) = dropped_asset(root, &drag.path, extensions)
-            {
-                *v = path;
+            }
+            let add = ui.button("Add part");
+            if add.clicked() {
+                slots.push(melon_core::MaterialSlot::default());
                 changed = true;
+            }
+            // A material dropped on the button adds a part with it.
+            if let Some(drag) = ui
+                .interact(add.rect, id.with("add_drop"), egui::Sense::hover())
+                .dnd_release_payload::<AssetDrag>()
+            {
+                changed |= drop_material(root, slots, None, &drag.path);
+            }
+            Some(changed)
+        }
+        WidgetKind::Asset { root, extensions } => {
+            let v = value.try_downcast_mut::<String>()?;
+            Some(asset_field(ui, id, v, root, extensions))
+        }
+        WidgetKind::Degrees { min, max } => {
+            let v = value.try_downcast_mut::<f32>()?;
+            Some(degrees_field(ui, v, *min, *max))
+        }
+        WidgetKind::Color => {
+            let v = value.try_downcast_mut::<Vec3>()?;
+            let mut rgb = v.to_array();
+            let changed = ui.color_edit_button_rgb(&mut rgb).changed();
+            if changed {
+                *v = Vec3::from_array(rgb);
             }
             Some(changed)
         }
@@ -691,6 +816,69 @@ mod tests {
     }
 
     #[test]
+    fn material_slots_take_a_dropped_material_and_a_picked_one() {
+        use melon_core::MaterialSlot;
+        let root = Path::new("/p");
+        let mut slots = vec![MaterialSlot::default(), MaterialSlot::default()];
+        // Dropping on slot 1 sets only that slot.
+        assert!(drop_material(
+            root,
+            &mut slots,
+            Some(1),
+            Path::new("/p/assets/m.mat")
+        ));
+        assert_eq!(slots[0].path, "");
+        assert_eq!(slots[1].path, "assets/m.mat");
+        // Not a material, or outside the project: refused.
+        assert!(!drop_material(
+            root,
+            &mut slots,
+            Some(0),
+            Path::new("/p/assets/a.glb")
+        ));
+        assert!(!drop_material(
+            root,
+            &mut slots,
+            Some(0),
+            Path::new("/q/m.mat")
+        ));
+        // Dropping on the empty list adds one slot.
+        let mut none = Vec::new();
+        assert!(drop_material(
+            root,
+            &mut none,
+            None,
+            Path::new("/p/assets/n.mat")
+        ));
+        assert_eq!(none.len(), 1);
+    }
+
+    #[test]
+    fn material_slots_widget_draws_its_rows() {
+        use melon_core::MaterialSlot;
+        let ctx = egui::Context::default();
+        let mut slots = vec![MaterialSlot {
+            guid: String::new(),
+            path: "assets/m.mat".into(),
+        }];
+        let widget = WidgetKind::Materials {
+            root: PathBuf::from("/p"),
+        };
+        let mut shown = String::new();
+        let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let changed = widget_ui(ui, egui::Id::new("slots"), &mut slots, &widget);
+            assert_eq!(changed, Some(false));
+        });
+        for clipped in &out.shapes {
+            shown.push_str(&format!("{:?}", clipped.shape));
+        }
+        assert!(
+            shown.contains("assets/m.mat") && shown.contains("Add part"),
+            "{shown}"
+        );
+    }
+
+    #[test]
     fn slider_widget_edits_a_float_field() {
         let h = Harness::new();
         let mut v = sample();
@@ -710,6 +898,72 @@ mod tests {
             texts.push_str(&format!("{:?}", clipped.shape));
         }
         assert!(texts.contains("Speed (linear)"), "label override drawn");
+    }
+
+    #[test]
+    fn degrees_widget_edits_radians_and_never_drifts_them() {
+        let mut h = Harness::new();
+        h.widgets.insert(
+            "speed",
+            FieldWidget {
+                label: None,
+                kind: WidgetKind::Degrees {
+                    min: 0.0,
+                    max: 90.0,
+                },
+            },
+        );
+        let mut value = sample();
+        value.speed = std::f32::consts::FRAC_PI_2;
+        // Drawing alone leaves the stored radians bit for bit.
+        for _ in 0..3 {
+            assert!(!h.frame(&mut value, vec![]));
+        }
+        assert_eq!(value.speed.to_bits(), std::f32::consts::FRAC_PI_2.to_bits());
+        // Dragging the value 10 points to the left lowers it by 5 degrees.
+        let pos = h.center(root().with("speed"));
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let left = pos - egui::vec2(10.0, 0.0);
+        let mut changed = false;
+        for events in [
+            vec![egui::Event::PointerMoved(pos)],
+            vec![button(true)],
+            vec![egui::Event::PointerMoved(left)],
+            vec![egui::Event::PointerButton {
+                pos: left,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![],
+        ] {
+            changed |= h.frame(&mut value, events);
+        }
+        assert!(changed);
+        let degrees = value.speed.to_degrees();
+        assert!((degrees - 85.0).abs() < 1.5, "{degrees}");
+    }
+
+    #[test]
+    fn colour_widget_leaves_an_unedited_colour_alone() {
+        let mut h = Harness::new();
+        h.widgets.insert(
+            "pos",
+            FieldWidget {
+                label: None,
+                kind: WidgetKind::Color,
+            },
+        );
+        let mut value = sample();
+        let before = value.pos;
+        assert!(!h.frame(&mut value, vec![]));
+        assert_eq!(value.pos, before);
+        assert!(h.ctx.read_response(root().with("pos")).is_some());
     }
 
     const FIELDS: [&str; 11] = [

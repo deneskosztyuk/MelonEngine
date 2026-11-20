@@ -13,6 +13,7 @@ pub enum AssetKind {
     Folder,
     Model,
     Texture,
+    Material,
     Shader,
     Scene,
     Audio,
@@ -21,9 +22,10 @@ pub enum AssetKind {
 
 impl AssetKind {
     /// Every kind a file can be, in filter-chip order.
-    pub const FILE_KINDS: [AssetKind; 6] = [
+    pub const FILE_KINDS: [AssetKind; 7] = [
         AssetKind::Model,
         AssetKind::Texture,
+        AssetKind::Material,
         AssetKind::Shader,
         AssetKind::Scene,
         AssetKind::Audio,
@@ -35,6 +37,7 @@ impl AssetKind {
             AssetKind::Folder => "Folder",
             AssetKind::Model => "Model",
             AssetKind::Texture => "Texture",
+            AssetKind::Material => "Material",
             AssetKind::Shader => "Shader",
             AssetKind::Scene => "Scene",
             AssetKind::Audio => "Audio",
@@ -54,6 +57,7 @@ pub fn asset_kind(path: &Path, is_dir: bool) -> AssetKind {
     match ext.as_str() {
         "glb" | "gltf" => AssetKind::Model,
         "png" | "jpg" | "jpeg" | "hdr" => AssetKind::Texture,
+        "mat" => AssetKind::Material,
         "wgsl" => AssetKind::Shader,
         "ron" => AssetKind::Scene,
         e if melon_core::audio::AUDIO_EXTENSIONS.contains(&e) => AssetKind::Audio,
@@ -110,6 +114,11 @@ pub fn list_dir(path: &Path) -> Vec<ContentEntry> {
 pub enum BrowserRequest {
     /// Create "New Folder" inside this folder.
     NewFolder(PathBuf),
+    /// Create "New Material.mat" inside this folder.
+    NewMaterial(PathBuf),
+    /// Write the glTF model's materials as `.mat` files (and textures) next
+    /// to it and assign them on the selected entity that uses it.
+    ExtractMaterials(PathBuf),
     Rename(PathBuf, String),
     Duplicate(PathBuf),
     /// Ask before deleting (the editor lists what uses it).
@@ -893,6 +902,7 @@ mod tests {
         assert_eq!(asset_kind(Path::new("a/b.gltf"), false), AssetKind::Model);
         assert_eq!(asset_kind(Path::new("t.JPeG"), false), AssetKind::Texture);
         assert_eq!(asset_kind(Path::new("s.wgsl"), false), AssetKind::Shader);
+        assert_eq!(asset_kind(Path::new("m.MAT"), false), AssetKind::Material);
         assert_eq!(asset_kind(Path::new("level.ron"), false), AssetKind::Scene);
         assert_eq!(asset_kind(Path::new("README.md"), false), AssetKind::Other);
         assert_eq!(asset_kind(Path::new("models"), true), AssetKind::Folder);

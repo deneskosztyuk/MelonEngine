@@ -19,6 +19,12 @@ use crate::Time;
 /// Asset type tag for 3D models (glTF files, or `builtin:cube`).
 pub struct Model;
 
+/// Asset type tag for textures (png, jpg, hdr files).
+pub struct Texture;
+
+/// Asset type tag for materials (`.mat` RON files, see `material`).
+pub struct Material;
+
 /// Prefix for assets that have no file (e.g. `builtin:cube`).
 pub const BUILTIN_PREFIX: &str = "builtin:";
 
@@ -140,6 +146,7 @@ struct AssetEntry {
     version: u32,
     modified: Option<SystemTime>,
     bounds: Option<(Vec3, Vec3)>,
+    part_bounds: Vec<(Vec3, Vec3)>,
 }
 
 /// Registry of every asset path the project uses.
@@ -150,6 +157,9 @@ pub struct AssetServer {
     by_path: HashMap<String, u32>,
     guid_to_path: HashMap<AssetGuid, String>,
     path_to_guid: HashMap<String, AssetGuid>,
+    /// Bumped whenever the GUID index changes, so anything that resolved
+    /// GUIDs to handles knows to resolve them again.
+    index_epoch: u32,
     since_poll: f32,
     pack: Option<std::sync::Arc<crate::pack::Pack>>,
 }
@@ -184,6 +194,7 @@ impl AssetServer {
             by_path: HashMap::new(),
             guid_to_path: HashMap::new(),
             path_to_guid: HashMap::new(),
+            index_epoch: 0,
             since_poll: 0.0,
             pack: None,
         }
@@ -203,6 +214,7 @@ impl AssetServer {
                     version: 0,
                     modified,
                     bounds: None,
+                    part_bounds: Vec::new(),
                 });
                 self.by_path.insert(path, id);
                 id
@@ -240,6 +252,20 @@ impl AssetServer {
         self.entries[handle.id as usize].bounds = Some((min, max));
     }
 
+    /// Local-space bounds of each mesh part (material slot), written by the
+    /// renderer after loading; empty until then.
+    pub fn set_part_bounds<T: Send + Sync + 'static>(
+        &mut self,
+        handle: Handle<T>,
+        parts: Vec<(Vec3, Vec3)>,
+    ) {
+        self.entries[handle.id as usize].part_bounds = parts;
+    }
+
+    pub fn part_bounds<T: Send + Sync + 'static>(&self, handle: Handle<T>) -> &[(Vec3, Vec3)] {
+        &self.entries[handle.id as usize].part_bounds
+    }
+
     pub fn bounds<T: Send + Sync + 'static>(&self, handle: Handle<T>) -> Option<(Vec3, Vec3)> {
         self.entries[handle.id as usize].bounds
     }
@@ -263,6 +289,7 @@ impl AssetServer {
 
     /// Serve every read and the GUID index from `pack`; no hot reload then.
     pub fn set_pack(&mut self, pack: std::sync::Arc<crate::pack::Pack>) {
+        self.index_epoch += 1;
         self.guid_to_path.clear();
         self.path_to_guid.clear();
         for (path, guid) in pack.entries() {
@@ -286,6 +313,7 @@ impl AssetServer {
         if self.pack.is_some() {
             return; // the pack index holds the GUIDs
         }
+        self.index_epoch += 1;
         self.guid_to_path.clear();
         self.path_to_guid.clear();
         for file in asset_dir_files(&self.root) {
@@ -315,6 +343,12 @@ impl AssetServer {
             self.guid_to_path.insert(meta.guid, path.clone());
             self.path_to_guid.insert(path, meta.guid);
         }
+    }
+
+    /// Changes whenever the GUID index does (`scan_metas`, `set_pack`, a
+    /// rename): cached `resolve` results older than it are stale.
+    pub fn index_epoch(&self) -> u32 {
+        self.index_epoch
     }
 
     /// GUID of a file-backed asset path (a `#mesh<N>` fragment is ignored).
@@ -364,6 +398,7 @@ impl AssetServer {
             entry.path = renamed;
         }
         if let Some(guid) = self.path_to_guid.remove(&old) {
+            self.index_epoch += 1;
             self.guid_to_path.insert(guid, new.clone());
             self.path_to_guid.insert(new, guid);
         }

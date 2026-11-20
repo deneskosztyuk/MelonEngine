@@ -60,6 +60,7 @@ impl Source {
 pub struct ModelCache {
     models: HashMap<u32, CachedModel>,
     builtin_cube: LoadedModel,
+    builtin_sphere: LoadedModel,
     /// (handle id, version) pairs that failed to load, so each failure is
     /// reported once and not retried every frame.
     failed: HashSet<(u32, u32)>,
@@ -90,6 +91,7 @@ impl ModelCache {
                 continue;
             }
             server.set_bounds(sibling, model.bounds.0, model.bounds.1);
+            server.set_part_bounds(sibling, model.part_bounds.clone());
             let version = server.version(sibling);
             self.models
                 .insert(sibling.id(), CachedModel { version, model });
@@ -101,6 +103,7 @@ impl ModelCache {
         Self {
             models: HashMap::new(),
             builtin_cube: scene.builtin_cube_model(),
+            builtin_sphere: scene.builtin_sphere_model(),
             failed: HashSet::new(),
         }
     }
@@ -129,8 +132,10 @@ impl ModelCache {
     /// The model to draw for `handle` (after `prepare`): the loaded model,
     /// or the built-in cube for `builtin:cube` and for anything not loaded.
     pub fn model(&self, server: &AssetServer, handle: Handle<Model>) -> &LoadedModel {
-        if server.path(handle) == "builtin:cube" {
-            return &self.builtin_cube;
+        match server.path(handle) {
+            "builtin:cube" => return &self.builtin_cube,
+            "builtin:sphere" => return &self.builtin_sphere,
+            _ => {}
         }
         self.models
             .get(&handle.id())
@@ -148,10 +153,20 @@ impl ModelCache {
     ) {
         let id = handle.id();
         let path = server.path(handle).to_string();
-        if path == "builtin:cube" {
+        if path == "builtin:cube" || path == "builtin:sphere" {
             if server.bounds(handle).is_none() {
-                let (min, max) = self.builtin_cube.bounds;
+                let (min, max) = if path == "builtin:cube" {
+                    self.builtin_cube.bounds
+                } else {
+                    self.builtin_sphere.bounds
+                };
                 server.set_bounds(handle, min, max);
+                let parts = if path == "builtin:cube" {
+                    self.builtin_cube.part_bounds.clone()
+                } else {
+                    self.builtin_sphere.part_bounds.clone()
+                };
+                server.set_part_bounds(handle, parts);
             }
             return;
         }
@@ -171,6 +186,7 @@ impl ModelCache {
             match result {
                 Ok(model) => {
                     server.set_bounds(handle, model.bounds.0, model.bounds.1);
+                    server.set_part_bounds(handle, model.part_bounds.clone());
                     self.models.insert(id, CachedModel { version, model });
                 }
                 Err(error) => {

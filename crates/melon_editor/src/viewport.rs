@@ -6,7 +6,9 @@ use bevy_ecs::entity::Entity;
 use bevy_ecs::world::World;
 use melon_core::glam::{Mat4, Vec2, Vec3};
 use melon_core::hierarchy::world_matrix;
-use melon_core::{AssetServer, Camera, Collider, ColliderShape, Handle, Model, Transform};
+use melon_core::{
+    AssetServer, Camera, Collider, ColliderShape, Handle, Model, PointLight, SpotLight, Transform,
+};
 use melon_render::LineVertex;
 
 /// Radians of look/orbit per point of pointer movement.
@@ -199,6 +201,7 @@ impl EditorCamera {
 /// bounds in the entity's own space (world matrix, parents included), so
 /// rotated and scaled boxes are exact.
 pub fn pick(world: &mut World, origin: Vec3, dir: Vec3) -> Option<Entity> {
+    let light_hit = pick_light(world, origin, dir);
     let mut query = world.query_filtered::<(Entity, &Handle<Model>), melon_core::With<Transform>>();
     let world: &World = world;
     let server = world.get_resource::<AssetServer>();
@@ -215,8 +218,124 @@ pub fn pick(world: &mut World, origin: Vec3, dir: Vec3) -> Option<Entity> {
             let d = inverse.transform_vector3(dir);
             ray_box(o, d, min, max).map(|t| (t, entity))
         })
+        .chain(light_hit)
         .min_by(|a, b| a.0.total_cmp(&b.0))
         .map(|(_, entity)| entity)
+}
+
+/// `pick`, plus the mesh part of the hit entity's model under the ray (the
+/// nearest part box; `None` when the model has no known parts, or for a
+/// light).
+pub fn pick_part(world: &mut World, origin: Vec3, dir: Vec3) -> Option<(Entity, Option<usize>)> {
+    let entity = pick(world, origin, dir)?;
+    let part = (|| {
+        let model = *world.get::<Handle<Model>>(entity)?;
+        let inverse = world_matrix(world, entity).inverse();
+        let o = inverse.transform_point3(origin);
+        let d = inverse.transform_vector3(dir);
+        let parts = world.get_resource::<AssetServer>()?.part_bounds(model);
+        parts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (min, max))| ray_box(o, d, *min, *max).map(|t| (t, i)))
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, i)| i)
+    })();
+    Some((entity, part))
+}
+
+/// Radius of a light's viewport icon, which is also its pick radius.
+pub const LIGHT_ICON_RADIUS: f32 = 0.18;
+
+/// Position, linear colour and range of the point or spot light on `e`.
+fn light_of(world: &World, e: Entity) -> Option<(Vec3, Vec3, f32, Option<f32>)> {
+    let at = world_matrix(world, e).w_axis.truncate();
+    if let Some(l) = world.get::<PointLight>(e) {
+        return Some((at, l.color, l.range, None));
+    }
+    let l = world.get::<SpotLight>(e)?;
+    Some((at, l.color, l.range, Some(l.outer_angle)))
+}
+
+/// Nearest ray hit on a light's icon sphere, as (distance, entity).
+fn pick_light(world: &mut World, origin: Vec3, dir: Vec3) -> Option<(f32, Entity)> {
+    let mut query = world.query_filtered::<Entity, melon_core::bevy_ecs::query::Or<(
+        melon_core::With<PointLight>,
+        melon_core::With<SpotLight>,
+    )>>();
+    let world: &World = world;
+    query
+        .iter(world)
+        .filter_map(|e| {
+            let (at, ..) = light_of(world, e)?;
+            let to = at - origin;
+            let along = to.dot(dir);
+            let miss = (to - dir * along).length();
+            (along > 0.0 && miss <= LIGHT_ICON_RADIUS).then_some((along, e))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+}
+
+/// Small coloured spheres at every point and spot light (hidden behind
+/// geometry).
+pub fn light_icons(world: &mut World) -> Vec<melon_render::OverlayDraw> {
+    let mut query = world.query_filtered::<Entity, melon_core::bevy_ecs::query::Or<(
+        melon_core::With<PointLight>,
+        melon_core::With<SpotLight>,
+    )>>();
+    let world: &World = world;
+    query
+        .iter(world)
+        .filter_map(|e| light_of(world, e))
+        .map(|(at, color, _, _)| melon_render::OverlayDraw {
+            shape: melon_render::OverlayShape::Sphere,
+            transform: Mat4::from_scale_rotation_translation(
+                Vec3::splat(LIGHT_ICON_RADIUS),
+                melon_core::glam::Quat::IDENTITY,
+                at,
+            ),
+            color: [color.x.min(1.0), color.y.min(1.0), color.z.min(1.0), 1.0],
+            depth: melon_render::OverlayDepth::SceneTested,
+        })
+        .collect()
+}
+
+const LIGHT_COLOR: [f32; 3] = [1.0, 0.85, 0.2];
+
+/// Range outline of the light on `entity`: three rings for a point light's
+/// sphere, a cone (end ring and edges) for a spot light, along its -Z axis.
+pub fn light_lines(world: &World, entity: Entity) -> Vec<LineVertex> {
+    let Some((at, _, range, cone)) = light_of(world, entity) else {
+        return Vec::new();
+    };
+    let (_, rotation, _) = world_matrix(world, entity).to_scale_rotation_translation();
+    let m = Mat4::from_rotation_translation(rotation, at);
+    let tau = std::f32::consts::TAU;
+    let mut vertices = Vec::new();
+    match cone {
+        None => {
+            for (a, b) in [(Vec3::X, Vec3::Y), (Vec3::X, Vec3::Z), (Vec3::Y, Vec3::Z)] {
+                vertices.extend(arc(m, Vec3::ZERO, a * range, b * range, 0.0, tau));
+            }
+        }
+        Some(outer) => {
+            let angle = outer.clamp(0.01, 1.5);
+            let (radius, depth) = (range * angle.sin(), -range * angle.cos());
+            let end = Vec3::new(0.0, 0.0, depth);
+            vertices.extend(arc(m, end, Vec3::X * radius, Vec3::Y * radius, 0.0, tau));
+            for side in [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y] {
+                vertices.extend(line(
+                    at,
+                    m.transform_point3(end + side * radius),
+                    COLLIDER_COLOR,
+                ));
+            }
+        }
+    }
+    for v in &mut vertices {
+        v.color = LIGHT_COLOR;
+    }
+    vertices
 }
 
 /// Slab test against the box `[min, max]`. Returns the entry distance
@@ -465,6 +584,68 @@ mod tests {
     use crate::theme;
     use melon_core::Name;
     use melon_core::glam::Quat;
+
+    #[test]
+    fn lights_are_pickable_and_outline_their_range() {
+        let mut world = World::new();
+        let light = world
+            .spawn((
+                Transform::from_translation(Vec3::new(0.0, 2.0, 0.0)),
+                PointLight::default(),
+            ))
+            .id();
+        let spot = world
+            .spawn((
+                Transform::from_translation(Vec3::new(5.0, 2.0, 0.0)),
+                SpotLight::default(),
+            ))
+            .id();
+        assert_eq!(
+            pick(&mut world, Vec3::new(0.0, 2.0, 5.0), Vec3::NEG_Z),
+            Some(light)
+        );
+        assert_eq!(
+            pick(&mut world, Vec3::new(5.0, 2.0, 5.0), Vec3::NEG_Z),
+            Some(spot)
+        );
+        assert_eq!(
+            pick(&mut world, Vec3::new(2.0, 2.0, 5.0), Vec3::NEG_Z),
+            None
+        );
+        assert_eq!(light_icons(&mut world).len(), 2);
+        // Point light range: every outline vertex lies on the range sphere.
+        let range = PointLight::default().range;
+        let lines = light_lines(&world, light);
+        assert!(!lines.is_empty());
+        for v in &lines {
+            let d = (Vec3::from_array(v.position) - Vec3::new(0.0, 2.0, 0.0)).length();
+            assert!((d - range).abs() < 1e-3, "{d}");
+        }
+        assert!(!light_lines(&world, spot).is_empty());
+        let plain = world.spawn(Transform::default()).id();
+        assert!(light_lines(&world, plain).is_empty());
+    }
+
+    #[test]
+    fn pick_part_names_the_mesh_part_under_the_ray() {
+        let mut world = World::new();
+        let mut server = AssetServer::new(".".into());
+        let model: Handle<Model> = server.load("assets/two.glb");
+        server.set_bounds(model, Vec3::new(-2.0, -0.5, -0.5), Vec3::new(2.0, 0.5, 0.5));
+        server.set_part_bounds(
+            model,
+            vec![
+                (Vec3::new(-2.0, -0.5, -0.5), Vec3::new(0.0, 0.5, 0.5)),
+                (Vec3::new(0.0, -0.5, -0.5), Vec3::new(2.0, 0.5, 0.5)),
+            ],
+        );
+        world.insert_resource(server);
+        let e = world.spawn((Transform::default(), model)).id();
+        let mut from = |x: f32| pick_part(&mut world, Vec3::new(x, 0.0, 5.0), Vec3::NEG_Z);
+        assert_eq!(from(-1.0), Some((e, Some(0))));
+        assert_eq!(from(1.0), Some((e, Some(1))));
+        assert_eq!(from(3.0), None);
+    }
 
     fn approx(a: Vec3, b: Vec3) -> bool {
         (a - b).length() < 1e-4

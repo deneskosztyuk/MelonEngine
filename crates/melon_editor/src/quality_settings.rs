@@ -23,7 +23,7 @@ pub fn profiles_dir(project_root: &Path) -> PathBuf {
     project_root.join("config").join("quality_profiles")
 }
 
-const GROUPS: [(&str, &[QualitySetting]); 3] = [
+const GROUPS: [(&str, &[QualitySetting]); 4] = [
     (
         "Lighting",
         &[
@@ -31,6 +31,16 @@ const GROUPS: [(&str, &[QualitySetting]); 3] = [
             QualitySetting::SsgiResolution,
             QualitySetting::Ao,
             QualitySetting::ShadowMap,
+        ],
+    ),
+    (
+        "Lights and shadows",
+        &[
+            QualitySetting::MaxLights,
+            QualitySetting::Cascades,
+            QualitySetting::ShadowDistance,
+            QualitySetting::ShadowedLights,
+            QualitySetting::LocalShadowSize,
         ],
     ),
     ("Image", &[QualitySetting::Msaa, QualitySetting::Bloom]),
@@ -408,6 +418,11 @@ fn name(setting: QualitySetting) -> &'static str {
         QualitySetting::Msaa => "Anti-aliasing",
         QualitySetting::Bloom => "Bloom",
         QualitySetting::Present => "Frame pacing",
+        QualitySetting::MaxLights => "Max lights",
+        QualitySetting::Cascades => "Sun shadow cascades",
+        QualitySetting::ShadowDistance => "Sun shadow distance",
+        QualitySetting::ShadowedLights => "Shadowed lights",
+        QualitySetting::LocalShadowSize => "Light shadow atlas",
     }
 }
 
@@ -419,6 +434,11 @@ fn options(setting: QualitySetting) -> &'static [&'static str] {
         QualitySetting::ShadowMap => &["1024", "2048", "4096"],
         QualitySetting::Msaa => &["Off", "MSAA 2x", "MSAA 4x"],
         QualitySetting::Present => &["Vsync", "Mailbox + cap"],
+        QualitySetting::MaxLights => &["64", "128", "256", "512"],
+        QualitySetting::Cascades => &["1", "2", "3", "4"],
+        QualitySetting::ShadowDistance => &["40 m", "60 m", "100 m", "200 m"],
+        QualitySetting::ShadowedLights => &["Off", "2", "4", "8", "16"],
+        QualitySetting::LocalShadowSize => &["1024", "2048", "4096"],
     }
 }
 
@@ -442,6 +462,21 @@ fn selected(q: &RenderQuality, setting: QualitySetting) -> usize {
         QualitySetting::Msaa => pos(quality::MSAA_SAMPLES.iter().position(|&s| s == q.msaa)),
         QualitySetting::Bloom => q.bloom as usize,
         QualitySetting::Present => pos(PRESENTS.iter().position(|&p| p == q.present)),
+        QualitySetting::MaxLights => pos(quality::MAX_LIGHTS_OPTIONS
+            .iter()
+            .position(|&v| v == q.max_lights)),
+        QualitySetting::Cascades => pos(quality::CASCADE_OPTIONS
+            .iter()
+            .position(|&v| v == q.cascades)),
+        QualitySetting::ShadowDistance => pos(quality::SHADOW_DISTANCE_OPTIONS
+            .iter()
+            .position(|&v| v == q.shadow_distance)),
+        QualitySetting::ShadowedLights => pos(quality::SHADOWED_LIGHTS_OPTIONS
+            .iter()
+            .position(|&v| v == q.shadowed_lights)),
+        QualitySetting::LocalShadowSize => pos(quality::LOCAL_SHADOW_SIZES
+            .iter()
+            .position(|&v| v == q.local_shadow_size)),
     }
 }
 
@@ -454,6 +489,15 @@ fn select(q: &mut RenderQuality, setting: QualitySetting, index: usize) {
         QualitySetting::Msaa => q.msaa = quality::MSAA_SAMPLES[index],
         QualitySetting::Bloom => q.bloom = index == 1,
         QualitySetting::Present => q.present = PRESENTS[index],
+        QualitySetting::MaxLights => q.max_lights = quality::MAX_LIGHTS_OPTIONS[index],
+        QualitySetting::Cascades => q.cascades = quality::CASCADE_OPTIONS[index],
+        QualitySetting::ShadowDistance => {
+            q.shadow_distance = quality::SHADOW_DISTANCE_OPTIONS[index]
+        }
+        QualitySetting::ShadowedLights => {
+            q.shadowed_lights = quality::SHADOWED_LIGHTS_OPTIONS[index]
+        }
+        QualitySetting::LocalShadowSize => q.local_shadow_size = quality::LOCAL_SHADOW_SIZES[index],
     }
 }
 
@@ -464,6 +508,7 @@ fn enabled(q: &RenderQuality, setting: QualitySetting) -> bool {
         QualitySetting::SsgiResolution => q.gi_mode == GiMode::Ssgi,
         QualitySetting::Ao => q.ao,
         QualitySetting::Bloom => q.bloom,
+        QualitySetting::ShadowedLights | QualitySetting::LocalShadowSize => q.shadowed_lights > 0,
         _ => true,
     }
 }
@@ -475,7 +520,14 @@ fn cost(t: &RenderTimings, setting: QualitySetting) -> Option<f32> {
         QualitySetting::ShadowMap => t.shadows,
         QualitySetting::Msaa => t.aa,
         QualitySetting::Bloom => t.bloom,
-        QualitySetting::Present => None,
+        // The light and cascade settings fall under the shadows pass, which
+        // the shadow map row already shows.
+        QualitySetting::Present
+        | QualitySetting::MaxLights
+        | QualitySetting::Cascades
+        | QualitySetting::ShadowDistance
+        | QualitySetting::ShadowedLights
+        | QualitySetting::LocalShadowSize => None,
     }
 }
 
@@ -487,7 +539,12 @@ fn pass_color(setting: QualitySetting) -> Option<egui::Color32> {
         QualitySetting::ShadowMap => Some(PASS_SHADOWS),
         QualitySetting::Msaa => Some(PASS_AA),
         QualitySetting::Bloom => Some(PASS_BLOOM),
-        QualitySetting::Present => None,
+        QualitySetting::Present
+        | QualitySetting::MaxLights
+        | QualitySetting::Cascades
+        | QualitySetting::ShadowDistance
+        | QualitySetting::ShadowedLights
+        | QualitySetting::LocalShadowSize => None,
     }
 }
 
@@ -663,6 +720,24 @@ mod tests {
                 assert_eq!(selected(&copy, setting), selected(&q, setting));
                 assert!(selected(&q, setting) < options(setting).len());
             }
+        }
+    }
+
+    #[test]
+    fn every_setting_is_listed_in_a_group_and_changes_its_field() {
+        for setting in QualitySetting::ALL {
+            let listed = GROUPS.iter().any(|(_, list)| list.contains(&setting));
+            assert!(listed, "{setting:?} is in no group");
+        }
+        // Picking another option really changes the value (and the preset
+        // match then reports a custom setting).
+        for setting in QualitySetting::ALL {
+            let base = RenderQuality::preset(QualityPreset::High);
+            let other = (selected(&base, setting) + 1) % options(setting).len();
+            let mut q = base;
+            select(&mut q, setting, other);
+            assert_ne!(q, base, "{setting:?}");
+            assert_eq!(q.matching_preset(), None, "{setting:?}");
         }
     }
 

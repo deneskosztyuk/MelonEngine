@@ -39,6 +39,7 @@ fn kind_color(kind: AssetKind) -> Color32 {
         AssetKind::Folder => colors::WARNING,
         AssetKind::Model => colors::ACCENT_HOVER,
         AssetKind::Texture => colors::SUCCESS,
+        AssetKind::Material => colors::ACCENT,
         AssetKind::Shader => colors::ERROR,
         AssetKind::Scene => colors::INFO,
         AssetKind::Audio => colors::ACCENT,
@@ -99,6 +100,11 @@ pub(crate) fn id_label(
 fn folder_menu(ui: &mut egui::Ui, dir: &Path, actions: &mut Vec<Action>) {
     if ui.button("New Folder").clicked() {
         actions.push(Action::Request(BrowserRequest::NewFolder(
+            dir.to_path_buf(),
+        )));
+    }
+    if ui.button("New Material").clicked() {
+        actions.push(Action::Request(BrowserRequest::NewMaterial(
             dir.to_path_buf(),
         )));
     }
@@ -501,17 +507,21 @@ impl ContentBrowser {
     /// One row (list) or tile; model files are drag sources carrying their
     /// project-relative path.
     fn item(&self, ui: &mut egui::Ui, entry: &ContentEntry, actions: &mut Vec<Action>) {
-        let model = (!entry.is_dir && is_model_path(&entry.name))
+        let is_material = entry.kind == AssetKind::Material;
+        let thumb = (!entry.is_dir && (is_model_path(&entry.name) || is_material))
             .then(|| {
                 self.root()
                     .parent()
                     .and_then(|p| melon_core::assets::project_relative(p, &entry.path))
             })
             .flatten();
+        let model = thumb.clone().filter(|_| !is_material);
         let drag = AssetDrag {
             path: entry.path.clone(),
             model: model.clone(),
         };
+        // Models and materials both draw a thumbnail (keyed by their path).
+        let model = thumb;
         // Not `dnd_drag_source`: its drag-only widget on top hides this
         // item's clicks (egui hit test), so the item senses both itself.
         let response = self.draw_item(ui, entry, model.as_deref());
@@ -566,6 +576,11 @@ impl ContentBrowser {
                 .clicked()
             {
                 actions.push(Action::Request(BrowserRequest::AskDelete(path.clone())));
+            }
+            if is_model_path(&entry.name) && ui.button("Extract Materials").clicked() {
+                actions.push(Action::Request(BrowserRequest::ExtractMaterials(
+                    path.clone(),
+                )));
             }
             ui.separator();
             if ui.button("Show in Explorer").clicked() {

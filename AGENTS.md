@@ -8,7 +8,7 @@ Current state and planned work: `docs/ROADMAP.md`.
 | Path | Role |
 |---|---|
 | `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera, scenes (`scene.rs`), asset pack (`pack.rs`), player settings (`player.rs`), packaging (`package.rs`). No GPU or window code. |
-| `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache`) records sun shadow pass, depth/normal prepass, SSAO passes, the GI mode's passes (`gi/`: DDGI voxel and probe passes or SSGI), 3D pass into HDR target, bloom passes, tonemap pass; `ui_pass` for the editor. |
+| `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache` and `MaterialCache`) records the sun cascade passes and the point / spot shadow atlas pass, depth/normal prepass, SSAO passes, the GI mode's passes (`gi/`: DDGI voxel and probe passes or SSGI), 3D pass into HDR target, bloom passes, tonemap pass; `ui_pass` for the editor. |
 | `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource): component sync (`sync.rs`), scene queries (`queries.rs`), character controller, mesh collider triangles. See "Physics" below. |
 | `crates/melon_audio` | kira playback: `Director` (decisions, tested with a mock `Backend`), `KiraBackend` (device, bus tracks), `spatial` (attenuation, pan), `AudioEngine` (host calls `update` once per frame). The game-facing types are in `melon_core::audio`. |
 | `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), Content Drawer (`drawer.rs`), asset `.meta` files (`asset_db.rs`), file operations (`asset_ops.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), scene wrappers that add physics (`scene.rs`; the scene code itself is `melon_core::scene`), undo history (`history.rs`), Project Settings window (`project_settings.rs`, with `quality_settings.rs`, `audio_settings.rs`, `player_settings.rs`), File > Build (`build_window.rs`). |
@@ -131,15 +131,19 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   size, MSAA, present mode. `Environment` is the look only (sky, fog,
   strengths, radii; no on/off switches). Presets are data
   (`RenderQuality::preset`, `matching_preset`; `Default` = High = the
-  renderer before quality settings, snapshots byte-identical). Saved as
+  renderer's settings before quality settings; the image has changed since:
+  IBL, mips, alpha to coverage). Saved as
   `config/quality.ron` (loaded by the host), named profiles as
   `config/quality_profiles/<name>.ron`; edited in Edit ▸ Project Settings ▸
   Quality, pending until Apply. `extract` copies it into
   `FrameData::quality`. Live, per frame: `gi_mode`, `ssgi_resolution`, `ao`, `bloom` (a pass
   runs only if the quality turns it on AND its `Environment` strength is
-  above 0). Rebuilt in `render_scene` before the frame that uses them:
-  `shadow_map_size` (`set_shadow_map_size`: shadow texture, frame bind
-  group, DDGI voxel groups; clamped 256..device limit) and `msaa`
+  above 0), plus `max_lights`, `shadowed_lights` and `shadow_distance`
+  (used when the frame is built). Rebuilt in `render_scene` before the frame
+  that uses them: `shadow_map_size` and `cascades` (`set_shadow_map_size`,
+  `set_cascades`: shadow texture array, frame bind
+  group, DDGI voxel groups; size clamped 256..device limit),
+  `local_shadow_size` (the point / spot atlas, `set_local_shadow_atlas`) and `msaa`
   (`set_msaa`: falls back to the largest supported count not above it,
   `msaa_counts`, 2x needs `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`; the
   target's MSAA colour, depth and overlay textures are recreated in place,
@@ -383,10 +387,15 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   GI shaded as Off without `Gi::update` (no DDGI voxelising or probe
   update, `updates` and SSGI history untouched), the current shadow map
   size and sample count (its `FrameData::quality` sizes are ignored, so no
-  rebuild), no GPU timestamps. Its target follows the current sample count
+  rebuild), no GPU timestamps. It also leaves the sky texture, the IBL
+  (`ibl_frozen`: it draws with the IBL the last main view built, and its
+  default light never rebuilds it) and the local shadow atlas alone (it
+  has no local lights), so a thumbnail reallocates nothing
+  (`SceneRenderer::ibl_rebuilds` / `shadow_rebuilds` count rebuilds). Its
+  target follows the current sample count
   (`match_msaa`, that target only). GPU checks
   `thumbnail_does_not_disturb_the_next_scene_frame` (DDGI on) and
-  `thumbnail_keeps_shadow_map_and_msaa`.
+  `thumbnail_keeps_shadow_map_and_msaa` (which also counts the rebuilds).
 - **One main `render_scene` per submit (hard rule).** The camera, light,
   environment, SSAO and GI uniforms and the instance buffer are shared and
   written with `queue.write_buffer`, which applies at the next submit: two
@@ -508,6 +517,161 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   (from the light into the scene). Shaders want the opposite; pass
   `Light::to_light()`.
 - **Ambient.** A sky/ground hemisphere on `Light` (`sky_color`, `ground_color`, scaled by `ambient`), blended by the world normal's y.
+- **Textures and materials (assets).** `Handle<Texture>` (png, jpg, hdr
+  files) and `Handle<Material>` (`.mat` RON, `melon_core::MaterialAsset`:
+  base colour + texture, metallic, roughness + metallic-roughness texture,
+  normal texture + scale, emissive + texture + strength, `AlphaMode`
+  `Opaque` / `Mask { cutoff }` / `Blend`, `double_sided`; missing fields
+  take glTF defaults; vectors are RON tuples `(r, g, b, a)`). Textures are
+  `TextureRef { guid, path }` (GUID wins). `MeshMaterials { parts: Vec<MaterialSlot> }`
+  (registered component, `guid` + `path` per part, empty = keep the glTF
+  material) assigns materials per mesh part; `extract` resolves it into
+  `FrameData::overrides` (index into `models`). `materials.rs`
+  `MaterialCache` builds the group 2 bind group per `.mat` (rebuilt when the
+  file or one of its textures changes, `builds` counts); a missing texture
+  binds the 1x1 default, a broken `.mat` keeps the last good one or the
+  model's own material; colour textures are sRGB, the rest linear.
+  `LoadedModel::surfaces` holds each glTF material's `Surface { blend,
+  double_sided, masked }`. Instances batch by (model, override set id).
+  Draw order in the 3D pass: opaque (back faces culled), two-sided, sky, then
+  blended draws one instance each, sorted far to near
+  (`sort_back_to_front`), no depth write, no shadows (documented limit).
+  Texture quality: every texture made by `create_texture_from_bytes` has a
+  full CPU mip chain (`mip_chain`, 2x2 box, sRGB averaged in linear light),
+  the material sampler is trilinear with 8x anisotropy where the adapter's
+  downlevel flags allow it (`material_sampler_descriptor`, `Renderer::new`
+  passes the clamp). Blend draws sample the SSAO of the opaque backdrop
+  (the prepass has no blended surfaces), so a blended surface gets AO from
+  what is behind it.
+  Mask: `MaterialUniform::alpha_cutoff` > 0 discards in the main pass at 1
+  sample; at MSAA > 1 the main pass draws Mask parts with the `Mask` /
+  `MaskTwoSided` variants (shader override `ALPHA_TO_COVERAGE`: no discard,
+  a one pixel ramp around the cutoff becomes the sample coverage). The
+  voxel pass, prepass and shadow passes keep the cutoff discard. Mask also
+  discards in the voxel pass and, through the `vs_mask` / `fs_mask` entry points of
+  prepass.wgsl and shadow.wgsl (group 2 = the material), the prepass and
+  every shadow pass. Double-sided and blend mesh pipelines are built lazily
+  per (sample count, GI mode) (`ensure_variant`, shader override
+  `ALPHA_BLEND`). Editor: Create > New Material (folder menu), `.mat`
+  Inspector card (`material_card.rs`: texture slots use
+  `inspect::asset_field`, the picker + drop target of `WidgetKind::Asset`;
+  colour pickers; the edited copy waits in egui memory and the file is
+  written when the pointer is released, not per tick); spot light angles
+  show in degrees (`WidgetKind::Degrees`), light colours get a picker
+  (`WidgetKind::Color`); `.mat` tiles
+  get a thumbnail (`Renderer::render_material_thumbnail`: the material on
+  `builtin:sphere`, same auxiliary view and own submission as model
+  thumbnails; `ThumbnailSubject`); dragging a `.mat` onto an entity in the
+  Scene view assigns it to the part under the cursor (`viewport::pick_part`
+  uses `AssetServer::part_bounds`, written by the renderer), onto a
+  Hierarchy row to every part, or into the `MeshMaterials` Inspector field
+  (`WidgetKind::Materials`), each one undo step (`assign_material_step`);
+  a glTF model's context menu "Extract Materials" writes `.mat` + png files
+  and `.meta`s next to it (`melon_render::extract_materials`,
+  `asset_ops::extract_materials`) and assigns them to the selected entity if
+  it draws that model.
+- **Local lights (`lights.rs`).** `PointLight` / `SpotLight` (core,
+  registered; spot shines along local -Z; radiance `color * intensity /
+  d^2` windowed to 0 at `range`, spot cone squared smooth). `extract` fills
+  `FrameData::lights`. Clustered forward: a 16 x 9 x 24 froxel grid
+  (exponential depth slices from the camera near plane, at most 500 m deep),
+  built on the CPU per main view (`ClusterGrid`, `build`): each light goes
+  in the clusters whose box its sphere touches (`range_of` gives the
+  candidate box, `cluster_aabbs` the per-cluster world boxes; sphere vs box
+  keeps big lights out of unrelated clusters), lists upload to
+  group 3 bindings 9 to 12 (lights, per-cluster (offset, count), indices,
+  `ClusterUniform`); `RenderQuality::max_lights` keeps the brightest per
+  squared distance. mesh.wgsl `local_light_radiance` loops over the
+  fragment's cluster. The per-view groups bind `frame_lights`; the unoccluded
+  and voxel groups' lights are an empty set / the frame set. Auxiliary views
+  (thumbnails) write an empty set. The shared index list holds
+  `INDEX_CAPACITY` entries: the overflow is counted
+  (`ClusterData::overflow`, `RenderStats::light_index_overflow`) and warned
+  once per change; those last clusters miss lights.
+  `RenderStats::lights`, `lights_dropped`. `extract` caches resolved LOD
+  and `MeshMaterials` handles in `ResolvedLod` / `ResolvedMaterials`
+  components (re-resolved when the source or `AssetServer::index_epoch`
+  changes) and writes `LodState` only when the level changes.
+  Editor: GameObject > Light, viewport icons (pickable spheres), range sphere
+  / cone outline for the selected light (`viewport::light_*`).
+- **Image-based ambient (`ibl.rs`).** Diffuse = irradiance as SH9 (CPU,
+  `project_diffuse`), specular = the environment prefiltered per roughness
+  into 6 mips of a 128 x 64 equirect (`prefilter`) + a 32 x 32 BRDF lookup
+  (split sum), all in group 0 bindings 7 to 10, rebuilt on the CPU when
+  `SkyParams` (sky colours, `Light` ambient / hemisphere colours) or the HDR
+  image change (`refresh_ibl`, called by `update_environment` /
+  `update_light`, so direct draws work; the specular texture is rewritten in
+  place, never reallocated, so a dragged sky slider costs CPU only). Rough
+  surfaces blend the prefiltered sky toward the hemisphere irradiance
+  (`smoothstep(0.25, 0.85, roughness)`: the drawn sky is several times
+  brighter than the ambient the scene is lit with) and reflections under
+  the surface's horizon fade out. Procedural source: diffuse = the
+  hemisphere ambient (its irradiance equals the old blend; SH9 within 6%),
+  specular = the drawn sky without the sun disc. HDR source:
+  `Environment::sky_texture` (any image file, `Handle<Texture>`) times
+  `sky_intensity`, drawn as the sky too (sky.wgsl reads mip 0); the
+  `Light` hemisphere colours the GI misses (`sky_light`) and GI-off
+  fallbacks read are overridden by the image's mean radiance above / below
+  the horizon (a two-colour approximation of the HDR for GI).
+- **Cascaded sun shadows (`cascades.rs`).** `RenderQuality::cascades` (1 to
+  4) and `shadow_distance`. `fit` cuts the camera frustum (practical split,
+  lambda 0.75; each cascade starts at 80% of the previous far depth so they
+  overlap), fits a sphere-bounded ortho box per slice (radius rounded to
+  1/16 m), snaps its centre to the shadow map texel grid in light space (no
+  shimmer), and reaches 200 m toward the sun for casters. The shadow map is a
+  Depth32Float 2D array, one layer per cascade (`set_cascades`,
+  `set_shadow_map_size` recreate it; `shadow_view` is the array view,
+  `shadow_layers` render into one layer each); one `render_cascade` pass per
+  layer with its own camera buffer (writes apply at submit, so one buffer
+  per cascade). Casters are culled per cascade. mesh.wgsl `shadow_factor`
+  picks the cascade by view depth (`LightUniform::cascade_far`,
+  `cascade_forward`), blends the last 15% into the next and fades the last
+  cascade to lit at the shadow distance; `shadow_factor_volume` (GI voxel
+  passes) reads the DDGI injection shadow map: one fixed cascade (2048,
+  `gi_shadow_matrix`, an ortho box around the volume's bounding sphere,
+  rendered from every caster that touches it) with its own light uniform,
+  so injection never depends on where the camera looks.
+  `update_light(light, matrix)` is the one-cascade form for direct draws
+  (covers every depth). Thumbnails use one cascade and do not resize the map.
+  `SHADOW_RADIUS` now only sizes the DDGI volume.
+- **Point / spot shadows (`local_shadows.rs`).** A light with `cast_shadows`
+  gets shadow tiles in one `Depth32Float` atlas (`RenderQuality::
+  local_shadow_size`, 4 x 4 stand-in while nothing casts): a spot light one
+  perspective tile along its cone, a point light six cube-face tiles (92
+  degrees). `lights::build(.., shadow_cap)` puts the nearest
+  `shadowed_lights` casters first in the light list (their `spot.w` = first
+  tile, `ClusterUniform::dims.w` = how many); `tile_layout` picks the tile
+  size (power of two, 128 to 1024) so all views fit; what does not fit
+  the atlas (`lights_that_fit`: 64 tiles at 1024, so ten point lights) is
+  dropped, farthest first, and drawn unshadowed
+  (`RenderStats::shadowed_lights_dropped`, warned once per change). One
+  pass
+  (`render_local_shadows`) draws each tile with a viewport / scissor and its
+  own camera buffer; casters culled per tile, at most `local_shadows::MAX_CASTERS` per tile
+  (`RenderStats::local_casters_dropped`). Atlas + tile records are
+  group 0 bindings 11 and 12 (also in the DDGI voxel passes' group 0);
+  mesh.wgsl `local_shadow` picks the cube face by the dominant axis, 3x3 PCF,
+  normal offset by 1.5 texels. DDGI injects only the shadowed lights (fs_voxel
+  loops over the first `dims.w` lights with `local_shadow`); unshadowed
+  local lights are not injected, so no light through walls. Shadow casters
+  off screen that touch the DDGI volume join the shadowed lights through
+  `build`'s `volume` argument (they sit in no cluster), so their injection
+  does not flicker with the camera. The voxel
+  pass lighting group binds the frame light set. `RenderStats::
+  shadowed_lights`, `shadow_views`. Alpha-masked casters work, blended ones
+  cast nothing.
+- **LOD (`melon_core::lod`).** `Lod { levels: Vec<LodLevel { guid, path,
+  screen_height }>, hysteresis }`, thresholds descending: level i is used
+  from `screen_height` (share of the view height the bounding sphere's
+  diameter covers, `screen_height(view_proj, ..)`) down to the next level's
+  threshold; below the last one the object is culled. `select_level` holds a
+  level until the height is past its threshold by the hysteresis share
+  (state in `LodState`, kept by `extract`). The entity's own `Handle<Model>`
+  is not drawn while `levels` is non-empty; the chosen level's model is, so
+  instancing groups by it. Bounds come from the first level the
+  `AssetServer` knows (a unit cube until one has loaded). `MeshMaterials` applies
+  to every level (same part indices; parts a level lacks are ignored). Not exposed in the editor beyond the generic
+  component Inspector.
 - **Materials.** glTF metallic-roughness per primitive (`MaterialUniform`:
   base colour, metallic, roughness, normal scale, emissive). Group 2 of the
   mesh pipeline: 0 base colour (sRGB), 1 sampler, 2 metallic-roughness
@@ -540,7 +704,12 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   view (`ViewLighting`) has the group with its AO and with white AO (AO
   off); `draw_meshes_textured` takes it. `unoccluded_lighting` (white AO,
   SSGI stand-ins) serves `draw_meshes` and tests, `voxel_pass_lighting`
-  the voxel passes.
+  the voxel passes. Bindings 9 to 12 are the point / spot lights and their
+  clusters (`lights::LightBuffers`; per-view groups bind the frame's set,
+  `unoccluded_lighting` an empty one). Group 0 (frame) also holds the IBL
+  (7 SH uniform, 8 prefiltered environment, 9 sampler, 10 BRDF lookup), the
+  point / spot shadow atlas (11) and its tile records (12); binding 2 is the
+  cascade shadow map array.
 - **SSAO.** Before the 3D pass `render_scene` draws the camera's batches once,
   single-sample, into the view's prepass targets (`Depth32Float` depth,
   `Rgba16Float` world normal + eye distance; `render_prepass`, also run
@@ -565,7 +734,7 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   (default 0.08; 0 skips the passes and binds black, the image matches the
   pre-bloom one exactly). Bloom textures live in `ViewportTarget` and are
   rebuilt with it. `tonemap_pass(hdr)` alone never blooms. Tradeoff: k
-  lowers local contrast near every edge by about k (guarded at 87% kept
+  lowers local contrast near every edge by about k (guarded at 85% kept
   by `bloom_adds_no_haze_keeps_edges`), so raise emitter brightness, not
   k, for more glow: lights want emissive strength well above 1 (the review
   cube is 12, about 10x a sunlit floor). GPU tests that
@@ -676,7 +845,7 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
 - **No overlapping slabs.** Boxes that overlap share face planes, which
   z-fight into stripes at oblique views (the first cornell room's wall
   tops inside the ceiling). Let walls end where the next slab starts.
-- **Sun shadow setup.** The shadow pass culls nothing (front faces of
+- **Sun shadow setup.** (Per cascade, see "Cascaded sun shadows".) The shadow pass culls no faces (front faces of
   closed meshes store depth; single-sided quads cast from both sides) with
   a small slope-scaled bias (`constant: 1, slope_scale: 1.5`), and
   `shadow_factor` in `mesh.wgsl` offsets the lookup along the geometric
@@ -689,11 +858,13 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   absent, not registered in `Core::new`): procedural sky (`zenith_color`,
   `horizon_color`) and exponential distance fog (`fog_density`). The fog
   colour is `horizon_color`. Mesh fog only; world lines and overlay shapes
-  are not fogged.
+  are not fogged. `sky_texture: Option<Handle<Texture>>` + `sky_intensity`
+  replace the procedural sky with an HDR equirect (see "Image-based
+  ambient"); it is never saved (handles are not stored in files).
 - **Camera conventions.** Right-handed, DirectX depth (near = 0, far = 1).
   Screen helpers take logical points.
 - **Checking rendering.** Agents verify rendering with the snapshot example
-  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only] [--ssgi-res half|quarter] [--size WxH]`;
+  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd|cornell|lights|alpha] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only] [--ssgi-res half|quarter] [--size WxH] [--no-lights]`;
   `--quality` starts from that `RenderQuality` preset (default high), the
   other flags override it; `--ao-only` saves the SSAO term as a grey
   image; `--no-ao` turns `RenderQuality::ao` off; `--no-shadow` moves scene
@@ -703,7 +874,11 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   bloom alone); `--gi` picks `RenderQuality::gi_mode` (default ddgi; `--no-gi` is
   `--gi off`), `--gi-only` saves that mode's indirect diffuse term alone; `crowd` adds about
   10,000 instances; `cornell` adds an open-front red/green room at
-  (-13, 0, -13) seen through its opening; the 100 timed frames run
+  (-13, 0, -13) seen through its opening; `lights` is the overview with 32
+  point / spot lights (every third a spot, 4 flagged as shadow casters),
+  `--no-lights` draws it without them (compare the GPU `total` for their cost);
+  `alpha` adds an alpha-masked checker and a blended pane (their `.mat` and
+  texture files are written to `target/review/`); the 100 timed frames run
   before the capture, so GI has converged (SSGI too: 300 frames differ
   by at most 2 sRGB steps); it prints the mean frame time,
   `RenderStats`, the quality with its MSAA count and the GPU
@@ -719,6 +894,12 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   switching); `render_qualities` reads back every frame and fails on a
   wgpu validation error (rebuild checks). Checks that change the shadow
   map size or MSAA end back on the default, since later checks share the
-  renderer.
+  renderer. Checks that use `.mat` files or lights build their own temp
+  project (`material_project`) and reset `r.materials` / `r.model_cache`
+  (the renderer's caches are keyed by handle id, which repeats across
+  servers); `render_slabs`, `render_lit`, `render_floor_under` and
+  `render_with_occluder` are the helpers. A `.mat` in RON writes colours as
+  tuples, and a file that fails to parse silently falls back to the glTF
+  material: assert `r.materials.builds`.
 
   SSGI tests need the bouncing surface on screen.
