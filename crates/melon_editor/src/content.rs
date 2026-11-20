@@ -190,6 +190,11 @@ pub struct ContentBrowser {
     pub(crate) tree_children: std::collections::HashMap<PathBuf, Vec<PathBuf>>,
     /// File kinds shown; folders are always shown outside search.
     filter: HashSet<AssetKind>,
+    /// The current folder as read by the last `refresh`.
+    listing: Vec<ContentEntry>,
+    /// Every file below the current folder, sorted; read from disk by the
+    /// first search after a `refresh`, so typing filters it in memory.
+    files: Option<Vec<ContentEntry>>,
     /// What the asset view shows, rebuilt only when the folder, search or
     /// filter changes.
     visible: Vec<ContentEntry>,
@@ -209,6 +214,8 @@ impl ContentBrowser {
             tree_width: theme::sizes::CONTENT_TREE,
             tree_children: std::collections::HashMap::new(),
             filter: AssetKind::FILE_KINDS.into_iter().collect(),
+            listing: Vec::new(),
+            files: None,
             visible: Vec::new(),
         };
         browser.refresh();
@@ -226,7 +233,7 @@ impl ContentBrowser {
     pub fn set_search(&mut self, text: String) {
         if text != self.search {
             self.search = text;
-            self.refresh();
+            self.update_visible();
         }
     }
 
@@ -238,7 +245,7 @@ impl ContentBrowser {
         if !self.filter.remove(&kind) {
             self.filter.insert(kind);
         }
-        self.refresh();
+        self.update_visible();
     }
 
     pub fn current(&self) -> &Path {
@@ -465,7 +472,8 @@ impl ContentBrowser {
     }
 
     /// Re-read the disk: the current folder, or with a search every file
-    /// below it whose name contains the search (case-insensitive).
+    /// below it whose name contains the search (case-insensitive). Clears
+    /// the tree cache.
     pub fn refresh(&mut self) {
         // The folder may have been deleted or renamed outside the editor.
         while !self.current.is_dir() && self.current != self.root {
@@ -475,18 +483,33 @@ impl ContentBrowser {
             }
         }
         self.tree_children.clear();
-        let shown = |e: &ContentEntry| e.is_dir || self.filter.contains(&e.kind);
+        self.listing = list_dir(&self.current);
+        self.files = None;
+        self.update_visible();
+    }
+
+    /// Rebuild `visible` from the cached listing (no disk read, except the
+    /// first search after a `refresh`).
+    fn update_visible(&mut self) {
+        let filter = &self.filter;
+        let shown = |e: &ContentEntry| e.is_dir || filter.contains(&e.kind);
         self.visible = if self.search.is_empty() {
-            list_dir(&self.current).into_iter().filter(shown).collect()
+            self.listing.iter().filter(|e| shown(e)).cloned().collect()
         } else {
-            let needle = self.search.to_lowercase();
-            let mut files = Vec::new();
-            walk_files(&self.current, &mut files);
-            files.retain(|e| shown(e) && e.name.to_lowercase().contains(&needle));
-            files.sort_by(|a, b| {
-                (a.name.to_lowercase(), &a.path).cmp(&(b.name.to_lowercase(), &b.path))
+            let files = self.files.get_or_insert_with(|| {
+                let mut files = Vec::new();
+                walk_files(&self.current, &mut files);
+                files.sort_by(|a, b| {
+                    (a.name.to_lowercase(), &a.path).cmp(&(b.name.to_lowercase(), &b.path))
+                });
+                files
             });
+            let needle = self.search.to_lowercase();
             files
+                .iter()
+                .filter(|e| shown(e) && e.name.to_lowercase().contains(&needle))
+                .cloned()
+                .collect()
         };
     }
 }
@@ -675,6 +698,26 @@ mod tests {
         }
         browser.set_search("a".into());
         assert!(browser.visible_entries().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_and_filter_reuse_the_last_disk_read() {
+        let dir = temp_dir("search_cache");
+        touch(&dir, "a.glb");
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.set_search("a".into());
+        browser
+            .tree_children
+            .insert(dir.clone(), vec![dir.join("kept")]);
+        touch(&dir, "ab.glb");
+        browser.set_search("ab".into());
+        browser.toggle_kind(AssetKind::Model);
+        browser.toggle_kind(AssetKind::Model);
+        assert!(browser.visible_entries().is_empty(), "no disk read");
+        assert!(browser.tree_children.contains_key(&dir), "tree kept");
+        browser.refresh();
+        assert_eq!(names(&browser), ["ab.glb"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
