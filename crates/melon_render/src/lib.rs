@@ -679,6 +679,9 @@ struct Calls<'a> {
     masked: Vec<DrawCall<'a>>,
     single: Vec<DrawCall<'a>>,
     two_sided: Vec<DrawCall<'a>>,
+    /// Alpha-masked parts drawn with alpha to coverage (MSAA > 1 only).
+    mask: Vec<DrawCall<'a>>,
+    mask_two_sided: Vec<DrawCall<'a>>,
     /// Far to near, one instance each, with the instance's world position.
     blend: Vec<(glam::Vec3, DrawCall<'a>)>,
 }
@@ -695,7 +698,98 @@ enum Variant {
     TwoSided,
     /// Alpha blended (back to front, no depth write, back faces drawn).
     Blend,
+    /// Alpha-masked, alpha to coverage (MSAA > 1 only), back faces culled.
+    Mask,
+    /// `Mask` with back faces drawn too.
+    MaskTwoSided,
 }
+
+impl Variant {
+    fn alpha_to_coverage(self) -> bool {
+        matches!(self, Self::Mask | Self::MaskTwoSided)
+    }
+}
+
+/// The mip levels below the base of an RGBA8 image, each a 2x2 box average
+/// (colour in sRGB is averaged in linear light); `(size, pixels)` per level
+/// down to 1x1.
+fn mip_chain(pixels: &[u8], width: u32, height: u32, srgb: bool) -> Vec<((u32, u32), Vec<u8>)> {
+    let to_linear = |c: u8| {
+        let c = f32::from(c) / 255.0;
+        if !srgb {
+            c
+        } else if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let from_linear = |v: f32| {
+        let v = if !srgb {
+            v
+        } else if v <= 0.003_130_8 {
+            v * 12.92
+        } else {
+            1.055 * v.powf(1.0 / 2.4) - 0.055
+        };
+        (v * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+    };
+    let mut levels = Vec::new();
+    let (mut w, mut h) = (width, height);
+    let mut prev = pixels.to_vec();
+    while w > 1 || h > 1 {
+        let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+        let mut next = Vec::with_capacity((nw * nh * 4) as usize);
+        for y in 0..nh {
+            for x in 0..nw {
+                let at = |sx: u32, sy: u32| ((sy.min(h - 1) * w + sx.min(w - 1)) * 4) as usize;
+                let taps = [
+                    at(2 * x, 2 * y),
+                    at(2 * x + 1, 2 * y),
+                    at(2 * x, 2 * y + 1),
+                    at(2 * x + 1, 2 * y + 1),
+                ];
+                for c in 0..4 {
+                    next.push(if c == 3 {
+                        // Alpha is linear in either colour space.
+                        let sum: f32 = taps.iter().map(|&i| f32::from(prev[i + 3])).sum();
+                        (sum / 4.0 + 0.5) as u8
+                    } else {
+                        let sum: f32 = taps.iter().map(|&i| to_linear(prev[i + c])).sum();
+                        from_linear(sum / 4.0)
+                    });
+                }
+            }
+        }
+        levels.push(((nw, nh), next.clone()));
+        (w, h, prev) = (nw, nh, next);
+    }
+    levels
+}
+
+/// Mip levels of a `width` x `height` texture.
+fn mip_count(width: u32, height: u32) -> u32 {
+    32 - width.max(height).max(1).leading_zeros()
+}
+
+/// The material sampler: trilinear, anisotropic when the device supports it
+/// (`anisotropy` 1 = off).
+fn material_sampler_descriptor(anisotropy: u16) -> wgpu::SamplerDescriptor<'static> {
+    wgpu::SamplerDescriptor {
+        label: Some("material sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        anisotropy_clamp: anisotropy,
+        ..Default::default()
+    }
+}
+
+/// Anisotropy the renderer asks for where the device can do it.
+const MATERIAL_ANISOTROPY: u16 = 8;
 
 /// Most levels in a view's bloom mip chain.
 pub const BLOOM_LEVELS: usize = 6;
@@ -1166,7 +1260,16 @@ impl Renderer {
         );
 
         let timer = timings::GpuTimer::new(&device, &queue);
-        let scene = SceneRenderer::new(device, queue, surface_format, msaa_counts);
+        let anisotropy = if adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::ANISOTROPIC_FILTERING)
+        {
+            MATERIAL_ANISOTROPY
+        } else {
+            1
+        };
+        let scene = SceneRenderer::new(device, queue, surface_format, msaa_counts, anisotropy);
         let model_cache = ModelCache::new(&scene);
         let overlay =
             overlay::OverlayRenderer::new(&scene.device, surface_format.add_srgb_suffix());
@@ -1730,7 +1833,8 @@ impl Renderer {
             })
         };
         let eye = frame.eye;
-        let textured = |batches: &[(DrawKey, std::ops::Range<u32>)]| {
+        let main_coverage = self.scene.msaa() > 1;
+        let textured = |batches: &[(DrawKey, std::ops::Range<u32>)], coverage: bool| {
             let mut calls = Calls::default();
             for (key, instances) in batches {
                 let model = cache.model(assets, key.0);
@@ -1750,18 +1854,19 @@ impl Renderer {
                     } else {
                         calls.plain.push((mesh, instances.clone()));
                     }
-                    if surface.double_sided {
-                        calls.two_sided.push(call);
-                    } else {
-                        calls.single.push(call);
+                    match (surface.masked && coverage, surface.double_sided) {
+                        (true, true) => calls.mask_two_sided.push(call),
+                        (true, false) => calls.mask.push(call),
+                        (false, true) => calls.two_sided.push(call),
+                        (false, false) => calls.single.push(call),
                     }
                 }
             }
             sort_back_to_front(eye, &mut calls.blend);
             calls
         };
-        let calls = textured(&seen);
-        let voxel_calls = textured(&voxelized);
+        let calls = textured(&seen, main_coverage);
+        let voxel_calls = textured(&voxelized, false);
         let draw_calls = &calls.single;
         let voxel_draw_calls: Vec<_> = voxel_calls
             .single
@@ -1793,7 +1898,13 @@ impl Renderer {
         let shadow_calls: Vec<ShadowDraws> = casters.iter().map(casters_of).collect();
         let local_calls: Vec<ShadowDraws> = local_casters.iter().map(casters_of).collect();
         let gi_calls = casters_of(&gi_casters);
-        let all_draws = [draw_calls, &calls.two_sided, &blend_calls];
+        let all_draws = [
+            draw_calls,
+            &calls.two_sided,
+            &calls.mask,
+            &calls.mask_two_sided,
+            &blend_calls,
+        ];
         stats.draw_calls = all_draws.iter().map(|c| c.len() as u32).sum();
         stats.instances_drawn = all_draws
             .iter()
@@ -1823,6 +1934,12 @@ impl Renderer {
         }
         if !blend_calls.is_empty() {
             scene.ensure_variant(Variant::Blend);
+        }
+        if !calls.mask.is_empty() {
+            scene.ensure_variant(Variant::Mask);
+        }
+        if !calls.mask_two_sided.is_empty() {
+            scene.ensure_variant(Variant::MaskTwoSided);
         }
         for (layer, (plain, masked)) in shadow_calls.iter().enumerate() {
             scene.render_cascade(encoder, layer, plain, masked);
@@ -1893,6 +2010,14 @@ impl Renderer {
             scene.draw_meshes_textured(&mut pass, draw_calls, lighting);
             if !calls.two_sided.is_empty() {
                 scene.draw_meshes_variant(&mut pass, &calls.two_sided, lighting, Variant::TwoSided);
+            }
+            for (variant, group) in [
+                (Variant::Mask, &calls.mask),
+                (Variant::MaskTwoSided, &calls.mask_two_sided),
+            ] {
+                if !group.is_empty() {
+                    scene.draw_meshes_variant(&mut pass, group, lighting, variant);
+                }
             }
             scene.draw_sky(&mut pass);
             if !blend_calls.is_empty() {
@@ -1989,6 +2114,7 @@ impl SceneRenderer {
         queue: wgpu::Queue,
         surface_format: wgpu::TextureFormat,
         msaa_counts: Vec<u32>,
+        anisotropy: u16,
     ) -> Self {
         let uniform_entry = |binding, visibility| wgpu::BindGroupLayoutEntry {
             binding,
@@ -2349,16 +2475,7 @@ impl SceneRenderer {
             flat_normal: texture_1x1("default flat normal texture", [128, 128, 255, 255]),
             black: texture_1x1("default black texture", [0, 0, 0, 255]),
         };
-        let material_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("material sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
+        let material_sampler = device.create_sampler(&material_sampler_descriptor(anisotropy));
         let checker = Renderer::create_checkerboard_texture(&device, &queue)
             .create_view(&wgpu::TextureViewDescriptor::default());
         let checker_material = material_bind_group(
@@ -2941,9 +3058,11 @@ impl Renderer {
         variant: Option<Variant>,
     ) -> wgpu::RenderPipeline {
         let blend = variant == Some(Variant::Blend);
+        let a2c = variant.is_some_and(Variant::alpha_to_coverage);
         let constants = [
             ("GI_MODE", gi::shader_mode(gi)),
             ("ALPHA_BLEND", f64::from(blend)),
+            ("ALPHA_TO_COVERAGE", f64::from(a2c)),
         ];
         let compilation_options = wgpu::PipelineCompilationOptions {
             constants: &constants,
@@ -2979,7 +3098,8 @@ impl Renderer {
                 }],
             },
             primitive: wgpu::PrimitiveState {
-                cull_mode: variant.is_none().then_some(wgpu::Face::Back),
+                cull_mode: matches!(variant, None | Some(Variant::Mask))
+                    .then_some(wgpu::Face::Back),
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -2991,6 +3111,7 @@ impl Renderer {
             }),
             multisample: wgpu::MultisampleState {
                 count: samples,
+                alpha_to_coverage_enabled: a2c,
                 ..Default::default()
             },
             fragment: Some(wgpu::FragmentState {
@@ -4359,13 +4480,37 @@ impl SceneRenderer {
                 height,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1,
+            mip_level_count: mip_count(width, height),
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        for (level, ((w, h), data)) in mip_chain(pixels, width, height, format.is_srgb())
+            .iter()
+            .enumerate()
+        {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: level as u32 + 1,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(*h),
+                },
+                wgpu::Extent3d {
+                    width: *w,
+                    height: *h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -7614,6 +7759,137 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn mip_chain_halves_down_to_one_texel() {
+        assert_eq!(mip_count(1, 1), 1);
+        assert_eq!(mip_count(2, 2), 2);
+        assert_eq!(mip_count(256, 64), 9);
+        assert_eq!(mip_count(5, 3), 3);
+        // Black and white texels average to mid grey in linear light.
+        let pixels = [0, 0, 0, 255, 255, 255, 255, 255];
+        let chain = mip_chain(&pixels, 2, 1, false);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].0, (1, 1));
+        assert_eq!(chain[0].1, [128, 128, 128, 255]);
+        // sRGB averages in linear light: brighter than the gamma-space mean.
+        let srgb = mip_chain(&pixels, 2, 1, true);
+        assert!(srgb[0].1[0] > 180, "{:?}", srgb[0].1);
+        let big = vec![200u8; 8 * 4 * 4];
+        let levels: Vec<_> = mip_chain(&big, 8, 4, false).iter().map(|l| l.0).collect();
+        assert_eq!(levels, [(4, 2), (2, 1), (1, 1)]);
+    }
+
+    #[test]
+    fn material_sampler_is_trilinear_and_anisotropic() {
+        let d = material_sampler_descriptor(8);
+        assert_eq!(d.anisotropy_clamp, 8);
+        assert_eq!(d.mipmap_filter, wgpu::MipmapFilterMode::Linear);
+        assert_eq!(d.min_filter, wgpu::FilterMode::Linear);
+        // No support: plain trilinear.
+        assert_eq!(material_sampler_descriptor(1).anisotropy_clamp, 1);
+    }
+
+    /// With MSAA, Mask materials use alpha to coverage: the edge of an
+    /// alpha texture gets in-between pixels; at 1 sample it stays a
+    /// hard cut.
+    fn check_mask_edge_alpha_to_coverage(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("mat_a2c");
+        write_mat(
+            &root,
+            "edge",
+            "(metallic: 0.0, roughness: 0.8, alpha_mode: Mask(cutoff: 0.5), base_color_texture: Some((guid: None, path: \"assets/textures/edge.png\")))",
+        );
+        // Two texels: transparent, then opaque red; bilinear across the face.
+        let mut img = image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 0, 0, 255]));
+        img.put_pixel(0, 0, image::Rgba([255, 0, 0, 0]));
+        img.save(root.join("assets/textures/edge.png")).unwrap();
+        let mut server = fresh_ids_server(root.clone(), 9200);
+        r.model_cache = ModelCache::new(&r.scene);
+        r.materials = Default::default();
+        let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+        let material: melon_core::Handle<melon_core::Material> =
+            server.load("assets/materials/edge.mat");
+        let mut partial = |r: &mut Renderer, msaa: u32, shift: f32| {
+            let mut frame = FrameData {
+                view_proj: top_down_camera().view_proj(),
+                eye: top_down_camera().eye,
+                light: test_light(),
+                environment: plain_environment(),
+                quality: melon_core::RenderQuality {
+                    msaa,
+                    ..Default::default()
+                },
+                // Wider than the view: only the alpha edge remains.
+                models: vec![(
+                    glam::Mat4::from_scale_rotation_translation(
+                        glam::Vec3::new(14.0, 0.2, 14.0),
+                        glam::Quat::IDENTITY,
+                        glam::Vec3::new(shift, -0.1, shift),
+                    ),
+                    cube,
+                )],
+                ..Default::default()
+            };
+            frame.overrides.insert(0, vec![Some(material)]);
+            let mut target =
+                r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+            let mut encoder = r
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            r.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
+            let pixels = read_back(r.device(), r.queue(), encoder, &target.color_texture);
+            // Across the line that crosses the alpha edge: the biggest single
+            // step between neighbours as a share of the whole transition.
+            let step_share = |at: &dyn Fn(u32) -> (u32, u32)| {
+                let line: Vec<f32> = (0..TEST_SIZE)
+                    .map(|i| rgb_sum(pixel_at(r, &pixels, at(i))) as f32)
+                    .collect();
+                let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+                let whole = (mean(&line[..8]) - mean(&line[line.len() - 8..])).abs();
+                let jump = line
+                    .windows(2)
+                    .map(|w| (w[1] - w[0]).abs())
+                    .fold(0.0, f32::max);
+                (whole, jump / whole.max(1.0))
+            };
+            let (a, b) = (
+                step_share(&|x| (x, TEST_SIZE / 2)),
+                step_share(&|y| (TEST_SIZE / 2, y)),
+            );
+            if a.0 > b.0 { a } else { b }
+        };
+        // The edge moves a quarter pixel at a time (a pixel is about 0.125
+        // m): one position puts it mid-pixel.
+        let shifts = [0.0, 0.03, 0.06, 0.09];
+        let hard: Vec<_> = shifts.iter().map(|&d| partial(r, 1, d)).collect();
+        let soft: Vec<_> = shifts.iter().map(|&d| partial(r, 4, d)).collect();
+        let hard = (
+            hard.iter().map(|h| h.0).fold(f32::MAX, f32::min),
+            hard.iter().map(|h| h.1).fold(f32::MAX, f32::min),
+        );
+        let soft = (
+            soft.iter().map(|h| h.0).fold(f32::MAX, f32::min),
+            soft.iter().map(|h| h.1).fold(f32::MAX, f32::min),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        if r.msaa() != 4 {
+            return Err(format!("MSAA 4x not active ({})", r.msaa()));
+        }
+        let mips = r
+            .create_texture_from_bytes(&[0; 16 * 8 * 4], 16, 8, wgpu::TextureFormat::Rgba8Unorm)
+            .mip_level_count();
+        if mips != 5 {
+            return Err(format!("a 16x8 texture has {mips} mips, want 5"));
+        }
+        if hard.0 < 100.0 || hard.1 < 0.9 || soft.1 > 0.8 {
+            return Err(format!(
+                "Mask edge: the largest step is {:.2} of the edge at 1x (want a hard cut, over 0.9) and {:.2} at 4x (want under 0.8); contrast {:.0}",
+                hard.1, soft.1, hard.0
+            ));
+        }
+        Ok(())
+    }
+
     /// Materials and textures the scene no longer references are freed, and
     /// a material only a thumbnail needed is freed after it.
     fn check_material_cache_evicts(r: &mut Renderer) -> Result<(), String> {
@@ -9488,6 +9764,7 @@ mod tests {
             Box::new(check_material_bad_texture_refs),
             Box::new(check_ibl_updates_in_place),
             Box::new(check_material_cache_evicts),
+            Box::new(check_mask_edge_alpha_to_coverage),
             Box::new(check_gi_sun_injection_ignores_the_camera),
         ];
 

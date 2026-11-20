@@ -157,6 +157,9 @@ override GI_MODE: u32 = GI_DDGI;
 // Alpha-blended variant: the fragment's alpha goes to the target (the opaque
 // variants write 1).
 override ALPHA_BLEND: bool = false;
+// Alpha-masked variant at MSAA > 1: no discard, the sharpened alpha becomes
+// the sample coverage (alpha to coverage), so the edge anti-aliases.
+override ALPHA_TO_COVERAGE: bool = false;
 
 @vertex
 fn vs_main(in: VsIn, @builtin(instance_index) instance: u32) -> VsOut {
@@ -440,7 +443,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let base = base_rgba.rgb;
     let mr = textureSample(metallic_roughness_tex, material_sampler, in.uv);
     let emissive_texel = textureSample(emissive_tex, material_sampler, in.uv).rgb;
-    if (material.alpha_cutoff > 0.0 && base_rgba.a < material.alpha_cutoff) {
+    if (!ALPHA_TO_COVERAGE && material.alpha_cutoff > 0.0 && base_rgba.a < material.alpha_cutoff) {
         discard;
     }
     let metallic = clamp(mr.b * material.metallic, 0.0, 1.0);
@@ -487,7 +490,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let color = sun + locals + ambient + emissive;
 
     let fog = 1.0 - exp(-env.fog_density * distance(in.world_pos, camera.eye));
-    return vec4f(mix(color, env.horizon_color, fog), select(1.0, base_rgba.a, ALPHA_BLEND));
+    var out_alpha = select(1.0, base_rgba.a, ALPHA_BLEND);
+    if (ALPHA_TO_COVERAGE) {
+        // About one pixel wide ramp around the cutoff.
+        out_alpha = clamp(
+            (base_rgba.a - material.alpha_cutoff) / max(fwidth(base_rgba.a), 1e-4) + 0.5,
+            0.0, 1.0);
+    }
+    return vec4f(mix(color, env.horizon_color, fog), out_alpha);
 }
 
 // Voxel passes: every instance in the GI volume, projected orthographically
