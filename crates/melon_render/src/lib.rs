@@ -310,6 +310,12 @@ pub struct RenderStats {
     /// they drew.
     pub shadowed_lights: u32,
     pub shadow_views: u32,
+    /// Shadow-casting lights (beyond `RenderQuality::shadowed_lights`'s
+    /// nearest) that did not fit the shadow atlas and drew unshadowed.
+    pub shadowed_lights_dropped: u32,
+    /// Light-in-cluster entries over the shared index list's capacity; the
+    /// clusters at its end miss lights. 0 when everything fits.
+    pub light_index_overflow: u32,
 }
 
 #[repr(C)]
@@ -853,6 +859,16 @@ pub struct SceneRenderer {
     ibl_hdr: Option<(std::sync::Arc<ibl::HdrImage>, f32)>,
     /// What the IBL data was built for (`refresh_ibl`).
     ibl_built: Option<(ibl::SkyParams, Option<(usize, u32)>)>,
+    /// Auxiliary views (thumbnails) leave the IBL as the main view built it.
+    ibl_frozen: bool,
+    /// Times the IBL data was recomputed, and the shadow map / atlas
+    /// reallocated (tests count them; a thumbnail must not add any).
+    ibl_rebuilds: u32,
+    shadow_rebuilds: u32,
+    /// Last shadow-atlas / index-list overflow that was reported (log once
+    /// per change).
+    warned_shadow_cap: u32,
+    warned_index_overflow: u32,
     shadow_pipeline: wgpu::RenderPipeline,
     /// Shadow pass for alpha-masked casters (reads the material, group 2).
     shadow_mask_pipeline: wgpu::RenderPipeline,
@@ -1434,10 +1450,15 @@ impl Renderer {
             View::Auxiliary => (&[][..], &[][..]),
         };
         let quality = &frame.quality;
-        let sky = self.sky_image(server, frame.environment.sky_texture);
+        // An auxiliary view keeps the sky, IBL and atlas the last main view
+        // built (a thumbnail must not reallocate shared textures).
+        let sky = main
+            .then(|| self.sky_image(server, frame.environment.sky_texture))
+            .flatten();
         let scene = &mut self.scene;
-        scene.set_sky_texture(sky.map(|image| (image, frame.environment.sky_intensity)));
+        scene.ibl_frozen = !main;
         if main {
+            scene.set_sky_texture(sky.map(|image| (image, frame.environment.sky_intensity)));
             scene.set_shadow_map_size(quality.shadow_map_size);
             scene.set_msaa(quality.msaa);
         }
@@ -1458,13 +1479,15 @@ impl Renderer {
         // The lights and their cluster lists of this view; other views draw
         // without local lights.
         // The shadow atlas exists at full size only while a light casts shadows.
-        let wants_atlas =
-            main && quality.shadowed_lights > 0 && frame.lights.iter().any(|l| l.cast_shadows);
-        scene.set_local_shadow_atlas(if wants_atlas {
-            quality.local_shadow_size
-        } else {
-            4
-        });
+        if main {
+            let wants_atlas =
+                quality.shadowed_lights > 0 && frame.lights.iter().any(|l| l.cast_shadows);
+            scene.set_local_shadow_atlas(if wants_atlas {
+                quality.local_shadow_size
+            } else {
+                4
+            });
+        }
         let (mut cluster, mut cluster_data) = if main {
             let size = target.size();
             let grid = lights::ClusterGrid::new(
@@ -1477,6 +1500,7 @@ impl Renderer {
                 &frame.lights,
                 quality.max_lights as usize,
                 quality.shadowed_lights as usize,
+                (gi_mode == melon_core::GiMode::Ddgi).then(gi::ddgi::volume_bounds),
             );
             (grid.uniform(), data)
         } else {
@@ -1485,8 +1509,20 @@ impl Renderer {
         // Point / spot shadows: a tile per spot light, six per point light.
         let mut local_views: Vec<glam::Mat4> = Vec::new();
         let mut local_layout = (4, 1);
+        let mut shadowed_dropped = 0;
         if cluster_data.shadowed > 0 {
             let mut tans = Vec::new();
+            // The atlas holds a limited number of tiles; the farthest
+            // shadowed lights beyond that draw without shadows.
+            let fits = local_shadows::lights_that_fit(
+                scene.local_atlas.width(),
+                (0..cluster_data.shadowed).map(|slot| {
+                    local_shadows::view_count(&frame.lights[cluster_data.source[slot]])
+                }),
+            );
+            shadowed_dropped = cluster_data.shadowed - fits;
+            scene.warn_shadow_cap(shadowed_dropped);
+            cluster_data.shadowed = fits;
             for slot in 0..cluster_data.shadowed {
                 let light = &frame.lights[cluster_data.source[slot]];
                 let (views, tan_half) = local_shadows::views_for(light);
@@ -1519,6 +1555,7 @@ impl Renderer {
         scene
             .frame_lights
             .write(&scene.queue, &cluster, &cluster_data);
+        scene.warn_index_overflow(cluster_data.overflow);
         let stats_lights = (
             cluster_data.lights.len() as u32,
             cluster_data.dropped as u32,
@@ -1576,6 +1613,8 @@ impl Renderer {
             lights_dropped: stats_lights.1,
             shadowed_lights: stats_lights.2,
             shadow_views: local_views.len() as u32,
+            shadowed_lights_dropped: shadowed_dropped as u32,
+            light_index_overflow: cluster_data.overflow as u32,
             ..Default::default()
         };
         let (mut seen, mut voxelized) = (Vec::new(), Vec::new());
@@ -2332,6 +2371,11 @@ impl SceneRenderer {
             ibl_sky,
             ibl_hdr: None,
             ibl_built: Some((ibl_sky, None)),
+            ibl_frozen: false,
+            ibl_rebuilds: 0,
+            shadow_rebuilds: 0,
+            warned_shadow_cap: 0,
+            warned_index_overflow: 0,
             shadow_pipeline,
             shadow_mask_pipeline,
             shadow_camera_buffers,
@@ -2396,6 +2440,7 @@ impl SceneRenderer {
         (self.shadow_texture, self.shadow_view, self.shadow_layers) =
             create_shadow_map(&self.device, size, layers);
         self.shadow_bindings_changed();
+        self.shadow_rebuilds += 1;
         tracing::debug!(size, layers, "shadow map recreated");
     }
 
@@ -2408,7 +2453,31 @@ impl SceneRenderer {
         }
         (self.local_atlas, self.local_atlas_view) = create_local_atlas(&self.device, size);
         self.shadow_bindings_changed();
+        self.shadow_rebuilds += 1;
         tracing::debug!(size, "local shadow atlas recreated");
+    }
+
+    /// Warn when shadow-casting lights did not fit the atlas (once per
+    /// change of the count).
+    fn warn_shadow_cap(&mut self, dropped: usize) {
+        if dropped as u32 != self.warned_shadow_cap && dropped > 0 {
+            tracing::warn!(
+                dropped,
+                "{dropped} shadow-casting lights do not fit the local shadow atlas and draw without shadows; raise its size or lower the shadowed lights"
+            );
+        }
+        self.warned_shadow_cap = dropped as u32;
+    }
+
+    /// Warn when the cluster light index list overflowed (once per change).
+    fn warn_index_overflow(&mut self, overflow: usize) {
+        if overflow as u32 != self.warned_index_overflow && overflow > 0 {
+            tracing::warn!(
+                overflow,
+                "cluster light index list is full: {overflow} light entries dropped, some screen areas miss lights"
+            );
+        }
+        self.warned_index_overflow = overflow as u32;
     }
 
     /// Rebind everything that reads the shadow textures (group 0, the GI
@@ -2538,6 +2607,9 @@ impl SceneRenderer {
     /// Recompute the IBL data when its inputs (sky colours, hemisphere
     /// ambient, HDR image) changed since the last build.
     fn refresh_ibl(&mut self) {
+        if self.ibl_frozen {
+            return;
+        }
         let key = (
             self.ibl_sky,
             self.ibl_hdr.as_ref().map(|(image, intensity)| {
@@ -2551,8 +2623,8 @@ impl SceneRenderer {
             Some((image, intensity)) => ibl::Source::Hdr(image, *intensity),
             None => ibl::Source::Procedural(self.ibl_sky),
         };
-        self.ibl.rebuild(&self.device, &self.queue, &source);
-        self.rebuild_frame_bind_group();
+        self.ibl.rebuild(&self.queue, &source);
+        self.ibl_rebuilds += 1;
         self.ibl_built = Some(key);
     }
 
@@ -3903,8 +3975,10 @@ impl SceneRenderer {
 
     /// Sky colours and fog density for the mesh and sky shaders.
     pub fn update_environment(&mut self, environment: &melon_core::Environment) {
-        self.ibl_sky.zenith = environment.zenith_color;
-        self.ibl_sky.horizon = environment.horizon_color;
+        if !self.ibl_frozen {
+            self.ibl_sky.zenith = environment.zenith_color;
+            self.ibl_sky.horizon = environment.horizon_color;
+        }
         self.refresh_ibl();
         let uniform = EnvironmentUniform {
             zenith_color: environment.zenith_color.to_array(),
@@ -3926,9 +4000,11 @@ impl SceneRenderer {
 
     /// `update_light` with the sun's shadow cascades.
     fn update_light_cascades(&mut self, light: &melon_core::Light, set: &cascades::CascadeSet) {
-        self.ibl_sky.ambient = light.ambient;
-        self.ibl_sky.sky_color = light.sky_color;
-        self.ibl_sky.ground_color = light.ground_color;
+        if !self.ibl_frozen {
+            self.ibl_sky.ambient = light.ambient;
+            self.ibl_sky.sky_color = light.sky_color;
+            self.ibl_sky.ground_color = light.ground_color;
+        }
         self.refresh_ibl();
         // With an HDR sky the hemisphere colours (read by GI misses and the
         // GI-off fallbacks) follow the mean radiance of the image above and
@@ -6267,8 +6343,10 @@ mod tests {
             )
         };
         let mut run = |renderer: &mut Renderer, thumbnails: bool| -> Result<Vec<u8>, String> {
+            let mut counts = None;
             for (i, frame) in [&reset, &main, &main].into_iter().enumerate() {
                 if i == 2 && thumbnails {
+                    counts = Some((renderer.scene.ibl_rebuilds, renderer.scene.shadow_rebuilds));
                     let before = identity(renderer, &scene_target);
                     for _ in 0..2 {
                         renderer
@@ -6290,6 +6368,13 @@ mod tests {
                     &[],
                     &[],
                 );
+                // The thumbnails and the main frame after them rebuild
+                // neither the IBL nor the shadow textures.
+                if let Some(counts) = counts
+                    && counts != (renderer.scene.ibl_rebuilds, renderer.scene.shadow_rebuilds)
+                {
+                    return Err(format!("{name}: a thumbnail rebuilt the IBL or atlas"));
+                }
                 if i < 2 {
                     renderer.queue().submit([encoder.finish()]);
                 } else {
@@ -7290,6 +7375,26 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// Dragging a sky slider changes the IBL every frame: the prefiltered
+    /// texture is rewritten in place, never reallocated.
+    fn check_ibl_updates_in_place(r: &mut Renderer) -> Result<(), String> {
+        let before = r.scene.ibl.specular_texture().clone();
+        let rebuilds = r.scene.ibl_rebuilds;
+        for i in 1..6 {
+            r.update_environment(&melon_core::Environment {
+                zenith_color: glam::Vec3::splat(0.1 * i as f32),
+                ..Default::default()
+            });
+        }
+        if r.scene.ibl_rebuilds < rebuilds + 5 {
+            return Err("the sky change did not rebuild the IBL".into());
+        }
+        if r.scene.ibl.specular_texture() != &before {
+            return Err("the IBL texture was reallocated".into());
+        }
         Ok(())
     }
 
@@ -9108,6 +9213,7 @@ mod tests {
             Box::new(check_edge_quality_and_lights),
             Box::new(check_blend_material_thumbnail),
             Box::new(check_material_bad_texture_refs),
+            Box::new(check_ibl_updates_in_place),
         ];
 
         #[cfg(target_os = "windows")]

@@ -15,7 +15,8 @@ pub const CLUSTER_Z: u32 = 24;
 pub const CLUSTER_COUNT: usize = (CLUSTER_X * CLUSTER_Y * CLUSTER_Z) as usize;
 /// Lights the GPU buffer holds (`RenderQuality::max_lights` caps it lower).
 pub const LIGHT_CAPACITY: usize = 1024;
-/// Entries of the shared light index list; overflow drops the rest.
+/// Entries of the shared light index list; overflow drops the rest (counted
+/// in `ClusterData::overflow`, `RenderStats::light_index_overflow`).
 pub const INDEX_CAPACITY: usize = 262_144;
 /// Deepest slice boundary in metres, so a huge far plane does not stretch
 /// the slices.
@@ -131,6 +132,57 @@ impl ClusterGrid {
         (x + CLUSTER_X * (y + CLUSTER_Y * z)) as usize
     }
 
+    /// World-space boxes around every cluster (x fastest, as `index`). A
+    /// froxel is a skewed prism, so the box is a little loose.
+    fn cluster_aabbs(&self) -> Vec<(Vec3, Vec3)> {
+        let inverse = self.view_proj.inverse();
+        let depths: Vec<f32> = (0..=CLUSTER_Z)
+            .map(|k| self.near * (k as f32 / self.depth_scale).exp())
+            .collect();
+        let corner = |ix: u32, iy: u32, iz: u32| {
+            let ndc = glam::Vec2::new(
+                ix as f32 / CLUSTER_X as f32 * 2.0 - 1.0,
+                1.0 - iy as f32 / CLUSTER_Y as f32 * 2.0,
+            );
+            let p0 = inverse.project_point3(ndc.extend(0.0));
+            let dir = inverse.project_point3(ndc.extend(1.0)) - p0;
+            // The point on this pixel ray at view depth `d` along the camera axis.
+            let along = dir.dot(self.forward);
+            let t = if along.abs() < 1e-6 {
+                0.0
+            } else {
+                (depths[iz as usize] - (p0 - self.eye).dot(self.forward)) / along
+            };
+            p0 + dir * t
+        };
+        let mut points = Vec::new();
+        for iz in 0..=CLUSTER_Z {
+            for iy in 0..=CLUSTER_Y {
+                for ix in 0..=CLUSTER_X {
+                    points.push(corner(ix, iy, iz));
+                }
+            }
+        }
+        let at = |x: u32, y: u32, z: u32| {
+            points[(x + (CLUSTER_X + 1) * (y + (CLUSTER_Y + 1) * z)) as usize]
+        };
+        let mut boxes = Vec::with_capacity(CLUSTER_COUNT);
+        for z in 0..CLUSTER_Z {
+            for y in 0..CLUSTER_Y {
+                for x in 0..CLUSTER_X {
+                    let (mut lo, mut hi) = (Vec3::MAX, Vec3::MIN);
+                    for c in 0..8 {
+                        let p = at(x + (c & 1), y + ((c >> 1) & 1), z + ((c >> 2) & 1));
+                        lo = lo.min(p);
+                        hi = hi.max(p);
+                    }
+                    boxes.push((lo, hi));
+                }
+            }
+        }
+        boxes
+    }
+
     /// Inclusive cluster ranges `[x0, x1, y0, y1, z0, z1]` a bounding sphere
     /// touches (conservative: its bounding box), `None` if it is off screen
     /// or in front of the near plane.
@@ -185,6 +237,9 @@ pub struct ClusterData {
     pub indices: Vec<u32>,
     /// Lights dropped for `max_lights`.
     pub dropped: usize,
+    /// Light-in-cluster entries that did not fit `INDEX_CAPACITY` (those
+    /// clusters miss some lights).
+    pub overflow: usize,
     /// Shaded lights, in `lights` order, as given to `build` (callers match
     /// shadow slots to them).
     pub source: Vec<usize>,
@@ -195,33 +250,51 @@ pub struct ClusterData {
 
 /// Pick the `max_lights` most important visible lights (brightest per
 /// squared distance), put the nearest `shadow_cap` of the shadow-casting
-/// ones first, and list them per cluster.
+/// ones first, and list them per cluster (a light is listed in the clusters
+/// whose box its sphere touches). With a `volume` (the DDGI box), shadow
+/// casters off screen that touch it join the shadowed lights so they still
+/// inject light there; they are in no cluster.
 pub fn build(
     grid: &ClusterGrid,
     lights: &[LocalLight],
     max_lights: usize,
     shadow_cap: usize,
+    volume: Option<(Vec3, Vec3)>,
 ) -> ClusterData {
     let max_lights = max_lights.min(LIGHT_CAPACITY);
-    let mut visible: Vec<(usize, [u32; 6], f32)> = lights
+    let valid = |l: &LocalLight| {
+        l.range > 0.0
+            && l.range.is_finite()
+            && l.position.is_finite()
+            && l.color.is_finite()
+            && l.direction.is_finite()
+    };
+    let mut visible: Vec<(usize, Option<[u32; 6]>, f32)> = lights
         .iter()
         .enumerate()
-        .filter(|(_, l)| {
-            l.range > 0.0
-                && l.range.is_finite()
-                && l.position.is_finite()
-                && l.color.is_finite()
-                && l.direction.is_finite()
-        })
+        .filter(|(_, l)| valid(l))
         .filter_map(|(i, l)| {
             let range = grid.range_of(l.position, l.range)?;
             let importance = l.color.max_element() / (l.position.distance_squared(grid.eye) + 1.0);
-            Some((i, range, importance))
+            Some((i, Some(range), importance))
         })
         .collect();
     let dropped = visible.len().saturating_sub(max_lights);
     visible.sort_by(|a, b| b.2.total_cmp(&a.2));
     visible.truncate(max_lights);
+    if let Some((lo, hi)) = volume {
+        let hidden: Vec<usize> = (0..lights.len())
+            .filter(|&i| {
+                let l = &lights[i];
+                valid(l)
+                    && l.cast_shadows
+                    && !visible.iter().any(|v| v.0 == i)
+                    && (l.position + Vec3::splat(l.range)).cmpge(lo).all()
+                    && (l.position - Vec3::splat(l.range)).cmple(hi).all()
+            })
+            .collect();
+        visible.extend(hidden.into_iter().map(|i| (i, None, 0.0)));
+    }
     let distance = |i: usize| lights[i].position.distance_squared(grid.eye);
     let mut casters: Vec<usize> = visible
         .iter()
@@ -230,22 +303,38 @@ pub fn build(
         .collect();
     casters.sort_by(|&a, &b| distance(a).total_cmp(&distance(b)));
     casters.truncate(shadow_cap);
+    // Off-screen lights stay only as shadowed injectors.
+    visible.retain(|v| v.1.is_some() || casters.contains(&v.0));
     // Shadowed lights first (nearest first), the rest in importance order.
     visible.sort_by_key(|v| casters.iter().position(|&c| c == v.0).unwrap_or(usize::MAX));
     let shadowed = casters.len();
 
-    let mut counts = vec![0u32; CLUSTER_COUNT];
-    let each_cluster = |range: &[u32; 6], mut f: Box<dyn FnMut(usize) + '_>| {
-        for z in range[4]..=range[5] {
-            for y in range[2]..=range[3] {
-                for x in range[0]..=range[1] {
-                    f(ClusterGrid::index(x, y, z));
+    // (cluster, light slot) pairs: every cluster of the light's range whose
+    // box the light's sphere touches.
+    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    if visible.iter().any(|v| v.1.is_some()) {
+        let boxes = grid.cluster_aabbs();
+        for (slot, (i, range, _)) in visible.iter().enumerate() {
+            let Some(range) = range else { continue };
+            let l = &lights[*i];
+            for z in range[4]..=range[5] {
+                for y in range[2]..=range[3] {
+                    for x in range[0]..=range[1] {
+                        let c = ClusterGrid::index(x, y, z);
+                        let (lo, hi) = boxes[c];
+                        if l.position.clamp(lo, hi).distance_squared(l.position)
+                            <= l.range * l.range
+                        {
+                            pairs.push((c as u32, slot as u32));
+                        }
+                    }
                 }
             }
         }
-    };
-    for (_, range, _) in &visible {
-        each_cluster(range, Box::new(|c| counts[c] += 1));
+    }
+    let mut counts = vec![0u32; CLUSTER_COUNT];
+    for (c, _) in &pairs {
+        counts[*c as usize] += 1;
     }
     let mut ranges = vec![[0u32; 2]; CLUSTER_COUNT];
     let mut total = 0u32;
@@ -254,18 +343,15 @@ pub fn build(
         *range = [total, count];
         total += count;
     }
+    let overflow = pairs.len() - total as usize;
     let mut indices = vec![0u32; total as usize];
     let mut filled = vec![0u32; CLUSTER_COUNT];
-    for (slot, (_, range, _)) in visible.iter().enumerate() {
-        each_cluster(
-            range,
-            Box::new(|c| {
-                if filled[c] < ranges[c][1] {
-                    indices[(ranges[c][0] + filled[c]) as usize] = slot as u32;
-                    filled[c] += 1;
-                }
-            }),
-        );
+    for (c, slot) in &pairs {
+        let c = *c as usize;
+        if filled[c] < ranges[c][1] {
+            indices[(ranges[c][0] + filled[c]) as usize] = *slot;
+            filled[c] += 1;
+        }
     }
     let gpu = visible
         .iter()
@@ -292,6 +378,7 @@ pub fn build(
         ranges,
         indices,
         dropped,
+        overflow,
         source: visible.iter().map(|(i, _, _)| *i).collect(),
         shadowed,
     }
@@ -455,18 +542,18 @@ mod tests {
         let g = grid();
         assert!(g.range_of(Vec3::new(0.0, 0.0, 10.0), 1.0).is_none());
         assert!(g.range_of(Vec3::new(100.0, 0.0, -10.0), 1.0).is_none());
-        let data = build(&g, &[point(Vec3::new(0.0, 0.0, 10.0), 1.0)], 16, 0);
+        let data = build(&g, &[point(Vec3::new(0.0, 0.0, 10.0), 1.0)], 16, 0, None);
         assert!(data.lights.is_empty() && data.indices.is_empty());
     }
 
     #[test]
-    fn each_light_is_listed_in_exactly_its_clusters() {
+    fn each_light_is_listed_only_inside_its_cluster_range() {
         let g = grid();
         let lights = [
             point(Vec3::new(0.0, 0.0, -10.0), 1.0),
             point(Vec3::new(6.0, 2.0, -20.0), 3.0),
         ];
-        let data = build(&g, &lights, 16, 0);
+        let data = build(&g, &lights, 16, 0, None);
         assert_eq!(data.lights.len(), 2);
         for (slot, &source) in data.source.iter().enumerate() {
             let l = lights[source];
@@ -480,7 +567,7 @@ mod tests {
                         let inside = (x0..=x1).contains(&x)
                             && (y0..=y1).contains(&y)
                             && (z0..=z1).contains(&z);
-                        assert_eq!(listed, inside, "light {slot} cluster ({x},{y},{z})");
+                        assert!(!listed || inside, "light {slot} cluster ({x},{y},{z})");
                     }
                 }
             }
@@ -495,7 +582,7 @@ mod tests {
             point(Vec3::new(0.0, 0.0, -5.0), 2.0),
             point(Vec3::new(0.0, 0.0, -12.0), 2.0),
         ];
-        let data = build(&g, &lights, 2, 0);
+        let data = build(&g, &lights, 2, 0, None);
         assert_eq!(data.dropped, 1);
         let mut kept = data.source.clone();
         kept.sort();
@@ -516,12 +603,12 @@ mod tests {
             caster(-15.0),
             caster(-4.0),
         ];
-        let data = build(&g, &lights, 16, 2);
+        let data = build(&g, &lights, 16, 2, None);
         assert_eq!(data.shadowed, 2);
         // The two nearest casters, nearest first, ahead of everything else.
         assert_eq!(&data.source[..2], [4, 2]);
-        assert_eq!(build(&g, &lights, 16, 0).shadowed, 0);
-        assert_eq!(build(&g, &lights, 16, 9).shadowed, 4);
+        assert_eq!(build(&g, &lights, 16, 0, None).shadowed, 0);
+        assert_eq!(build(&g, &lights, 16, 9, None).shadowed, 4);
     }
 
     #[test]
@@ -531,7 +618,7 @@ mod tests {
             spot: Some((0.3, 0.6)),
             ..point(Vec3::new(0.0, 0.0, -10.0), 5.0)
         };
-        let l = build(&g, &[spot], 4, 0).lights[0];
+        let l = build(&g, &[spot], 4, 0, None).lights[0];
         let at = |angle: f32| (angle.cos() * l.spot[0] + l.spot[1]).clamp(0.0, 1.0);
         assert!((at(0.3) - 1.0).abs() < 1e-4 && at(0.6).abs() < 1e-4 && at(0.45) > 0.3);
         assert_eq!(l.spot[2], 1.0);
@@ -593,7 +680,7 @@ mod tests {
             LocalLight { range: 0.0, ..good },
         ];
         for l in bad {
-            let data = build(&g, &[l, good], 16, 4);
+            let data = build(&g, &[l, good], 16, 4, None);
             assert_eq!(data.source, [1], "{l:?}");
             assert!(
                 data.lights
@@ -611,7 +698,7 @@ mod tests {
                 spot: Some((inner, outer)),
                 ..point(Vec3::new(0.0, 0.0, -10.0), 5.0)
             };
-            let l = build(&g, &[spot], 4, 0).lights[0];
+            let l = build(&g, &[spot], 4, 0, None).lights[0];
             assert!(
                 l.spot.iter().all(|v| v.is_finite()),
                 "{inner} {outer}: {:?}",
@@ -623,17 +710,73 @@ mod tests {
     #[test]
     fn no_lights_and_one_over_the_cap() {
         let g = grid();
-        let none = build(&g, &[], 16, 4);
+        let none = build(&g, &[], 16, 4, None);
         assert!(none.lights.is_empty() && none.indices.is_empty() && none.dropped == 0);
         assert_eq!(none.ranges.len(), CLUSTER_COUNT);
         let many: Vec<_> = (0..=LIGHT_CAPACITY)
             .map(|i| point(Vec3::new(i as f32 * 0.001, 0.0, -10.0), 1.0))
             .collect();
-        let data = build(&g, &many, usize::MAX, 4);
+        let data = build(&g, &many, usize::MAX, 4, None);
         assert_eq!(data.lights.len(), LIGHT_CAPACITY);
         assert_eq!(data.dropped, 1);
         assert!(data.indices.len() <= INDEX_CAPACITY);
         assert!(data.indices.iter().all(|&i| (i as usize) < LIGHT_CAPACITY));
+    }
+
+    #[test]
+    fn a_large_light_skips_clusters_its_sphere_does_not_touch() {
+        let g = grid();
+        // A wide light near the edge of the view: its bounding box covers
+        // far more clusters than its sphere touches.
+        let l = point(Vec3::new(14.0, 7.0, -14.0), 9.0);
+        let data = build(&g, &[l], 4, 0, None);
+        let boxes = g.cluster_aabbs();
+        let [x0, x1, y0, y1, z0, z1] = g.range_of(l.position, l.range).unwrap();
+        let in_box = ((x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1)) as usize;
+        let listed: usize = data.ranges.iter().map(|r| r[1] as usize).sum();
+        assert!(listed > 0 && listed < in_box, "{listed} of {in_box}");
+        for (c, r) in data.ranges.iter().enumerate() {
+            let (lo, hi) = boxes[c];
+            let touches = l.position.clamp(lo, hi).distance(l.position) <= l.range;
+            assert_eq!(r[1] == 1, touches, "cluster {c}");
+        }
+    }
+
+    #[test]
+    fn index_overflow_is_counted() {
+        let g = grid();
+        let wide: Vec<_> = (0..100)
+            .map(|i| point(Vec3::new(i as f32 * 0.01, 0.0, -10.0), 2000.0))
+            .collect();
+        let data = build(&g, &wide, 100, 0, None);
+        assert_eq!(data.indices.len(), INDEX_CAPACITY);
+        assert!(data.overflow > 0, "{}", data.overflow);
+        assert_eq!(data.overflow, 100 * CLUSTER_COUNT - INDEX_CAPACITY);
+        assert_eq!(build(&g, &wide[..10], 100, 0, None).overflow, 0);
+    }
+
+    #[test]
+    fn an_off_screen_shadow_caster_in_the_volume_still_injects() {
+        let g = grid();
+        let caster = LocalLight {
+            cast_shadows: true,
+            ..point(Vec3::new(0.0, 2.0, 22.0), 5.0)
+        };
+        let volume = Some((Vec3::splat(-20.0), Vec3::splat(20.0)));
+        assert_eq!(build(&g, &[caster], 4, 4, None).shadowed, 0);
+        let data = build(&g, &[caster], 4, 4, volume);
+        assert_eq!((data.shadowed, data.lights.len()), (1, 1));
+        assert!(data.indices.is_empty(), "in no cluster");
+        let outside = LocalLight {
+            position: Vec3::new(0.0, 2.0, 90.0),
+            ..caster
+        };
+        assert_eq!(build(&g, &[outside], 4, 4, volume).shadowed, 0);
+        let unshadowed = LocalLight {
+            cast_shadows: false,
+            ..caster
+        };
+        assert_eq!(build(&g, &[unshadowed], 4, 4, volume).lights.len(), 0);
     }
 
     #[test]

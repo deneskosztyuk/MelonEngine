@@ -57,6 +57,32 @@ pub fn views_for(light: &LocalLight) -> (Vec<Mat4>, f32) {
     }
 }
 
+/// Shadow views `light` needs: one for a spot light, six for a point light.
+pub fn view_count(light: &LocalLight) -> usize {
+    if light.spot.is_some() { 1 } else { 6 }
+}
+
+/// Most tiles an `atlas`-sized square holds at the smallest tile size.
+pub fn view_capacity(atlas: u32) -> usize {
+    (((atlas / MIN_TILE) as usize).pow(2)).min(MAX_VIEWS)
+}
+
+/// How many of the leading lights (given their view counts, most important
+/// first) fit the atlas; the rest must draw without shadows.
+pub fn lights_that_fit(atlas: u32, view_counts: impl IntoIterator<Item = usize>) -> usize {
+    let capacity = view_capacity(atlas);
+    let mut used = 0;
+    let mut fits = 0;
+    for count in view_counts {
+        if used + count > capacity {
+            break;
+        }
+        used += count;
+        fits += 1;
+    }
+    fits
+}
+
 /// Tile edge and tiles per atlas side for `views` tiles in an `atlas`-sized
 /// square: the largest power-of-two tile (128 to 1024) whose grid holds
 /// them all.
@@ -121,6 +147,26 @@ mod tests {
         assert!(on_axis.x.abs() < 1e-4 && on_axis.y.abs() < 1e-4);
         let outside = views[0].project_point3(l.position + Vec3::new(5.0, -1.0, 0.0));
         assert!(outside.x.abs() > 1.0, "{outside}");
+    }
+
+    #[test]
+    fn views_that_do_not_fit_are_dropped_and_every_kept_tile_is_inside() {
+        // The panel's worst case: 16 shadowed point lights (96 views) in
+        // every atlas size it offers.
+        for atlas in [256u32, 512, 1024, 2048, 4096] {
+            let fits = lights_that_fit(atlas, [6; 16]);
+            let views = fits * 6;
+            assert!(views <= view_capacity(atlas), "{atlas}");
+            let (tile, grid) = tile_layout(atlas, views);
+            for i in 0..views {
+                let (x, y) = tile_origin(i, tile, grid);
+                assert!(x + tile <= atlas && y + tile <= atlas, "{atlas}: tile {i}");
+            }
+        }
+        assert_eq!(lights_that_fit(1024, [6; 16]), 10);
+        assert_eq!(lights_that_fit(1024, [1; 16]), 16);
+        assert_eq!(lights_that_fit(2048, [6; 16]), 16);
+        assert_eq!(lights_that_fit(256, [6]), 0);
     }
 
     #[test]

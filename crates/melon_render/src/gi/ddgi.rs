@@ -729,6 +729,11 @@ impl Ddgi {
     }
 }
 
+/// The GI volume as a world AABB (min, max).
+pub(crate) fn volume_bounds() -> (Vec3, Vec3) {
+    (GI_ORIGIN, GI_ORIGIN + volume_size())
+}
+
 /// Whether a world AABB touches the GI volume (its instance is voxelised).
 pub(crate) fn in_volume(min: Vec3, max: Vec3) -> bool {
     min.cmple(GI_ORIGIN + volume_size()).all() && max.cmpge(GI_ORIGIN).all()

@@ -356,6 +356,9 @@ pub fn brdf_lut(size: u32) -> Vec<[u16; 2]> {
 pub struct IblGpu {
     pub uniform: wgpu::Buffer,
     pub specular: wgpu::TextureView,
+    /// The prefiltered texture behind `specular`: rewritten in place by
+    /// `rebuild`, never reallocated.
+    specular_texture: wgpu::Texture,
     pub brdf: wgpu::TextureView,
     pub sampler: wgpu::Sampler,
     /// Mean diffuse radiance above and below the horizon of the last build.
@@ -363,38 +366,57 @@ pub struct IblGpu {
     pub mean_down: Vec3,
 }
 
-fn upload_specular(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    data: &IblData,
-) -> wgpu::TextureView {
+fn upload_specular(device: &wgpu::Device, queue: &wgpu::Queue, data: &IblData) -> wgpu::Texture {
     use wgpu::util::DeviceExt;
     let bytes: Vec<u8> = data
         .levels
         .iter()
         .flat_map(|(_, _, texels)| bytemuck::cast_slice::<[u16; 4], u8>(texels).iter().copied())
         .collect();
-    device
-        .create_texture_with_data(
-            queue,
-            &wgpu::TextureDescriptor {
-                label: Some("ibl specular"),
-                size: wgpu::Extent3d {
-                    width: BASE_SIZE.0,
-                    height: BASE_SIZE.1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: LEVELS,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba16Float,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
+    device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("ibl specular"),
+            size: wgpu::Extent3d {
+                width: BASE_SIZE.0,
+                height: BASE_SIZE.1,
+                depth_or_array_layers: 1,
             },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            &bytes,
-        )
-        .create_view(&wgpu::TextureViewDescriptor::default())
+            mip_level_count: LEVELS,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        &bytes,
+    )
+}
+
+/// Overwrite every mip of `texture` with `data`.
+fn write_specular(queue: &wgpu::Queue, texture: &wgpu::Texture, data: &IblData) {
+    for (level, (width, height, texels)) in data.levels.iter().enumerate() {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(texels),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 8),
+                rows_per_image: Some(*height),
+            },
+            wgpu::Extent3d {
+                width: *width,
+                height: *height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
 }
 
 impl IblGpu {
@@ -422,13 +444,15 @@ impl IblGpu {
                 bytemuck::cast_slice(&brdf_lut(BRDF_SIZE)),
             )
             .create_view(&wgpu::TextureViewDescriptor::default());
+        let specular_texture = upload_specular(device, queue, &data);
         Self {
             uniform: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("ibl uniform"),
                 contents: bytemuck::bytes_of(&data.uniform),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             }),
-            specular: upload_specular(device, queue, &data),
+            specular: specular_texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            specular_texture,
             brdf,
             sampler: device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("ibl sampler"),
@@ -444,12 +468,17 @@ impl IblGpu {
         }
     }
 
-    /// Recompute for `source`: the uniform is rewritten and the specular
-    /// texture replaced (the caller rebuilds the bind group).
-    pub fn rebuild(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, source: &Source) {
+    #[cfg(test)]
+    pub fn specular_texture(&self) -> &wgpu::Texture {
+        &self.specular_texture
+    }
+
+    /// Recompute for `source`: the uniform and the specular texture are
+    /// rewritten in place, so no bind group changes.
+    pub fn rebuild(&mut self, queue: &wgpu::Queue, source: &Source) {
         let data = build(source);
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&data.uniform));
-        self.specular = upload_specular(device, queue, &data);
+        write_specular(queue, &self.specular_texture, &data);
         self.mean_up = data.mean_up;
         self.mean_down = data.mean_down;
     }
