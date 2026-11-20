@@ -1,6 +1,7 @@
 //! Edit > Project Settings: a window with project-wide settings, saved under
 //! the project root: the input mapping (`config/input.ron`) and render
-//! quality (`config/quality.ron`, see `quality_settings`).
+//! quality (`config/quality.ron`, see `quality_settings`) and audio buses
+//! (`config/audio.ron`, see `audio_settings`).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -8,6 +9,7 @@ use std::path::{Path, PathBuf};
 use bevy_ecs::world::World;
 use melon_core::{Action, ActionKind, AxisBinding, InputButton, InputMap, KeyCode, RawPresses};
 
+use crate::audio_settings::AudioSettingsPanel;
 use crate::quality_settings::QualitySettings;
 use crate::{StatusKind, theme};
 
@@ -21,6 +23,7 @@ pub enum Section {
     #[default]
     InputMapping,
     Quality,
+    Audio,
 }
 
 /// The binding the next raw press goes to (index into `InputMap::actions`).
@@ -43,6 +46,7 @@ pub struct ProjectSettings {
     /// Action name being typed (index, text); applied when the field loses focus.
     name_edit: Option<(usize, String)>,
     quality: QualitySettings,
+    audio: AudioSettingsPanel,
 }
 
 impl ProjectSettings {
@@ -53,6 +57,11 @@ impl ProjectSettings {
     /// `config/quality.ron` failed to load: the first Apply backs it up.
     pub fn set_quality_broken(&mut self, broken: bool) {
         self.quality.set_broken_on_load(broken);
+    }
+
+    /// `config/audio.ron` failed to load: the first Apply backs it up.
+    pub fn set_audio_broken(&mut self, broken: bool) {
+        self.audio.set_broken_on_load(broken);
     }
 
     /// A rebinding capture owns this frame's presses: editor shortcuts stay off.
@@ -81,7 +90,7 @@ impl ProjectSettings {
         }
 
         let mut open = true;
-        let mut quality_status = None;
+        let mut panel_status = None;
         egui::Window::new("Project Settings")
             .open(&mut open)
             .collapsible(false)
@@ -96,12 +105,16 @@ impl ProjectSettings {
                             "Input Mapping",
                         );
                         ui.selectable_value(&mut self.section, Section::Quality, "Quality");
+                        ui.selectable_value(&mut self.section, Section::Audio, "Audio");
                     });
                     ui.separator();
                     ui.vertical(|ui| match self.section {
                         Section::InputMapping => self.input_mapping(ui, &mut map),
                         Section::Quality => {
-                            quality_status = self.quality.ui(ui, world, project_root);
+                            panel_status = self.quality.ui(ui, world, project_root);
+                        }
+                        Section::Audio => {
+                            panel_status = self.audio.ui(ui, world, project_root);
                         }
                     });
                 });
@@ -111,7 +124,7 @@ impl ProjectSettings {
             self.capture = None;
         }
         if map == current {
-            return quality_status;
+            return panel_status;
         }
         let status = self.commit(world, project_root, map);
         if status.is_some() {

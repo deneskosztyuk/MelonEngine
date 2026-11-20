@@ -1391,6 +1391,33 @@ mod tests {
     }
 
     #[test]
+    fn audio_source_and_listener_round_trip() {
+        use melon_core::{AudioListener, AudioSource};
+        let mut world = reg_world();
+        let source = AudioSource {
+            clip: "assets/audio/door.ogg".into(),
+            volume: 0.5,
+            pitch: 1.5,
+            looping: true,
+            play_on_start: true,
+            spatial: true,
+            min_distance: 2.0,
+            max_distance: 40.0,
+            bus: "Music".into(),
+        };
+        world.spawn((
+            Name("Speaker".to_string()),
+            Transform::default(),
+            source.clone(),
+            AudioListener,
+        ));
+        round_trip(&mut world, &mut PhysicsWorld::new());
+        let e = named(&mut world, "Speaker");
+        assert_eq!(world.get::<AudioSource>(e), Some(&source));
+        assert!(world.get::<AudioListener>(e).is_some());
+    }
+
+    #[test]
     fn v5_file_has_no_runtime_components() {
         let mut world = reg_world();
         let root = world

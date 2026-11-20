@@ -22,6 +22,7 @@ use winit::window::Window;
 pub mod asset_db;
 pub mod asset_ops;
 pub mod asset_watch;
+pub mod audio_settings;
 pub mod console;
 pub mod content;
 mod content_view;
@@ -597,6 +598,11 @@ impl Editor {
         self.project_settings.set_quality_broken(broken);
     }
 
+    /// The host loaded a broken `config/audio.ron`: the first Apply backs it up.
+    pub fn set_audio_broken(&mut self, broken: bool) {
+        self.project_settings.set_audio_broken(broken);
+    }
+
     pub fn selected_entity(&self) -> Option<Entity> {
         self.selected
     }
@@ -841,6 +847,21 @@ impl Editor {
             }
             Request::Reveal(path) => {
                 asset_ops::reveal(&path);
+                None
+            }
+            Request::PreviewAudio(path) => {
+                if let Some(clip) = melon_core::assets::project_relative(&self.project_root, &path)
+                {
+                    world
+                        .resource_mut::<melon_core::AudioRequests>()
+                        .preview_play(&clip);
+                }
+                None
+            }
+            Request::StopAudioPreview => {
+                world
+                    .resource_mut::<melon_core::AudioRequests>()
+                    .preview_stop();
                 None
             }
             Request::Open(path) => {
@@ -2693,6 +2714,11 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                 self.editor.content_tab_shown = true;
                 self.editor.content.blocked =
                     self.editor.delete_confirm.is_some() || self.editor.confirm_open.is_some();
+                let playing = self
+                    .world
+                    .get_resource::<melon_core::AudioPreview>()
+                    .and_then(|p| p.0.clone());
+                self.editor.content.set_audio_preview(playing);
                 self.editor.content.ui(ui);
                 self.editor.apply_content_requests(self.world);
             }

@@ -15,16 +15,18 @@ pub enum AssetKind {
     Texture,
     Shader,
     Scene,
+    Audio,
     Other,
 }
 
 impl AssetKind {
     /// Every kind a file can be, in filter-chip order.
-    pub const FILE_KINDS: [AssetKind; 5] = [
+    pub const FILE_KINDS: [AssetKind; 6] = [
         AssetKind::Model,
         AssetKind::Texture,
         AssetKind::Shader,
         AssetKind::Scene,
+        AssetKind::Audio,
         AssetKind::Other,
     ];
 
@@ -35,6 +37,7 @@ impl AssetKind {
             AssetKind::Texture => "Texture",
             AssetKind::Shader => "Shader",
             AssetKind::Scene => "Scene",
+            AssetKind::Audio => "Audio",
             AssetKind::Other => "Other",
         }
     }
@@ -53,6 +56,7 @@ pub fn asset_kind(path: &Path, is_dir: bool) -> AssetKind {
         "png" | "jpg" | "jpeg" | "hdr" => AssetKind::Texture,
         "wgsl" => AssetKind::Shader,
         "ron" => AssetKind::Scene,
+        e if melon_core::audio::AUDIO_EXTENSIONS.contains(&e) => AssetKind::Audio,
         _ => AssetKind::Other,
     }
 }
@@ -117,6 +121,9 @@ pub enum BrowserRequest {
     Reveal(PathBuf),
     /// Open a file (scene or OS default app).
     Open(PathBuf),
+    /// Play this audio file on the `Ui` bus.
+    PreviewAudio(PathBuf),
+    StopAudioPreview,
 }
 
 /// An inline rename in progress.
@@ -302,6 +309,8 @@ pub struct ContentBrowser {
     /// filter changes.
     visible: Vec<ContentEntry>,
     requests: Vec<BrowserRequest>,
+    /// Project-relative path of the clip the editor preview is playing.
+    audio_preview: Option<String>,
     /// The last click landed inside the browser: its keys (F2, Ctrl+D,
     /// Delete, Enter) act on the selection.
     pub(crate) focused: bool,
@@ -339,6 +348,7 @@ impl ContentBrowser {
             files: None,
             visible: Vec::new(),
             requests: Vec::new(),
+            audio_preview: None,
             focused: false,
             renaming: None,
             blocked: false,
@@ -354,6 +364,26 @@ impl ContentBrowser {
     /// File operations asked for since the last call.
     pub fn take_requests(&mut self) -> Vec<BrowserRequest> {
         std::mem::take(&mut self.requests)
+    }
+
+    /// What the audio preview plays now (the editor sets it each frame).
+    pub fn set_audio_preview(&mut self, playing: Option<String>) {
+        self.audio_preview = playing;
+    }
+
+    /// For a selected audio file: whether it is playing, and the request a
+    /// click on the Preview button sends (stop when playing, else play).
+    pub(crate) fn audio_toggle(&self) -> Option<(bool, BrowserRequest)> {
+        let path = self.selected()?;
+        if asset_kind(path, path.is_dir()) != AssetKind::Audio {
+            return None;
+        }
+        let rel = melon_core::assets::project_relative(self.root().parent()?, path)?;
+        if self.audio_preview.as_deref() == Some(rel.as_str()) {
+            Some((true, BrowserRequest::StopAudioPreview))
+        } else {
+            Some((false, BrowserRequest::PreviewAudio(path.to_path_buf())))
+        }
     }
 
     pub(crate) fn request(&mut self, request: BrowserRequest) {
@@ -839,6 +869,39 @@ mod tests {
         assert_eq!(asset_kind(Path::new("level.ron"), false), AssetKind::Scene);
         assert_eq!(asset_kind(Path::new("README.md"), false), AssetKind::Other);
         assert_eq!(asset_kind(Path::new("models"), true), AssetKind::Folder);
+        for audio in ["a.wav", "b.OGG", "c.mp3", "d.Flac"] {
+            assert_eq!(
+                asset_kind(Path::new(audio), false),
+                AssetKind::Audio,
+                "{audio}"
+            );
+        }
+    }
+
+    #[test]
+    fn audio_toggle_plays_or_stops_the_selected_clip() {
+        let dir = temp_dir("audio_toggle");
+        let root = dir.join("assets");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("door.ogg"), b"x").unwrap();
+        std::fs::write(root.join("a.glb"), b"x").unwrap();
+        let mut browser = ContentBrowser::new(root.clone());
+        assert!(browser.audio_toggle().is_none(), "nothing selected");
+        browser.select(Some(root.join("a.glb")));
+        assert!(browser.audio_toggle().is_none(), "not audio");
+        browser.select(Some(root.join("door.ogg")));
+        assert!(matches!(
+            browser.audio_toggle(),
+            Some((false, BrowserRequest::PreviewAudio(p))) if p == root.join("door.ogg")
+        ));
+        browser.set_audio_preview(Some("assets/door.ogg".into()));
+        assert!(matches!(
+            browser.audio_toggle(),
+            Some((true, BrowserRequest::StopAudioPreview))
+        ));
+        browser.set_audio_preview(Some("assets/other.ogg".into()));
+        assert!(matches!(browser.audio_toggle(), Some((false, _))));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
