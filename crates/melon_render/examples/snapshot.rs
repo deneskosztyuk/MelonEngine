@@ -1,6 +1,6 @@
 // Renders the fixed review scene offscreen and saves it as a PNG.
 // Run: cargo run -p melon_render --example snapshot -- <out.png> [view]
-// Views: overview (default), low, sun.
+// Views: overview (default), low, sun, materials.
 
 use std::sync::Arc;
 
@@ -16,11 +16,15 @@ use winit::window::{Window, WindowId};
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 
-/// The review scene: floor, cubes, a tall pillar, `cube.glb` and a wall
-/// corner, all inside the shadow box around the origin.
+/// The review scene: grey floor, blocks, a tall pillar and a wall corner,
+/// one checkerboard `builtin:cube`, `cube.glb`, the material spheres and the
+/// normal-mapped panel, all inside the shadow box around the origin.
 fn review_scene(server: &mut AssetServer) -> Vec<(Mat4, Handle<Model>)> {
-    let cube: Handle<Model> = server.load("builtin:cube");
+    let checker: Handle<Model> = server.load("builtin:cube");
+    let cube: Handle<Model> = server.load("assets/models/review/grey_cube.glb");
     let glb: Handle<Model> = server.load("assets/models/cube.glb");
+    let spheres: Handle<Model> = server.load("assets/models/review/material_spheres.glb");
+    let panel: Handle<Model> = server.load("assets/models/review/normal_panel.glb");
     let place = |scale: Vec3, yaw_deg: f32, pos: Vec3| {
         Mat4::from_scale_rotation_translation(
             scale,
@@ -35,7 +39,7 @@ fn review_scene(server: &mut AssetServer) -> Vec<(Mat4, Handle<Model>)> {
             cube,
         ),
         // Cubes at different heights and rotations.
-        (place(Vec3::ONE, 0.0, Vec3::new(0.0, 0.5, 0.0)), cube),
+        (place(Vec3::ONE, 0.0, Vec3::new(0.0, 0.5, 0.0)), checker),
         (
             place(Vec3::splat(1.5), 30.0, Vec3::new(-2.5, 0.75, 3.0)),
             cube,
@@ -64,6 +68,11 @@ fn review_scene(server: &mut AssetServer) -> Vec<(Mat4, Handle<Model>)> {
             place(Vec3::new(0.2, 3.0, 6.0), 0.0, Vec3::new(6.1, 1.5, -3.0)),
             cube,
         ),
+        // Sphere rows along x (rough to the right; dielectric on top, metal
+        // below), lit from the camera side in the materials view.
+        (place(Vec3::ONE, 0.0, Vec3::new(0.0, 0.0, 6.5)), spheres),
+        // Normal-mapped panel facing -x -z, toward the sun.
+        (place(Vec3::ONE, 225.0, Vec3::new(3.8, 1.05, 7.5)), panel),
     ]
 }
 
@@ -86,7 +95,9 @@ fn camera(view: &str) -> Result<Camera> {
             );
             (eye, eye + dir)
         }
-        _ => bail!("unknown view {view:?}; expected overview, low or sun"),
+        // From the sun's side onto the sphere rows and the panel.
+        "materials" => (Vec3::new(0.0, 2.4, 0.0), Vec3::new(1.0, 0.9, 6.5)),
+        _ => bail!("unknown view {view:?}; expected overview, low, sun or materials"),
     };
     Ok(Camera {
         eye,
@@ -199,7 +210,7 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let out = args
         .next()
-        .context("usage: snapshot <out.png> [overview|low|sun]")?;
+        .context("usage: snapshot <out.png> [overview|low|sun|materials]")?;
     let view = args.next().unwrap_or_else(|| "overview".into());
 
     #[cfg(target_os = "windows")]
@@ -234,6 +245,8 @@ mod tests {
     #[test]
     fn unknown_view_is_an_error() {
         assert!(camera("sideways").is_err());
-        assert!(camera("overview").is_ok() && camera("low").is_ok() && camera("sun").is_ok());
+        for view in ["overview", "low", "sun", "materials"] {
+            assert!(camera(view).is_ok(), "{view}");
+        }
     }
 }
