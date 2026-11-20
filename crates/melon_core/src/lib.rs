@@ -22,6 +22,7 @@ pub mod quality;
 pub mod reflect;
 pub mod resources;
 mod ron_file;
+pub mod scene;
 pub mod stages;
 
 pub use actions::{
