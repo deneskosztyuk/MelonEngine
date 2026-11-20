@@ -1,0 +1,8 @@
+(
+    game_name: "Sich Demo",
+    version: "0.1.0",
+    startup_scene: "assets/scenes/sich_demo.ron",
+    window_mode: Windowed,
+    window_size: (1600, 900),
+    exclude: ["assets/shaders/**", "**/*.md"],
+)

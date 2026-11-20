@@ -1,0 +1,24 @@
+{
+  "source": "Gatherer Hut.gltf",
+  "source_sha256": "ac5ea203d3e38ff4ebc9f66939fc4b941e2eade8c6745e6e1ea16ed9b635d0f8",
+  "runtime": "gatherer_hut.gltf",
+  "grid_size": [
+    2,
+    2
+  ],
+  "visual_span_metres": 1.875,
+  "model_scale": 0.3229262961807594,
+  "model_position_godot": [
+    0.0774124264365519,
+    -0.0,
+    0.006827271169895394
+  ],
+  "dimensions_metres_xyz_godot": [
+    1.875,
+    1.7142680414072886,
+    1.5476941120128416
+  ],
+  "origin": "Wrapper centers horizontal bounds and places lowest geometry at ground level.",
+  "collision": "Single root BoxShape3D fitted to full model bounds.",
+  "texture_filter": "nearest with nearest mipmaps"
+}
