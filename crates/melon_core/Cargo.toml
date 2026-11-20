@@ -11,6 +11,7 @@ tracing.workspace = true
 serde.workspace = true
 ron.workspace = true
 anyhow.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

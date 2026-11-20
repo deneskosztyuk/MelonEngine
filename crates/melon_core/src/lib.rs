@@ -18,7 +18,7 @@ pub mod stages;
 pub use actions::{
     Action, ActionKind, Actions, AxisBinding, InputMap, LoadOutcome, update_actions_system,
 };
-pub use assets::{AssetServer, Handle, Model};
+pub use assets::{AssetGuid, AssetMeta, AssetServer, Handle, META_VERSION, Model, meta_path};
 pub use bevy_ecs;
 pub use bevy_ecs::query::With;
 pub use components::{

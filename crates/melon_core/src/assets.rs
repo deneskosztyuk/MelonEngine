@@ -12,6 +12,7 @@ use bevy_ecs::component::Component;
 use bevy_ecs::resource::Resource;
 use bevy_ecs::system::{Res, ResMut};
 use glam::Vec3;
+use serde::{Deserialize, Serialize};
 
 use crate::Time;
 
@@ -20,6 +21,73 @@ pub struct Model;
 
 /// Prefix for assets that have no file (e.g. `builtin:cube`).
 pub const BUILTIN_PREFIX: &str = "builtin:";
+
+/// Stable id of an asset file, kept in its `.meta` sidecar so references
+/// survive a rename or move. Serialised as the hyphenated lower-case UUID.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AssetGuid(uuid::Uuid);
+
+impl AssetGuid {
+    /// A new random (v4) GUID.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+impl std::fmt::Display for AssetGuid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.hyphenated().fmt(f)
+    }
+}
+
+impl std::str::FromStr for AssetGuid {
+    type Err = uuid::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse().map(Self)
+    }
+}
+
+/// Version of the `.meta` file format.
+pub const META_VERSION: u32 = 1;
+
+/// Contents of `<asset file name>.meta`. `melon_core` only reads these; the
+/// editor writes them.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct AssetMeta {
+    pub version: u32,
+    pub guid: AssetGuid,
+}
+
+impl AssetMeta {
+    /// Parse a `.meta` file; any version other than `META_VERSION` is an error.
+    pub fn read(path: &Path) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path)?;
+        let meta: Self = ron::from_str(&text)?;
+        anyhow::ensure!(
+            meta.version == META_VERSION,
+            "unsupported .meta version {} (expected {META_VERSION})",
+            meta.version
+        );
+        Ok(meta)
+    }
+
+    pub fn to_ron(&self) -> String {
+        format!(
+            "(version: {}, guid: \"{}\")
+",
+            self.version, self.guid
+        )
+    }
+}
+
+/// The sidecar of `asset`: its full file name plus `.meta`.
+pub fn meta_path(asset: &Path) -> PathBuf {
+    let mut name = asset.file_name().unwrap_or_default().to_os_string();
+    name.push(".meta");
+    asset.with_file_name(name)
+}
 
 /// Typed reference to an asset registered in the `AssetServer`. Scenes store
 /// the asset's path, never the id.
@@ -385,5 +453,48 @@ mod tests {
         frame(&mut core);
         assert_eq!(core.world.resource::<AssetServer>().version(h), 1);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn meta_round_trips_and_guid_is_a_string() {
+        let meta = AssetMeta {
+            version: META_VERSION,
+            guid: AssetGuid::new(),
+        };
+        let text = meta.to_ron();
+        assert!(text.contains(&format!("\"{}\"", meta.guid)), "{text}");
+        let dir = temp_root("meta_rt");
+        let file = dir.join("a.glb.meta");
+        std::fs::write(&file, &text).unwrap();
+        assert_eq!(AssetMeta::read(&file).unwrap(), meta);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn meta_with_other_version_is_an_error() {
+        let dir = temp_root("meta_ver");
+        let file = dir.join("a.glb.meta");
+        std::fs::write(
+            &file,
+            format!("(version: 2, guid: \"{}\")", AssetGuid::new()),
+        )
+        .unwrap();
+        assert!(AssetMeta::read(&file).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn meta_path_appends_meta() {
+        assert_eq!(
+            meta_path(Path::new("assets/models/cube.glb")),
+            PathBuf::from("assets/models/cube.glb.meta")
+        );
+    }
+
+    #[test]
+    fn guids_differ_and_parse_back() {
+        let (a, b) = (AssetGuid::new(), AssetGuid::new());
+        assert_ne!(a, b);
+        assert_eq!(a.to_string().parse::<AssetGuid>().unwrap(), a);
     }
 }
