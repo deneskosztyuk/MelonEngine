@@ -68,6 +68,58 @@ pub fn create_folder(server: &mut AssetServer, parent: &Path) -> anyhow::Result<
     Ok(dir)
 }
 
+/// Write a default `New Material.mat` into `parent` (a free name).
+pub fn create_material(server: &mut AssetServer, parent: &Path) -> anyhow::Result<PathBuf> {
+    let file = unique_path(parent, "New Material.mat");
+    std::fs::write(&file, melon_core::MaterialAsset::new_default().to_ron())
+        .with_context(|| format!("could not create {}", file.display()))?;
+    reconcile(server);
+    Ok(file)
+}
+
+#[cfg(test)]
+pub(crate) const ONE_MATERIAL_GLTF: &str = r#"{
+    "asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}],
+    "nodes": [{"mesh": 0}],
+    "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "material": 0}]}],
+    "materials": [{"name": "Paint", "pbrMetallicRoughness": {"baseColorFactor": [0, 1, 0, 1]}}],
+    "buffers": [{"byteLength": 36,
+        "uri": "data:application/octet-stream;base64,AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAA"}],
+    "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 36}],
+    "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3,
+        "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0]}]
+}"#;
+
+/// Unpack the materials of the glTF `model` into `.mat` files (and png
+/// textures) next to it, give them `.meta`s and fill their texture GUIDs.
+/// Returns the project-relative `.mat` path of each mesh part, in part order.
+pub fn extract_materials(server: &mut AssetServer, model: &Path) -> anyhow::Result<Vec<String>> {
+    let root = server.root().to_path_buf();
+    let rel_dir = model
+        .parent()
+        .and_then(|dir| project_relative(&root, dir))
+        .context("the model is outside the project")?;
+    let parts = melon_render::extract_materials(model, &rel_dir)?;
+    reconcile(server);
+    for rel in parts.iter().collect::<std::collections::BTreeSet<_>>() {
+        let file = root.join(rel);
+        let mut material = melon_core::MaterialAsset::read(&file)?;
+        for texture in [
+            &mut material.base_color_texture,
+            &mut material.metallic_roughness_texture,
+            &mut material.normal_texture,
+            &mut material.emissive_texture,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *texture = melon_core::TextureRef::for_path(server, &texture.path);
+        }
+        material.save(&file)?;
+    }
+    Ok(parts)
+}
+
 pub fn rename(server: &mut AssetServer, path: &Path, new_name: &str) -> anyhow::Result<PathBuf> {
     validate_name(new_name)?;
     let (Some(parent), Some(old_name)) = (path.parent(), path.file_name()) else {
@@ -375,6 +427,7 @@ pub fn open_external(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    use super::ONE_MATERIAL_GLTF;
     use super::*;
     use crate::asset_db::reconcile;
     use melon_core::{AssetGuid, AssetServer, Handle, Model, meta_path};
@@ -434,6 +487,23 @@ mod tests {
     }
 
     #[test]
+    fn extract_materials_writes_mats_with_metas_next_to_the_model() {
+        let (root, mut server) = project("extract");
+        let model = root.join("assets/models/thing.gltf");
+        std::fs::write(&model, ONE_MATERIAL_GLTF).unwrap();
+        reconcile(&mut server);
+        let parts = extract_materials(&mut server, &model).unwrap();
+        assert_eq!(parts, ["assets/models/thing_Paint.mat"]);
+        let mat = root.join("assets/models/thing_Paint.mat");
+        assert_eq!(
+            melon_core::MaterialAsset::read(&mat).unwrap().base_color,
+            [0.0, 1.0, 0.0, 1.0]
+        );
+        assert!(meta_path(&mat).is_file(), "the .mat has a .meta");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn unique_path_counts_up() {
         let (root, _) = project("unique");
         let dir = root.join("assets");
@@ -443,6 +513,22 @@ mod tests {
         assert_eq!(unique_path(&dir, "A.GLB"), dir.join("A 3.GLB"));
         assert_eq!(unique_path(&dir, "models"), dir.join("models 2"));
         assert_eq!(unique_path(&dir, "b.glb"), dir.join("b.glb"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_material_writes_a_loadable_default_with_a_meta() {
+        let (root, mut server) = project("create_material");
+        let assets = root.join("assets");
+        let first = create_material(&mut server, &assets).unwrap();
+        let second = create_material(&mut server, &assets).unwrap();
+        assert_eq!(first, assets.join("New Material.mat"));
+        assert_eq!(second, assets.join("New Material 2.mat"));
+        assert_eq!(
+            melon_core::MaterialAsset::read(&first).unwrap(),
+            melon_core::MaterialAsset::new_default()
+        );
+        assert!(melon_core::meta_path(&first).is_file());
         let _ = std::fs::remove_dir_all(&root);
     }
 

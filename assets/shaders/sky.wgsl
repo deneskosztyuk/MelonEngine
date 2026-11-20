@@ -31,6 +31,14 @@ struct EnvironmentUniform {
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 @group(0) @binding(1) var<uniform> light: LightUniform;
 @group(0) @binding(4) var<uniform> env: EnvironmentUniform;
+// The image sky (see mesh.wgsl): params.y = 1 draws it, params.z its intensity.
+struct IblUniform {
+    sh: array<vec4f, 9>,
+    params: vec4f,
+};
+@group(0) @binding(7) var<uniform> ibl: IblUniform;
+@group(0) @binding(8) var ibl_specular: texture_2d<f32>;
+@group(0) @binding(9) var ibl_sampler: sampler;
 
 // Sun disc radiance relative to the light colour: bright enough for bloom.
 const SUN_RADIANCE: f32 = 40.0;
@@ -69,6 +77,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let haze = 0.8 * env.horizon_color * tint;
     let below = mix(env.horizon_color, haze, smoothstep(0.0, 0.5, -dir.y));
     var color = select(below, above, dir.y >= 0.0);
+    if (ibl.params.y > 0.5) {
+        let uv = vec2f(atan2(dir.z, dir.x) / 6.2831853 + 0.5, acos(clamp(dir.y, -1.0, 1.0)) / 3.14159265);
+        color = textureSampleLevel(ibl_specular, ibl_sampler, uv, 0.0).rgb;
+    }
 
     let sun = smoothstep(SUN_COS_OUTER, SUN_COS_INNER, dot(dir, light.direction));
     color += sun * SUN_RADIANCE * light.color;

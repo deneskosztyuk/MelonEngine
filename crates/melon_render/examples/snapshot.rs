@@ -2,7 +2,10 @@
 // Run: cargo run -p melon_render --example snapshot -- <out.png> [view] [flag]
 // Views: overview (default), low, sun, materials, corner, crowd (overview
 // plus about 10,000 grey cubes and spheres), cornell (the review scene plus
-// a red/green open-front room at (-13, 0, -13), seen through its opening).
+// a red/green open-front room at (-13, 0, -13), seen through its opening),
+// lights (the overview with 32 point and spot lights, 4 flagged to cast
+// shadows; --no-lights draws the same scene without them, to measure their
+// cost), alpha (the overview plus an alpha-masked checker and a blended pane).
 // Prints the backend and present mode, the mean frame time and the `RenderStats`. The timed frames run
 // before the capture, so the GI probes have converged.
 // Debug flags (any order): --quality low|medium|high|max starts from that
@@ -27,7 +30,7 @@ use melon_core::{
     AssetServer, Camera, Environment, GiMode, Handle, Light, Model, QualityPreset, RenderQuality,
     SsgiResolution,
 };
-use melon_render::{FrameData, RenderStats, Renderer};
+use melon_render::{FrameData, LocalLight, RenderStats, Renderer};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -132,6 +135,52 @@ fn crowd(server: &mut AssetServer) -> Vec<(Mat4, Handle<Model>)> {
 /// green right wall (seen from the front), open toward -z where the sun
 /// comes in. Interior 5 x 4 x 5 m centred on (-13, 0, -13), walls 0.4 m:
 /// inside the GI volume and the sun's shadow box, just off the review floor.
+/// Two panels of `builtin:cube` in the overview: an alpha-masked checker
+/// (holes where the texture is transparent) and a blue, 40% blended pane in
+/// front of the sphere rows. Writes their `.mat` and texture files to
+/// `target/review/` and assigns them through `frame.overrides`.
+fn alpha(server: &mut AssetServer, frame: &mut FrameData) -> Result<()> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/review");
+    std::fs::create_dir_all(&dir)?;
+    let holes = image::RgbaImage::from_fn(8, 8, |x, y| {
+        let open = (x / 2 + y / 2) % 2 == 0;
+        image::Rgba([230, 140, 40, if open { 255 } else { 0 }])
+    });
+    holes.save(dir.join("alpha_mask.png"))?;
+    std::fs::write(
+        dir.join("alpha_mask.mat"),
+        "(metallic: 0.0, roughness: 0.6, base_color_texture: Some((guid: None, path: \"target/review/alpha_mask.png\")), alpha_mode: Mask(cutoff: 0.5), double_sided: true)",
+    )?;
+    std::fs::write(
+        dir.join("alpha_blend.mat"),
+        "(base_color: (0.2, 0.4, 1.0, 0.4), metallic: 0.0, roughness: 0.1, alpha_mode: Blend, double_sided: true)",
+    )?;
+    let cube: Handle<Model> = server.load("builtin:cube");
+    let panels = [
+        (
+            "alpha_mask",
+            Vec3::new(3.0, 3.0, 0.1),
+            Vec3::new(2.0, 1.6, 3.0),
+        ),
+        (
+            "alpha_blend",
+            Vec3::new(4.0, 2.0, 0.1),
+            Vec3::new(7.0, 1.0, 5.5),
+        ),
+    ];
+    for (name, size, at) in panels {
+        let material = server.load(&format!("target/review/{name}.mat"));
+        frame
+            .overrides
+            .insert(frame.models.len(), vec![Some(material)]);
+        frame.models.push((
+            Mat4::from_scale_rotation_translation(size, Quat::IDENTITY, at),
+            cube,
+        ));
+    }
+    Ok(())
+}
+
 fn cornell(server: &mut AssetServer) -> Vec<(Mat4, Handle<Model>)> {
     let grey: Handle<Model> = server.load("assets/models/review/grey_cube.glb");
     let red: Handle<Model> = server.load("assets/models/review/red_panel.glb");
@@ -166,10 +215,36 @@ fn cornell(server: &mut AssetServer) -> Vec<(Mat4, Handle<Model>)> {
 }
 
 /// Named camera presets.
+/// 32 coloured lights over the review floor: a 4 x 8 grid, every third one a
+/// spot pointing down, the first four flagged as shadow casters.
+fn lights_scene() -> Vec<LocalLight> {
+    (0..32)
+        .map(|i| {
+            let (column, row) = ((i % 8) as f32, (i / 8) as f32);
+            let hue = i as f32 / 32.0 * std::f32::consts::TAU;
+            let colour = Vec3::new(
+                0.6 + 0.4 * hue.cos(),
+                0.6 + 0.4 * (hue + 2.1).cos(),
+                0.6 + 0.4 * (hue + 4.2).cos(),
+            );
+            LocalLight {
+                position: Vec3::new(-8.75 + column * 2.5, 1.4, -5.0 + row * 3.3),
+                direction: Vec3::NEG_Y,
+                color: colour * 12.0,
+                range: 4.5,
+                spot: (i % 3 == 0).then_some((0.4, 0.8)),
+                cast_shadows: i < 4,
+            }
+        })
+        .collect()
+}
+
 fn camera(view: &str) -> Result<Camera> {
     let (eye, center) = match view {
         // Three-quarter view from above.
-        "overview" | "crowd" => (Vec3::new(-11.0, 9.0, 12.0), Vec3::new(0.5, 0.5, -1.0)),
+        "overview" | "crowd" | "lights" | "alpha" => {
+            (Vec3::new(-11.0, 9.0, 12.0), Vec3::new(0.5, 0.5, -1.0))
+        }
         // Near the floor, looking toward the horizon.
         "low" => (Vec3::new(-9.0, 0.6, 9.0), Vec3::new(9.0, 1.2, -9.0)),
         // From the +x +z side, up toward the default sun (disc near the top
@@ -192,7 +267,7 @@ fn camera(view: &str) -> Result<Camera> {
         "cornell" => (Vec3::new(-13.0, 2.0, -21.5), Vec3::new(-13.0, 1.9, -12.0)),
         _ => {
             bail!(
-                "unknown view {view:?}; expected overview, low, sun, materials, corner, crowd or cornell"
+                "unknown view {view:?}; expected overview, low, sun, materials, corner, crowd, cornell, lights or alpha"
             )
         }
     };
@@ -288,7 +363,8 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
     let mut ssgi_res = None;
     let mut args = flags.iter();
     while let Some(flag) = args.next() {
-        const FLAGS: [&str; 11] = [
+        const FLAGS: [&str; 12] = [
+            "--no-lights",
             "--quality",
             "--ao-only",
             "--no-ao",
@@ -347,12 +423,20 @@ fn render(window: Arc<Window>, out: &str, view: &str, flags: &[String]) -> Resul
         },
         quality,
         models: review_scene(&mut server),
+        overrides: Default::default(),
+        lights: Default::default(),
     };
     if view == "crowd" {
         frame.models.extend(crowd(&mut server));
     }
     if view == "cornell" {
         frame.models.extend(cornell(&mut server));
+    }
+    if view == "alpha" {
+        alpha(&mut server, &mut frame)?;
+    }
+    if view == "lights" && !has("--no-lights") {
+        frame.lights = lights_scene();
     }
     for (matrix, _) in &mut frame.models {
         *matrix = Mat4::from_translation(offset) * *matrix;
@@ -465,7 +549,7 @@ impl ApplicationHandler for App {
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let out = args.next().context(
-        "usage: snapshot <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only] [--ssgi-res half|quarter] [--size WxH]",
+        "usage: snapshot <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only] [--ssgi-res half|quarter] [--size WxH] [--no-lights]",
     )?;
     let view = args.next().unwrap_or_else(|| "overview".into());
     let flags = args.collect();
@@ -554,6 +638,8 @@ mod tests {
             "corner",
             "crowd",
             "cornell",
+            "lights",
+            "alpha",
         ] {
             assert!(camera(view).is_ok(), "{view}");
         }

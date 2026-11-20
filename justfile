@@ -15,13 +15,15 @@ fmt:
 fmt-check:
     cargo fmt --all --check
 
-# Run clippy with warnings denied (gate).
+# Run clippy with warnings denied (gate), also on the player build (no editor).
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy -p melon_host --no-default-features -- -D warnings
 
-# Compile-check all crates (gate).
+# Compile-check all crates and the player build (gate).
 check:
     cargo check --workspace
+    cargo check -p melon_host --no-default-features
 
 # Full gate: fmt-check + clippy + check. Run before commit and before run.
 gate: fmt-check clippy check
@@ -37,11 +39,11 @@ snapshot view="overview":
 # Run the engine in release mode (game plugin linked statically, no live reload).
 # Runs the gate first; only launches if gate passes.
 run: gate
-    cargo run -p melon_host --release --no-default-features
+    cargo run -p melon_host --release --no-default-features --features editor
 
 # Fast run — skip the gate, release build (use during active dev).
 fast-run:
-    cargo run -p melon_host --release --no-default-features
+    cargo run -p melon_host --release --no-default-features --features editor
 
 # Debug run — with live reload of the melon_game plugin. Use for game logic dev.
 dev-run: gate
@@ -57,8 +59,20 @@ game:
 
 # Ship build — release, live reload disabled (statically links melon_game).
 ship:
-    cargo build -p melon_host --release --no-default-features
+    cargo build -p melon_host --release --no-default-features --features editor
 
 # Run the ship build.
 ship-run:
-    cargo run -p melon_host --release --no-default-features
+    cargo run -p melon_host --release --no-default-features --features editor
+
+# Package the game: build the player (release, no editor, static C runtime) and
+# write <out>/<GameName>/ with the executable and game.pak. The folder runs on a
+# PC without Rust or the Windows SDK. Same as the editor's File > Build.
+# Extra flags pass through: `just package "D:/My Games" --no-build`.
+package out *flags:
+    cargo run -p melon_host --no-default-features --bin melon_package -- "{{out}}" {{flags}}
+
+# Run the renderer's GPU tests with the DX12 FXC shader compiler, the one the
+# packaged player uses (the default looks for the Windows SDK's dxcompiler.dll).
+test-fxc:
+    $env:WGPU_DX12_COMPILER = 'fxc'; cargo test -p melon_render

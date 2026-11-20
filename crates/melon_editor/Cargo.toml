@@ -25,6 +25,7 @@ serde.workspace = true
 ron.workspace = true
 rfd.workspace = true
 anyhow.workspace = true
+uuid.workspace = true
 
 
 

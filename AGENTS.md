@@ -7,26 +7,28 @@ Current state and planned work: `docs/ROADMAP.md`.
 
 | Path | Role |
 |---|---|
-| `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera. No GPU or window code. |
-| `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache`) records sun shadow pass, depth/normal prepass, SSAO passes, the GI mode's passes (`gi/`: DDGI voxel and probe passes or SSGI), 3D pass into HDR target, bloom passes, tonemap pass; `ui_pass` for the editor. |
-| `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource) and ECS sync systems. |
-| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), Content Drawer (`drawer.rs`), asset `.meta` files (`asset_db.rs`), file operations (`asset_ops.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), RON scenes (`scene.rs`), Project Settings window (`project_settings.rs`). |
+| `crates/melon_core` | ECS bootstrap (`Core` = bevy_ecs `World` + `Schedule`), components, resources, input, fly camera, scenes (`scene.rs`), asset pack (`pack.rs`), player settings (`player.rs`), packaging (`package.rs`). No GPU or window code. |
+| `crates/melon_render` | wgpu renderer: pipelines, meshes, textures, glTF loading, offscreen viewport target. `extract(world)` → `FrameData`; `Renderer::render_scene` (owns the `ModelCache` and `MaterialCache`) records the sun cascade passes and the point / spot shadow atlas pass, depth/normal prepass, SSAO passes, the GI mode's passes (`gi/`: DDGI voxel and probe passes or SSGI), 3D pass into HDR target, bloom passes, tonemap pass; `ui_pass` for the editor. |
+| `crates/melon_physics` | rapier3d wrapper (`PhysicsWorld` resource): component sync (`sync.rs`), scene queries (`queries.rs`), character controller, mesh collider triangles. See "Physics" below. |
+| `crates/melon_audio` | kira playback: `Director` (decisions, tested with a mock `Backend`), `KiraBackend` (device, bus tracks), `spatial` (attenuation, pan), `AudioEngine` (host calls `update` once per frame). The game-facing types are in `melon_core::audio`. |
+| `crates/melon_editor` | egui editor (ADR-0001): dock layout (`layout.rs`, `EditorTab`), theme tokens (`theme.rs`), console (`console.rs`, fed by `tracing`), content browser (`content.rs` state and logic, `content_view.rs` drawing), Content Drawer (`drawer.rs`), asset `.meta` files (`asset_db.rs`), file operations (`asset_ops.rs`), viewport logic (`viewport.rs`), gizmo math (`gizmo.rs`), play/pause/stop (`play.rs`), scene wrappers that add physics (`scene.rs`; the scene code itself is `melon_core::scene`), undo history (`history.rs`), Project Settings window (`project_settings.rs`, with `quality_settings.rs`, `audio_settings.rs`, `player_settings.rs`), File > Build (`build_window.rs`). |
 | `crates/melon_game` | Game logic as an `rlib` + `dylib`, hot-reloaded in dev builds. |
-| `crates/melon_host` | Binary: winit event loop, input mapping, frame order (core update, editor, extract, render_scene, ui pass). No render pass code. |
+| `crates/melon_host` | Binaries. `melon_host`: winit event loop, input mapping, frame order (core update, editor, extract, render_scene, ui pass); with `--no-default-features` it is the player (`player.rs`, no `melon_editor` linked). `melon_package`: `just package`. No render pass code. |
 | `assets/models` | glTF models. `cube.glb` loads at startup. `review/` holds the snapshot scene's material test models (`grey_cube`, `material_spheres`, `normal_panel`, `emissive_cube`, `red_panel`, `green_panel`), written by `cargo run -p melon_render --example gen_review_assets` from the repo root; commit them when regenerated. |
 | `assets/shaders` | WGSL shaders, compiled in with `wgpu::include_wgsl!` (no runtime reload). Shared pieces are prepended with `concat!(include_str!(..))` (WGSL has no include): `mesh.wgsl` = `gi_common` + `ddgi_common` + `gi_ddgi` + `gi_ssgi` + `mesh`; `ddgi_update.wgsl` = `gi_common` + `ddgi_common` + it; `ssgi.wgsl` = `gi_common` + it. |
 
-Dependency direction: `core` <- `render`, `physics` <- `editor` <- `host`.
+Dependency direction: `core` <- `render`, `physics`, `audio`; `render`, `physics` <- `editor`; `editor`, `audio` <- `host`.
 `melon_game` depends only on `melon_core`. Keep it that way.
 
 ## Commands
 
 ```powershell
-just gate        # fmt-check + clippy -D warnings + check. Run before every commit.
+just gate        # fmt-check + clippy -D warnings + check, also of the player build. Run before every commit.
 just test        # gate, then cargo test --workspace
 just dev-run     # debug build with melon_game live reload
 just game        # rebuild only melon_game; a running dev-run reloads it
 just fast-run    # release run, no gate, no hot reload
+just package <out>  # build the player, write <out>/<GameName>/ (exe + game.pak)
 just snapshot    # render the review scene offscreen to target/review/snapshot.png
 ```
 
@@ -76,10 +78,45 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   every reload (a second hook registration panics). `cargo test` / `just test`
   while a dev-run is open rewrites `target/debug/melon_game.dll` with other
   features; the running host refuses that reload (fingerprint error). Run
-  `just game` again. Plugin `FixedUpdate` systems run after the
-  physics chain. Release builds call `core.add_plugin(&GamePlugin)`.
+  `just game` again. Plugin systems of a stage run after the engine's of
+  that stage (see Physics for the fixed-step stages). Release builds call
+  `core.add_plugin(&GamePlugin)`.
+- **Audio.** Types the game uses live in `melon_core::audio`: `AudioSource`
+  (clip path, linear volume 0..1, pitch, looping, `play_on_start`, spatial,
+  min/max distance, bus) and `AudioListener` (both registered components;
+  without a listener the `Camera` listens), `AudioSettings` (buses, `Master`
+  first; `config/audio.ron`, edited in Edit ▸ Project Settings ▸ Audio,
+  pending until Apply; `gain(bus)` = bus x master, mute = 0) and
+  `AudioRequests` (game systems push `play_one_shot[_at]`, `play`, `pause`,
+  `stop`, `set_volume`; drained once per frame; game requests are dropped
+  unless `Playing`). `melon_audio::Director` reads them: nothing plays in
+  `Editing`; `play_on_start` sources start once per Play session; Pause
+  pauses and Stop stops every game sound; the editor preview
+  (`preview_play`, Content Browser button, `Ui` bus, `AudioPreview` says what
+  plays) works in every state and is left alone by Pause / Stop. Clips are
+  `AssetServer::load::<AudioClip>` (`.wav .ogg .mp3 .flac`, hot reload
+  restarts a playing source). Under 5 s decodes to memory (cached per file
+  version), longer streams from disk (`spatial::STREAM_THRESHOLD`).
+  Attenuation is `min/d` shifted to reach 0 at `max`; pan is the listener's
+  right vector dotted with the direction to the source. No output device:
+  one warning, silent run. Tests use a mock `Backend` or
+  `KiraBackend::silent()`; never open a device in a test. Adding a bus field
+  needs `#[serde(default)]`-style compatibility, as for quality files.
+  Live edits: a source whose clip, `looping` or `bus` changes restarts;
+  removing or renaming a bus drops its track (`Backend::retain_buses`) and
+  restarts its voices on Master (an unknown bus plays on Master). Inspector:
+  `AudioSource` fields use `inspect::FieldWidget` (bus dropdown, clip picker
+  with Content Browser drop, volume slider); other components can add theirs
+  in `Editor::field_widgets`.
+  Manual check (no device in tests): add an Audio Source (looping, spatial,
+  clip from `assets/`) to a cube and press Play: it sounds, and walking the
+  camera past pans it left/right and fades it with distance. Select a clip
+  in the Content Browser and press Preview (works while Editing). Mute Sfx
+  in Project Settings ▸ Audio and Apply: it goes silent. Pause pauses it,
+  Stop silences it, and nothing sounds in edit mode.
 - **Stages.** Register systems with `core.add_systems(Stage, ...)`:
-  `FixedUpdate` (1/60 s, 0..N times per frame, not while paused), `Update`
+  `FixedUpdate` (1/60 s, 0..N times per frame, not while paused, followed in
+  each fixed step by `PhysicsStep` and `FixedPostUpdate`), `Update`
   (once per frame, read `Time::delta_seconds`), `PostUpdate`. `PreUpdate`
   runs first each frame and fills `Actions`.
 - **Input.** Game code reads `Actions` (`pressed` / `just_pressed` /
@@ -94,15 +131,19 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   size, MSAA, present mode. `Environment` is the look only (sky, fog,
   strengths, radii; no on/off switches). Presets are data
   (`RenderQuality::preset`, `matching_preset`; `Default` = High = the
-  renderer before quality settings, snapshots byte-identical). Saved as
+  renderer's settings before quality settings; the image has changed since:
+  IBL, mips, alpha to coverage). Saved as
   `config/quality.ron` (loaded by the host), named profiles as
   `config/quality_profiles/<name>.ron`; edited in Edit ▸ Project Settings ▸
   Quality, pending until Apply. `extract` copies it into
   `FrameData::quality`. Live, per frame: `gi_mode`, `ssgi_resolution`, `ao`, `bloom` (a pass
   runs only if the quality turns it on AND its `Environment` strength is
-  above 0). Rebuilt in `render_scene` before the frame that uses them:
-  `shadow_map_size` (`set_shadow_map_size`: shadow texture, frame bind
-  group, DDGI voxel groups; clamped 256..device limit) and `msaa`
+  above 0), plus `max_lights`, `shadowed_lights` and `shadow_distance`
+  (used when the frame is built). Rebuilt in `render_scene` before the frame
+  that uses them: `shadow_map_size` and `cascades` (`set_shadow_map_size`,
+  `set_cascades`: shadow texture array, frame bind
+  group, DDGI voxel groups; size clamped 256..device limit),
+  `local_shadow_size` (the point / spot atlas, `set_local_shadow_atlas`) and `msaa`
   (`set_msaa`: falls back to the largest supported count not above it,
   `msaa_counts`, 2x needs `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES`; the
   target's MSAA colour, depth and overlay textures are recreated in place,
@@ -179,6 +220,14 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   scene, despawn its entities (`load_scene` despawns entities with a
   `Transform`). Never call `World::clear_entities()`: in bevy 0.19 resources
   are entities, so it deletes them too.
+- **Inspector enum editing (`inspect.rs`, `reflect_ui`).** A unit enum is a
+  combo (`id.with("combo")`, options `id.with(variant)`). An enum with payload
+  variants gets a variant combo (click id `id.with("variant")`, options
+  `id.with(variant)`) and then only the active variant's fields, each
+  `id.with(field)`; picking another variant builds it from default field
+  values (`ReflectDefault` of each field type, zero for glam vectors; a
+  field type without a default makes the switch fail). `Option` keeps its
+  checkbox editor. Any new reflected enum with payloads needs no editor code.
 - **Editor panels.** A new panel is a variant of `layout::EditorTab` (title,
   `ALL`) plus a match arm in `EditorTabs::ui`. Colours and sizes come from
   `theme::colors` / `theme::sizes`, not literals. Log with `tracing`; INFO and
@@ -214,12 +263,106 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   returns `RenderStats` (draws, instances, culled).
 - **Deleting entities.** Call `melon_core::hierarchy::mark_for_delete` (marks
   the subtree `PendingDelete`); `cleanup_deleted_system` removes the rapier
-  bodies and despawns. Do not despawn physics entities directly.
+  bodies and despawns. Do not despawn physics entities directly (a stray
+  despawn is swept by `sync_components`, but joints and events lag a step).
+  Editor code calls `History::delete` instead (it marks the subtree and
+  records the undo step); `mark_for_delete` stays for game and engine code.
+- **Physics (`melon_physics`).** Game data is in `melon_core::physics`
+  (usable from `melon_game`): `RigidBody` (kind, mass, damping, gravity
+  scale, per-axis rotation lock, ccd), `Collider` (`shape`: `Box {
+  half_extents }` / `Sphere { radius }` / `Capsule { half_height, radius }` /
+  `Mesh`; friction, restitution, `sensor`, `membership` / `filter` bit
+  masks), `CharacterController`, `Joint` (`kind`: `Fixed` / `Hinge { axis,
+  limited, min, max }` / `Ball { limited, cone_limit }` / `Slider { axis,
+  limited, min, max }`, plus `anchor`, `parent_anchor`, `auto_anchor`); all
+  registered, so scenes and the Inspector need no special code. A collider
+  without a body is static; a collider on a child attaches to the nearest
+  ancestor body (a body's mass is shared by its solid colliders). Shapes
+  and joint anchors follow the entity's world scale. Adding a `Collider`
+  in the Inspector fits its box to the model bounds (else 0.5).
+  Rapier objects are internal: `melon_physics::sync_components` (system
+  `sync_components_system`, first in `PhysicsStep` and in `PostUpdate`, so
+  edit mode and Inspector edits are covered; scene load and the Inspector
+  call it directly) looks only at what changed: entities with a changed
+  `Transform`, physics component, `ChildOf` or model, everything below them
+  (their world poses moved) and mesh colliders whose model file version
+  changed. Each is compared with what it last built
+  (`RigidBodyComponent` / `ColliderComponent` / `JointComponent` hold the
+  handles and the built copy) and created, updated in place (body parameters
+  keep velocity), rebuilt (collider shape, owner, scale, mesh version) or
+  removed. Removals come through component `on_remove` hooks that queue the
+  handles in `PhysicsWorld`, so despawned entities cost nothing to find. An
+  idle scene does no rebuild work (`PhysicsWorld::stats` counts builds and
+  examined entities; a test pins it). Pose comparisons use a tolerance
+  relative to the distance from the origin. Never insert the handle
+  components yourself. Fixed and kinematic bodies follow their `Transform`
+  (kinematic via the next-position API, so they push); dynamic bodies write
+  theirs. Mesh colliders read positions and indices of the entity's glTF
+  (`x.glb#meshN` unbaked, a whole file with node transforms; `builtin:cube`
+  is a unit box); a missing or broken model warns and builds no collider
+  until its file version or handle changes. A mesh collider on a dynamic or
+  kinematic body warns once per build and takes mass and inertia from its
+  bounding box (rapier gives a triangle mesh none unless it is closed).
+  Stages: each fixed step runs `FixedUpdate` (game systems, previous
+  transforms), then `PhysicsStep` (sync, velocity writes, requests,
+  characters, rapier step, write back), then `FixedPostUpdate` (read events,
+  poses, `grounded`). A `melon_game` system in `FixedUpdate` therefore runs
+  before the step of the same fixed step: that is where to call
+  `CharacterController::move_by`, write `Velocity` or queue
+  `PhysicsRequests`. Plugin systems cannot be ordered against engine
+  systems of the same stage (separate schedules), hence the stages.
+  Game control of dynamic bodies: `Velocity { linear, angular }` is added to
+  every dynamic body, written after each step, and a value the game changes
+  goes into the body before the next one. `ResMut<PhysicsRequests>`:
+  `apply_impulse`, `apply_torque_impulse`, `apply_force` / `apply_torque`
+  (one step only) and `teleport(entity, position, rotation)`: the way to move
+  a dynamic body, whose `Transform` belongs to physics (a plain write is
+  overwritten by the next step). Requests for an entity without a body are
+  dropped. Queries: `Res<PhysicsQueries>` (`raycast`, `raycast_all`,
+  `sphere_cast`, `overlap_sphere`, `overlap_box` with `QueryFilter { layers,
+  exclude, sensors, hit_inside }`) read the live colliders and broad phase
+  (shared behind a lock, no copy; a new collider shows once a step has run).
+  A ray that starts inside a collider skips it unless `hit_inside`. Events:
+  `Messages<CollisionEvent>` (`Started` / `Ended` for solids,
+  `TriggerEntered` / `TriggerExited` for sensors; both entities; read with
+  `MessageReader` in `FixedPostUpdate`). Pairs with a fixed or kinematic
+  collider are detected for sensors, kinematic bodies and characters (every
+  pair, static with static too, only for a `CharacterController` collider),
+  so a kinematic or body-less character entering a static trigger fires; a
+  static sensor over a static floor does not. Removing a touching collider
+  (component removal, despawn, `PendingDelete`) emits `Ended` /
+  `TriggerExited` for its active pairs. Play and Stop clear the event queue.
+  Character: `CharacterController::move_by` (world-space delta, include
+  gravity) before the step; the character moves the `Transform` with
+  rapier's `KinematicCharacterController` (offset, max slope in degrees,
+  autostep height, snap distance) and writes `grounded` / `applied`. It sees
+  the live colliders; a capsule's round bottom climbs a ledge only with a
+  large enough move per step (about 0.1 m). Joints connect the entity's body
+  to its nearest ancestor body, or a fixed world body (then `parent_anchor`
+  is a world position). With `auto_anchor` (default) `anchor` is the pivot
+  on this body and the ancestor side is worked out so the pair keeps its
+  current pose when the joint is made (hinge limits count from that pose);
+  without it both anchors are used as given. Hinge and slider axes and the
+  ball cone are in the pair's relative frame (the axis is local to this
+  body). A `Joint` on an entity without a `RigidBody` warns once and does
+  nothing. Ball `cone_limit` (when `limited`) bounds the Y and Z swing,
+  twist is free. `PreviousTransform` is added to dynamic bodies and removed
+  again when the body stops being dynamic (an entity the game gave one keeps
+  it). Layers and gravity: `melon_core::PhysicsSettings`
+  (`config/physics.ron`, Project Settings ▸ Physics, pending until Apply,
+  gravity applied live) holds 32 layer names; a collider's `membership` /
+  `filter` show them as checkboxes (`WidgetKind::Layers`) and are saved as
+  raw bits. The Scene view draws outlines of the selected entity's colliders
+  (and its descendants'): green for solid ones, another colour for sensors
+  (`theme::colors::COLLIDER_SENSOR`); a mesh collider is drawn as its model
+  bounds, not its triangles.
 - **Hierarchy.** Parents use bevy's `ChildOf` / `Children`. `Transform` is
   local to the parent; for world poses use `melon_core::hierarchy`
   (`world_matrix`, `set_world_transform`, `set_parent_keep_world`,
   `render_matrices`) or `GlobalTransform` (written in `PostUpdate` and before
   physics sync). Fixed bodies follow their parent; dynamic bodies don't.
+  Root order is `melon_core::hierarchy::RootOrder` (the Hierarchy lists
+  roots through `root_order`; `move_root` reorders).
 - **Assets.** Reference files through `AssetServer::load::<Model>(path)` →
   `Handle<Model>`; paths are project-relative with forward slashes
   (`assets/models/x.glb`), plus `builtin:cube`; `x.glb#mesh2` draws one glTF
@@ -244,10 +387,15 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   GI shaded as Off without `Gi::update` (no DDGI voxelising or probe
   update, `updates` and SSGI history untouched), the current shadow map
   size and sample count (its `FrameData::quality` sizes are ignored, so no
-  rebuild), no GPU timestamps. Its target follows the current sample count
+  rebuild), no GPU timestamps. It also leaves the sky texture, the IBL
+  (`ibl_frozen`: it draws with the IBL the last main view built, and its
+  default light never rebuilds it) and the local shadow atlas alone (it
+  has no local lights), so a thumbnail reallocates nothing
+  (`SceneRenderer::ibl_rebuilds` / `shadow_rebuilds` count rebuilds). Its
+  target follows the current sample count
   (`match_msaa`, that target only). GPU checks
   `thumbnail_does_not_disturb_the_next_scene_frame` (DDGI on) and
-  `thumbnail_keeps_shadow_map_and_msaa`.
+  `thumbnail_keeps_shadow_map_and_msaa` (which also counts the rebuilds).
 - **One main `render_scene` per submit (hard rule).** The camera, light,
   environment, SSAO and GI uniforms and the instance buffer are shared and
   written with `queue.write_buffer`, which applies at the next submit: two
@@ -255,22 +403,275 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   Auxiliary views (thumbnails) go in their own submission after the
   frame's. A second main view (a Game view next to the Scene view) needs
   per-view uniform and instance buffers first.
-- **Scene format.** RON, `SCENE_VERSION = 5` in `melon_editor/src/scene.rs`:
+- **Undo / redo (`history.rs`).** A step stores the scene-file form
+  (`scene::capture_entity`) of the entities it touched, before and after;
+  undo writes "before" back, redo "after" (`restore_entity` overwrites an
+  entity in place or spawns it; then parents, sibling order, bodies via
+  `rebuild_body`). Steps name entities by `EditorId` (uuid component, added
+  lazily, saved as `SceneEntity::uid` so ids survive Play / Stop and saves),
+  never by `Entity`. Edits to the selected entity (Inspector, Add / Remove
+  Component, mesh, gizmo) are found by `History::track` once per frame
+  (`Editor::track_history`): it diffs a snapshot taken at rest and records
+  one step when the gesture ends (no dragged widget, no focused text field,
+  no gizmo drag). Create, delete, reparent, rename, duplicate are explicit
+  (`record_created`, `delete`, `reparent`, `rename`, `duplicate`): never
+  `mark_for_delete` or `hierarchy_drop` straight from editor UI. Nothing is
+  recorded or undone unless `SimulationState::Editing`; cap `MAX_STEPS` =
+  200; opening a scene clears it. Shortcuts: Ctrl+Z, Ctrl+Y / Ctrl+Shift+Z,
+  Ctrl+D, F2 (not while typing or with the Content Browser focused, which
+  owns F2 / Ctrl+D). A new editable thing that is not a registered
+  component, `Name`, `Handle<Model>` or the hierarchy is invisible to
+  history. Root order is the `melon_core::hierarchy::RootOrder` resource (healed
+  by `root_order`, set from file order by `apply_scene`, so the scene
+  version is unaffected); steps store a root's index like a child's.
+- **Scene format.** RON, `SCENE_VERSION = 6` in `melon_core/src/scene.rs` (`SceneData`, `apply_scene`, `load_scene`, `read_scene_asset`; the editor wraps `apply_scene` / `load_scene` to clear and re-sync `PhysicsWorld`):
   each entity has `name`, `parent` (index into `entities`), `model` (path,
   `#mesh<N>` included), `model_guid` (wins when it resolves, so a scene
-  written by hand may give only `model`) and `components`, a map from type
+  written by hand may give only `model`), optional `uid`
+  (the entity's `EditorId`: assigned when missing, regenerated on load if two
+  entities share one; `uid` is kept in v6) and `components`, a map from type
   path to the component's RON written through the registry (`Transform` is
   local to the parent). Adding a saved component = `#[derive(Component,
   Reflect)]` + `register_component`; no `SceneEntity` edit. Unknown or
   unreadable components are kept (`KeptComponents`, written back unchanged,
-  inserted once their type registers). Versions 1-4 still load (old fields
+  inserted once their type registers). Version 6 stores bodies as `RigidBody`
+  + `Collider` components; version 1-5 `BodyInfo` (world-unit half extents) is
+  converted on load to a box collider (extents divided by the entity scale;
+  kind `None` = no body). Versions 1-4 still load (old fields
   converted on load). Scene code needs the world's `AppTypeRegistry`: tests
   use `Core::new().world`, not `World::new()`. Bump the version on breaking
   changes and keep reading the old one.
+- **Scene changes at runtime.** Game code asks with
+  `SceneRequests::load("assets/scenes/level2.ron")` (a `ResMut` in any
+  system). `scene_requests_system` (first in `PreUpdate`) reads the file
+  through the `AssetServer` (pack or disk), despawns every entity with a
+  `Transform` and spawns the new scene; so a request made in frame N lands
+  at the start of frame N+1. A broken file is logged and the old scene
+  stays. Physics bodies of the old scene go through the component hooks,
+  the new ones come from `sync_components_system` in `PostUpdate`. Entities
+  with the `KeepOnSceneLoad` marker (and their children) survive a request
+  (Unity's DontDestroyOnLoad; not saved in scenes); the editor's Play / Stop
+  rebuilds do not keep them. The system runs `.before(update_actions_system)`.
+- **Player mode.** `cargo run -p melon_host --no-default-features` is the
+  player: no editor, game plugin linked statically (`core.add_plugin`),
+  `Playing` from frame 1, `GameInputGate` open, Esc is the game's, the
+  cursor follows the `Cursor` resource (default free and visible; a game
+  sets `*cursor = Cursor::locked()` for mouse look; the player applies it when
+  it changes and again on focus regain, and frees it while unfocused). Window title, mode and size,
+  startup scene come from `config/player.ron` (`PlayerSettings`, edited in
+  Edit > Project Settings > Player; vsync is `RenderQuality::present`).
+  `--frames N` renders N frames, logs `rendered N frames; exiting` and exits
+  0 (1 on a startup error). A game quits with
+  `world.resource_mut::<AppExit>().request()` (the player closes at the end of
+  the frame; the editor's Play stops Play instead and stays open; the editor
+  applies the game's `Cursor` only while the game has input, and its own free
+  cursor after Esc / Stop). A missing or broken startup scene logs an error
+  and the game runs an empty world (exit 0). The project root is the executable's folder when
+  `game.pak` lies beside it, else the source tree. Features of `melon_host`:
+  `editor` (links `melon_editor`), `hot-reload` (implies `editor`); the
+  editor builds need `--no-default-features --features editor` (the
+  `just run` / `ship` recipes do). Keep shared host code (`map_key`,
+  `record_button`, `pacing`) free of editor types.
+- **Asset pack (`game.pak`, `melon_core::pack`).** Little endian: 32-byte
+  header (`MELONPAK`, version u32 = 1, count u32, index offset u64, index
+  length u64), each file's bytes padded to 8, then the index (per file:
+  path_len u32, UTF-8 project-relative path, has_guid u8, guid 16 bytes,
+  offset u64, size u64). No compression. It holds everything under `assets/`
+  (not `.meta` sidecars: their GUIDs are in the index; nothing starting with
+  `.`) and `config/*.ron`, minus the exclude globs of `PlayerSettings`
+  (`*` in a segment, `**` across, `?`). `AssetServer::set_pack` serves
+  `read` and the GUID index from the pack and stops hot reload; models
+  (`melon_render::models::Source`) and audio (`PlayParams::data`) read bytes
+  from it. A packed `.gltf` also reads its external `.bin` / image files
+  through the `AssetServer` (`packed_gltf.rs`: URIs are percent-decoded and
+  resolved against the model's pack path). Settings loaders
+  (`ron_file::load`) read `config/*.ron` from the installed pack
+  (`pack::install`) without a disk fallback.
+- **Packaging.** `just package <out>` (binary `melon_package`) and the
+  editor's File > Build run the same steps: `build_player` builds the
+  player with `cargo build -p melon_host --release --no-default-features
+  --target-dir target/package` and `RUSTFLAGS=-C target-feature=+crt-static`,
+  then `package_game` writes `<out>/<GameName>/<GameName>.exe` and
+  `game.pak`. The separate target dir keeps the changed flags from
+  rebuilding the normal release. Nothing else ships: the static C runtime
+  needs no VC++ redistributable, and the player asks wgpu for the DX12
+  **FXC** shader compiler (`Renderer::new_with_dx12_compiler`; FXC is part of
+  Windows) instead of `Auto`, which looks for `dxcompiler.dll` / `dxil.dll`
+  (Windows SDK files, redistributable only under their own licence). Set
+  `WGPU_DX12_COMPILER` to override. The editor's own DX12 stays on `Auto`.
+  Safety: `package_game` refuses an output that is, holds or lies inside
+  the project folder, `assets/`, `config/`, `crates/` or `.git/`, and only
+  replaces a game folder that holds `game.pak` and `build.manifest` (written
+  by a previous build). `build_player` finds cargo via `$CARGO`, PATH, then
+  `~/.cargo/bin`; File > Build can cancel (kills cargo and its children),
+  remembers the output folder in `.melon/build_output.txt` and offers Open
+  Folder / Run. cargo also builds the `melon_game` dylib in that build (it
+  builds every crate type of a dependency); harmless, not shipped.
+  `just test-fxc` runs the renderer GPU tests under FXC (all pass). First
+  start of the player under FXC took about 2.5 s to "renderer ready"
+  (about 1.0 s with DXC), then 60 frames in 0.5 s.
+  End-to-end check: `cargo test -p melon_host --test package_smoke --
+  --ignored` (builds the player, packages a temp project, runs it with
+  `--frames 30`).
 - **Light direction sign.** `Light::direction` is the direction light travels
   (from the light into the scene). Shaders want the opposite; pass
   `Light::to_light()`.
 - **Ambient.** A sky/ground hemisphere on `Light` (`sky_color`, `ground_color`, scaled by `ambient`), blended by the world normal's y.
+- **Textures and materials (assets).** `Handle<Texture>` (png, jpg, hdr
+  files) and `Handle<Material>` (`.mat` RON, `melon_core::MaterialAsset`:
+  base colour + texture, metallic, roughness + metallic-roughness texture,
+  normal texture + scale, emissive + texture + strength, `AlphaMode`
+  `Opaque` / `Mask { cutoff }` / `Blend`, `double_sided`; missing fields
+  take glTF defaults; vectors are RON tuples `(r, g, b, a)`). Textures are
+  `TextureRef { guid, path }` (GUID wins). `MeshMaterials { parts: Vec<MaterialSlot> }`
+  (registered component, `guid` + `path` per part, empty = keep the glTF
+  material) assigns materials per mesh part; `extract` resolves it into
+  `FrameData::overrides` (index into `models`). `materials.rs`
+  `MaterialCache` builds the group 2 bind group per `.mat` (rebuilt when the
+  file or one of its textures changes, `builds` counts); a missing texture
+  binds the 1x1 default, a broken `.mat` keeps the last good one or the
+  model's own material; colour textures are sRGB, the rest linear.
+  `LoadedModel::surfaces` holds each glTF material's `Surface { blend,
+  double_sided, masked }`. Instances batch by (model, override set id).
+  Draw order in the 3D pass: opaque (back faces culled), two-sided, sky, then
+  blended draws one instance each, sorted far to near
+  (`sort_back_to_front`), no depth write, no shadows (documented limit).
+  Texture quality: every texture made by `create_texture_from_bytes` has a
+  full CPU mip chain (`mip_chain`, 2x2 box, sRGB averaged in linear light),
+  the material sampler is trilinear with 8x anisotropy where the adapter's
+  downlevel flags allow it (`material_sampler_descriptor`, `Renderer::new`
+  passes the clamp). Blend draws sample the SSAO of the opaque backdrop
+  (the prepass has no blended surfaces), so a blended surface gets AO from
+  what is behind it.
+  Mask: `MaterialUniform::alpha_cutoff` > 0 discards in the main pass at 1
+  sample; at MSAA > 1 the main pass draws Mask parts with the `Mask` /
+  `MaskTwoSided` variants (shader override `ALPHA_TO_COVERAGE`: no discard,
+  a one pixel ramp around the cutoff becomes the sample coverage). The
+  voxel pass, prepass and shadow passes keep the cutoff discard. Mask also
+  discards in the voxel pass and, through the `vs_mask` / `fs_mask` entry points of
+  prepass.wgsl and shadow.wgsl (group 2 = the material), the prepass and
+  every shadow pass. Double-sided and blend mesh pipelines are built lazily
+  per (sample count, GI mode) (`ensure_variant`, shader override
+  `ALPHA_BLEND`). Editor: Create > New Material (folder menu), `.mat`
+  Inspector card (`material_card.rs`: texture slots use
+  `inspect::asset_field`, the picker + drop target of `WidgetKind::Asset`;
+  colour pickers; the edited copy waits in egui memory and the file is
+  written when the pointer is released, not per tick); spot light angles
+  show in degrees (`WidgetKind::Degrees`), light colours get a picker
+  (`WidgetKind::Color`); `.mat` tiles
+  get a thumbnail (`Renderer::render_material_thumbnail`: the material on
+  `builtin:sphere`, same auxiliary view and own submission as model
+  thumbnails; `ThumbnailSubject`); dragging a `.mat` onto an entity in the
+  Scene view assigns it to the part under the cursor (`viewport::pick_part`
+  uses `AssetServer::part_bounds`, written by the renderer), onto a
+  Hierarchy row to every part, or into the `MeshMaterials` Inspector field
+  (`WidgetKind::Materials`), each one undo step (`assign_material_step`);
+  a glTF model's context menu "Extract Materials" writes `.mat` + png files
+  and `.meta`s next to it (`melon_render::extract_materials`,
+  `asset_ops::extract_materials`) and assigns them to the selected entity if
+  it draws that model.
+- **Local lights (`lights.rs`).** `PointLight` / `SpotLight` (core,
+  registered; spot shines along local -Z; radiance `color * intensity /
+  d^2` windowed to 0 at `range`, spot cone squared smooth). `extract` fills
+  `FrameData::lights`. Clustered forward: a 16 x 9 x 24 froxel grid
+  (exponential depth slices from the camera near plane, at most 500 m deep),
+  built on the CPU per main view (`ClusterGrid`, `build`): each light goes
+  in the clusters whose box its sphere touches (`range_of` gives the
+  candidate box, `cluster_aabbs` the per-cluster world boxes; sphere vs box
+  keeps big lights out of unrelated clusters), lists upload to
+  group 3 bindings 9 to 12 (lights, per-cluster (offset, count), indices,
+  `ClusterUniform`); `RenderQuality::max_lights` keeps the brightest per
+  squared distance. mesh.wgsl `local_light_radiance` loops over the
+  fragment's cluster. The per-view groups bind `frame_lights`; the unoccluded
+  and voxel groups' lights are an empty set / the frame set. Auxiliary views
+  (thumbnails) write an empty set. The shared index list holds
+  `INDEX_CAPACITY` entries: the overflow is counted
+  (`ClusterData::overflow`, `RenderStats::light_index_overflow`) and warned
+  once per change; those last clusters miss lights.
+  `RenderStats::lights`, `lights_dropped`. `extract` caches resolved LOD
+  and `MeshMaterials` handles in `ResolvedLod` / `ResolvedMaterials`
+  components (re-resolved when the source or `AssetServer::index_epoch`
+  changes) and writes `LodState` only when the level changes.
+  Editor: GameObject > Light, viewport icons (pickable spheres), range sphere
+  / cone outline for the selected light (`viewport::light_*`).
+- **Image-based ambient (`ibl.rs`).** Diffuse = irradiance as SH9 (CPU,
+  `project_diffuse`), specular = the environment prefiltered per roughness
+  into 6 mips of a 128 x 64 equirect (`prefilter`) + a 32 x 32 BRDF lookup
+  (split sum), all in group 0 bindings 7 to 10, rebuilt on the CPU when
+  `SkyParams` (sky colours, `Light` ambient / hemisphere colours) or the HDR
+  image change (`refresh_ibl`, called by `update_environment` /
+  `update_light`, so direct draws work; the specular texture is rewritten in
+  place, never reallocated, so a dragged sky slider costs CPU only). Rough
+  surfaces blend the prefiltered sky toward the hemisphere irradiance
+  (`smoothstep(0.25, 0.85, roughness)`: the drawn sky is several times
+  brighter than the ambient the scene is lit with) and reflections under
+  the surface's horizon fade out. Procedural source: diffuse = the
+  hemisphere ambient (its irradiance equals the old blend; SH9 within 6%),
+  specular = the drawn sky without the sun disc. HDR source:
+  `Environment::sky_texture` (any image file, `Handle<Texture>`) times
+  `sky_intensity`, drawn as the sky too (sky.wgsl reads mip 0); the
+  `Light` hemisphere colours the GI misses (`sky_light`) and GI-off
+  fallbacks read are overridden by the image's mean radiance above / below
+  the horizon (a two-colour approximation of the HDR for GI).
+- **Cascaded sun shadows (`cascades.rs`).** `RenderQuality::cascades` (1 to
+  4) and `shadow_distance`. `fit` cuts the camera frustum (practical split,
+  lambda 0.75; each cascade starts at 80% of the previous far depth so they
+  overlap), fits a sphere-bounded ortho box per slice (radius rounded to
+  1/16 m), snaps its centre to the shadow map texel grid in light space (no
+  shimmer), and reaches 200 m toward the sun for casters. The shadow map is a
+  Depth32Float 2D array, one layer per cascade (`set_cascades`,
+  `set_shadow_map_size` recreate it; `shadow_view` is the array view,
+  `shadow_layers` render into one layer each); one `render_cascade` pass per
+  layer with its own camera buffer (writes apply at submit, so one buffer
+  per cascade). Casters are culled per cascade. mesh.wgsl `shadow_factor`
+  picks the cascade by view depth (`LightUniform::cascade_far`,
+  `cascade_forward`), blends the last 15% into the next and fades the last
+  cascade to lit at the shadow distance; `shadow_factor_volume` (GI voxel
+  passes) reads the DDGI injection shadow map: one fixed cascade (2048,
+  `gi_shadow_matrix`, an ortho box around the volume's bounding sphere,
+  rendered from every caster that touches it) with its own light uniform,
+  so injection never depends on where the camera looks.
+  `update_light(light, matrix)` is the one-cascade form for direct draws
+  (covers every depth). Thumbnails use one cascade and do not resize the map.
+  `SHADOW_RADIUS` now only sizes the DDGI volume.
+- **Point / spot shadows (`local_shadows.rs`).** A light with `cast_shadows`
+  gets shadow tiles in one `Depth32Float` atlas (`RenderQuality::
+  local_shadow_size`, 4 x 4 stand-in while nothing casts): a spot light one
+  perspective tile along its cone, a point light six cube-face tiles (92
+  degrees). `lights::build(.., shadow_cap)` puts the nearest
+  `shadowed_lights` casters first in the light list (their `spot.w` = first
+  tile, `ClusterUniform::dims.w` = how many); `tile_layout` picks the tile
+  size (power of two, 128 to 1024) so all views fit; what does not fit
+  the atlas (`lights_that_fit`: 64 tiles at 1024, so ten point lights) is
+  dropped, farthest first, and drawn unshadowed
+  (`RenderStats::shadowed_lights_dropped`, warned once per change). One
+  pass
+  (`render_local_shadows`) draws each tile with a viewport / scissor and its
+  own camera buffer; casters culled per tile, at most `local_shadows::MAX_CASTERS` per tile
+  (`RenderStats::local_casters_dropped`). Atlas + tile records are
+  group 0 bindings 11 and 12 (also in the DDGI voxel passes' group 0);
+  mesh.wgsl `local_shadow` picks the cube face by the dominant axis, 3x3 PCF,
+  normal offset by 1.5 texels. DDGI injects only the shadowed lights (fs_voxel
+  loops over the first `dims.w` lights with `local_shadow`); unshadowed
+  local lights are not injected, so no light through walls. Shadow casters
+  off screen that touch the DDGI volume join the shadowed lights through
+  `build`'s `volume` argument (they sit in no cluster), so their injection
+  does not flicker with the camera. The voxel
+  pass lighting group binds the frame light set. `RenderStats::
+  shadowed_lights`, `shadow_views`. Alpha-masked casters work, blended ones
+  cast nothing.
+- **LOD (`melon_core::lod`).** `Lod { levels: Vec<LodLevel { guid, path,
+  screen_height }>, hysteresis }`, thresholds descending: level i is used
+  from `screen_height` (share of the view height the bounding sphere's
+  diameter covers, `screen_height(view_proj, ..)`) down to the next level's
+  threshold; below the last one the object is culled. `select_level` holds a
+  level until the height is past its threshold by the hysteresis share
+  (state in `LodState`, kept by `extract`). The entity's own `Handle<Model>`
+  is not drawn while `levels` is non-empty; the chosen level's model is, so
+  instancing groups by it. Bounds come from the first level the
+  `AssetServer` knows (a unit cube until one has loaded). `MeshMaterials` applies
+  to every level (same part indices; parts a level lacks are ignored). Not exposed in the editor beyond the generic
+  component Inspector.
 - **Materials.** glTF metallic-roughness per primitive (`MaterialUniform`:
   base colour, metallic, roughness, normal scale, emissive). Group 2 of the
   mesh pipeline: 0 base colour (sRGB), 1 sampler, 2 metallic-roughness
@@ -303,7 +704,12 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   view (`ViewLighting`) has the group with its AO and with white AO (AO
   off); `draw_meshes_textured` takes it. `unoccluded_lighting` (white AO,
   SSGI stand-ins) serves `draw_meshes` and tests, `voxel_pass_lighting`
-  the voxel passes.
+  the voxel passes. Bindings 9 to 12 are the point / spot lights and their
+  clusters (`lights::LightBuffers`; per-view groups bind the frame's set,
+  `unoccluded_lighting` an empty one). Group 0 (frame) also holds the IBL
+  (7 SH uniform, 8 prefiltered environment, 9 sampler, 10 BRDF lookup), the
+  point / spot shadow atlas (11) and its tile records (12); binding 2 is the
+  cascade shadow map array.
 - **SSAO.** Before the 3D pass `render_scene` draws the camera's batches once,
   single-sample, into the view's prepass targets (`Depth32Float` depth,
   `Rgba16Float` world normal + eye distance; `render_prepass`, also run
@@ -328,7 +734,7 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   (default 0.08; 0 skips the passes and binds black, the image matches the
   pre-bloom one exactly). Bloom textures live in `ViewportTarget` and are
   rebuilt with it. `tonemap_pass(hdr)` alone never blooms. Tradeoff: k
-  lowers local contrast near every edge by about k (guarded at 87% kept
+  lowers local contrast near every edge by about k (guarded at 85% kept
   by `bloom_adds_no_haze_keeps_edges`), so raise emitter brightness, not
   k, for more glow: lights want emissive strength well above 1 (the review
   cube is 12, about 10x a sunlit floor). GPU tests that
@@ -439,7 +845,7 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
 - **No overlapping slabs.** Boxes that overlap share face planes, which
   z-fight into stripes at oblique views (the first cornell room's wall
   tops inside the ceiling). Let walls end where the next slab starts.
-- **Sun shadow setup.** The shadow pass culls nothing (front faces of
+- **Sun shadow setup.** (Per cascade, see "Cascaded sun shadows".) The shadow pass culls no faces (front faces of
   closed meshes store depth; single-sided quads cast from both sides) with
   a small slope-scaled bias (`constant: 1, slope_scale: 1.5`), and
   `shadow_factor` in `mesh.wgsl` offsets the lookup along the geometric
@@ -452,11 +858,13 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   absent, not registered in `Core::new`): procedural sky (`zenith_color`,
   `horizon_color`) and exponential distance fog (`fog_density`). The fog
   colour is `horizon_color`. Mesh fog only; world lines and overlay shapes
-  are not fogged.
+  are not fogged. `sky_texture: Option<Handle<Texture>>` + `sky_intensity`
+  replace the procedural sky with an HDR equirect (see "Image-based
+  ambient"); it is never saved (handles are not stored in files).
 - **Camera conventions.** Right-handed, DirectX depth (near = 0, far = 1).
   Screen helpers take logical points.
 - **Checking rendering.** Agents verify rendering with the snapshot example
-  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd|cornell] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only] [--ssgi-res half|quarter] [--size WxH]`;
+  (`cargo run -p melon_render --example snapshot -- <out.png> [overview|low|sun|materials|corner|crowd|cornell|lights|alpha] [--quality low|medium|high|max] [--ao-only] [--no-ao] [--no-shadow] [--no-bloom] [--bloom-only] [--gi off|ssgi|ddgi] [--no-gi] [--gi-only] [--ssgi-res half|quarter] [--size WxH] [--no-lights]`;
   `--quality` starts from that `RenderQuality` preset (default high), the
   other flags override it; `--ao-only` saves the SSAO term as a grey
   image; `--no-ao` turns `RenderQuality::ao` off; `--no-shadow` moves scene
@@ -466,7 +874,11 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   bloom alone); `--gi` picks `RenderQuality::gi_mode` (default ddgi; `--no-gi` is
   `--gi off`), `--gi-only` saves that mode's indirect diffuse term alone; `crowd` adds about
   10,000 instances; `cornell` adds an open-front red/green room at
-  (-13, 0, -13) seen through its opening; the 100 timed frames run
+  (-13, 0, -13) seen through its opening; `lights` is the overview with 32
+  point / spot lights (every third a spot, 4 flagged as shadow casters),
+  `--no-lights` draws it without them (compare the GPU `total` for their cost);
+  `alpha` adds an alpha-masked checker and a blended pane (their `.mat` and
+  texture files are written to `target/review/`); the 100 timed frames run
   before the capture, so GI has converged (SSGI too: 300 frames differ
   by at most 2 sRGB steps); it prints the mean frame time,
   `RenderStats`, the quality with its MSAA count and the GPU
@@ -482,6 +894,12 @@ user sees in the Console. The terminal output still follows `RUST_LOG`.
   switching); `render_qualities` reads back every frame and fails on a
   wgpu validation error (rebuild checks). Checks that change the shadow
   map size or MSAA end back on the default, since later checks share the
-  renderer.
+  renderer. Checks that use `.mat` files or lights build their own temp
+  project (`material_project`) and reset `r.materials` / `r.model_cache`
+  (the renderer's caches are keyed by handle id, which repeats across
+  servers); `render_slabs`, `render_lit`, `render_floor_under` and
+  `render_with_occluder` are the helpers. A `.mat` in RON writes colours as
+  tuples, and a file that fails to parse silently falls back to the glTF
+  material: assert `r.materials.builds`.
 
   SSGI tests need the bouncing surface on screen.

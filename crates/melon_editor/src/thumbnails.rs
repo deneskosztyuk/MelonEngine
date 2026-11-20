@@ -4,14 +4,21 @@
 
 use std::collections::HashMap;
 
-use melon_core::{AssetServer, Handle, Model};
+use melon_core::{AssetServer, Handle, Material, Model};
 
-/// One model to render, and the texture id to update if it had one.
+/// What a thumbnail shows: a model, or a material on a sphere.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ThumbnailSubject {
+    Model(Handle<Model>),
+    Material(Handle<Material>),
+}
+
+/// One model or material to render, and the texture id to update if it had one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ThumbnailRequest {
-    /// Project-relative model path.
+    /// Project-relative path of the model or `.mat` file.
     pub path: String,
-    pub handle: Handle<Model>,
+    pub subject: ThumbnailSubject,
     /// The model file's `AssetServer` version this render is for.
     pub version: u32,
     pub existing: Option<egui::TextureId>,
@@ -46,12 +53,17 @@ impl Thumbnails {
     /// version (a failed version is not retried).
     pub fn request(&self, server: &mut AssetServer) -> Option<ThumbnailRequest> {
         self.wanted.iter().find_map(|path| {
-            let handle: Handle<Model> = server.load(path);
-            let version = server.version(handle);
+            let (subject, version) = if path.to_lowercase().ends_with(".mat") {
+                let handle: Handle<Material> = server.load(path);
+                (ThumbnailSubject::Material(handle), server.version(handle))
+            } else {
+                let handle: Handle<Model> = server.load(path);
+                (ThumbnailSubject::Model(handle), server.version(handle))
+            };
             let done = self.done.get(path);
             (done.map(|(v, _)| *v) != Some(version)).then(|| ThumbnailRequest {
                 path: path.clone(),
-                handle,
+                subject,
                 version,
                 existing: done.and_then(|(_, id)| *id),
             })
@@ -104,6 +116,21 @@ mod tests {
 
     const A: &str = "assets/a.glb";
     const B: &str = "assets/b.glb";
+
+    #[test]
+    fn material_files_get_a_material_thumbnail_request() {
+        let (root, mut server) = project("material");
+        std::fs::write(root.join("assets/m.mat"), "()").unwrap();
+        let mut thumbs = Thumbnails::default();
+        thumbs.want("assets/m.mat".into());
+        let request = thumbs.request(&mut server).unwrap();
+        assert!(matches!(request.subject, ThumbnailSubject::Material(_)));
+        thumbs.want(A.into());
+        thumbs.finish(&request, Some(egui::TextureId::User(7)));
+        let next = thumbs.request(&mut server).unwrap();
+        assert!(matches!(next.subject, ThumbnailSubject::Model(_)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn requests_only_wanted_paths_one_at_a_time() {

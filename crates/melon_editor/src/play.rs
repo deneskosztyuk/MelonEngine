@@ -2,9 +2,10 @@
 //! so anything changed while playing is thrown away.
 
 use anyhow::{Context, Result};
+use bevy_ecs::message::Messages;
 use bevy_ecs::resource::Resource;
 use bevy_ecs::world::World;
-use melon_core::{InputFocus, SimulationState, Time};
+use melon_core::{CollisionEvent, InputFocus, SimulationState, Time};
 use melon_physics::PhysicsWorld;
 
 use crate::scene::{SceneData, apply_scene, scene_to_data};
@@ -20,13 +21,18 @@ fn state(world: &World) -> SimulationState {
         .unwrap_or_default()
 }
 
-/// Rebuild the scene (and its physics bodies) from `data`.
+/// Rebuild the scene (and its physics bodies) from `data`. Collision events
+/// of the session before name entities that no longer exist, so they go.
 fn rebuild(world: &mut World, data: &SceneData) -> Result<()> {
     world
         .try_resource_scope::<PhysicsWorld, _>(|world, mut physics| {
             apply_scene(world, &mut physics, data)
         })
-        .context("no PhysicsWorld resource")?
+        .context("no PhysicsWorld resource")??;
+    if let Some(mut events) = world.get_resource_mut::<Messages<CollisionEvent>>() {
+        events.clear();
+    }
+    Ok(())
 }
 
 /// From `Editing`: snapshot the scene, rebuild it from the snapshot so physics
@@ -98,9 +104,7 @@ mod tests {
     use super::*;
     use bevy_ecs::entity::Entity;
     use melon_core::glam::Vec3;
-    use melon_core::{
-        AssetServer, BodyInfo, BodyKind, Handle, Model, Name, NameCounter, Time, Transform,
-    };
+    use melon_core::{AssetServer, Handle, Model, Name, NameCounter, Time, Transform};
     use melon_physics::RigidBodyComponent;
 
     fn edit_world() -> World {
@@ -115,21 +119,52 @@ mod tests {
             Name("Floor".to_string()),
             Transform::from_translation(Vec3::new(0.0, -1.0, 0.0)),
             cube,
-            BodyInfo {
-                body_type: BodyKind::Fixed,
-                half_extents: Vec3::new(5.0, 0.5, 5.0),
+            melon_core::RigidBody {
+                kind: melon_core::RigidBodyKind::Fixed,
+                ..Default::default()
+            },
+            melon_core::Collider {
+                shape: melon_core::ColliderShape::Box {
+                    half_extents: Vec3::new(5.0, 0.5, 5.0),
+                },
+                ..Default::default()
             },
         ));
         world.spawn((
             Name("Box".to_string()),
             Transform::from_translation(Vec3::new(0.0, 3.0, 0.0)),
             cube,
-            BodyInfo {
-                body_type: BodyKind::Dynamic,
-                half_extents: Vec3::splat(0.5),
-            },
+            melon_core::RigidBody::default(),
+            melon_core::Collider::default(),
         ));
         world
+    }
+
+    fn push_event(world: &mut World) {
+        let stale = world.spawn_empty().id();
+        world.write_message(melon_core::CollisionEvent {
+            a: stale,
+            b: stale,
+            kind: melon_core::CollisionEventKind::Started,
+        });
+    }
+
+    fn pending_events(world: &World) -> usize {
+        world
+            .resource::<bevy_ecs::message::Messages<melon_core::CollisionEvent>>()
+            .len()
+    }
+
+    #[test]
+    fn play_and_stop_drop_collision_events_of_the_session_before() {
+        let mut world = edit_world();
+        push_event(&mut world);
+        assert_eq!(pending_events(&world), 1);
+        play(&mut world).unwrap();
+        assert_eq!(pending_events(&world), 0, "Play starts clean");
+        push_event(&mut world);
+        stop(&mut world).unwrap();
+        assert_eq!(pending_events(&world), 0, "Stop leaves none behind");
     }
 
     fn find(world: &mut World, name: &str) -> Entity {
@@ -163,6 +198,33 @@ mod tests {
         stop(&mut world).unwrap();
         assert!((box_transform(&mut world).translation.y - 3.0).abs() < 1e-6);
         assert_eq!(state(&world), SimulationState::Editing);
+    }
+
+    #[test]
+    fn stop_puts_the_rapier_bodies_back_at_their_edit_poses() {
+        let mut world = edit_world();
+        play(&mut world).unwrap();
+        for _ in 0..60 {
+            world.resource_mut::<PhysicsWorld>().step();
+        }
+        let e = find(&mut world, "Box");
+        let handle = world.get::<RigidBodyComponent>(e).unwrap().body_handle;
+        let fallen = world
+            .resource::<PhysicsWorld>()
+            .body_translation(handle)
+            .unwrap()
+            .y;
+        assert!(fallen < 2.5, "the body fell while playing: {fallen}");
+        stop(&mut world).unwrap();
+        let e = find(&mut world, "Box");
+        let handle = world.get::<RigidBodyComponent>(e).unwrap().body_handle;
+        let pw = world.resource::<PhysicsWorld>();
+        assert!((pw.body_translation(handle).unwrap().y - 3.0).abs() < 1e-6);
+        assert!(
+            pw.bodies.get(handle).unwrap().linvel().length() < 1e-6,
+            "velocity reset"
+        );
+        assert_eq!((pw.bodies.len(), pw.colliders().len()), (2, 2));
     }
 
     #[test]

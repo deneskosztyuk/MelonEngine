@@ -85,10 +85,26 @@ pub struct RenderQuality {
     pub msaa: u32,
     pub bloom: bool,
     pub present: PresentPreference,
+    /// Most point / spot lights shaded per frame (the most important
+    /// visible ones; the rest are dropped).
+    pub max_lights: u32,
+    /// Sun shadow cascades, 1 to 4.
+    pub cascades: u32,
+    /// Farthest distance in metres the sun casts shadows at.
+    pub shadow_distance: u32,
+    /// Most point / spot lights with shadows (nearest first); 0 = none.
+    pub shadowed_lights: u32,
+    /// Edge in texels of the point / spot shadow atlas.
+    pub local_shadow_size: u32,
 }
 
 pub const SHADOW_MAP_SIZES: [u32; 3] = [1024, 2048, 4096];
 pub const MSAA_SAMPLES: [u32; 3] = [1, 2, 4];
+pub const MAX_LIGHTS_OPTIONS: [u32; 4] = [64, 128, 256, 512];
+pub const CASCADE_OPTIONS: [u32; 4] = [1, 2, 3, 4];
+pub const SHADOW_DISTANCE_OPTIONS: [u32; 4] = [40, 60, 100, 200];
+pub const SHADOWED_LIGHTS_OPTIONS: [u32; 5] = [0, 2, 4, 8, 16];
+pub const LOCAL_SHADOW_SIZES: [u32; 3] = [1024, 2048, 4096];
 
 impl Default for RenderQuality {
     fn default() -> Self {
@@ -106,10 +122,15 @@ pub enum QualitySetting {
     Msaa,
     Bloom,
     Present,
+    MaxLights,
+    Cascades,
+    ShadowDistance,
+    ShadowedLights,
+    LocalShadowSize,
 }
 
 impl QualitySetting {
-    pub const ALL: [QualitySetting; 7] = [
+    pub const ALL: [QualitySetting; 12] = [
         Self::Gi,
         Self::SsgiResolution,
         Self::Ao,
@@ -117,12 +138,20 @@ impl QualitySetting {
         Self::Msaa,
         Self::Bloom,
         Self::Present,
+        Self::MaxLights,
+        Self::Cascades,
+        Self::ShadowDistance,
+        Self::ShadowedLights,
+        Self::LocalShadowSize,
     ];
 
     /// True when a change recreates GPU targets and pipelines (shadow map,
     /// MSAA); false when it switches on the next frame.
     pub fn needs_rebuild(self) -> bool {
-        matches!(self, Self::ShadowMap | Self::Msaa)
+        matches!(
+            self,
+            Self::ShadowMap | Self::Msaa | Self::Cascades | Self::LocalShadowSize
+        )
     }
 }
 
@@ -136,6 +165,14 @@ impl RenderQuality {
             QualityPreset::High => (GiMode::Ddgi, Half, true, 2048, 4, true, MailboxCapped),
             QualityPreset::Max => (GiMode::Ddgi, Half, true, 4096, 4, true, MailboxCapped),
         };
+        // (max lights, cascades, shadow distance, shadowed lights, atlas size)
+        let (max_lights, cascades, shadow_distance, shadowed_lights, local_shadow_size) =
+            match preset {
+                QualityPreset::Low => (64, 1, 40, 0, 1024),
+                QualityPreset::Medium => (128, 2, 60, 4, 2048),
+                QualityPreset::High => (256, 3, 100, 8, 2048),
+                QualityPreset::Max => (512, 4, 200, 16, 4096),
+            };
         Self {
             gi_mode,
             ssgi_resolution,
@@ -144,6 +181,11 @@ impl RenderQuality {
             msaa,
             bloom,
             present,
+            max_lights,
+            cascades,
+            shadow_distance,
+            shadowed_lights,
+            local_shadow_size,
         }
     }
 
@@ -296,6 +338,12 @@ mod tests {
             msaa,
             bloom,
             present,
+            ..RenderQuality::preset(match gi_mode {
+                GiMode::Off => QualityPreset::Low,
+                GiMode::Ssgi => QualityPreset::Medium,
+                GiMode::Ddgi if shadow_map_size == 4096 => QualityPreset::Max,
+                GiMode::Ddgi => QualityPreset::High,
+            })
         }
     }
 
@@ -320,6 +368,28 @@ mod tests {
             p(QualityPreset::Max),
             q(GiMode::Ddgi, Half, true, 4096, 4, true, MailboxCapped)
         );
+    }
+
+    #[test]
+    fn every_preset_value_is_one_of_the_panel_options() {
+        for p in QualityPreset::ALL {
+            let q = RenderQuality::preset(p);
+            assert!(MAX_LIGHTS_OPTIONS.contains(&q.max_lights), "{p:?}");
+            assert!(CASCADE_OPTIONS.contains(&q.cascades), "{p:?}");
+            assert!(
+                SHADOW_DISTANCE_OPTIONS.contains(&q.shadow_distance),
+                "{p:?}"
+            );
+            assert!(
+                SHADOWED_LIGHTS_OPTIONS.contains(&q.shadowed_lights),
+                "{p:?}"
+            );
+            assert!(LOCAL_SHADOW_SIZES.contains(&q.local_shadow_size), "{p:?}");
+        }
+        assert!(QualitySetting::Cascades.needs_rebuild());
+        assert!(QualitySetting::LocalShadowSize.needs_rebuild());
+        assert!(!QualitySetting::MaxLights.needs_rebuild());
+        assert_eq!(QualitySetting::ALL.len(), 12);
     }
 
     #[test]
@@ -443,6 +513,12 @@ mod tests {
         let mut expected = RenderQuality::preset(QualityPreset::Low);
         expected.bloom = RenderQuality::default().bloom;
         expected.ssgi_resolution = RenderQuality::default().ssgi_resolution;
+        let default = RenderQuality::default();
+        expected.max_lights = default.max_lights;
+        expected.cascades = default.cascades;
+        expected.shadow_distance = default.shadow_distance;
+        expected.shadowed_lights = default.shadowed_lights;
+        expected.local_shadow_size = default.local_shadow_size;
         assert_eq!(RenderQuality::load(&path), (expected, LoadOutcome::Loaded));
 
         // A file from before `ssgi_resolution`: Medium loads with the
@@ -454,7 +530,15 @@ mod tests {
         .unwrap();
         let expected = RenderQuality {
             ssgi_resolution: SsgiResolution::Half,
-            ..RenderQuality::preset(QualityPreset::Medium)
+            ..RenderQuality {
+                gi_mode: GiMode::Ssgi,
+                ao: true,
+                shadow_map_size: 2048,
+                msaa: 2,
+                bloom: true,
+                present: PresentPreference::Vsync,
+                ..RenderQuality::default()
+            }
         };
         assert_eq!(RenderQuality::load(&path), (expected, LoadOutcome::Loaded));
 

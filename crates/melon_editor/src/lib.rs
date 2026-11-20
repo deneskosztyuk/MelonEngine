@@ -8,11 +8,11 @@ use egui_wgpu::ScreenDescriptor;
 use melon_core::bevy_reflect::{TypePath, TypeRegistry, std_traits::ReflectDefault};
 use melon_core::glam;
 use melon_core::hierarchy::{
-    depth_first, mark_for_delete, set_parent_keep_world, set_world_transform, world_matrix,
+    depth_first, set_parent_keep_world, set_world_transform, world_matrix,
 };
 use melon_core::{
-    Aabb, AssetServer, BodyInfo, Camera, GameInputGate, Handle, InputFocus, Model, Name,
-    SimulationState, Transform,
+    Aabb, AssetServer, Camera, GameInputGate, Handle, InputFocus, Model, Name, SimulationState,
+    Transform,
 };
 use melon_render::LineVertex;
 use tracing::instrument;
@@ -22,14 +22,21 @@ use winit::window::Window;
 pub mod asset_db;
 pub mod asset_ops;
 pub mod asset_watch;
+pub mod audio_settings;
+pub mod build_window;
 pub mod console;
 pub mod content;
 mod content_view;
 mod drawer;
 pub mod gizmo;
+pub mod history;
 pub mod inspect;
 pub mod layout;
+mod material_assign;
+mod material_card;
+pub mod physics_settings;
 pub mod play;
+pub mod player_settings;
 pub mod project_settings;
 pub mod quality_settings;
 pub mod scene;
@@ -117,6 +124,8 @@ pub struct Editor {
     hovered: Option<GizmoHandle>,
     /// The gizmo's shapes this frame (drawn by the overlay pass).
     overlay_draws: Vec<melon_render::OverlayDraw>,
+    /// Icons of the point and spot lights (drawn with the gizmo).
+    light_icons: Vec<melon_render::OverlayDraw>,
     pending_dialog: Option<DialogChannel>,
     pending_operation: Option<PendingOperation>,
     /// A Content Browser delete waiting for Delete / Cancel.
@@ -189,9 +198,47 @@ pub struct Editor {
     flying: bool,
     show_about: bool,
     project_settings: project_settings::ProjectSettings,
+    build_window: build_window::BuildWindow,
     /// A rebinding capture was waiting when this frame began: its keys are not shortcuts.
     keys_captured: bool,
     logo: Option<egui::TextureHandle>,
+    /// Undo / redo steps (edit mode only).
+    history: history::History,
+    /// Hierarchy row being renamed inline.
+    renaming: Option<Renaming>,
+}
+
+/// An inline rename in the Hierarchy.
+struct Renaming {
+    entity: Entity,
+    text: String,
+    /// First frame: take keyboard focus and select the text.
+    fresh: bool,
+    /// Its row was drawn this frame.
+    drawn: bool,
+    /// Frames it has gone undrawn after the first; a hidden row cancels it.
+    undrawn: u8,
+}
+
+impl Renaming {
+    fn new(entity: Entity, text: String) -> Self {
+        Self {
+            entity,
+            text,
+            fresh: true,
+            drawn: false,
+            undrawn: 0,
+        }
+    }
+}
+
+/// What the Hierarchy row menu does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowAction {
+    Rename,
+    Duplicate,
+    Delete,
+    CreateChild,
 }
 
 impl Default for Editor {
@@ -202,6 +249,7 @@ impl Default for Editor {
             gizmo_drag: None,
             hovered: None,
             overlay_draws: Vec::new(),
+            light_icons: Vec::new(),
             pending_dialog: None,
             pending_operation: None,
             delete_confirm: None,
@@ -237,8 +285,11 @@ impl Default for Editor {
             flying: false,
             show_about: false,
             project_settings: project_settings::ProjectSettings::default(),
+            build_window: build_window::BuildWindow::default(),
             keys_captured: false,
             logo: None,
+            history: history::History::default(),
+            renaming: None,
         }
     }
 }
@@ -285,9 +336,169 @@ impl Editor {
     /// Mark the selected entity for deletion and clear the selection.
     pub fn delete_selected(&mut self, world: &mut World) {
         if let Some(entity) = self.selected {
-            mark_for_delete(world, entity);
+            self.history.delete(world, entity, self.selected);
         }
         self.clear_selection();
+    }
+
+    /// Spawn a cube and record it as a step.
+    fn create_cube_step(&mut self, world: &mut World) {
+        self.create_cube_step_in(world, None);
+    }
+
+    /// `create_cube_step` under `parent`.
+    fn create_cube_step_in(&mut self, world: &mut World, parent: Option<Entity>) {
+        let cube = create_cube_in(world, parent);
+        let label = format!("Create {}", history::name_of(world, cube));
+        self.history
+            .record_created(world, cube, label, self.selected);
+        self.selected = Some(cube);
+    }
+
+    /// Assign the `.mat` file `path` (project-relative) to part `part` of
+    /// `entity`'s model, or to every part for `None`, as one undo step.
+    pub(crate) fn assign_material_step(
+        &mut self,
+        world: &mut World,
+        entity: Entity,
+        path: &str,
+        part: Option<usize>,
+    ) {
+        let Some(model) = world.get::<Handle<Model>>(entity).copied() else {
+            return;
+        };
+        let parts = world
+            .get_resource::<AssetServer>()
+            .map_or(0, |server| server.part_bounds(model).len());
+        let slot = material_assign::slot_for(&self.project_root, path);
+        let before = self.history.begin(world, &[entity]);
+        let mut materials = world
+            .get::<melon_core::MeshMaterials>(entity)
+            .cloned()
+            .unwrap_or_default();
+        material_assign::assign(&mut materials.parts, part, parts, slot);
+        world.entity_mut(entity).insert(materials);
+        self.history.commit(
+            world,
+            before,
+            &[],
+            "Assign Material".to_string(),
+            self.selected,
+            self.selected,
+        );
+    }
+
+    /// Set every part's material of `entity` from `parts` (project-relative
+    /// `.mat` paths, one per part) as one undo step.
+    fn assign_materials_step(&mut self, world: &mut World, entity: Entity, parts: &[String]) {
+        let slots: Vec<_> = parts
+            .iter()
+            .map(|p| material_assign::slot_for(&self.project_root, p))
+            .collect();
+        let before = self.history.begin(world, &[entity]);
+        world
+            .entity_mut(entity)
+            .insert(melon_core::MeshMaterials { parts: slots });
+        self.history.commit(
+            world,
+            before,
+            &[],
+            "Extract Materials".to_string(),
+            self.selected,
+            self.selected,
+        );
+    }
+
+    /// The project-relative `.mat` path of a Content Browser drag, if it is one.
+    fn dragged_material(&self, drag: &content::AssetDrag) -> Option<String> {
+        let rel = melon_core::assets::project_relative(&self.project_root, &drag.path)?;
+        content::has_extension(&rel, &["mat"]).then_some(rel)
+    }
+
+    /// Spawn a light, select it and record it as a step.
+    fn create_light_step(&mut self, world: &mut World, kind: LightKind) {
+        let light = create_light(world, kind);
+        let label = format!("Create {}", history::name_of(world, light));
+        self.history
+            .record_created(world, light, label, self.selected);
+        self.selected = Some(light);
+    }
+
+    /// Spawn a model (see `spawn_model`), select it and record it as a step.
+    fn spawn_model_step(
+        &mut self,
+        world: &mut World,
+        path: &str,
+        at: glam::Vec3,
+        parent: Option<Entity>,
+    ) {
+        let root = spawn_model(world, &self.project_root, path, at, parent);
+        let label = format!("Create {}", history::name_of(world, root));
+        self.history
+            .record_created(world, root, label, self.selected);
+        self.selected = Some(root);
+    }
+
+    /// Show what an undo / redo / jump selected.
+    fn adopt_history_selection(&mut self, selection: Option<Option<Entity>>) {
+        if let Some(selection) = selection {
+            self.clear_selection();
+            self.selected = selection;
+            self.renaming = None;
+        }
+    }
+
+    fn undo(&mut self, world: &mut World) {
+        let selection = self.history.undo(world);
+        self.adopt_history_selection(selection);
+    }
+
+    fn redo(&mut self, world: &mut World) {
+        let selection = self.history.redo(world);
+        self.adopt_history_selection(selection);
+    }
+
+    /// Copy the selected entity (Ctrl+D); the copy becomes the selection.
+    fn duplicate_selected(&mut self, world: &mut World) {
+        let Some(entity) = self.selected else { return };
+        if let Some(copy) = self.history.duplicate(world, entity, self.selected) {
+            self.clear_selection();
+            self.selected = Some(copy);
+        }
+    }
+
+    /// Record this frame's edits to the selected entity (Inspector, gizmo).
+    fn track_history(&mut self, world: &mut World, ui: &egui::Ui) {
+        let ctx = ui.ctx();
+        let active =
+            self.gizmo_drag.is_some() || ctx.dragged_id().is_some() || ctx.text_edit_focused();
+        let hint = self.gizmo_drag.map(|d| match d.mode {
+            GizmoMode::Move => "Move",
+            GizmoMode::Rotate => "Rotate",
+            GizmoMode::Scale => "Scale",
+        });
+        self.history.track(world, self.selected, active, hint);
+    }
+
+    /// A rename whose row is not on screen (filtered out, panel closed) is
+    /// dropped, so it cannot pop up later.
+    fn cancel_hidden_rename(&mut self) {
+        if let Some(r) = &mut self.renaming {
+            if std::mem::take(&mut r.drawn) {
+                r.undrawn = 0;
+            } else if r.undrawn >= 1 {
+                self.renaming = None;
+            } else {
+                r.undrawn += 1;
+            }
+        }
+    }
+
+    /// Open the inline rename on the selected Hierarchy row (F2).
+    fn start_rename(&mut self, world: &World) {
+        if let Some(entity) = self.selected {
+            self.renaming = Some(Renaming::new(entity, history::name_of(world, entity)));
+        }
     }
 
     fn open_dialog(&mut self, save: bool) {
@@ -359,6 +570,7 @@ impl Editor {
 
     fn handle_shortcuts(&mut self, world: &mut World, ui: &egui::Ui) {
         let typing = ui.ctx().text_edit_focused();
+        let dragging = self.gizmo_drag.is_some() || ui.ctx().dragged_id().is_some();
         let pressed: Vec<Shortcut> = ui.input(|i| {
             [
                 egui::Key::S,
@@ -368,10 +580,22 @@ impl Editor {
                 egui::Key::R,
                 egui::Key::Escape,
                 egui::Key::Space,
+                egui::Key::Z,
+                egui::Key::Y,
+                egui::Key::D,
+                egui::Key::F2,
             ]
             .into_iter()
             .filter(|key| fresh_press(i, *key))
-            .filter_map(|key| shortcut_for(key, i.modifiers.command, typing, self.flying))
+            .filter_map(|key| {
+                shortcut_for(
+                    key,
+                    i.modifiers.command,
+                    i.modifiers.shift,
+                    typing,
+                    self.flying,
+                )
+            })
             .collect()
         });
         let game_focus = input_focus(world) == InputFocus::Game;
@@ -390,6 +614,14 @@ impl Editor {
                 Shortcut::Rotate => self.gizmo_mode = GizmoMode::Rotate,
                 Shortcut::Scale => self.gizmo_mode = GizmoMode::Scale,
                 Shortcut::ToggleDrawer => self.toggle_drawer(),
+                // Not mid-gesture: the step is still being recorded.
+                Shortcut::Undo | Shortcut::Redo if dragging => {}
+                Shortcut::Undo => self.undo(world),
+                Shortcut::Redo => self.redo(world),
+                // With the Content Browser focused, Ctrl+D and F2 are its own.
+                Shortcut::Duplicate | Shortcut::Rename if self.content.has_focus() => {}
+                Shortcut::Duplicate => self.duplicate_selected(world),
+                Shortcut::Rename => self.start_rename(world),
             }
         }
     }
@@ -434,12 +666,59 @@ impl Editor {
                 {
                     self.open_dialog(true);
                 }
+                if ui.button("Build…").clicked() {
+                    self.build_window.open = true;
+                }
                 ui.separator();
                 if ui.button("Exit").clicked() {
                     self.pending_operation = Some(PendingOperation::Exit);
                 }
             });
             ui.menu_button("Edit", |ui| {
+                let step = |verb: &str, label: Option<&str>| match label {
+                    Some(label) => format!("{verb} {label}"),
+                    None => verb.to_string(),
+                };
+                let undo_text = step("Undo", self.history.undo_label());
+                if ui
+                    .add_enabled(
+                        editing && self.history.can_undo(),
+                        egui::Button::new(undo_text).shortcut_text("Ctrl+Z"),
+                    )
+                    .clicked()
+                {
+                    self.undo(world);
+                }
+                let redo_text = step("Redo", self.history.redo_label());
+                if ui
+                    .add_enabled(
+                        editing && self.history.can_redo(),
+                        egui::Button::new(redo_text).shortcut_text("Ctrl+Y"),
+                    )
+                    .clicked()
+                {
+                    self.redo(world);
+                }
+                ui.separator();
+                let has_selection = editing && self.selected.is_some();
+                if ui
+                    .add_enabled(
+                        has_selection,
+                        egui::Button::new("Duplicate").shortcut_text("Ctrl+D"),
+                    )
+                    .clicked()
+                {
+                    self.duplicate_selected(world);
+                }
+                if ui
+                    .add_enabled(
+                        has_selection,
+                        egui::Button::new("Rename").shortcut_text("F2"),
+                    )
+                    .clicked()
+                {
+                    self.start_rename(world);
+                }
                 if ui
                     .add_enabled(
                         self.selected.is_some(),
@@ -456,8 +735,18 @@ impl Editor {
             });
             ui.menu_button("GameObject", |ui| {
                 if ui.button("Create Cube").clicked() {
-                    self.selected = Some(create_cube(world));
+                    self.create_cube_step(world);
                 }
+                ui.menu_button("Light", |ui| {
+                    if ui.button("Point Light").clicked() {
+                        self.create_light_step(world, LightKind::Point);
+                        ui.close();
+                    }
+                    if ui.button("Spot Light").clicked() {
+                        self.create_light_step(world, LightKind::Spot);
+                        ui.close();
+                    }
+                });
             });
             ui.menu_button("Window", |ui| {
                 for tab in layout::EditorTab::ALL {
@@ -575,6 +864,15 @@ impl Editor {
             });
     }
 
+    fn build_window_ui(&mut self, world: &mut World, ui: &egui::Ui) {
+        match self.build_window.ui(ui.ctx(), world, &self.project_root) {
+            Some((StatusKind::Success, message)) => self.set_status(message),
+            Some((StatusKind::Warning, message)) => self.set_status_warning(message),
+            Some((StatusKind::Error, message)) => self.set_status_error(message),
+            None => {}
+        }
+    }
+
     fn project_settings_window(&mut self, world: &mut World, ui: &egui::Ui) {
         match self
             .project_settings
@@ -595,6 +893,112 @@ impl Editor {
     /// The host loaded a broken `config/quality.ron`: the first Apply backs it up.
     pub fn set_quality_broken(&mut self, broken: bool) {
         self.project_settings.set_quality_broken(broken);
+    }
+
+    /// The host loaded a broken `config/physics.ron`: the first Apply backs it up.
+    pub fn set_physics_broken(&mut self, broken: bool) {
+        self.project_settings.set_physics_broken(broken);
+    }
+    /// The host loaded a broken `config/player.ron`: the first Apply backs it up.
+    pub fn set_player_broken(&mut self, broken: bool) {
+        self.project_settings.set_player_broken(broken);
+    }
+
+    /// The host loaded a broken `config/audio.ron`: the first Apply backs it up.
+    pub fn set_audio_broken(&mut self, broken: bool) {
+        self.project_settings.set_audio_broken(broken);
+    }
+
+    /// Custom field editors of a component type (see `inspect::FieldWidget`).
+    fn field_widgets(&self, world: &World, type_path: &str) -> inspect::FieldWidgets {
+        use inspect::{FieldWidget, WidgetKind};
+        let mut widgets = inspect::FieldWidgets::new();
+        if type_path == melon_core::AudioSource::type_path() {
+            let buses = world
+                .get_resource::<melon_core::AudioSettings>()
+                .map(|s| s.buses.iter().map(|b| b.name.clone()).collect())
+                .unwrap_or_default();
+            widgets.insert(
+                "bus",
+                FieldWidget {
+                    label: None,
+                    kind: WidgetKind::Choice(buses),
+                },
+            );
+            widgets.insert(
+                "clip",
+                FieldWidget {
+                    label: None,
+                    kind: WidgetKind::Asset {
+                        root: self.project_root.clone(),
+                        extensions: &melon_core::audio::AUDIO_EXTENSIONS,
+                    },
+                },
+            );
+            widgets.insert(
+                "volume",
+                FieldWidget {
+                    label: Some("Volume (linear)"),
+                    kind: WidgetKind::Slider { min: 0.0, max: 1.0 },
+                },
+            );
+        }
+        if type_path == melon_core::PointLight::type_path()
+            || type_path == melon_core::SpotLight::type_path()
+        {
+            widgets.insert(
+                "color",
+                FieldWidget {
+                    label: None,
+                    kind: WidgetKind::Color,
+                },
+            );
+        }
+        if type_path == melon_core::SpotLight::type_path() {
+            // Stored in radians, edited in degrees.
+            for (field, label) in [
+                ("inner_angle", "Inner angle"),
+                ("outer_angle", "Outer angle"),
+            ] {
+                widgets.insert(
+                    field,
+                    FieldWidget {
+                        label: Some(label),
+                        kind: WidgetKind::Degrees {
+                            min: 0.0,
+                            max: 85.0,
+                        },
+                    },
+                );
+            }
+        }
+        if type_path == melon_core::MeshMaterials::type_path() {
+            widgets.insert(
+                "parts",
+                FieldWidget {
+                    label: Some("Materials"),
+                    kind: WidgetKind::Materials {
+                        root: self.project_root.clone(),
+                    },
+                },
+            );
+        }
+        if type_path == melon_core::Collider::type_path() {
+            let names = world
+                .get_resource::<melon_core::PhysicsSettings>()
+                .map(|s| s.layer_names.clone())
+                .unwrap_or_default();
+            for (field, label) in [("membership", "Layer"), ("filter", "Collides with")] {
+                widgets.insert(
+                    field,
+                    FieldWidget {
+                        label: Some(label),
+                        kind: WidgetKind::Layers(names.clone()),
+                    },
+                );
+            }
+        }
+        widgets
     }
 
     pub fn selected_entity(&self) -> Option<Entity> {
@@ -627,7 +1031,9 @@ impl Editor {
     }
 
     pub fn take_overlay_draws(&mut self) -> Vec<melon_render::OverlayDraw> {
-        std::mem::take(&mut self.overlay_draws)
+        let mut draws = std::mem::take(&mut self.light_icons);
+        draws.append(&mut self.overlay_draws);
+        draws
     }
 
     pub fn take_pending_operation(&mut self) -> Option<PendingOperation> {
@@ -665,6 +1071,8 @@ impl Editor {
                 match result {
                     Ok(()) => {
                         self.clear_selection();
+                        self.history.clear();
+                        self.renaming = None;
                         self.set_status(format!("Loaded from {}", path.display()));
                         self.set_current_scene(path);
                     }
@@ -788,6 +1196,34 @@ impl Editor {
                 self.content.start_rename(dir.clone());
                 Some(dir)
             }
+            Request::NewMaterial(parent) => {
+                let file =
+                    asset_ops::create_material(&mut world.resource_mut::<AssetServer>(), &parent)?;
+                self.content.open(parent);
+                self.content.set_search(String::new());
+                self.content.refresh();
+                self.content.start_rename(file.clone());
+                Some(file)
+            }
+            Request::ExtractMaterials(model) => {
+                let parts =
+                    asset_ops::extract_materials(&mut world.resource_mut::<AssetServer>(), &model)?;
+                let rel = melon_core::assets::project_relative(&self.project_root, &model);
+                // The selected entity gets them if it draws this model.
+                if let Some(entity) = self.selected
+                    && let Some(handle) = world.get::<Handle<Model>>(entity).copied()
+                    && rel.as_deref() == Some(world.resource::<AssetServer>().path(handle))
+                {
+                    self.assign_materials_step(world, entity, &parts);
+                }
+                self.content.refresh();
+                tracing::info!(
+                    "extracted {} materials from {}",
+                    parts.len(),
+                    model.display()
+                );
+                None
+            }
             Request::Rename(path, name) => {
                 let new =
                     asset_ops::rename(&mut world.resource_mut::<AssetServer>(), &path, &name)?;
@@ -841,6 +1277,21 @@ impl Editor {
             }
             Request::Reveal(path) => {
                 asset_ops::reveal(&path);
+                None
+            }
+            Request::PreviewAudio(path) => {
+                if let Some(clip) = melon_core::assets::project_relative(&self.project_root, &path)
+                {
+                    world
+                        .resource_mut::<melon_core::AudioRequests>()
+                        .preview_play(&clip);
+                }
+                None
+            }
+            Request::StopAudioPreview => {
+                world
+                    .resource_mut::<melon_core::AudioRequests>()
+                    .preview_stop();
                 None
             }
             Request::Open(path) => {
@@ -1122,6 +1573,7 @@ impl Editor {
             .show(ui, |ui| self.status_bar(world, ui));
         self.about_window(ui);
         self.project_settings_window(world, ui);
+        self.build_window_ui(world, ui);
         self.follow_asset_changes(world, ui, std::time::Instant::now());
         self.delete_dialog(world, ui);
         self.open_scene_dialog(world, ui);
@@ -1150,6 +1602,8 @@ impl Editor {
                     );
             });
         self.dock = dock;
+        self.cancel_hidden_rename();
+        self.track_history(world, ui);
         self.drawer_ui(world, ui);
         if std::mem::take(&mut self.focus_content_tab) {
             layout::reopen(&mut self.dock, layout::EditorTab::ContentBrowser);
@@ -1185,14 +1639,22 @@ impl Editor {
         let vp = viewport_input(&ctx, &response, rect);
         // A model dragged from the Content Browser lands on the ground under the cursor.
         if let Some(drag) = response.dnd_release_payload::<content::AssetDrag>()
-            && let Some(path) = drag.model.clone()
-            && content::is_model_path(&path)
             && let (Some(pointer), Some(camera)) =
                 (vp.pointer, world.get_resource::<Camera>().copied())
         {
-            let at = viewport::drop_point(&camera, pointer, vp.size);
-            self.selected = Some(spawn_model(world, &self.project_root, &path, at, None));
-            self.gizmo_drag = None;
+            if let Some(path) = drag.model.clone()
+                && content::is_model_path(&path)
+            {
+                let at = viewport::drop_point(&camera, pointer, vp.size);
+                self.spawn_model_step(world, &path, at, None);
+                self.gizmo_drag = None;
+            } else if let Some(path) = self.dragged_material(&drag) {
+                // A material goes on the part of the entity under the cursor.
+                let (origin, dir) = camera.screen_to_world_ray(pointer, vp.size);
+                if let Some((entity, part)) = viewport::pick_part(world, origin, dir) {
+                    self.assign_material_step(world, entity, &path, part);
+                }
+            }
         }
         self.flying = vp.right_down;
         let focus = focus_after_click(sim_state(world), input_focus(world), vp.left_clicked);
@@ -1242,6 +1704,7 @@ impl Editor {
         }
 
         self.world_line_vertices = viewport::grid_lines();
+        self.light_icons = viewport::light_icons(world);
         if let Some(e) = self.selected
             && world.get::<Transform>(e).is_some()
         {
@@ -1250,6 +1713,10 @@ impl Editor {
                     world_matrix(world, e),
                     viewport::model_bounds(world, e),
                 ));
+            self.world_line_vertices
+                .extend(viewport::collider_lines(world, e));
+            self.world_line_vertices
+                .extend(viewport::light_lines(world, e));
         }
 
         let painter = ui.painter_at(rect);
@@ -1338,16 +1805,19 @@ impl Editor {
         });
 
         if add {
-            self.selected = Some(create_cube(world));
+            self.create_cube_step(world);
         }
 
         ui.separator();
 
         // Entity tree. Rows are drag sources (reparent) and drop targets for
         // entities and models; the space below the rows makes roots.
-        let mut to_delete: Option<Entity> = None;
+        let mut row_action: Option<(RowAction, Entity)> = None;
         let mut reparent: Option<(Entity, Option<Entity>)> = None;
         let mut model_drop: Option<(String, Option<Entity>)> = None;
+        let mut material_drop: Option<(String, Entity)> = None;
+        // Inline rename finished this frame: the new text, or `None` for Esc.
+        let mut rename_done: Option<(Entity, Option<String>)> = None;
         let searching = !self.hierarchy_query.trim().is_empty();
         let rows: Vec<(Entity, usize, String, bool)> = depth_first(world)
             .into_iter()
@@ -1368,7 +1838,10 @@ impl Editor {
         let carried_entity = egui::DragAndDrop::payload::<Entity>(ui.ctx()).map(|e| *e);
         let carried_model = egui::DragAndDrop::payload::<content::AssetDrag>(ui.ctx())
             .and_then(|drag| drag.model.clone());
-        let carrying = carried_entity.is_some() || carried_model.is_some();
+        let carried_material = egui::DragAndDrop::payload::<content::AssetDrag>(ui.ctx())
+            .and_then(|drag| self.dragged_material(&drag));
+        let carrying =
+            carried_entity.is_some() || carried_model.is_some() || carried_material.is_some();
         let released = ui.ctx().input(|i| i.pointer.any_released());
         // Row the pointer was released over, if any (a row wins over the zone).
         let mut released_on_row: Option<Entity> = None;
@@ -1425,13 +1898,30 @@ impl Editor {
                     }
                 }
                 if response.secondary_clicked() {
-                    to_delete = Some(entity);
+                    self.selected = Some(entity);
+                }
+                response.context_menu(|ui| {
+                    for (label, action) in [
+                        ("Rename", RowAction::Rename),
+                        ("Duplicate", RowAction::Duplicate),
+                        ("Delete", RowAction::Delete),
+                        ("Create Child", RowAction::CreateChild),
+                    ] {
+                        if ui.button(label).clicked() {
+                            row_action = Some((action, entity));
+                            ui.close();
+                        }
+                    }
+                });
+                if !searching && response.double_clicked() && !on_arrow {
+                    self.selected = Some(entity);
+                    self.renaming = Some(Renaming::new(entity, name.clone()));
                 }
                 if !searching && response.drag_started() {
                     egui::DragAndDrop::set_payload(ui.ctx(), entity);
                 }
 
-                let painter = ui.painter();
+                let painter = ui.painter().clone();
                 let fill = if is_selected {
                     theme::colors::ACCENT_SOFT
                 } else if response.hovered() {
@@ -1467,13 +1957,50 @@ impl Editor {
                 } else {
                     arrow_rect.right()
                 };
-                painter.text(
-                    egui::pos2(text_x, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    &name,
-                    egui::TextStyle::Body.resolve(ui.style()),
-                    theme::colors::TEXT,
-                );
+                let renaming_here = self.renaming.as_ref().is_some_and(|r| r.entity == entity);
+                if renaming_here && let Some(r) = self.renaming.as_mut() {
+                    r.drawn = true;
+                    let edit_rect = egui::Rect::from_min_max(
+                        egui::pos2(text_x, rect.top()),
+                        rect.right_bottom(),
+                    );
+                    let id = egui::Id::new("hierarchy_rename");
+                    let edit = ui.put(
+                        edit_rect,
+                        egui::TextEdit::singleline(&mut r.text)
+                            .id(id)
+                            .desired_width(edit_rect.width()),
+                    );
+                    if std::mem::take(&mut r.fresh) {
+                        edit.request_focus();
+                        if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
+                            let end = egui::text::CCursor::new(r.text.chars().count());
+                            state
+                                .cursor
+                                .set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(0),
+                                    end,
+                                )));
+                            state.store(ui.ctx(), id);
+                        }
+                    } else {
+                        // Esc cancels; Enter or clicking away commits.
+                        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                        if escape {
+                            rename_done = Some((entity, None));
+                        } else if edit.lost_focus() {
+                            rename_done = Some((entity, Some(r.text.clone())));
+                        }
+                    }
+                } else {
+                    painter.text(
+                        egui::pos2(text_x, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        &name,
+                        egui::TextStyle::Body.resolve(ui.style()),
+                        theme::colors::TEXT,
+                    );
+                }
 
                 if !searching && carrying && response.contains_pointer() {
                     painter.rect_stroke(
@@ -1497,31 +2024,87 @@ impl Editor {
             if let Some(path) = carried_model {
                 model_drop = Some((path, released_on_row));
             }
+            if let (Some(path), Some(row)) = (carried_material, released_on_row) {
+                material_drop = Some((path, row));
+            }
+        }
+
+        // A material dropped on a row goes on every part of that entity.
+        if let Some((path, entity)) = material_drop {
+            self.assign_material_step(world, entity, &path, None);
+        }
+
+        if let Some((entity, new_name)) = rename_done {
+            self.renaming = None;
+            if let Some(text) = new_name
+                && let Err(message) = self.history.rename(world, entity, &text, self.selected)
+            {
+                self.set_status_warning(message);
+            }
         }
 
         if let Some((dragged, target)) = reparent
             && target != Some(dragged)
-            && let Err(message) = hierarchy_drop(world, dragged, target)
+            && let Err(message) = self.history.reparent(world, dragged, target, self.selected)
         {
             self.set_status_warning(message);
         }
         if let Some((path, parent)) = model_drop
             && content::is_model_path(&path)
         {
-            self.selected = Some(spawn_model(
-                world,
-                &self.project_root,
-                &path,
-                glam::Vec3::ZERO,
-                parent,
-            ));
+            self.spawn_model_step(world, &path, glam::Vec3::ZERO, parent);
         }
 
-        if let Some(entity) = to_delete {
-            mark_for_delete(world, entity);
-            if self.selected == Some(entity) {
-                self.clear_selection();
+        if let Some((action, entity)) = row_action {
+            self.row_action(world, action, entity);
+        }
+    }
+
+    /// A Hierarchy row menu entry, recorded in the history like its shortcut.
+    fn row_action(&mut self, world: &mut World, action: RowAction, entity: Entity) {
+        match action {
+            RowAction::Rename => {
+                self.selected = Some(entity);
+                self.start_rename(world);
             }
+            RowAction::Duplicate => {
+                self.selected = Some(entity);
+                self.duplicate_selected(world);
+            }
+            RowAction::Delete => {
+                self.history.delete(world, entity, self.selected);
+                if self.selected == Some(entity) {
+                    self.clear_selection();
+                }
+            }
+            RowAction::CreateChild => self.create_cube_step_in(world, Some(entity)),
+        }
+    }
+
+    /// The History panel: every step, the applied ones solid; a click goes there.
+    fn build_history(&mut self, world: &mut World, ui: &mut egui::Ui) {
+        let cursor = self.history.cursor();
+        let mut jump = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                if ui.selectable_label(cursor == 0, "Initial state").clicked() {
+                    jump = Some(0);
+                }
+                for (i, label) in self.history.labels().enumerate() {
+                    let text = if i < cursor {
+                        egui::RichText::new(label)
+                    } else {
+                        egui::RichText::new(label).weak()
+                    };
+                    if ui.selectable_label(i + 1 == cursor, text).clicked() {
+                        jump = Some(i + 1);
+                    }
+                }
+            });
+        if let Some(target) = jump {
+            let selection = self.history.jump_to(world, target);
+            self.adopt_history_selection(selection);
         }
     }
 
@@ -1537,6 +2120,9 @@ impl Editor {
             .retain(|cached, _| asset.as_ref().is_some_and(|(path, _)| path == cached));
         if let Some((path, details)) = &asset {
             self.asset_card(ui, path, details);
+            if details.kind == content::AssetKind::Material {
+                material_card::show(ui, path, world.get_resource::<AssetServer>());
+            }
         }
         let Some(entity) = self.selected else {
             if asset.is_none() {
@@ -1658,7 +2244,7 @@ impl Editor {
 
         // Every other registered component, by display name. The registry is
         // an Arc cloned out of the world, so the world can change meanwhile.
-        let mut body_changed = false;
+        let mut components_changed = false;
         if let Some(registry) = world.get_resource::<AppTypeRegistry>().cloned() {
             let infos = melon_core::registered_components(world);
             let registry = registry.read();
@@ -1681,23 +2267,28 @@ impl Editor {
                     .map(|v| v.into_partial_reflect())
                     .unwrap_or_else(|_| value.to_dynamic());
                 let id = egui::Id::new(("inspector_component", info.type_path));
+                let widgets = self.field_widgets(world, info.type_path);
                 let (changed, remove) =
                     component_card(ui, &mut card_fills, &info.display_name, id, |ui| {
-                        inspect::reflect_ui(ui, id, copy.as_mut(), &registry)
+                        inspect::reflect_ui_with(ui, id, copy.as_mut(), &registry, &widgets)
                     });
                 if remove {
                     reflect.remove(&mut world.entity_mut(entity));
                 } else if changed {
                     reflect.apply(world.entity_mut(entity), copy.as_ref());
                 }
-                body_changed |= (changed || remove) && info.type_path == BodyInfo::type_path();
+                components_changed |= changed || remove;
             }
-            if let Some(added) = self.add_component_ui(ui, world, entity, &registry) {
-                body_changed |= added == BodyInfo::type_path();
+            if self
+                .add_component_ui(ui, world, entity, &registry)
+                .is_some()
+            {
+                components_changed = true;
             }
         }
-        if body_changed {
-            rebuild_body(world, entity);
+        if components_changed {
+            // Rapier follows the edit now, not at the next frame.
+            melon_physics::sync_components_system(world);
         }
 
         if transform_edited {
@@ -1769,6 +2360,9 @@ impl Editor {
             default.as_partial_reflect(),
             registry,
         );
+        if path == <melon_core::Collider as melon_core::bevy_reflect::TypePath>::type_path() {
+            fit_collider_to_model(world, entity);
+        }
         Some(path)
     }
 
@@ -2207,15 +2801,19 @@ fn sim_state(world: &World) -> SimulationState {
         .unwrap_or_default()
 }
 
-/// Spawn a unit cube at the origin, named "Cube N".
+/// Spawn a unit cube at the origin, named "Cube", then "Cube (1)", "Cube (2)"
+/// (first free among its siblings).
 pub fn create_cube(world: &mut World) -> Entity {
-    let mut counter = world.get_resource_or_insert_with(melon_core::NameCounter::default);
-    let name = format!("Cube {}", counter.0);
-    counter.0 += 1;
+    create_cube_in(world, None)
+}
+
+/// `create_cube` as a child of `parent` (a root for `None`).
+pub fn create_cube_in(world: &mut World, parent: Option<Entity>) -> Entity {
+    let name = history::unused_name(world, parent, "Cube", true);
     let cube: Handle<Model> = world
         .get_resource_or_insert_with(|| AssetServer::new(".".into()))
         .load("builtin:cube");
-    world
+    let id = world
         .spawn((
             Name(name),
             melon_core::Transform::default(),
@@ -2224,7 +2822,42 @@ pub fn create_cube(world: &mut World) -> Entity {
                 half_extents: glam::Vec3::new(0.5, 0.5, 0.5),
             },
         ))
-        .id()
+        .id();
+    if let Some(p) = parent {
+        world.entity_mut(id).insert(melon_core::ChildOf(p));
+    }
+    id
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LightKind {
+    Point,
+    Spot,
+}
+
+/// Spawn a point or spot light 3 m up at the origin, named "Point Light" /
+/// "Spot Light" (a spot light points straight down).
+fn create_light(world: &mut World, kind: LightKind) -> Entity {
+    let name = history::unused_name(
+        world,
+        None,
+        match kind {
+            LightKind::Point => "Point Light",
+            LightKind::Spot => "Spot Light",
+        },
+        true,
+    );
+    let mut transform = melon_core::Transform::from_translation(glam::Vec3::new(0.0, 3.0, 0.0));
+    let mut entity = world.spawn_empty();
+    match kind {
+        LightKind::Point => entity.insert(melon_core::PointLight::default()),
+        LightKind::Spot => {
+            transform.rotation = glam::Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+            entity.insert(melon_core::SpotLight::default())
+        }
+    };
+    entity.insert((Name(name), transform));
+    entity.id()
 }
 
 /// Registered components Add Component offers for `entity`: addable, not on
@@ -2252,21 +2885,19 @@ fn add_component_choices(
         .collect()
 }
 
-/// Rebuild `entity`'s rapier body from its `BodyInfo`, or remove it when
-/// the entity has none.
-fn rebuild_body(world: &mut World, entity: Entity) {
-    world.try_resource_scope(
-        |world, mut physics: bevy_ecs::world::Mut<melon_physics::PhysicsWorld>| {
-            let mut e = world.entity_mut(entity);
-            if let Some(old) = e.take::<melon_physics::RigidBodyComponent>() {
-                physics.remove_body(old.body_handle);
-            }
-            e.remove::<melon_physics::ColliderComponent>();
-            if let Some(info) = e.get::<BodyInfo>().copied() {
-                scene::spawn_body(world, &mut physics, entity, info);
-            }
-        },
-    );
+/// A new `Collider` on an entity with a measured model: its box takes the
+/// model's half size (the bounds' centre is ignored), else it keeps 0.5.
+fn fit_collider_to_model(world: &mut World, entity: Entity) {
+    let bounds = world
+        .get::<Handle<Model>>(entity)
+        .zip(world.get_resource::<AssetServer>())
+        .and_then(|(h, server)| server.bounds(*h));
+    if let (Some((min, max)), Some(mut c)) = (bounds, world.get_mut::<melon_core::Collider>(entity))
+    {
+        c.shape = melon_core::ColliderShape::Box {
+            half_extents: (max - min) * 0.5,
+        };
+    }
 }
 
 fn card_frame(fill: egui::Color32) -> egui::Frame {
@@ -2605,6 +3236,14 @@ pub enum Shortcut {
     ReleaseGame,
     /// Ctrl+Space: show or hide the Content Drawer.
     ToggleDrawer,
+    /// Ctrl+Z.
+    Undo,
+    /// Ctrl+Y or Ctrl+Shift+Z.
+    Redo,
+    /// Ctrl+D.
+    Duplicate,
+    /// F2: rename in the Hierarchy.
+    Rename,
 }
 
 /// `key` went down this frame. Key repeat does not count, so a key held since
@@ -2617,7 +3256,13 @@ fn fresh_press(i: &egui::InputState, key: egui::Key) -> bool {
 
 /// Map a pressed key to a shortcut. Nothing fires while typing in a text
 /// field; W/E/R are fly keys while the right mouse button flies the camera.
-pub fn shortcut_for(key: egui::Key, ctrl: bool, typing: bool, flying: bool) -> Option<Shortcut> {
+pub fn shortcut_for(
+    key: egui::Key,
+    ctrl: bool,
+    shift: bool,
+    typing: bool,
+    flying: bool,
+) -> Option<Shortcut> {
     if typing {
         return None;
     }
@@ -2629,6 +3274,11 @@ pub fn shortcut_for(key: egui::Key, ctrl: bool, typing: bool, flying: bool) -> O
         egui::Key::R if !flying && !ctrl => Some(Shortcut::Scale),
         egui::Key::Escape => Some(Shortcut::ReleaseGame),
         egui::Key::Space if ctrl => Some(Shortcut::ToggleDrawer),
+        egui::Key::Z if ctrl && shift => Some(Shortcut::Redo),
+        egui::Key::Z if ctrl => Some(Shortcut::Undo),
+        egui::Key::Y if ctrl => Some(Shortcut::Redo),
+        egui::Key::D if ctrl => Some(Shortcut::Duplicate),
+        egui::Key::F2 => Some(Shortcut::Rename),
         _ => None,
     }
 }
@@ -2693,9 +3343,15 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
                 self.editor.content_tab_shown = true;
                 self.editor.content.blocked =
                     self.editor.delete_confirm.is_some() || self.editor.confirm_open.is_some();
+                let playing = self
+                    .world
+                    .get_resource::<melon_core::AudioPreview>()
+                    .and_then(|p| p.0.clone());
+                self.editor.content.set_audio_preview(playing);
                 self.editor.content.ui(ui);
                 self.editor.apply_content_requests(self.world);
             }
+            EditorTab::History => self.editor.build_history(self.world, ui),
             EditorTab::Console => {
                 console::console_ui(ui, &self.editor.console, &mut self.editor.console_filter)
             }
@@ -2920,31 +3576,48 @@ mod tests {
         );
     }
 
+    /// An entity with a unit box body of `kind` at `translation`, and rapier
+    /// made to match. The world gets its `PhysicsWorld` if it has none.
+    fn spawn_body_entity(
+        world: &mut World,
+        translation: glam::Vec3,
+        kind: melon_core::RigidBodyKind,
+    ) -> (Entity, melon_physics::rapier3d::dynamics::RigidBodyHandle) {
+        if !world.contains_resource::<melon_physics::PhysicsWorld>() {
+            world.insert_resource(melon_physics::PhysicsWorld::new());
+        }
+        let e = world
+            .spawn((
+                Transform::from_translation(translation),
+                melon_core::RigidBody {
+                    kind,
+                    ..Default::default()
+                },
+                melon_core::Collider::default(),
+            ))
+            .id();
+        melon_physics::sync_components_system(world);
+        let handle = world
+            .get::<melon_physics::RigidBodyComponent>(e)
+            .unwrap()
+            .body_handle;
+        (e, handle)
+    }
+
     #[test]
     fn hierarchy_drop_moves_fixed_body_to_world_pose() {
         let mut world = World::new();
-        let mut physics = melon_physics::PhysicsWorld::new();
-        let (body, _) = physics.spawn_fixed_cuboid(
+        let (dragged, body) = spawn_body_entity(
+            &mut world,
             glam::Vec3::new(2.0, 0.0, 0.0),
-            glam::Quat::IDENTITY,
-            glam::Vec3::splat(0.5),
+            melon_core::RigidBodyKind::Fixed,
         );
-        world.insert_resource(physics);
         let target = world
             .spawn(Transform {
                 translation: glam::Vec3::new(5.0, 0.0, 0.0),
                 rotation: glam::Quat::from_rotation_y(1.0),
                 ..Default::default()
             })
-            .id();
-        let dragged = world
-            .spawn((
-                Transform::from_translation(glam::Vec3::new(2.0, 0.0, 0.0)),
-                melon_physics::RigidBodyComponent {
-                    body_handle: body,
-                    body_type: melon_physics::RigidBodyType::Fixed,
-                },
-            ))
             .id();
         // Move the dragged entity first so the body is stale, then drop.
         world.get_mut::<Transform>(dragged).unwrap().translation = glam::Vec3::new(4.0, 0.0, 0.0);
@@ -3286,23 +3959,12 @@ mod tests {
     #[test]
     fn gizmo_physics_write_works_while_paused() {
         let mut world = World::new();
-        let mut physics = melon_physics::PhysicsWorld::new();
-        let (body, _) = physics.spawn_dynamic_cuboid(
+        let (e, body) = spawn_body_entity(
+            &mut world,
             glam::Vec3::ZERO,
-            glam::Quat::IDENTITY,
-            glam::Vec3::splat(0.5),
+            melon_core::RigidBodyKind::Dynamic,
         );
-        world.insert_resource(physics);
         world.insert_resource(SimulationState::Paused);
-        let e = world
-            .spawn((
-                Transform::default(),
-                melon_physics::RigidBodyComponent {
-                    body_handle: body,
-                    body_type: melon_physics::RigidBodyType::Dynamic,
-                },
-            ))
-            .id();
         Editor::new().write_to_physics_body(
             &mut world,
             e,
@@ -3320,24 +3982,16 @@ mod tests {
     #[test]
     fn inspector_edit_while_paused_reaches_physics_and_prev() {
         let mut world = World::new();
-        let mut physics = melon_physics::PhysicsWorld::new();
-        let (body, _) = physics.spawn_dynamic_cuboid(
+        let (e, body) = spawn_body_entity(
+            &mut world,
             glam::Vec3::ZERO,
-            glam::Quat::IDENTITY,
-            glam::Vec3::splat(0.5),
+            melon_core::RigidBodyKind::Dynamic,
         );
-        world.insert_resource(physics);
         world.insert_resource(SimulationState::Paused);
-        let e = world
-            .spawn((
-                Transform::from_translation(glam::Vec3::new(4.0, 0.0, 0.0)),
-                melon_core::PreviousTransform(Transform::default()),
-                melon_physics::RigidBodyComponent {
-                    body_handle: body,
-                    body_type: melon_physics::RigidBodyType::Dynamic,
-                },
-            ))
-            .id();
+        world.entity_mut(e).insert((
+            Transform::from_translation(glam::Vec3::new(4.0, 0.0, 0.0)),
+            melon_core::PreviousTransform(Transform::default()),
+        ));
         Editor::new().after_transform_edit(&mut world, e);
         let x = world
             .resource::<melon_physics::PhysicsWorld>()
@@ -3460,10 +4114,10 @@ mod tests {
     #[test]
     fn ctrl_s_saves() {
         assert_eq!(
-            shortcut_for(egui::Key::S, true, false, false),
+            shortcut_for(egui::Key::S, true, false, false, false),
             Some(Shortcut::Save)
         );
-        assert_eq!(shortcut_for(egui::Key::S, false, false, false), None);
+        assert_eq!(shortcut_for(egui::Key::S, false, false, false, false), None);
     }
 
     #[test]
@@ -3473,27 +4127,27 @@ mod tests {
             (egui::Key::Delete, false),
             (egui::Key::S, true),
         ] {
-            assert_eq!(shortcut_for(key, ctrl, true, false), None, "{key:?}");
+            assert_eq!(shortcut_for(key, ctrl, false, true, false), None, "{key:?}");
         }
     }
 
     #[test]
     fn tool_keys_ignored_while_flying() {
-        assert_eq!(shortcut_for(egui::Key::W, false, false, true), None);
+        assert_eq!(shortcut_for(egui::Key::W, false, false, false, true), None);
         assert_eq!(
-            shortcut_for(egui::Key::W, false, false, false),
+            shortcut_for(egui::Key::W, false, false, false, false),
             Some(Shortcut::Move)
         );
         assert_eq!(
-            shortcut_for(egui::Key::E, false, false, false),
+            shortcut_for(egui::Key::E, false, false, false, false),
             Some(Shortcut::Rotate)
         );
         assert_eq!(
-            shortcut_for(egui::Key::R, false, false, false),
+            shortcut_for(egui::Key::R, false, false, false, false),
             Some(Shortcut::Scale)
         );
         assert_eq!(
-            shortcut_for(egui::Key::Delete, false, false, false),
+            shortcut_for(egui::Key::Delete, false, false, false, false),
             Some(Shortcut::Delete)
         );
     }
@@ -3685,13 +4339,57 @@ mod tests {
     }
 
     #[test]
+    fn assigning_a_material_is_one_undoable_step_and_part_aware() {
+        use melon_core::MeshMaterials;
+        let (mut editor, mut world, root) = browser_project("assign_material");
+        std::fs::write(root.join("assets/m.mat"), "()").unwrap();
+        let model: Handle<Model> = world.resource_mut::<AssetServer>().load("builtin:cube");
+        let e = world
+            .spawn((Name("Cube".to_string()), Transform::default(), model))
+            .id();
+        world
+            .resource_mut::<AssetServer>()
+            .set_part_bounds(model, vec![(glam::Vec3::ZERO, glam::Vec3::ONE); 3]);
+        editor.assign_material_step(&mut world, e, "assets/m.mat", None);
+        let parts = world.get::<MeshMaterials>(e).unwrap().parts.clone();
+        assert_eq!(parts.len(), 3, "every part of the model");
+        assert!(parts.iter().all(|p| p.path == "assets/m.mat"));
+        assert_eq!(editor.history.undo_label(), Some("Assign Material"));
+        editor.assign_material_step(&mut world, e, "assets/other.mat", Some(1));
+        let parts = world.get::<MeshMaterials>(e).unwrap().parts.clone();
+        assert_eq!(parts[1].path, "assets/other.mat");
+        assert_eq!(parts[0].path, "assets/m.mat");
+        editor.undo(&mut world);
+        assert_eq!(
+            world.get::<MeshMaterials>(e).unwrap().parts[1].path,
+            "assets/m.mat"
+        );
+        editor.undo(&mut world);
+        assert!(world.get::<MeshMaterials>(e).is_none(), "undone to none");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_light_spawns_a_named_light_pointing_down_for_spots() {
+        let mut world = World::new();
+        let point = create_light(&mut world, LightKind::Point);
+        assert_eq!(world.get::<Name>(point).unwrap().0, "Point Light");
+        assert!(world.get::<melon_core::PointLight>(point).is_some());
+        let spot = create_light(&mut world, LightKind::Spot);
+        assert_eq!(world.get::<Name>(spot).unwrap().0, "Spot Light");
+        let t = world.get::<melon_core::Transform>(spot).unwrap();
+        let axis = t.rotation * glam::Vec3::NEG_Z;
+        assert!((axis - glam::Vec3::NEG_Y).length() < 1e-5, "{axis}");
+    }
+
+    #[test]
     fn create_cube_spawns_named_cube() {
         let mut world = World::new();
         let e = create_cube(&mut world);
-        assert_eq!(world.get::<Name>(e).unwrap().0, "Cube 0");
+        assert_eq!(world.get::<Name>(e).unwrap().0, "Cube");
         assert!(world.get::<Handle<Model>>(e).is_some());
         let e2 = create_cube(&mut world);
-        assert_eq!(world.get::<Name>(e2).unwrap().0, "Cube 1");
+        assert_eq!(world.get::<Name>(e2).unwrap().0, "Cube (1)");
     }
 
     #[test]
@@ -3716,7 +4414,7 @@ mod tests {
     #[test]
     fn escape_returns_focus_to_editor_while_playing() {
         assert_eq!(
-            shortcut_for(egui::Key::Escape, false, false, false),
+            shortcut_for(egui::Key::Escape, false, false, false, false),
             Some(Shortcut::ReleaseGame)
         );
         let mut world = World::new();
@@ -3923,6 +4621,45 @@ mod tests {
         editor_key(&mut editor, &mut world, egui::Key::Delete);
         assert!(world.get::<melon_core::PendingDelete>(entity).is_some());
         assert!(x.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extract_materials_request_assigns_them_to_the_selected_entity_using_the_model() {
+        use melon_core::MeshMaterials;
+        let (mut editor, mut world, root) = browser_project("extract_request");
+        let model_file = root.join("assets/models/thing.gltf");
+        std::fs::write(&model_file, crate::asset_ops::ONE_MATERIAL_GLTF).unwrap();
+        let model: Handle<Model> = world
+            .resource_mut::<AssetServer>()
+            .load("assets/models/thing.gltf");
+        let user = world.spawn((Transform::default(), model)).id();
+        let other = world.spawn((Transform::default(), model)).id();
+        let cube: Handle<Model> = world.resource_mut::<AssetServer>().load("builtin:cube");
+        let unrelated = world.spawn((Transform::default(), cube)).id();
+        editor.set_selected(Some(user));
+        editor
+            .content
+            .request(content::BrowserRequest::ExtractMaterials(model_file));
+        editor.apply_content_requests(&mut world);
+        assert!(root.join("assets/models/thing_Paint.mat").is_file());
+        let parts = world.get::<MeshMaterials>(user).unwrap().parts.clone();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].path, "assets/models/thing_Paint.mat");
+        assert!(!parts[0].guid.is_empty());
+        assert!(
+            world.get::<MeshMaterials>(other).is_none(),
+            "only the selected one"
+        );
+        // A selection that does not use the model is left alone.
+        editor.set_selected(Some(unrelated));
+        editor
+            .content
+            .request(content::BrowserRequest::ExtractMaterials(
+                root.join("assets/models/thing.gltf"),
+            ));
+        editor.apply_content_requests(&mut world);
+        assert!(world.get::<MeshMaterials>(unrelated).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4891,7 +5628,7 @@ mod tests {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(400.0, 900.0),
+                    egui::vec2(700.0, 900.0),
                 )),
                 time: Some(self.time),
                 events,
@@ -4944,31 +5681,23 @@ mod tests {
         InspectorHarness::new(world, e)
     }
 
-    /// An entity with a fixed rapier body built from its `BodyInfo`.
+    /// An entity with a fixed `RigidBody` and a unit box `Collider`, and
+    /// rapier made to match.
     fn fixed_body_entity() -> InspectorHarness {
         let mut world = melon_core::Core::new().world;
-        let mut physics = melon_physics::PhysicsWorld::new();
-        let half = glam::Vec3::splat(0.5);
-        let (body, collider) =
-            physics.spawn_fixed_cuboid(glam::Vec3::ZERO, glam::Quat::IDENTITY, half);
-        world.insert_resource(physics);
+        world.insert_resource(melon_physics::PhysicsWorld::new());
         let e = world
             .spawn((
                 Name("Body".to_string()),
                 Transform::default(),
-                BodyInfo {
-                    body_type: melon_core::BodyKind::Fixed,
-                    half_extents: half,
+                melon_core::RigidBody {
+                    kind: melon_core::RigidBodyKind::Fixed,
+                    ..Default::default()
                 },
-                melon_physics::RigidBodyComponent {
-                    body_handle: body,
-                    body_type: melon_physics::RigidBodyType::Fixed,
-                },
-                melon_physics::ColliderComponent {
-                    collider_handle: collider,
-                },
+                melon_core::Collider::default(),
             ))
             .id();
+        melon_physics::sync_components_system(&mut world);
         InspectorHarness::new(world, e)
     }
 
@@ -5008,10 +5737,63 @@ mod tests {
         let mut h = entity_with(Spin);
         h.open_add_component();
         assert!(h.has(add_row_id::<melon_core::Bob>()));
-        assert!(h.has(add_row_id::<BodyInfo>()));
+        assert!(h.has(add_row_id::<melon_core::RigidBody>()));
         assert!(h.has(add_row_id::<Aabb>()));
         assert!(!h.has(add_row_id::<Spin>()));
         assert!(!h.has(add_row_id::<Transform>()));
+    }
+
+    #[test]
+    fn adding_a_collider_fits_its_box_to_the_model_bounds() {
+        let mut world = melon_core::Core::new().world;
+        let handle: Handle<Model> = world.resource_mut::<AssetServer>().load("builtin:cube");
+        world.resource_mut::<AssetServer>().set_bounds(
+            handle,
+            glam::Vec3::new(-1.0, -2.0, -3.0),
+            glam::Vec3::new(1.0, 2.0, 3.0),
+        );
+        let with_model = world
+            .spawn((Name("M".to_string()), Transform::default(), handle))
+            .id();
+        let mut h = InspectorHarness::new(world, with_model);
+        h.open_add_component();
+        h.click(add_row_id::<melon_core::Collider>());
+        let c = h.world.get::<melon_core::Collider>(h.entity).unwrap();
+        assert_eq!(
+            c.shape,
+            melon_core::ColliderShape::Box {
+                half_extents: glam::Vec3::new(1.0, 2.0, 3.0)
+            }
+        );
+        // Without a model the default 0.5 box stays.
+        let mut h = entity_with(Spin);
+        h.open_add_component();
+        h.click(add_row_id::<melon_core::Collider>());
+        let c = h.world.get::<melon_core::Collider>(h.entity).unwrap();
+        assert_eq!(c.shape, melon_core::ColliderShape::default());
+    }
+
+    #[test]
+    fn collider_layer_fields_use_the_named_layer_widget() {
+        let mut world = melon_core::Core::new().world;
+        world
+            .resource_mut::<melon_core::PhysicsSettings>()
+            .layer_names[4] = "Enemies".into();
+        let widgets = Editor::new().field_widgets(
+            &world,
+            <melon_core::Collider as melon_core::bevy_reflect::TypePath>::type_path(),
+        );
+        for field in ["membership", "filter"] {
+            let widget = widgets
+                .get(field)
+                .unwrap_or_else(|| panic!("no widget for {field}"));
+            let inspect::WidgetKind::Layers(names) = &widget.kind else {
+                panic!("{field} is not a layer widget");
+            };
+            assert_eq!(names[0], "Default");
+            assert_eq!(names[4], "Enemies");
+        }
+        assert!(widgets["membership"].label.is_some());
     }
 
     #[test]
@@ -5042,41 +5824,56 @@ mod tests {
     }
 
     #[test]
-    fn editing_body_info_rebuilds_the_body() {
+    fn editing_the_body_kind_updates_the_rapier_body() {
         let mut h = fixed_body_entity();
-        let body_type = card_id::<BodyInfo>().with("body_type");
-        h.click(body_type);
-        h.click(body_type.with("Dynamic"));
-        let info = h.world.get::<BodyInfo>(h.entity).unwrap();
-        assert_eq!(info.body_type, melon_core::BodyKind::Dynamic);
-        let rb = *h
+        let kind = card_id::<melon_core::RigidBody>().with("kind");
+        h.click(kind);
+        h.click(kind.with("Dynamic"));
+        let rb = h.world.get::<melon_core::RigidBody>(h.entity).unwrap();
+        assert_eq!(rb.kind, melon_core::RigidBodyKind::Dynamic);
+        let handle = h
             .world
             .get::<melon_physics::RigidBodyComponent>(h.entity)
             .unwrap();
-        assert_eq!(rb.body_type, melon_physics::RigidBodyType::Dynamic);
+        assert_eq!(handle.body_type, melon_physics::RigidBodyType::Dynamic);
         let physics = h.world.resource::<melon_physics::PhysicsWorld>();
-        assert!(physics.bodies.get(rb.body_handle).unwrap().is_dynamic());
-        assert_eq!(physics.bodies.len(), 1, "the old body is removed");
+        assert!(physics.bodies.get(handle.body_handle).unwrap().is_dynamic());
+        assert_eq!(physics.bodies.len(), 1, "the body is updated in place");
     }
 
     #[test]
-    fn removing_body_info_removes_the_body() {
+    fn editing_the_collider_shape_rebuilds_the_collider() {
         let mut h = fixed_body_entity();
-        h.click(card_id::<BodyInfo>().with("remove"));
-        assert!(h.world.get::<BodyInfo>(h.entity).is_none());
+        let shape = card_id::<melon_core::Collider>().with("shape");
+        h.click(shape.with("variant"));
+        h.click(shape.with("Sphere"));
+        let handle = h
+            .world
+            .get::<melon_physics::ColliderComponent>(h.entity)
+            .unwrap()
+            .collider_handle
+            .unwrap();
+        let physics = h.world.resource::<melon_physics::PhysicsWorld>();
+        let colliders = physics.colliders();
+        let co = colliders.get(handle).unwrap();
+        assert!(co.shared_shape().as_ball().is_some());
+        assert_eq!(physics.colliders().len(), 1);
+    }
+
+    #[test]
+    fn removing_the_rigid_body_removes_the_rapier_body() {
+        let mut h = fixed_body_entity();
+        h.click(card_id::<melon_core::RigidBody>().with("remove"));
+        assert!(h.world.get::<melon_core::RigidBody>(h.entity).is_none());
         assert!(
             h.world
                 .get::<melon_physics::RigidBodyComponent>(h.entity)
                 .is_none()
         );
-        assert!(
-            h.world
-                .get::<melon_physics::ColliderComponent>(h.entity)
-                .is_none()
-        );
         let physics = h.world.resource::<melon_physics::PhysicsWorld>();
         assert_eq!(physics.bodies.len(), 0);
-        assert_eq!(physics.colliders.len(), 0);
+        // The collider stays, as a static one.
+        assert_eq!(physics.colliders().len(), 1);
     }
 
     /// A moving, selected entity must not make egui run extra passes (each
@@ -5121,5 +5918,308 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&root);
         assert!(reasons.is_empty(), "extra passes: {reasons:#?}");
+    }
+
+    fn history_world() -> World {
+        let mut world = melon_core::Core::new().world;
+        world.insert_resource(melon_physics::PhysicsWorld::new());
+        world
+    }
+
+    fn live_names(world: &mut World) -> Vec<String> {
+        let mut names: Vec<String> = world
+            .query_filtered::<&Name, bevy_ecs::query::Without<melon_core::PendingDelete>>()
+            .iter(world)
+            .map(|n| n.0.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn press(editor: &mut Editor, world: &mut World, key: egui::Key, shift: bool) {
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            shift,
+            ..Default::default()
+        };
+        let input = egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        let _ = egui::Context::default().run_ui(input, |ui| editor.handle_shortcuts(world, ui));
+    }
+
+    #[test]
+    fn undo_redo_duplicate_shortcuts_map() {
+        let s = |key, ctrl, shift, typing| shortcut_for(key, ctrl, shift, typing, false);
+        assert_eq!(s(egui::Key::Z, true, false, false), Some(Shortcut::Undo));
+        assert_eq!(s(egui::Key::Z, true, true, false), Some(Shortcut::Redo));
+        assert_eq!(s(egui::Key::Y, true, false, false), Some(Shortcut::Redo));
+        assert_eq!(
+            s(egui::Key::D, true, false, false),
+            Some(Shortcut::Duplicate)
+        );
+        assert_eq!(
+            s(egui::Key::F2, false, false, false),
+            Some(Shortcut::Rename)
+        );
+        assert_eq!(s(egui::Key::Z, false, false, false), None);
+        for key in [egui::Key::Z, egui::Key::Y, egui::Key::D] {
+            assert_eq!(
+                s(key, true, false, true),
+                None,
+                "typing keeps egui's own undo"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_z_and_ctrl_y_walk_a_delete_and_restore_the_selection() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        editor.create_cube_step(&mut world);
+        let cube = editor.selected.unwrap();
+        editor.delete_selected(&mut world);
+        assert_eq!(editor.selected, None);
+        // What the physics PostUpdate does with marked entities.
+        let mut cleanup = bevy_ecs::schedule::Schedule::default();
+        cleanup.add_systems(melon_physics::cleanup_deleted_system);
+        cleanup.run(&mut world);
+        assert!(live_names(&mut world).is_empty());
+
+        press(&mut editor, &mut world, egui::Key::Z, false);
+        assert_eq!(live_names(&mut world), ["Cube"]);
+        assert!(
+            editor.selected.is_some(),
+            "the deleted entity is selected again"
+        );
+        let _ = cube;
+        press(&mut editor, &mut world, egui::Key::Z, true); // redo
+        assert!(live_names(&mut world).is_empty());
+        assert_eq!(editor.selected, None);
+        press(&mut editor, &mut world, egui::Key::Z, false);
+        press(&mut editor, &mut world, egui::Key::Z, false); // undoes the create
+        assert!(live_names(&mut world).is_empty());
+    }
+
+    #[test]
+    fn ctrl_d_duplicates_and_selects_the_copy() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        editor.create_cube_step(&mut world);
+        let original = editor.selected.unwrap();
+        press(&mut editor, &mut world, egui::Key::D, false);
+        assert_ne!(editor.selected, Some(original));
+        assert_eq!(live_names(&mut world), ["Cube", "Cube (1)"]);
+        assert_eq!(
+            editor.history.undo_label(),
+            Some("Duplicate Cube"),
+            "one step"
+        );
+    }
+
+    #[test]
+    fn create_while_playing_records_nothing() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        world.insert_resource(SimulationState::Playing);
+        editor.create_cube_step(&mut world);
+        assert!(!editor.history.can_undo());
+    }
+
+    #[test]
+    fn f2_renames_inline_on_enter_and_esc_cancels() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        editor.create_cube_step(&mut world);
+        let cube = editor.selected.unwrap();
+        let ctx = egui::Context::default();
+        let frame = |editor: &mut Editor, world: &mut World, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| editor.build_hierarchy(world, ui));
+        };
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        editor.start_rename(&world);
+        frame(&mut editor, &mut world, vec![]);
+        frame(&mut editor, &mut world, vec![]);
+        frame(
+            &mut editor,
+            &mut world,
+            vec![egui::Event::Text("Hero".into())],
+        );
+        frame(&mut editor, &mut world, vec![key(egui::Key::Enter)]);
+        frame(&mut editor, &mut world, vec![]);
+        assert_eq!(world.get::<Name>(cube).unwrap().0, "Hero");
+        assert!(editor.renaming.is_none());
+        assert_eq!(editor.history.undo_label(), Some("Rename Cube"));
+
+        editor.start_rename(&world);
+        frame(&mut editor, &mut world, vec![]);
+        frame(
+            &mut editor,
+            &mut world,
+            vec![egui::Event::Text("Nope".into())],
+        );
+        frame(&mut editor, &mut world, vec![key(egui::Key::Escape)]);
+        frame(&mut editor, &mut world, vec![]);
+        assert_eq!(world.get::<Name>(cube).unwrap().0, "Hero");
+        assert!(editor.renaming.is_none());
+    }
+
+    #[test]
+    fn loading_a_scene_clears_the_history() {
+        let dir = pending_dir("history_clear");
+        let path = dir.join("scene.ron");
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        editor.create_cube_step(&mut world);
+        editor.pending_operation = Some(PendingOperation::Save(path.clone()));
+        editor.run_pending_operation(&mut world);
+        assert!(editor.history.can_undo(), "saving keeps the history");
+        editor.pending_operation = Some(PendingOperation::Load(path));
+        editor.run_pending_operation(&mut world);
+        assert!(!editor.history.can_undo() && !editor.history.can_redo());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ctrl_z_with_an_empty_history_changes_nothing() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        let e = create_cube(&mut world);
+        editor.selected = Some(e);
+        press(&mut editor, &mut world, egui::Key::Z, false);
+        press(&mut editor, &mut world, egui::Key::Y, false);
+        assert_eq!(editor.selected, Some(e));
+        assert_eq!(live_names(&mut world), ["Cube"]);
+    }
+
+    #[test]
+    fn undoing_a_create_leaves_no_stale_selection() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        editor.create_cube_step(&mut world);
+        press(&mut editor, &mut world, egui::Key::Z, false);
+        assert_eq!(editor.selected, None, "nothing was selected before");
+        press(&mut editor, &mut world, egui::Key::Z, true);
+        assert!(editor.selected.is_some());
+        // With a selection before the create, undo returns to it.
+        let first = editor.selected.unwrap();
+        editor.create_cube_step(&mut world);
+        assert_ne!(editor.selected, Some(first));
+        press(&mut editor, &mut world, egui::Key::Z, false);
+        assert_eq!(editor.selected, Some(first));
+        let mut cleanup = bevy_ecs::schedule::Schedule::default();
+        cleanup.add_systems(melon_physics::cleanup_deleted_system);
+        cleanup.run(&mut world);
+        assert_eq!(live_names(&mut world), ["Cube"]);
+    }
+
+    /// One frame: a text field (focused from the first frame when `typing`),
+    /// then the shortcuts with Ctrl+Z pressed on frame 3.
+    fn ctrl_z_frames(editor: &mut Editor, world: &mut World, typing: bool) {
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        for frame in 0..4 {
+            let modifiers = if frame == 3 {
+                egui::Modifiers::COMMAND
+            } else {
+                egui::Modifiers::NONE
+            };
+            let events = if frame == 3 {
+                vec![egui::Event::Key {
+                    key: egui::Key::Z,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }]
+            } else {
+                vec![]
+            };
+            let input = egui::RawInput {
+                modifiers,
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                if typing {
+                    let edit = ui.add(egui::TextEdit::singleline(&mut text).id(egui::Id::new("t")));
+                    if frame == 0 {
+                        edit.request_focus();
+                    }
+                }
+                editor.handle_shortcuts(world, ui);
+            });
+        }
+    }
+
+    #[test]
+    fn ctrl_z_in_a_focused_text_field_leaves_the_scene_alone() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        editor.create_cube_step(&mut world);
+        ctrl_z_frames(&mut editor, &mut world, true);
+        assert_eq!(live_names(&mut world), ["Cube"], "scene not undone");
+        assert!(editor.history.can_undo());
+        // Control: with no text field focused the same keys undo.
+        ctrl_z_frames(&mut editor, &mut world, false);
+        assert!(!editor.history.can_undo());
+    }
+
+    #[test]
+    fn row_menu_actions_are_recorded() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        editor.create_cube_step(&mut world);
+        let cube = editor.selected.unwrap();
+        editor.row_action(&mut world, RowAction::CreateChild, cube);
+        let child = editor.selected.unwrap();
+        assert_eq!(
+            world.get::<melon_core::ChildOf>(child).unwrap().parent(),
+            cube
+        );
+        assert_eq!(world.get::<Name>(child).unwrap().0, "Cube");
+        assert_eq!(editor.history.undo_label(), Some("Create Cube"));
+        editor.row_action(&mut world, RowAction::Duplicate, child);
+        assert_eq!(editor.history.undo_label(), Some("Duplicate Cube"));
+        editor.row_action(&mut world, RowAction::Delete, child);
+        assert_eq!(editor.history.undo_label(), Some("Delete Cube"));
+        editor.row_action(&mut world, RowAction::Rename, cube);
+        assert_eq!(editor.renaming.as_ref().map(|r| r.entity), Some(cube));
+    }
+
+    #[test]
+    fn rename_is_cancelled_when_its_row_is_hidden() {
+        let mut world = history_world();
+        let mut editor = Editor::new();
+        editor.create_cube_step(&mut world);
+        editor.hierarchy_query = "zzz".into();
+        editor.start_rename(&world);
+        let ctx = egui::Context::default();
+        full_frame(&ctx, &mut editor, &mut world, vec![]);
+        full_frame(&ctx, &mut editor, &mut world, vec![]);
+        assert!(editor.renaming.is_none());
     }
 }

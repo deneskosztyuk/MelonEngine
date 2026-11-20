@@ -19,6 +19,12 @@ use crate::Time;
 /// Asset type tag for 3D models (glTF files, or `builtin:cube`).
 pub struct Model;
 
+/// Asset type tag for textures (png, jpg, hdr files).
+pub struct Texture;
+
+/// Asset type tag for materials (`.mat` RON files, see `material`).
+pub struct Material;
+
 /// Prefix for assets that have no file (e.g. `builtin:cube`).
 pub const BUILTIN_PREFIX: &str = "builtin:";
 
@@ -33,6 +39,14 @@ impl AssetGuid {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4())
+    }
+
+    pub fn to_bytes(self) -> [u8; 16] {
+        *self.0.as_bytes()
+    }
+
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(uuid::Uuid::from_bytes(bytes))
     }
 }
 
@@ -132,6 +146,7 @@ struct AssetEntry {
     version: u32,
     modified: Option<SystemTime>,
     bounds: Option<(Vec3, Vec3)>,
+    part_bounds: Vec<(Vec3, Vec3)>,
 }
 
 /// Registry of every asset path the project uses.
@@ -142,7 +157,11 @@ pub struct AssetServer {
     by_path: HashMap<String, u32>,
     guid_to_path: HashMap<AssetGuid, String>,
     path_to_guid: HashMap<String, AssetGuid>,
+    /// Bumped whenever the GUID index changes, so anything that resolved
+    /// GUIDs to handles knows to resolve them again.
+    index_epoch: u32,
     since_poll: f32,
+    pack: Option<std::sync::Arc<crate::pack::Pack>>,
 }
 
 /// Seconds between hot-reload checks.
@@ -175,7 +194,9 @@ impl AssetServer {
             by_path: HashMap::new(),
             guid_to_path: HashMap::new(),
             path_to_guid: HashMap::new(),
+            index_epoch: 0,
             since_poll: 0.0,
+            pack: None,
         }
     }
 
@@ -193,6 +214,7 @@ impl AssetServer {
                     version: 0,
                     modified,
                     bounds: None,
+                    part_bounds: Vec::new(),
                 });
                 self.by_path.insert(path, id);
                 id
@@ -230,6 +252,20 @@ impl AssetServer {
         self.entries[handle.id as usize].bounds = Some((min, max));
     }
 
+    /// Local-space bounds of each mesh part (material slot), written by the
+    /// renderer after loading; empty until then.
+    pub fn set_part_bounds<T: Send + Sync + 'static>(
+        &mut self,
+        handle: Handle<T>,
+        parts: Vec<(Vec3, Vec3)>,
+    ) {
+        self.entries[handle.id as usize].part_bounds = parts;
+    }
+
+    pub fn part_bounds<T: Send + Sync + 'static>(&self, handle: Handle<T>) -> &[(Vec3, Vec3)] {
+        &self.entries[handle.id as usize].part_bounds
+    }
+
     pub fn bounds<T: Send + Sync + 'static>(&self, handle: Handle<T>) -> Option<(Vec3, Vec3)> {
         self.entries[handle.id as usize].bounds
     }
@@ -238,11 +274,46 @@ impl AssetServer {
         &self.root
     }
 
+    /// Read an asset's bytes: from the pack when one is set (and nothing else:
+    /// a path the pack lacks is `NotFound`), else from `<root>/<path>`.
+    pub fn read(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        let path = normalise(path);
+        let file = split_mesh_fragment(&path).0;
+        match &self.pack {
+            Some(pack) => pack
+                .read(file)
+                .unwrap_or_else(|| Err(std::io::ErrorKind::NotFound.into())),
+            None => std::fs::read(self.root.join(file)),
+        }
+    }
+
+    /// Serve every read and the GUID index from `pack`; no hot reload then.
+    pub fn set_pack(&mut self, pack: std::sync::Arc<crate::pack::Pack>) {
+        self.index_epoch += 1;
+        self.guid_to_path.clear();
+        self.path_to_guid.clear();
+        for (path, guid) in pack.entries() {
+            if let Some(guid) = guid {
+                self.guid_to_path.insert(guid, path.to_string());
+                self.path_to_guid.insert(path.to_string(), guid);
+            }
+        }
+        self.pack = Some(pack);
+    }
+
+    pub fn has_pack(&self) -> bool {
+        self.pack.is_some()
+    }
+
     /// Rebuild the GUID index from every `.meta` under `<root>/assets`.
     /// Read-only. Broken `.meta` files are logged and skipped, as are ones
     /// whose asset is missing; of two sharing a GUID the first in path order
     /// wins (the editor's reconcile fixes duplicates before scanning).
     pub fn scan_metas(&mut self) {
+        if self.pack.is_some() {
+            return; // the pack index holds the GUIDs
+        }
+        self.index_epoch += 1;
         self.guid_to_path.clear();
         self.path_to_guid.clear();
         for file in asset_dir_files(&self.root) {
@@ -272,6 +343,12 @@ impl AssetServer {
             self.guid_to_path.insert(meta.guid, path.clone());
             self.path_to_guid.insert(path, meta.guid);
         }
+    }
+
+    /// Changes whenever the GUID index does (`scan_metas`, `set_pack`, a
+    /// rename): cached `resolve` results older than it are stale.
+    pub fn index_epoch(&self) -> u32 {
+        self.index_epoch
     }
 
     /// GUID of a file-backed asset path (a `#mesh<N>` fragment is ignored).
@@ -321,6 +398,7 @@ impl AssetServer {
             entry.path = renamed;
         }
         if let Some(guid) = self.path_to_guid.remove(&old) {
+            self.index_epoch += 1;
             self.guid_to_path.insert(guid, new.clone());
             self.path_to_guid.insert(new, guid);
         }
@@ -328,7 +406,7 @@ impl AssetServer {
 
     /// Modified time of a file-backed asset, `None` if built-in or missing.
     fn modified_time(&self, path: &str) -> Option<SystemTime> {
-        if path.starts_with(BUILTIN_PREFIX) {
+        if path.starts_with(BUILTIN_PREFIX) || self.pack.is_some() {
             return None;
         }
         std::fs::metadata(self.root.join(split_mesh_fragment(path).0))
@@ -698,7 +776,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn packed_guid_follows_an_asset_renamed_with_its_meta() {
+        let root = temp_root("pack_rename");
+        let guid = write_asset_with_meta(&root, "assets/models/a.glb");
+        for ext in ["", ".meta"] {
+            std::fs::rename(
+                root.join(format!("assets/models/a.glb{ext}")),
+                root.join(format!("assets/models/sub dir b.glb{ext}")),
+            )
+            .unwrap();
+        }
+        let out = root.join("game.pak");
+        crate::pack::build_pack(&root, &[], &out).unwrap();
+        let mut server = AssetServer::new(root.clone());
+        server.set_pack(std::sync::Arc::new(crate::pack::Pack::open(&out).unwrap()));
+        assert_eq!(
+            server.path_of_guid(guid),
+            Some("assets/models/sub dir b.glb")
+        );
+        assert!(server.read("assets/models/a.glb").is_err());
+        assert!(
+            server.read(r"assets\models\sub dir b.glb").is_ok(),
+            "backslashes are normalised"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Fixture: a `.meta` file as `AssetMeta::to_ron` writes it.
+
+    #[test]
+    fn pack_wins_over_disk_and_serves_guids_without_hot_reload() {
+        let root = temp_root("pack");
+        let guid = write_asset_with_meta(&root, "assets/models/a.glb");
+        std::fs::write(root.join("assets/models/a.glb"), b"packed").unwrap();
+        let out = root.join("game.pak");
+        crate::pack::build_pack(&root, &[], &out).unwrap();
+        std::fs::write(root.join("assets/models/a.glb"), b"on disk now").unwrap();
+        std::fs::remove_file(meta_path(&root.join("assets/models/a.glb"))).unwrap();
+
+        let mut server = AssetServer::new(root.clone());
+        assert_eq!(server.read("assets/models/a.glb").unwrap(), b"on disk now");
+        server.set_pack(std::sync::Arc::new(crate::pack::Pack::open(&out).unwrap()));
+        assert!(server.has_pack());
+        assert_eq!(server.read("assets/models/a.glb").unwrap(), b"packed");
+        assert_eq!(
+            server.read("./assets/models/a.glb#mesh1").unwrap(),
+            b"packed",
+            "paths are normalised, fragments ignored"
+        );
+        assert_eq!(
+            server.read("assets/missing.glb").unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(server.path_of_guid(guid), Some("assets/models/a.glb"));
+        assert_eq!(server.guid_of("assets/models/a.glb"), Some(guid));
+
+        let handle: Handle<Model> = server.load("assets/models/a.glb");
+        touch_later(&root.join("assets/models/a.glb"));
+        server.poll_changes();
+        assert_eq!(server.version(handle), 0, "packed games do not hot reload");
+        let _ = std::fs::remove_dir_all(&root);
+    }
     #[test]
     fn meta_fixture_loads() {
         let root = temp_root("meta_fixture");

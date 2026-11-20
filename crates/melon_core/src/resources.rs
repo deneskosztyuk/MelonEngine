@@ -204,6 +204,13 @@ pub struct Environment {
     /// ambient (`RenderQuality::gi_mode` picks the technique); 0 = off, like
     /// `GiMode::Off` (no GI passes).
     pub gi_intensity: f32,
+    /// An HDR equirect image (linear radiance, `.hdr` or any image file)
+    /// used as the sky: drawn as the background and as the image-based
+    /// ambient light. `None` = the procedural sky (`zenith_color`,
+    /// `horizon_color`).
+    pub sky_texture: Option<crate::Handle<crate::Texture>>,
+    /// Multiplies `sky_texture`'s radiance.
+    pub sky_intensity: f32,
 }
 
 impl Default for Environment {
@@ -217,6 +224,8 @@ impl Default for Environment {
             ao_radius: 0.5,
             bloom_intensity: 0.08,
             gi_intensity: 1.0,
+            sky_texture: None,
+            sky_intensity: 1.0,
         }
     }
 }

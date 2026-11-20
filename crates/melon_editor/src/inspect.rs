@@ -5,14 +5,299 @@ use melon_core::bevy_reflect::{
     enums::{DynamicEnum, DynamicVariant, Enum, VariantInfo},
     list::List,
     std_traits::ReflectDefault,
+    structs::DynamicStruct,
     tuple::DynamicTuple,
 };
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
 use melon_core::glam::{EulerRot, Quat, Vec2, Vec3, Vec4};
 
+use melon_core::ReflectVariantDefaults;
+
+use crate::content::{self, AssetDrag};
 use crate::content_view::id_label;
 use crate::{inspector_value, theme};
 
 const FLOAT_SPEED: f64 = 0.01;
+
+/// How one top-level field of a component is drawn instead of its default
+/// editor (by field name). The caller builds these per component type.
+pub struct FieldWidget {
+    /// Row label; the field name when `None`.
+    pub label: Option<&'static str>,
+    pub kind: WidgetKind,
+}
+
+pub enum WidgetKind {
+    /// A `String` picked from a list. A value not in it shows as missing.
+    Choice(Vec<String>),
+    /// A `String` asset path: a picker of the files under `<root>/assets`
+    /// with one of the extensions, and a drop target for Content Browser drags.
+    Asset {
+        root: PathBuf,
+        extensions: &'static [&'static str],
+    },
+    /// A `u32` bit mask of collision layers: a dropdown with one checkbox per
+    /// layer (labelled by the given names, `Layer N` when empty).
+    Layers(Vec<String>),
+    /// An `f32` slider.
+    Slider { min: f32, max: f32 },
+    /// A `Vec<MaterialSlot>`: one picker per mesh part (`.mat` files under
+    /// `<root>/assets`), each a drop target for Content Browser drags.
+    Materials { root: PathBuf },
+    /// An `f32` angle stored in radians, shown and edited in degrees.
+    Degrees { min: f32, max: f32 },
+    /// A linear `Vec3` colour edited with a colour picker.
+    Color,
+}
+
+/// An angle stored in radians as a drag value in degrees. The stored value
+/// is only touched when the user edits it, so drawing never drifts it.
+pub(crate) fn degrees_field(ui: &mut egui::Ui, radians: &mut f32, min: f32, max: f32) -> bool {
+    let mut degrees = radians.to_degrees();
+    let changed = ui
+        .add(
+            egui::DragValue::new(&mut degrees)
+                .speed(0.5)
+                .range(min..=max)
+                .suffix("\u{b0}")
+                .max_decimals(1),
+        )
+        .changed();
+    if changed {
+        *radians = degrees.to_radians();
+    }
+    changed
+}
+
+/// A picker of the files under `<root>/assets` with one of `extensions`,
+/// and a drop target for Content Browser drags. An empty path shows `None`,
+/// a path that is not a file is flagged missing.
+pub(crate) fn asset_field(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    v: &mut String,
+    root: &Path,
+    extensions: &[&str],
+) -> bool {
+    let mut changed = false;
+    let missing = !v.is_empty() && !root.join(&*v).is_file();
+    let text = if missing {
+        format!("{v} (missing)")
+    } else {
+        choice_label(v, std::slice::from_ref(v))
+    };
+    let combo = egui::ComboBox::from_id_salt(id)
+        .selected_text(text)
+        .width(ui.available_width())
+        .show_ui(ui, |ui| {
+            // Listed only while the dropdown is open.
+            if ui.selectable_label(v.is_empty(), "None").clicked() {
+                v.clear();
+                changed = true;
+            }
+            for path in content::asset_list(root, extensions) {
+                if ui
+                    .selectable_label(*v == path, &path)
+                    .on_hover_text(&path)
+                    .clicked()
+                {
+                    *v = path;
+                    changed = true;
+                }
+            }
+        });
+    // A file dragged from the Content Browser replaces it.
+    let drop = ui.interact(combo.response.rect, id.with("drop"), egui::Sense::hover());
+    if let Some(drag) = drop.dnd_release_payload::<AssetDrag>()
+        && let Some(path) = dropped_asset(root, &drag.path, extensions)
+    {
+        *v = path;
+        changed = true;
+    }
+    changed
+}
+
+pub type FieldWidgets = HashMap<&'static str, FieldWidget>;
+
+/// Dropdown text: the value, flagged when it is not one of `choices`.
+fn choice_label(value: &str, choices: &[String]) -> String {
+    if value.is_empty() {
+        "None".to_string()
+    } else if choices.iter().any(|c| c == value) {
+        value.to_string()
+    } else {
+        format!("{value} (missing)")
+    }
+}
+
+/// Dropdown text of a layer mask: `Nothing`, `Everything` or the layer names.
+fn layers_summary(mask: u32, names: &[String]) -> String {
+    match mask {
+        0 => "Nothing".to_string(),
+        u32::MAX => "Everything".to_string(),
+        _ => (0..32)
+            .filter(|i| mask & (1 << i) != 0)
+            .map(|i| layer_label(names, i))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
+fn layer_label(names: &[String], i: usize) -> String {
+    match names.get(i) {
+        Some(name) if !name.trim().is_empty() => name.clone(),
+        _ => format!("Layer {i}"),
+    }
+}
+
+/// The project-relative path of a dragged file when it has a wanted extension.
+fn dropped_asset(root: &Path, dragged: &Path, extensions: &[&str]) -> Option<String> {
+    let rel = melon_core::assets::project_relative(root, dragged)?;
+    content::has_extension(&rel, extensions).then_some(rel)
+}
+
+/// Put the `.mat` file `dragged` on slot `index` (or add a slot for
+/// `None`); false when it is not a project material.
+fn drop_material(
+    root: &Path,
+    slots: &mut Vec<melon_core::MaterialSlot>,
+    index: Option<usize>,
+    dragged: &Path,
+) -> bool {
+    let Some(rel) = dropped_asset(root, dragged, &["mat"]) else {
+        return false;
+    };
+    let slot = crate::material_assign::slot_for(root, &rel);
+    match index {
+        Some(i) if i < slots.len() => slots[i] = slot,
+        _ => slots.push(slot),
+    }
+    true
+}
+
+/// The editor for a field with a `FieldWidget`; `None` when the value is not
+/// of the type the widget edits (the default editor draws it then).
+fn widget_ui(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    value: &mut dyn PartialReflect,
+    widget: &WidgetKind,
+) -> Option<bool> {
+    match widget {
+        WidgetKind::Slider { min, max } => {
+            let v = value.try_downcast_mut::<f32>()?;
+            Some(ui.add(egui::Slider::new(v, *min..=*max)).changed())
+        }
+        WidgetKind::Layers(names) => {
+            let v = value.try_downcast_mut::<u32>()?;
+            let mut changed = false;
+            egui::ComboBox::from_id_salt(id.with("combo"))
+                .selected_text(layers_summary(*v, names))
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show_ui(ui, |ui| {
+                    for i in 0..32usize {
+                        let mut on = *v & (1 << i) != 0;
+                        let check = ui.checkbox(&mut on, layer_label(names, i));
+                        // Fixed id over the checkbox (widget ids are positional).
+                        ui.interact(check.rect, id.with("layer").with(i), egui::Sense::hover());
+                        if check.changed() {
+                            *v ^= 1 << i;
+                            changed = true;
+                        }
+                    }
+                });
+            Some(changed)
+        }
+        WidgetKind::Choice(choices) => {
+            let v = value.try_downcast_mut::<String>()?;
+            let mut changed = false;
+            egui::ComboBox::from_id_salt(id)
+                .selected_text(choice_label(v, choices))
+                .show_ui(ui, |ui| {
+                    for choice in choices {
+                        if ui.selectable_label(v == choice, choice).clicked() && v != choice {
+                            v.clone_from(choice);
+                            changed = true;
+                        }
+                    }
+                });
+            Some(changed)
+        }
+        WidgetKind::Materials { root } => {
+            let slots = value.try_downcast_mut::<Vec<melon_core::MaterialSlot>>()?;
+            let mut changed = false;
+            for i in 0..slots.len() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Part {i}"));
+                    let current = slots[i].path.clone();
+                    let text = if current.is_empty() {
+                        "Keep glTF material".to_string()
+                    } else {
+                        current.clone()
+                    };
+                    let combo = egui::ComboBox::from_id_salt(id.with(i))
+                        .selected_text(text)
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(current.is_empty(), "Keep glTF material")
+                                .clicked()
+                            {
+                                slots[i] = melon_core::MaterialSlot::default();
+                                changed = true;
+                            }
+                            for path in content::asset_list(root, &["mat"]) {
+                                if ui.selectable_label(current == path, &path).clicked() {
+                                    slots[i] = crate::material_assign::slot_for(root, &path);
+                                    changed = true;
+                                }
+                            }
+                        });
+                    let drop = ui.interact(
+                        combo.response.rect,
+                        id.with(("drop", i)),
+                        egui::Sense::hover(),
+                    );
+                    if let Some(drag) = drop.dnd_release_payload::<AssetDrag>() {
+                        changed |= drop_material(root, slots, Some(i), &drag.path);
+                    }
+                });
+            }
+            let add = ui.button("Add part");
+            if add.clicked() {
+                slots.push(melon_core::MaterialSlot::default());
+                changed = true;
+            }
+            // A material dropped on the button adds a part with it.
+            if let Some(drag) = ui
+                .interact(add.rect, id.with("add_drop"), egui::Sense::hover())
+                .dnd_release_payload::<AssetDrag>()
+            {
+                changed |= drop_material(root, slots, None, &drag.path);
+            }
+            Some(changed)
+        }
+        WidgetKind::Asset { root, extensions } => {
+            let v = value.try_downcast_mut::<String>()?;
+            Some(asset_field(ui, id, v, root, extensions))
+        }
+        WidgetKind::Degrees { min, max } => {
+            let v = value.try_downcast_mut::<f32>()?;
+            Some(degrees_field(ui, v, *min, *max))
+        }
+        WidgetKind::Color => {
+            let v = value.try_downcast_mut::<Vec3>()?;
+            let mut rgb = v.to_array();
+            let changed = ui.color_edit_button_rgb(&mut rgb).changed();
+            if changed {
+                *v = Vec3::from_array(rgb);
+            }
+            Some(changed)
+        }
+    }
+}
 
 /// Edit `value` in place. A struct or tuple struct draws one grid row per
 /// field; each row's editor gets the id `id.with(field_name)` (nested fields
@@ -25,8 +310,21 @@ pub fn reflect_ui(
     value: &mut dyn PartialReflect,
     registry: &TypeRegistry,
 ) -> bool {
+    reflect_ui_with(ui, id, value, registry, &FieldWidgets::new())
+}
+
+/// `reflect_ui`, with `widgets` replacing the editors of named top-level fields.
+pub fn reflect_ui_with(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    value: &mut dyn PartialReflect,
+    registry: &TypeRegistry,
+    widgets: &FieldWidgets,
+) -> bool {
     match value.reflect_ref() {
-        ReflectRef::Struct(_) | ReflectRef::TupleStruct(_) => fields_ui(ui, id, value, registry),
+        ReflectRef::Struct(_) | ReflectRef::TupleStruct(_) => {
+            fields_ui(ui, id, value, registry, widgets)
+        }
         _ => value_ui(ui, id, value, registry),
     }
 }
@@ -37,6 +335,7 @@ fn fields_ui(
     id: egui::Id,
     value: &mut dyn PartialReflect,
     registry: &TypeRegistry,
+    widgets: &FieldWidgets,
 ) -> bool {
     let names: Vec<String> = match value.reflect_ref() {
         ReflectRef::Struct(s) => (0..s.field_len())
@@ -58,9 +357,14 @@ fn fields_ui(
                     _ => None,
                 };
                 let Some(field) = field else { continue };
-                ui.label(&name);
+                let widget = widgets.get(name.as_str());
+                ui.label(widget.and_then(|w| w.label).unwrap_or(&name));
                 let row = id.with(name.as_str());
-                let editor = ui.scope(|ui| value_ui(ui, row, field, registry));
+                let editor = ui.scope(|ui| {
+                    widget
+                        .and_then(|w| widget_ui(ui, row, field, &w.kind))
+                        .unwrap_or_else(|| value_ui(ui, row, field, registry))
+                });
                 // Fixed id over the editor (widget ids are positional).
                 ui.interact(editor.response.rect, row, egui::Sense::hover());
                 changed |= editor.inner;
@@ -139,6 +443,11 @@ fn value_ui(
     {
         return unit_enum_ui(ui, id, e, info.variant_names());
     }
+    if let ReflectMut::Enum(e) = value.reflect_mut()
+        && e.get_represented_enum_info().is_some()
+    {
+        return payload_enum_ui(ui, id, e, registry);
+    }
     if matches!(
         value.reflect_ref(),
         ReflectRef::Struct(_) | ReflectRef::TupleStruct(_)
@@ -147,7 +456,9 @@ fn value_ui(
         return egui::CollapsingHeader::new(title)
             .id_salt(id.with("header"))
             .default_open(true)
-            .show(ui, |ui| fields_ui(ui, id, value, registry))
+            .show(ui, |ui| {
+                fields_ui(ui, id, value, registry, &FieldWidgets::new())
+            })
             .body_returned
             .unwrap_or(false);
     }
@@ -210,6 +521,131 @@ fn unit_enum_ui(ui: &mut egui::Ui, id: egui::Id, e: &mut dyn Enum, names: &[&str
             }
         });
     picked.is_some_and(|name| e.try_apply(&DynamicEnum::new(name, ())).is_ok())
+}
+
+/// Variant dropdown (the combo carries the fixed id `id.with("variant")`,
+/// options `id.with(variant)`), then only the active variant's fields, each
+/// with the id `id.with(field)`. Switching inserts the new variant with the
+/// values `ReflectVariantDefaults` supplies, else default field values.
+fn payload_enum_ui(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    e: &mut dyn Enum,
+    registry: &TypeRegistry,
+) -> bool {
+    let Some(info) = e.get_represented_enum_info() else {
+        return false;
+    };
+    let current = e.variant_name().to_string();
+    let mut picked = None;
+    ui.vertical(|ui| {
+        let combo = egui::ComboBox::from_id_salt(id.with("combo"))
+            .selected_text(&current)
+            .show_ui(ui, |ui| {
+                for name in info.variant_names() {
+                    if id_label(ui, id.with(*name), *name, *name == current).clicked()
+                        && *name != current
+                    {
+                        picked = Some(*name);
+                    }
+                }
+            });
+        ui.interact(
+            combo.response.rect,
+            id.with("variant"),
+            egui::Sense::hover(),
+        );
+    });
+    if let Some(name) = picked
+        && let Some(variant) = info.variant(name)
+    {
+        // The type's own values for the variant, else every field at its default.
+        let supplied = registry
+            .get_type_data::<ReflectVariantDefaults>(info.type_id())
+            .and_then(|d| d.variant_default(name));
+        return match supplied {
+            Some(value) => e.try_apply(&*value).is_ok(),
+            None => e
+                .try_apply(&DynamicEnum::new(name, default_variant(variant, registry)))
+                .is_ok(),
+        };
+    }
+    let mut changed = false;
+    let count = e.field_len();
+    if count > 0 {
+        egui::Grid::new(id.with("fields"))
+            .num_columns(2)
+            .spacing([theme::sizes::SPACING; 2])
+            .show(ui, |ui| {
+                for i in 0..count {
+                    let name = e.name_at(i).map_or_else(|| i.to_string(), str::to_string);
+                    let Some(field) = e.field_at_mut(i) else {
+                        continue;
+                    };
+                    ui.label(&name);
+                    let row = id.with(name.as_str());
+                    let editor = ui.scope(|ui| value_ui(ui, row, field, registry));
+                    ui.interact(editor.response.rect, row, egui::Sense::hover());
+                    changed |= editor.inner;
+                    ui.end_row();
+                }
+            });
+    }
+    changed
+}
+
+/// A variant's payload with every field at its type's default.
+fn default_variant(variant: &VariantInfo, registry: &TypeRegistry) -> DynamicVariant {
+    let default = |tid, path| default_value(registry, tid, path);
+    match variant {
+        VariantInfo::Unit(_) => DynamicVariant::Unit,
+        VariantInfo::Tuple(t) => {
+            let mut tuple = DynamicTuple::default();
+            for f in t.iter() {
+                if let Some(v) = default(f.type_id(), f.type_path()) {
+                    tuple.insert_boxed(v);
+                }
+            }
+            DynamicVariant::Tuple(tuple)
+        }
+        VariantInfo::Struct(s) => {
+            let mut dynamic = DynamicStruct::default();
+            for f in s.iter() {
+                if let Some(v) = default(f.type_id(), f.type_path()) {
+                    dynamic.insert_boxed(f.name(), v);
+                }
+            }
+            DynamicVariant::Struct(dynamic)
+        }
+    }
+}
+
+/// `Default::default()` of a registered type. glam vectors are not
+/// reflected themselves (remote wrappers), so they become the zero struct
+/// the wrapper reads.
+fn default_value(
+    registry: &TypeRegistry,
+    t: std::any::TypeId,
+    path: &str,
+) -> Option<Box<dyn PartialReflect>> {
+    if let Some(d) = registry.get_type_data::<ReflectDefault>(t) {
+        return Some(d.default().into_partial_reflect());
+    }
+    let name = path.rsplit("::").next().unwrap_or(path);
+    let axes: &[&str] = if name.starts_with("Vec2") {
+        &["x", "y"]
+    } else if name.starts_with("Vec3") {
+        &["x", "y", "z"]
+    } else if name.starts_with("Vec4") {
+        &["x", "y", "z", "w"]
+    } else {
+        return None;
+    };
+    let mut s = DynamicStruct::default();
+    for axis in axes {
+        s.insert(*axis, 0.0f32);
+    }
+    Some(Box::new(s))
 }
 
 /// Checkbox for Some / None, then the inner editor. Enabling inserts the
@@ -297,7 +733,7 @@ mod tests {
     use super::*;
     use melon_core::bevy_reflect::{self, Reflect, std_traits::ReflectDefault};
     use melon_core::glam::{EulerRot, Quat, Vec3};
-    use melon_core::{QuatReflect, Vec3Reflect};
+    use melon_core::{QuatReflect, ReflectVariantDefaults, VariantDefaults, Vec3Reflect};
 
     #[derive(Reflect, Debug, Clone, PartialEq, Default)]
     #[reflect(Default)]
@@ -313,6 +749,31 @@ mod tests {
     struct Inner {
         weight: f32,
     }
+    #[derive(Reflect, Debug, Clone, PartialEq)]
+    #[reflect(VariantDefaults)]
+    enum Shape {
+        Ball {
+            radius: f32,
+        },
+        Cube {
+            side: f32,
+            #[reflect(remote = Vec3Reflect)]
+            offset: Vec3,
+        },
+        Point,
+    }
+
+    impl VariantDefaults for Shape {
+        fn variant_default(name: &str) -> Option<Self> {
+            match name {
+                "Cube" => Some(Self::Cube {
+                    side: 2.0,
+                    offset: Vec3::new(0.0, 1.0, 0.0),
+                }),
+                _ => None,
+            }
+        }
+    }
 
     #[derive(Reflect, Debug, Clone, PartialEq)]
     struct Sample {
@@ -327,10 +788,186 @@ mod tests {
         inner: Inner,
         limit: Option<f32>,
         list: Vec<f32>,
+        shape: Shape,
+        mask: u32,
     }
 
-    const FIELDS: [&str; 9] = [
-        "speed", "on", "label", "pos", "rot", "mode", "inner", "limit", "list",
+    #[test]
+    fn choice_label_flags_unknown_values() {
+        let choices = ["Master".to_string(), "Sfx".to_string()];
+        assert_eq!(choice_label("Sfx", &choices), "Sfx");
+        assert_eq!(choice_label("Gone", &choices), "Gone (missing)");
+        assert_eq!(choice_label("", &choices), "None");
+    }
+
+    #[test]
+    fn dropped_asset_needs_project_path_and_extension() {
+        let root = Path::new("/p");
+        let ext = ["ogg", "wav"];
+        assert_eq!(
+            dropped_asset(root, Path::new("/p/assets/a/B.OGG"), &ext).as_deref(),
+            Some("assets/a/B.OGG")
+        );
+        assert_eq!(
+            dropped_asset(root, Path::new("/p/assets/a.glb"), &ext),
+            None
+        );
+        assert_eq!(dropped_asset(root, Path::new("/q/a.wav"), &ext), None);
+    }
+
+    #[test]
+    fn material_slots_take_a_dropped_material_and_a_picked_one() {
+        use melon_core::MaterialSlot;
+        let root = Path::new("/p");
+        let mut slots = vec![MaterialSlot::default(), MaterialSlot::default()];
+        // Dropping on slot 1 sets only that slot.
+        assert!(drop_material(
+            root,
+            &mut slots,
+            Some(1),
+            Path::new("/p/assets/m.mat")
+        ));
+        assert_eq!(slots[0].path, "");
+        assert_eq!(slots[1].path, "assets/m.mat");
+        // Not a material, or outside the project: refused.
+        assert!(!drop_material(
+            root,
+            &mut slots,
+            Some(0),
+            Path::new("/p/assets/a.glb")
+        ));
+        assert!(!drop_material(
+            root,
+            &mut slots,
+            Some(0),
+            Path::new("/q/m.mat")
+        ));
+        // Dropping on the empty list adds one slot.
+        let mut none = Vec::new();
+        assert!(drop_material(
+            root,
+            &mut none,
+            None,
+            Path::new("/p/assets/n.mat")
+        ));
+        assert_eq!(none.len(), 1);
+    }
+
+    #[test]
+    fn material_slots_widget_draws_its_rows() {
+        use melon_core::MaterialSlot;
+        let ctx = egui::Context::default();
+        let mut slots = vec![MaterialSlot {
+            guid: String::new(),
+            path: "assets/m.mat".into(),
+        }];
+        let widget = WidgetKind::Materials {
+            root: PathBuf::from("/p"),
+        };
+        let mut shown = String::new();
+        let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let changed = widget_ui(ui, egui::Id::new("slots"), &mut slots, &widget);
+            assert_eq!(changed, Some(false));
+        });
+        for clipped in &out.shapes {
+            shown.push_str(&format!("{:?}", clipped.shape));
+        }
+        assert!(
+            shown.contains("assets/m.mat") && shown.contains("Add part"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn slider_widget_edits_a_float_field() {
+        let h = Harness::new();
+        let mut v = sample();
+        let widgets = FieldWidgets::from([(
+            "speed",
+            FieldWidget {
+                label: Some("Speed (linear)"),
+                kind: WidgetKind::Slider { min: 0.0, max: 1.0 },
+            },
+        )]);
+        let registry = &h.registry;
+        let mut texts = String::new();
+        let out = h.ctx.run_ui(egui::RawInput::default(), |ui| {
+            reflect_ui_with(ui, root(), &mut v, registry, &widgets);
+        });
+        for clipped in &out.shapes {
+            texts.push_str(&format!("{:?}", clipped.shape));
+        }
+        assert!(texts.contains("Speed (linear)"), "label override drawn");
+    }
+
+    #[test]
+    fn degrees_widget_edits_radians_and_never_drifts_them() {
+        let mut h = Harness::new();
+        h.widgets.insert(
+            "speed",
+            FieldWidget {
+                label: None,
+                kind: WidgetKind::Degrees {
+                    min: 0.0,
+                    max: 90.0,
+                },
+            },
+        );
+        let mut value = sample();
+        value.speed = std::f32::consts::FRAC_PI_2;
+        // Drawing alone leaves the stored radians bit for bit.
+        for _ in 0..3 {
+            assert!(!h.frame(&mut value, vec![]));
+        }
+        assert_eq!(value.speed.to_bits(), std::f32::consts::FRAC_PI_2.to_bits());
+        // Dragging the value 10 points to the left lowers it by 5 degrees.
+        let pos = h.center(root().with("speed"));
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let left = pos - egui::vec2(10.0, 0.0);
+        let mut changed = false;
+        for events in [
+            vec![egui::Event::PointerMoved(pos)],
+            vec![button(true)],
+            vec![egui::Event::PointerMoved(left)],
+            vec![egui::Event::PointerButton {
+                pos: left,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            vec![],
+        ] {
+            changed |= h.frame(&mut value, events);
+        }
+        assert!(changed);
+        let degrees = value.speed.to_degrees();
+        assert!((degrees - 85.0).abs() < 1.5, "{degrees}");
+    }
+
+    #[test]
+    fn colour_widget_leaves_an_unedited_colour_alone() {
+        let mut h = Harness::new();
+        h.widgets.insert(
+            "pos",
+            FieldWidget {
+                label: None,
+                kind: WidgetKind::Color,
+            },
+        );
+        let mut value = sample();
+        let before = value.pos;
+        assert!(!h.frame(&mut value, vec![]));
+        assert_eq!(value.pos, before);
+        assert!(h.ctx.read_response(root().with("pos")).is_some());
+    }
+
+    const FIELDS: [&str; 11] = [
+        "speed", "on", "label", "pos", "rot", "mode", "inner", "limit", "list", "shape", "mask",
     ];
 
     fn sample() -> Sample {
@@ -349,6 +986,8 @@ mod tests {
             inner: Inner { weight: 1.5 },
             limit: Some(4.0),
             list: vec![1.0],
+            shape: Shape::Ball { radius: 1.0 },
+            mask: 0b101,
         }
     }
 
@@ -360,6 +999,7 @@ mod tests {
         ctx: egui::Context,
         registry: TypeRegistry,
         time: f64,
+        widgets: FieldWidgets,
     }
 
     impl Harness {
@@ -370,6 +1010,7 @@ mod tests {
                 ctx: egui::Context::default(),
                 registry,
                 time: 0.0,
+                widgets: FieldWidgets::new(),
             }
         }
 
@@ -381,9 +1022,9 @@ mod tests {
                 ..Default::default()
             };
             let mut changed = false;
-            let registry = &self.registry;
+            let (registry, widgets) = (&self.registry, &self.widgets);
             let _ = self.ctx.run_ui(input, |ui| {
-                changed = reflect_ui(ui, root(), value, registry);
+                changed = reflect_ui_with(ui, root(), value, registry, widgets);
             });
             changed
         }
@@ -488,6 +1129,113 @@ mod tests {
         let mut expected = sample();
         expected.mode = Mode::Run;
         assert_eq!(value, expected);
+    }
+
+    #[test]
+    fn payload_enum_shows_only_the_active_variant_fields() {
+        let mut h = Harness::new();
+        let mut value = sample();
+        h.frame(&mut value, vec![]);
+        let shape = root().with("shape");
+        assert!(h.ctx.read_response(shape.with("radius")).is_some());
+        assert!(h.ctx.read_response(shape.with("side")).is_none());
+    }
+
+    #[test]
+    fn switching_a_payload_variant_inserts_default_fields() {
+        let mut h = Harness::new();
+        let mut value = sample();
+        h.frame(&mut value, vec![]);
+        let shape = root().with("shape");
+        h.click(&mut value, shape.with("variant"));
+        assert!(h.click(&mut value, shape.with("Cube")));
+        assert_eq!(
+            value.shape,
+            Shape::Cube {
+                side: 2.0,
+                offset: Vec3::new(0.0, 1.0, 0.0)
+            }
+        );
+        assert!(h.ctx.read_response(shape.with("side")).is_some());
+        assert!(h.ctx.read_response(shape.with("offset")).is_some());
+        assert!(h.ctx.read_response(shape.with("radius")).is_none());
+        h.click(&mut value, shape.with("variant"));
+        assert!(h.click(&mut value, shape.with("Point")));
+        assert_eq!(value.shape, Shape::Point);
+    }
+
+    #[test]
+    fn editing_a_payload_field_changes_only_it() {
+        let mut h = Harness::new();
+        let mut value = sample();
+        h.frame(&mut value, vec![]);
+        let radius = root().with("shape").with("radius");
+        let pos = h.center(radius);
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut changed = false;
+        for events in [
+            vec![egui::Event::PointerMoved(pos)],
+            vec![button(true)],
+            vec![egui::Event::PointerMoved(pos + egui::vec2(30.0, 0.0))],
+            vec![button(false)],
+        ] {
+            changed |= h.frame(&mut value, events);
+        }
+        assert!(changed);
+        assert!(matches!(value.shape, Shape::Ball { radius } if radius > 1.0));
+    }
+
+    fn layer_names() -> Vec<String> {
+        (0..32)
+            .map(|i| match i {
+                0 => "Default".to_string(),
+                2 => "Enemies".to_string(),
+                _ => String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn layer_mask_widget_shows_named_checkboxes_and_keeps_raw_bits() {
+        let mut h = Harness::new();
+        h.widgets.insert(
+            "mask",
+            FieldWidget {
+                label: None,
+                kind: WidgetKind::Layers(layer_names()),
+            },
+        );
+        let mut value = sample();
+        h.frame(&mut value, vec![]);
+        let mask = root().with("mask");
+        // Open the dropdown: bits 0 (Default) and 2 (Enemies) are on.
+        h.click(&mut value, mask);
+        let layer = |i: usize| mask.with("layer").with(i);
+        assert!(
+            h.ctx.read_response(layer(2)).is_some(),
+            "a checkbox per layer"
+        );
+        assert!(h.ctx.read_response(layer(31)).is_some());
+        // Turning layer 1 on sets only that bit.
+        assert!(h.click(&mut value, layer(1)));
+        assert_eq!(value.mask, 0b111);
+        assert!(h.click(&mut value, layer(0)));
+        assert_eq!(value.mask, 0b110);
+        assert_eq!(value.speed, 2.0, "nothing else changed");
+    }
+
+    #[test]
+    fn layer_summary_names_the_layers() {
+        let names = layer_names();
+        assert_eq!(layers_summary(0b101, &names), "Default, Enemies");
+        assert_eq!(layers_summary(0, &names), "Nothing");
+        assert_eq!(layers_summary(u32::MAX, &names), "Everything");
+        assert_eq!(layers_summary(0b1010, &names), "Layer 1, Layer 3");
     }
 
     #[test]

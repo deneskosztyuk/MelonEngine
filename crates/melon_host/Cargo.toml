@@ -12,7 +12,8 @@ path = "src/game_build.rs"
 melon_core.workspace = true
 melon_render.workspace = true
 melon_physics.workspace = true
-melon_editor.workspace = true
+melon_audio.workspace = true
+melon_editor = { workspace = true, optional = true }
 melon_game.workspace = true
 winit.workspace = true
 wgpu.workspace = true
@@ -21,15 +22,17 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-log.workspace = true
-egui.workspace = true
+egui = { workspace = true, optional = true }
 libloading = { workspace = true, optional = true }
 
 [build-dependencies]
 embed-resource.workspace = true
 
 [features]
+# `--no-default-features` is the player: no editor linked, game plugin linked statically.
 default = ["hot-reload"]
-hot-reload = ["dep:libloading"]
+editor = ["dep:melon_editor", "dep:egui"]
+hot-reload = ["editor", "dep:libloading"]
 
 
 [lints]

@@ -11,20 +11,37 @@ use tracing::instrument;
 
 pub mod actions;
 pub mod assets;
+pub mod audio;
 pub mod components;
+pub mod cursor;
 pub mod hierarchy;
 pub mod input;
+pub mod local_lights;
+pub mod lod;
+pub mod material;
+pub mod pack;
+pub mod package;
+pub mod physics;
+pub mod physics_settings;
+pub mod player;
 pub mod plugin;
 pub mod quality;
 pub mod reflect;
 pub mod resources;
 mod ron_file;
+pub mod scene;
 pub mod stages;
 
 pub use actions::{
     Action, ActionKind, Actions, AxisBinding, InputMap, LoadOutcome, update_actions_system,
 };
-pub use assets::{AssetGuid, AssetMeta, AssetServer, Handle, META_VERSION, Model, meta_path};
+pub use assets::{
+    AssetGuid, AssetMeta, AssetServer, Handle, META_VERSION, Material, Model, Texture, meta_path,
+};
+pub use audio::{
+    AudioBus, AudioClip, AudioListener, AudioPreview, AudioRequest, AudioRequests, AudioSettings,
+    AudioSource,
+};
 pub use bevy_ecs;
 pub use bevy_ecs::query::With;
 pub use bevy_reflect;
@@ -32,20 +49,32 @@ pub use components::{
     Aabb, Bob, BodyInfo, BodyKind, Name, PendingDelete, PreviousTransform, Spin, Transform,
     store_previous_transforms_system,
 };
+pub use cursor::{AppExit, Cursor, CursorMode};
 pub use glam;
 pub use hierarchy::{ChildOf, Children, GlobalTransform};
 pub use input::{GameInputGate, Input, InputButton, InputFocus, KeyCode, MouseButton, RawPresses};
+pub use local_lights::{PointLight, SpotLight};
+pub use lod::{Lod, LodLevel, LodState};
+pub use material::{AlphaMode, MaterialAsset, MaterialSlot, MeshMaterials, TextureRef};
+pub use physics::{
+    CharacterController, Collider, ColliderShape, CollisionEvent, CollisionEventKind, Joint,
+    JointKind, PhysicsQueries, PhysicsRequest, PhysicsRequests, QueryBackend, QueryFilter, RayHit,
+    RigidBody, RigidBodyKind, Velocity,
+};
+pub use physics_settings::{LAYER_COUNT, PhysicsSettings};
+pub use player::{PlayerSettings, WindowMode};
 pub use plugin::{App, Plugin, abi_fingerprint};
 pub use quality::{
     GiMode, PresentPreference, QualityPreset, QualitySetting, RenderQuality, RenderTimings,
     SsgiResolution,
 };
 pub use reflect::{
-    ComponentInfo, QuatReflect, RegistryGeneration, Vec2Reflect, Vec3Reflect, Vec4Reflect,
-    display_name, registered_components,
+    ComponentInfo, QuatReflect, ReflectVariantDefaults, RegistryGeneration, VariantDefaults,
+    Vec2Reflect, Vec3Reflect, Vec4Reflect, display_name, registered_components,
 };
 pub use resources::{Camera, Environment, Light, NameCounter, SimulationState, Time};
-pub use stages::{FixedUpdate, PostUpdate, PreUpdate, Update};
+pub use scene::{KeepOnSceneLoad, SceneRequests};
+pub use stages::{FixedPostUpdate, FixedUpdate, PhysicsStep, PostUpdate, PreUpdate, Update};
 
 /// What a game crate needs to define and register components:
 /// `use melon_core::prelude::*;` then `#[derive(Component, Reflect)]`.
@@ -113,6 +142,8 @@ fn stage_schedules() -> Schedules {
     let mut schedules = Schedules::new();
     schedules.insert(Schedule::new(PreUpdate));
     schedules.insert(Schedule::new(FixedUpdate));
+    schedules.insert(Schedule::new(PhysicsStep));
+    schedules.insert(Schedule::new(FixedPostUpdate));
     schedules.insert(Schedule::new(Update));
     schedules.insert(Schedule::new(PostUpdate));
     schedules
@@ -135,15 +166,32 @@ impl Core {
         world.init_resource::<InputMap>();
         world.init_resource::<Actions>();
         world.init_resource::<RenderQuality>();
+        world.init_resource::<AudioSettings>();
+        world.init_resource::<AudioRequests>();
+        world.init_resource::<AudioPreview>();
         world.init_resource::<AppTypeRegistry>();
         world.init_resource::<RegistryGeneration>();
+        world.init_resource::<bevy_ecs::message::Messages<CollisionEvent>>();
+        world.init_resource::<PhysicsQueries>();
+        world.init_resource::<PhysicsRequests>();
+        world.init_resource::<PhysicsSettings>();
+        world.init_resource::<scene::SceneRequests>();
+        world.init_resource::<PlayerSettings>();
+        world.init_resource::<Cursor>();
+        world.init_resource::<AppExit>();
 
         let mut core = Self {
             world,
             schedules: stage_schedules(),
             plugin_schedules: stage_schedules(),
         };
-        core.add_systems(PreUpdate, update_actions_system);
+        core.add_systems(
+            PreUpdate,
+            (
+                scene::scene_requests_system.before(update_actions_system),
+                update_actions_system,
+            ),
+        );
         core.add_systems(Update, (frame_counter_system, log_frame_system));
         core.add_systems(
             PostUpdate,
@@ -155,9 +203,18 @@ impl Core {
         core.add_systems(Update, assets::hot_reload_system);
         core.register_component::<Transform>()
             .register_component::<Aabb>()
-            .register_component::<BodyInfo>()
+            .register_component::<RigidBody>()
+            .register_component::<Collider>()
+            .register_component::<CharacterController>()
+            .register_component::<Joint>()
             .register_component::<Spin>()
-            .register_component::<Bob>();
+            .register_component::<Bob>()
+            .register_component::<AudioSource>()
+            .register_component::<AudioListener>()
+            .register_component::<MeshMaterials>()
+            .register_component::<PointLight>()
+            .register_component::<SpotLight>()
+            .register_component::<Lod>();
         core
     }
 
@@ -243,19 +300,27 @@ impl Core {
             if let Some(mut time) = self.world.get_resource_mut::<Time>() {
                 time.elapsed_seconds += time.fixed_delta;
             }
-            self.run_stage(FixedUpdate);
+            self.fixed_step();
         }
         // Time is borrowed only for the check, so the stage can borrow the world.
         while let Some(mut time) = self.world.get_resource_mut::<Time>()
             && time.overstep >= time.fixed_delta
         {
             time.overstep -= time.fixed_delta;
-            self.run_stage(FixedUpdate);
+            self.fixed_step();
         }
 
         self.run_stage(Update);
         self.run_stage(PostUpdate);
         self.world.clear_trackers();
+    }
+
+    /// One fixed step: game and engine `FixedUpdate`, the physics step, then
+    /// `FixedPostUpdate`.
+    fn fixed_step(&mut self) {
+        self.run_stage(FixedUpdate);
+        self.run_stage(PhysicsStep);
+        self.run_stage(FixedPostUpdate);
     }
 
     fn run_stage(&mut self, label: impl ScheduleLabel + Clone) {

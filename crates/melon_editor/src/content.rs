@@ -13,18 +13,22 @@ pub enum AssetKind {
     Folder,
     Model,
     Texture,
+    Material,
     Shader,
     Scene,
+    Audio,
     Other,
 }
 
 impl AssetKind {
     /// Every kind a file can be, in filter-chip order.
-    pub const FILE_KINDS: [AssetKind; 5] = [
+    pub const FILE_KINDS: [AssetKind; 7] = [
         AssetKind::Model,
         AssetKind::Texture,
+        AssetKind::Material,
         AssetKind::Shader,
         AssetKind::Scene,
+        AssetKind::Audio,
         AssetKind::Other,
     ];
 
@@ -33,8 +37,10 @@ impl AssetKind {
             AssetKind::Folder => "Folder",
             AssetKind::Model => "Model",
             AssetKind::Texture => "Texture",
+            AssetKind::Material => "Material",
             AssetKind::Shader => "Shader",
             AssetKind::Scene => "Scene",
+            AssetKind::Audio => "Audio",
             AssetKind::Other => "Other",
         }
     }
@@ -51,8 +57,10 @@ pub fn asset_kind(path: &Path, is_dir: bool) -> AssetKind {
     match ext.as_str() {
         "glb" | "gltf" => AssetKind::Model,
         "png" | "jpg" | "jpeg" | "hdr" => AssetKind::Texture,
+        "mat" => AssetKind::Material,
         "wgsl" => AssetKind::Shader,
         "ron" => AssetKind::Scene,
+        e if melon_core::audio::AUDIO_EXTENSIONS.contains(&e) => AssetKind::Audio,
         _ => AssetKind::Other,
     }
 }
@@ -106,6 +114,11 @@ pub fn list_dir(path: &Path) -> Vec<ContentEntry> {
 pub enum BrowserRequest {
     /// Create "New Folder" inside this folder.
     NewFolder(PathBuf),
+    /// Create "New Material.mat" inside this folder.
+    NewMaterial(PathBuf),
+    /// Write the glTF model's materials as `.mat` files (and textures) next
+    /// to it and assign them on the selected entity that uses it.
+    ExtractMaterials(PathBuf),
     Rename(PathBuf, String),
     Duplicate(PathBuf),
     /// Ask before deleting (the editor lists what uses it).
@@ -117,6 +130,9 @@ pub enum BrowserRequest {
     Reveal(PathBuf),
     /// Open a file (scene or OS default app).
     Open(PathBuf),
+    /// Play this audio file on the `Ui` bus.
+    PreviewAudio(PathBuf),
+    StopAudioPreview,
 }
 
 /// An inline rename in progress.
@@ -211,9 +227,10 @@ pub fn is_model_path(path: &str) -> bool {
 /// project-relative, forward-slash path, sorted.
 pub fn model_list(project_root: &Path) -> Vec<String> {
     let mut models = Vec::new();
-    collect_models(
+    collect_assets(
         &project_root.join("assets/models"),
         project_root,
+        &|name| is_model_path(name),
         &mut models,
     );
     models.sort();
@@ -221,11 +238,37 @@ pub fn model_list(project_root: &Path) -> Vec<String> {
     models
 }
 
-fn collect_models(dir: &Path, project_root: &Path, out: &mut Vec<String>) {
+/// Every file under `<project>/assets` with one of `extensions` (lower
+/// case, no dot) as a project-relative path, sorted.
+pub fn asset_list(project_root: &Path, extensions: &[&str]) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_assets(
+        &project_root.join("assets"),
+        project_root,
+        &|name| has_extension(name, extensions),
+        &mut files,
+    );
+    files.sort();
+    files
+}
+
+/// True when `name` ends in one of `extensions` (case-insensitive).
+pub fn has_extension(name: &str, extensions: &[&str]) -> bool {
+    Path::new(name)
+        .extension()
+        .is_some_and(|e| extensions.contains(&e.to_string_lossy().to_lowercase().as_str()))
+}
+
+fn collect_assets(
+    dir: &Path,
+    project_root: &Path,
+    wanted: &dyn Fn(&str) -> bool,
+    out: &mut Vec<String>,
+) {
     for entry in list_dir(dir) {
         if entry.is_dir {
-            collect_models(&entry.path, project_root, out);
-        } else if is_model_path(&entry.name)
+            collect_assets(&entry.path, project_root, wanted, out);
+        } else if wanted(&entry.name)
             && let Some(path) = project_relative(project_root, &entry.path)
         {
             out.push(path);
@@ -302,6 +345,8 @@ pub struct ContentBrowser {
     /// filter changes.
     visible: Vec<ContentEntry>,
     requests: Vec<BrowserRequest>,
+    /// Project-relative path of the clip the editor preview is playing.
+    audio_preview: Option<String>,
     /// The last click landed inside the browser: its keys (F2, Ctrl+D,
     /// Delete, Enter) act on the selection.
     pub(crate) focused: bool,
@@ -339,6 +384,7 @@ impl ContentBrowser {
             files: None,
             visible: Vec::new(),
             requests: Vec::new(),
+            audio_preview: None,
             focused: false,
             renaming: None,
             blocked: false,
@@ -354,6 +400,26 @@ impl ContentBrowser {
     /// File operations asked for since the last call.
     pub fn take_requests(&mut self) -> Vec<BrowserRequest> {
         std::mem::take(&mut self.requests)
+    }
+
+    /// What the audio preview plays now (the editor sets it each frame).
+    pub fn set_audio_preview(&mut self, playing: Option<String>) {
+        self.audio_preview = playing;
+    }
+
+    /// For a selected audio file: whether it is playing, and the request a
+    /// click on the Preview button sends (stop when playing, else play).
+    pub(crate) fn audio_toggle(&self) -> Option<(bool, BrowserRequest)> {
+        let path = self.selected()?;
+        if asset_kind(path, path.is_dir()) != AssetKind::Audio {
+            return None;
+        }
+        let rel = melon_core::assets::project_relative(self.root().parent()?, path)?;
+        if self.audio_preview.as_deref() == Some(rel.as_str()) {
+            Some((true, BrowserRequest::StopAudioPreview))
+        } else {
+            Some((false, BrowserRequest::PreviewAudio(path.to_path_buf())))
+        }
     }
 
     pub(crate) fn request(&mut self, request: BrowserRequest) {
@@ -836,9 +902,62 @@ mod tests {
         assert_eq!(asset_kind(Path::new("a/b.gltf"), false), AssetKind::Model);
         assert_eq!(asset_kind(Path::new("t.JPeG"), false), AssetKind::Texture);
         assert_eq!(asset_kind(Path::new("s.wgsl"), false), AssetKind::Shader);
+        assert_eq!(asset_kind(Path::new("m.MAT"), false), AssetKind::Material);
         assert_eq!(asset_kind(Path::new("level.ron"), false), AssetKind::Scene);
         assert_eq!(asset_kind(Path::new("README.md"), false), AssetKind::Other);
         assert_eq!(asset_kind(Path::new("models"), true), AssetKind::Folder);
+        for audio in ["a.wav", "b.OGG", "c.mp3", "d.Flac"] {
+            assert_eq!(
+                asset_kind(Path::new(audio), false),
+                AssetKind::Audio,
+                "{audio}"
+            );
+        }
+    }
+
+    #[test]
+    fn asset_list_finds_files_by_extension() {
+        let dir = temp_dir("asset_list");
+        let sub = dir.join("assets/audio/deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        for f in [
+            "assets/audio/b.OGG",
+            "assets/audio/deep/a.wav",
+            "assets/x.glb",
+        ] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        assert_eq!(
+            asset_list(&dir, &["wav", "ogg"]),
+            ["assets/audio/b.OGG", "assets/audio/deep/a.wav"]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn audio_toggle_plays_or_stops_the_selected_clip() {
+        let dir = temp_dir("audio_toggle");
+        let root = dir.join("assets");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("door.ogg"), b"x").unwrap();
+        std::fs::write(root.join("a.glb"), b"x").unwrap();
+        let mut browser = ContentBrowser::new(root.clone());
+        assert!(browser.audio_toggle().is_none(), "nothing selected");
+        browser.select(Some(root.join("a.glb")));
+        assert!(browser.audio_toggle().is_none(), "not audio");
+        browser.select(Some(root.join("door.ogg")));
+        assert!(matches!(
+            browser.audio_toggle(),
+            Some((false, BrowserRequest::PreviewAudio(p))) if p == root.join("door.ogg")
+        ));
+        browser.set_audio_preview(Some("assets/door.ogg".into()));
+        assert!(matches!(
+            browser.audio_toggle(),
+            Some((true, BrowserRequest::StopAudioPreview))
+        ));
+        browser.set_audio_preview(Some("assets/other.ogg".into()));
+        assert!(matches!(browser.audio_toggle(), Some((false, _))));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
