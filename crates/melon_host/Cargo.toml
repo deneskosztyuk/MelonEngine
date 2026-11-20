@@ -12,6 +12,7 @@ melon_physics.workspace = true
 melon_editor.workspace = true
 melon_game.workspace = true
 winit.workspace = true
+wgpu.workspace = true
 pollster.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

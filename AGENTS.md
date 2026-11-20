@@ -61,6 +61,23 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   it from `InputFocus`: `Game` while playing, Esc gives it back to `Editor`).
   `RawPresses` sees every press whatever the focus and is cleared after the
   editor UI (rebinding capture).
+- **Frame pacing (`melon_host/src/pacing.rs`).** Raw device events are off
+  (`DeviceEvents::Never`) and turn on (`WhenFocused`) only while
+  `GameInputGate` is open: mouse look is their only user, and while the
+  editor has input they were ~3,000 wake-ups/s that dropped frames on
+  right-drag. The surface presents with `Mailbox` when offered, else `Fifo`
+  (`MELON_PRESENT=fifo` forces FIFO, a debug A/B switch). Mailbox does not
+  wait for vblank, so the host caps frames at the monitor refresh rate
+  (60 Hz if unknown): `about_to_wait` sets `ControlFlow::WaitUntil` the next
+  deadline (previous deadline + period, no drift; a hitch restarts the grid)
+  and requests the redraw when it is due. FIFO keeps `Poll` + redraw.
+- **Diagnosing stutter.** `$env:MELON_FRAME_STATS=1` makes the host print one
+  stderr line every 2 s: FPS, average and worst frame interval, the worst
+  frame's stages (update, acquire, editor, render, submit, other = events and
+  waiting) and window/device events per frame. Off, it reads no clock.
+  Redirect stderr to a file (`2> stats.txt`): a pipe filter can block it. Nothing in the engine runs on
+  a 0.5 s beat except the asset poll, one `fs::metadata` per file-backed
+  asset (built-ins skipped).
 - **Never replace `core.world` after the first frame.** bevy systems are bound
   to the first `World` they run on and panic on another one. To reset a
   scene, despawn its entities (`load_scene` despawns entities with a

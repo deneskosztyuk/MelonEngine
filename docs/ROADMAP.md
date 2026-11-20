@@ -132,6 +132,9 @@ Goal: an editor that looks and works like Unity / Unreal / Godot.
 - [x] Layout redesign: dockable tabbed panels (saved layout), menu bar,
       toolbar, status bar, theme, console from `tracing`, content browser,
       hierarchy search, Step.
+- [x] Editor frame pacing: raw device events only while the game has
+      input, Mailbox present with a refresh-rate frame cap (FIFO fallback,
+      `MELON_PRESENT=fifo`), `MELON_FRAME_STATS=1` timing line.
 - [ ] Undo / Redo (command history), rename, duplicate.
 - [ ] Game view (game camera) next to the Scene view.
 - [ ] Gizmo upgrades: plane handles, local/world toggle.

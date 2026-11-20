@@ -2239,6 +2239,7 @@ dependencies = [
  "tracing",
  "tracing-log",
  "tracing-subscriber",
+ "wgpu",
  "winit",
 ]
 

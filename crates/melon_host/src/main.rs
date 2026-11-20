@@ -1,3 +1,5 @@
+mod pacing;
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,7 +23,7 @@ use winit::event::{
 use winit::keyboard::{KeyCode as WinitKeyCode, PhysicalKey};
 use winit::{
     application::ApplicationHandler,
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop},
     window::{CursorGrabMode, Window, WindowId},
 };
 
@@ -262,6 +264,10 @@ struct App {
     /// `config/input.ron` failed to load: the editor backs it up before its first save.
     input_map_broken: bool,
     last_frame: Option<Instant>,
+    /// Frame cap, set when the present mode does not wait for vblank.
+    pacer: Option<pacing::FrameDeadline>,
+    /// `MELON_FRAME_STATS=1` timings.
+    stats: pacing::FrameStats,
 }
 
 /// Project folder asset paths are relative to.
@@ -357,6 +363,8 @@ impl App {
             game_input: false,
             input_map_broken,
             last_frame: None,
+            pacer: None,
+            stats: pacing::FrameStats::from_env(),
         }
     }
 
@@ -437,11 +445,23 @@ impl ApplicationHandler for App {
         }
 
         tracing::info!(
-            "renderer ready: {}x{} {:?}",
+            "renderer ready: {}x{} {:?} {:?}",
             size.width,
             size.height,
-            renderer.surface_format()
+            renderer.surface_format(),
+            renderer.present_mode()
         );
+        if renderer.present_mode() == wgpu::PresentMode::Mailbox {
+            // ponytail: the rate is read once; moving the window to another
+            // monitor keeps the first one's cap.
+            let refresh = window
+                .current_monitor()
+                .and_then(|m| m.refresh_rate_millihertz());
+            self.pacer = Some(pacing::FrameDeadline::new(
+                pacing::frame_period(refresh),
+                Instant::now(),
+            ));
+        }
         tracing::info!(
             "viewport: right-drag look, right+WASD/QE fly, Alt+left orbit, middle pan, scroll zoom, F frame"
         );
@@ -459,6 +479,7 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        self.stats.window_event();
         // Whether egui used an event no longer matters: the raw stream records
         // everything and the gate decides what the game gets. While the game has
         // the mouse, egui gets no pointer input (the hidden cursor would click the UI).
@@ -518,7 +539,11 @@ impl ApplicationHandler for App {
                     .unwrap_or(0);
                 let _frame_span = tracing::info_span!("frame", n = frame_n).entered();
 
+                self.stats.frame_start();
                 let now = Instant::now();
+                if let Some(pacer) = self.pacer.as_mut() {
+                    pacer.advance(now);
+                }
                 if let Some(mut time) = self.core.world.get_resource_mut::<Time>() {
                     let dt = self
                         .last_frame
@@ -529,6 +554,7 @@ impl ApplicationHandler for App {
                 self.last_frame = Some(now);
 
                 self.core.update();
+                self.stats.lap(pacing::Stage::Update);
 
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
@@ -546,6 +572,7 @@ impl ApplicationHandler for App {
                     clear_raw_presses(&mut self.core.world);
                     return;
                 };
+                self.stats.lap(pacing::Stage::Acquire);
 
                 // Editor UI first: it may move the camera, edit entities or
                 // queue a File operation, and this frame should show all of it.
@@ -557,6 +584,7 @@ impl ApplicationHandler for App {
                     &mut self.core.world,
                     editor_ui,
                 );
+                self.stats.lap(pacing::Stage::Editor);
                 clear_raw_presses(&mut self.core.world);
                 // The editor wrote the gate during its UI pass; it applies from the next events on.
                 let gate = self
@@ -568,6 +596,7 @@ impl ApplicationHandler for App {
                     && apply_gate(&mut input, &mut self.game_input, gate)
                 {
                     grab_cursor(window, gate);
+                    event_loop.listen_device_events(pacing::device_events(gate));
                 }
                 if editor_ui.run_pending_operation(&mut self.core.world) {
                     event_loop.exit();
@@ -608,9 +637,14 @@ impl ApplicationHandler for App {
                     let mut pass = renderer.ui_pass(&mut frame);
                     editor.render(&mut pass);
                 }
+                self.stats.lap(pacing::Stage::Render);
                 renderer.end_frame(frame);
+                self.stats.lap(pacing::Stage::Submit);
 
-                window.request_redraw();
+                // Capped frames are requested in `about_to_wait`.
+                if self.pacer.is_none() {
+                    window.request_redraw();
+                }
             }
             _ => {}
         }
@@ -619,6 +653,7 @@ impl ApplicationHandler for App {
     /// Raw mouse motion (unaccelerated, works with a confined cursor) drives
     /// the game's mouse look.
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        self.stats.device_event();
         if let DeviceEvent::MouseMotion { delta: (x, y) } = event
             && self.game_input
             && let Some(mut input) = self.core.world.get_resource_mut::<Input>()
@@ -627,8 +662,16 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // ControlFlow::Poll already spins continuously — no redraw request needed.
+        // With the frame cap, sleep until the deadline (winit's Windows wait
+        // uses a high-resolution timer), still handling input meanwhile.
+        if let (Some(pacer), Some(window)) = (self.pacer.as_ref(), self.window.as_ref()) {
+            if Instant::now() >= pacer.next() {
+                window.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(pacer.next()));
+        }
     }
 }
 
@@ -648,6 +691,8 @@ fn main() {
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
+    // Raw mouse motion is only for the game; the gate turns it on.
+    event_loop.listen_device_events(DeviceEvents::Never);
 
     let mut app = App::new(console);
     if let Err(e) = event_loop.run_app(&mut app) {
