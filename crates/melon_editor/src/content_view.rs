@@ -166,6 +166,13 @@ impl ContentBrowser {
                 Some(_) => {}
             }
         }
+        let browser_rect = ui.max_rect();
+        if let Some(start) = &mut self.flashed {
+            let start = *start.get_or_insert(now);
+            if now - start >= sizes::PING_SECONDS {
+                self.flashed = None;
+            }
+        }
 
         self.toolbar(ui, &mut actions);
         ui.separator();
@@ -203,6 +210,15 @@ impl ContentBrowser {
             .id_salt("content_items")
             .auto_shrink(false)
             .show(ui, |ui| self.asset_view(ui, &mut actions));
+        if self.flashing() {
+            ui.painter().rect_stroke(
+                browser_rect,
+                sizes::RADIUS,
+                egui::Stroke::new(sizes::PING_STROKE, colors::ACCENT),
+                egui::StrokeKind::Inside,
+            );
+            ui.ctx().request_repaint();
+        }
 
         for action in actions {
             match action {

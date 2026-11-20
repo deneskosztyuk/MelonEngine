@@ -23,6 +23,7 @@ pub mod asset_watch;
 pub mod console;
 pub mod content;
 mod content_view;
+mod drawer;
 pub mod gizmo;
 pub mod layout;
 pub mod play;
@@ -121,6 +122,10 @@ pub struct Editor {
     confirm_open: Option<std::path::PathBuf>,
     /// The Content Browser tab was drawn last frame (it takes OS file drops).
     content_shown: bool,
+    /// The Content Browser tab (not the drawer) was drawn last frame;
+    /// during the dock, whether it was drawn this frame.
+    content_tab_shown: bool,
+    drawer: drawer::DrawerState,
     /// Follows changes under `assets/` made outside the editor; `None` if
     /// it could not start (Refresh still works).
     watcher: Option<asset_watch::AssetWatcher>,
@@ -193,6 +198,8 @@ impl Default for Editor {
             delete_confirm: None,
             confirm_open: None,
             content_shown: false,
+            content_tab_shown: false,
+            drawer: drawer::DrawerState::default(),
             watcher: None,
             watch_check: None,
             meta_recheck: None,
@@ -349,6 +356,7 @@ impl Editor {
                 egui::Key::E,
                 egui::Key::R,
                 egui::Key::Escape,
+                egui::Key::Space,
             ]
             .into_iter()
             .filter(|key| fresh_press(i, *key))
@@ -370,6 +378,7 @@ impl Editor {
                 Shortcut::Move => self.gizmo_mode = GizmoMode::Move,
                 Shortcut::Rotate => self.gizmo_mode = GizmoMode::Rotate,
                 Shortcut::Scale => self.gizmo_mode = GizmoMode::Scale,
+                Shortcut::ToggleDrawer => self.toggle_drawer(),
             }
         }
     }
@@ -504,6 +513,13 @@ impl Editor {
                 }
             } else {
                 ui.colored_label(theme::colors::SUCCESS, "Ready");
+            }
+            let button = ui
+                .add(egui::Button::selectable(self.drawer.open, "Content Drawer"))
+                .on_hover_text("Ctrl+Space");
+            self.drawer.button = Some(button.rect);
+            if button.clicked() {
+                self.toggle_drawer();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let tool = match self.gizmo_mode {
@@ -1084,6 +1100,7 @@ impl Editor {
         self.delete_dialog(world, ui);
         self.open_scene_dialog(world, ui);
         self.take_dropped_files(ui);
+        self.content_tab_shown = false;
 
         // Dockable panels fill the rest of the window.
         self.overlay_draws.clear();
@@ -1107,6 +1124,7 @@ impl Editor {
                     );
             });
         self.dock = dock;
+        self.drawer_ui(world, ui);
         if std::mem::take(&mut self.focus_content_tab) {
             layout::reopen(&mut self.dock, layout::EditorTab::ContentBrowser);
         }
@@ -2420,6 +2438,8 @@ pub enum Shortcut {
     Scale,
     /// Esc: input focus back to the editor (the game keeps running).
     ReleaseGame,
+    /// Ctrl+Space: show or hide the Content Drawer.
+    ToggleDrawer,
 }
 
 /// `key` went down this frame. Key repeat does not count, so a key held since
@@ -2443,6 +2463,7 @@ pub fn shortcut_for(key: egui::Key, ctrl: bool, typing: bool, flying: bool) -> O
         egui::Key::E if !flying && !ctrl => Some(Shortcut::Rotate),
         egui::Key::R if !flying && !ctrl => Some(Shortcut::Scale),
         egui::Key::Escape => Some(Shortcut::ReleaseGame),
+        egui::Key::Space if ctrl => Some(Shortcut::ToggleDrawer),
         _ => None,
     }
 }
@@ -2504,6 +2525,7 @@ impl egui_dock::TabViewer for EditorTabs<'_> {
             }
             EditorTab::ContentBrowser => {
                 self.editor.content_shown = true;
+                self.editor.content_tab_shown = true;
                 self.editor.content.blocked =
                     self.editor.delete_confirm.is_some() || self.editor.confirm_open.is_some();
                 self.editor.content.ui(ui);
@@ -4327,6 +4349,281 @@ mod tests {
             editor.content_shown,
             "Show brought the browser to the front"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One 1600 x 900 frame at `time` with `modifiers` held.
+    fn drawer_frame(
+        ctx: &egui::Context,
+        editor: &mut Editor,
+        world: &mut World,
+        time: f64,
+        modifiers: egui::Modifiers,
+        events: Vec<egui::Event>,
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            time: Some(time),
+            modifiers,
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| editor.build_ui(world, ui));
+    }
+
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    fn ctrl_space(ctx: &egui::Context, editor: &mut Editor, world: &mut World, time: f64) {
+        let ctrl = egui::Modifiers::COMMAND;
+        drawer_frame(
+            ctx,
+            editor,
+            world,
+            time,
+            ctrl,
+            vec![
+                key_event(egui::Key::Space, ctrl),
+                egui::Event::Key {
+                    key: egui::Key::Space,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: ctrl,
+                },
+            ],
+        );
+    }
+
+    fn press_events(pos: egui::Pos2) -> Vec<egui::Event> {
+        let press = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        vec![egui::Event::PointerMoved(pos), press(true), press(false)]
+    }
+
+    /// The Console in front of the Content Browser in their shared group.
+    fn hide_content_tab(editor: &mut Editor) {
+        let console = editor.dock.find_tab(&layout::EditorTab::Console).unwrap();
+        let _ = editor.dock.set_active_tab(console);
+    }
+
+    /// A project with the browser tab hidden and the drawer opened by
+    /// Ctrl+Space and slid fully in. Returns the time of the last frame.
+    fn open_drawer(name: &str) -> (Editor, World, std::path::PathBuf, egui::Context, f64) {
+        let (mut editor, mut world, root) = browser_project(name);
+        hide_content_tab(&mut editor);
+        let ctx = egui::Context::default();
+        let none = egui::Modifiers::NONE;
+        drawer_frame(&ctx, &mut editor, &mut world, 0.0, none, Vec::new());
+        ctrl_space(&ctx, &mut editor, &mut world, 0.1);
+        let mut t = 0.1;
+        for _ in 0..5 {
+            t += 0.1;
+            drawer_frame(&ctx, &mut editor, &mut world, t, none, Vec::new());
+        }
+        assert!(editor.drawer.open);
+        (editor, world, root, ctx, t)
+    }
+
+    #[test]
+    fn ctrl_space_toggles_the_drawer_when_the_tab_is_hidden() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_toggle");
+        let rect = editor.drawer.rect.expect("drawer drawn");
+        assert_eq!(rect.width(), 1600.0);
+        let full = 900.0 * theme::sizes::DRAWER_HEIGHT_SHARE;
+        assert!((rect.height() - full).abs() < 1.0, "{rect:?}");
+        assert!((rect.bottom() - (900.0 - theme::sizes::STATUS_HEIGHT)).abs() < 1.0);
+        assert!(!editor.content_tab_shown);
+        ctrl_space(&ctx, &mut editor, &mut world, t + 0.1);
+        assert!(!editor.drawer.open);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ctrl_space_with_the_tab_visible_flashes_it_instead() {
+        let (mut editor, mut world, root) = browser_project("drawer_flash");
+        let ctx = egui::Context::default();
+        drawer_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            0.0,
+            egui::Modifiers::NONE,
+            Vec::new(),
+        );
+        ctrl_space(&ctx, &mut editor, &mut world, 0.1);
+        assert!(!editor.drawer.open);
+        assert!(editor.content.flashing());
+        assert!(editor.content_tab_shown);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ctrl_space_ignored_with_game_focus() {
+        let (mut editor, mut world, root) = browser_project("drawer_game");
+        hide_content_tab(&mut editor);
+        world.insert_resource(SimulationState::Playing);
+        world.insert_resource(InputFocus::Game);
+        let ctx = egui::Context::default();
+        drawer_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            0.0,
+            egui::Modifiers::NONE,
+            Vec::new(),
+        );
+        ctrl_space(&ctx, &mut editor, &mut world, 0.1);
+        assert!(!editor.drawer.open);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn esc_closes_the_drawer() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_esc");
+        let none = egui::Modifiers::NONE;
+        let esc = vec![key_event(egui::Key::Escape, none)];
+        drawer_frame(&ctx, &mut editor, &mut world, t + 0.1, none, esc);
+        assert!(!editor.drawer.open);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn esc_while_renaming_keeps_the_drawer() {
+        let (mut editor, mut world, root, ctx, mut t) = open_drawer("drawer_rename");
+        let none = egui::Modifiers::NONE;
+        editor.content.open(root.join("assets/models"));
+        editor
+            .content
+            .start_rename(root.join("assets/models/x.glb"));
+        for _ in 0..3 {
+            t += 0.1;
+            drawer_frame(&ctx, &mut editor, &mut world, t, none, Vec::new());
+        }
+        assert!(ctx.text_edit_focused(), "rename field has focus");
+        let esc = vec![key_event(egui::Key::Escape, none)];
+        drawer_frame(&ctx, &mut editor, &mut world, t + 0.1, none, esc);
+        assert!(
+            editor.content.renaming.is_none(),
+            "Esc cancelled the rename"
+        );
+        assert!(editor.drawer.open, "and only the rename");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn press_outside_closes_inside_keeps() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_outside");
+        let none = egui::Modifiers::NONE;
+        let inside = editor.drawer.rect.unwrap().center();
+        drawer_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            t + 0.1,
+            none,
+            press_events(inside),
+        );
+        assert!(editor.drawer.open);
+        let top = egui::pos2(800.0, 5.0);
+        drawer_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            t + 0.2,
+            none,
+            press_events(top),
+        );
+        assert!(!editor.drawer.open);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn button_toggles_closed_not_reopened() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_button");
+        let none = egui::Modifiers::NONE;
+        let button = editor
+            .drawer
+            .button
+            .expect("status bar button drawn")
+            .center();
+        drawer_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            t + 0.1,
+            none,
+            press_events(button),
+        );
+        assert!(!editor.drawer.open);
+        drawer_frame(&ctx, &mut editor, &mut world, t + 0.2, none, Vec::new());
+        assert!(!editor.drawer.open);
+        drawer_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            t + 0.3,
+            none,
+            press_events(button),
+        );
+        assert!(editor.drawer.open, "the button opens it again");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dragging_out_of_the_drawer_hides_it() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_drag");
+        let none = egui::Modifiers::NONE;
+        let rect = editor.drawer.rect.unwrap();
+        let drag = content::AssetDrag {
+            path: root.join("assets/models/x.glb"),
+            model: Some("assets/models/x.glb".into()),
+        };
+        egui::DragAndDrop::set_payload(&ctx, drag);
+        let inside = vec![egui::Event::PointerMoved(rect.center())];
+        drawer_frame(&ctx, &mut editor, &mut world, t + 0.1, none, inside);
+        assert!(editor.drawer.open, "a drag inside the drawer keeps it");
+        let above = vec![egui::Event::PointerMoved(egui::pos2(
+            800.0,
+            rect.top() - 50.0,
+        ))];
+        drawer_frame(&ctx, &mut editor, &mut world, t + 0.2, none, above);
+        assert!(!editor.drawer.open);
+        assert!(
+            egui::DragAndDrop::has_payload_of_type::<content::AssetDrag>(&ctx),
+            "the drop still lands on what is under the cursor"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dock_in_layout_opens_the_tab_and_closes() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_dock");
+        editor.dock_drawer();
+        drawer_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            t + 0.1,
+            egui::Modifiers::NONE,
+            Vec::new(),
+        );
+        assert!(!editor.drawer.open);
+        assert!(editor.content_tab_shown, "the tab was drawn");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

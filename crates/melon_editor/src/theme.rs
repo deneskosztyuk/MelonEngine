@@ -65,6 +65,9 @@ pub mod sizes {
     /// How long a pinged browser item flashes, and its outline width.
     pub const PING_SECONDS: f64 = 1.0;
     pub const PING_STROKE: f32 = 2.0;
+    /// Content Drawer: share of the window height, and its slide-in time.
+    pub const DRAWER_HEIGHT_SHARE: f32 = 0.4;
+    pub const DRAWER_SLIDE_SECONDS: f32 = 0.15;
     /// Largest share of the Content Browser width the folder tree takes.
     pub const CONTENT_TREE_MAX_SHARE: f32 = 0.5;
     /// Folder tree indent per depth level.

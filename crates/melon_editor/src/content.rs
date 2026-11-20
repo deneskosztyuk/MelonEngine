@@ -313,6 +313,9 @@ pub struct ContentBrowser {
     pub(crate) pinged: Option<(PathBuf, Option<f64>)>,
     /// Scroll the pinged item into view this frame.
     pub(crate) ping_scroll: bool,
+    /// The whole browser flashes (`flash`); when it started, set by the
+    /// view on the first draw.
+    pub(crate) flashed: Option<Option<f64>>,
     /// Model tile thumbnails (rendered by the host, one per frame).
     pub(crate) thumbnails: crate::thumbnails::Thumbnails,
 }
@@ -341,6 +344,7 @@ impl ContentBrowser {
             blocked: false,
             pinged: None,
             ping_scroll: false,
+            flashed: None,
             thumbnails: crate::thumbnails::Thumbnails::default(),
         };
         browser.refresh();
@@ -378,6 +382,15 @@ impl ContentBrowser {
         self.select(Some(file.to_path_buf()));
         self.pinged = Some((file.to_path_buf(), None));
         true
+    }
+
+    /// Outline the whole browser for `PING_SECONDS`, to point at it.
+    pub fn flash(&mut self) {
+        self.flashed = Some(None);
+    }
+
+    pub fn flashing(&self) -> bool {
+        self.flashed.is_some()
     }
 
     /// Show a text field in place of the item's name.
