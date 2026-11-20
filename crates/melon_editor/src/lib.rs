@@ -2138,6 +2138,9 @@ impl Editor {
             default.as_partial_reflect(),
             registry,
         );
+        if path == <melon_core::Collider as melon_core::bevy_reflect::TypePath>::type_path() {
+            fit_collider_to_model(world, entity);
+        }
         Some(path)
     }
 
@@ -2627,6 +2630,21 @@ fn add_component_choices(
                 .is_some_and(|r| !r.contains(world.entity(entity)))
         })
         .collect()
+}
+
+/// A new `Collider` on an entity with a measured model: its box takes the
+/// model's half size (the bounds' centre is ignored), else it keeps 0.5.
+fn fit_collider_to_model(world: &mut World, entity: Entity) {
+    let bounds = world
+        .get::<Handle<Model>>(entity)
+        .zip(world.get_resource::<AssetServer>())
+        .and_then(|(h, server)| server.bounds(*h));
+    if let (Some((min, max)), Some(mut c)) = (bounds, world.get_mut::<melon_core::Collider>(entity))
+    {
+        c.shape = melon_core::ColliderShape::Box {
+            half_extents: (max - min) * 0.5,
+        };
+    }
 }
 
 fn card_frame(fill: egui::Color32) -> egui::Frame {
@@ -5387,6 +5405,36 @@ mod tests {
         assert!(h.has(add_row_id::<Aabb>()));
         assert!(!h.has(add_row_id::<Spin>()));
         assert!(!h.has(add_row_id::<Transform>()));
+    }
+
+    #[test]
+    fn adding_a_collider_fits_its_box_to_the_model_bounds() {
+        let mut world = melon_core::Core::new().world;
+        let handle: Handle<Model> = world.resource_mut::<AssetServer>().load("builtin:cube");
+        world.resource_mut::<AssetServer>().set_bounds(
+            handle,
+            glam::Vec3::new(-1.0, -2.0, -3.0),
+            glam::Vec3::new(1.0, 2.0, 3.0),
+        );
+        let with_model = world
+            .spawn((Name("M".to_string()), Transform::default(), handle))
+            .id();
+        let mut h = InspectorHarness::new(world, with_model);
+        h.open_add_component();
+        h.click(add_row_id::<melon_core::Collider>());
+        let c = h.world.get::<melon_core::Collider>(h.entity).unwrap();
+        assert_eq!(
+            c.shape,
+            melon_core::ColliderShape::Box {
+                half_extents: glam::Vec3::new(1.0, 2.0, 3.0)
+            }
+        );
+        // Without a model the default 0.5 box stays.
+        let mut h = entity_with(Spin);
+        h.open_add_component();
+        h.click(add_row_id::<melon_core::Collider>());
+        let c = h.world.get::<melon_core::Collider>(h.entity).unwrap();
+        assert_eq!(c.shape, melon_core::ColliderShape::default());
     }
 
     #[test]

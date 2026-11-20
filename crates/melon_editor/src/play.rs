@@ -2,9 +2,10 @@
 //! so anything changed while playing is thrown away.
 
 use anyhow::{Context, Result};
+use bevy_ecs::message::Messages;
 use bevy_ecs::resource::Resource;
 use bevy_ecs::world::World;
-use melon_core::{InputFocus, SimulationState, Time};
+use melon_core::{CollisionEvent, InputFocus, SimulationState, Time};
 use melon_physics::PhysicsWorld;
 
 use crate::scene::{SceneData, apply_scene, scene_to_data};
@@ -20,13 +21,18 @@ fn state(world: &World) -> SimulationState {
         .unwrap_or_default()
 }
 
-/// Rebuild the scene (and its physics bodies) from `data`.
+/// Rebuild the scene (and its physics bodies) from `data`. Collision events
+/// of the session before name entities that no longer exist, so they go.
 fn rebuild(world: &mut World, data: &SceneData) -> Result<()> {
     world
         .try_resource_scope::<PhysicsWorld, _>(|world, mut physics| {
             apply_scene(world, &mut physics, data)
         })
-        .context("no PhysicsWorld resource")?
+        .context("no PhysicsWorld resource")??;
+    if let Some(mut events) = world.get_resource_mut::<Messages<CollisionEvent>>() {
+        events.clear();
+    }
+    Ok(())
 }
 
 /// From `Editing`: snapshot the scene, rebuild it from the snapshot so physics
@@ -132,6 +138,33 @@ mod tests {
             melon_core::Collider::default(),
         ));
         world
+    }
+
+    fn push_event(world: &mut World) {
+        let stale = world.spawn_empty().id();
+        world.write_message(melon_core::CollisionEvent {
+            a: stale,
+            b: stale,
+            kind: melon_core::CollisionEventKind::Started,
+        });
+    }
+
+    fn pending_events(world: &World) -> usize {
+        world
+            .resource::<bevy_ecs::message::Messages<melon_core::CollisionEvent>>()
+            .len()
+    }
+
+    #[test]
+    fn play_and_stop_drop_collision_events_of_the_session_before() {
+        let mut world = edit_world();
+        push_event(&mut world);
+        assert_eq!(pending_events(&world), 1);
+        play(&mut world).unwrap();
+        assert_eq!(pending_events(&world), 0, "Play starts clean");
+        push_event(&mut world);
+        stop(&mut world).unwrap();
+        assert_eq!(pending_events(&world), 0, "Stop leaves none behind");
     }
 
     fn find(world: &mut World, name: &str) -> Entity {

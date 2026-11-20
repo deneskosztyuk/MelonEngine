@@ -11,7 +11,7 @@ use melon_core::assets::split_mesh_fragment;
 use melon_core::bevy_reflect::serde::{TypedReflectDeserializer, TypedReflectSerializer};
 use melon_core::bevy_reflect::{FromReflect, PartialReflect, ReflectFromReflect, TypeRegistry};
 use melon_core::glam::Vec3;
-use melon_core::hierarchy::depth_first;
+use melon_core::hierarchy::{depth_first, world_matrix};
 use melon_core::{
     Aabb, AssetGuid, AssetServer, Bob, BodyInfo, BodyKind, ChildOf, Collider, ColliderShape,
     Handle, Model, Name, NameCounter, RigidBody, RigidBodyKind, Spin, Transform,
@@ -154,11 +154,10 @@ fn read_body_info(raw: &RawValue) -> Result<BodyInfo> {
 /// other component. `scale` is the entity scale. A body of kind `None` was no body at all.
 fn convert_body_info(
     info: BodyInfo,
-    scale: Vec3,
     entity: &SceneEntity,
     registry: &TypeRegistry,
     saved: &mut BTreeMap<String, Box<RawValue>>,
-) -> Result<()> {
+) -> Result<Option<Vec3>> {
     let he = info.half_extents;
     if he.x <= 0.0 || he.y <= 0.0 || he.z <= 0.0 {
         bail!(
@@ -167,7 +166,7 @@ fn convert_body_info(
         );
     }
     let kind = match info.body_type {
-        BodyKind::None => return Ok(()),
+        BodyKind::None => return Ok(None),
         BodyKind::Dynamic => RigidBodyKind::Dynamic,
         BodyKind::Fixed => RigidBodyKind::Fixed,
     };
@@ -176,10 +175,9 @@ fn convert_body_info(
         ..Default::default()
     };
     let collider = Collider {
-        // `BodyInfo` was in world units; the collider follows the entity scale.
-        shape: ColliderShape::Box {
-            half_extents: he / scale.abs().max(Vec3::splat(1e-6)),
-        },
+        // World units for now: `apply_scene` divides by the world scale once
+        // the parents are in place.
+        shape: ColliderShape::Box { half_extents: he },
         ..Default::default()
     };
     for value in [&body as &dyn PartialReflect, &collider] {
@@ -189,7 +187,7 @@ fn convert_body_info(
             slot.insert(component_ron(value, registry)?);
         }
     }
-    Ok(())
+    Ok(Some(he))
 }
 
 /// Insert a value `decode` returned.
@@ -206,6 +204,8 @@ fn insert(world: &mut World, registry: &TypeRegistry, id: Entity, value: &dyn Pa
 
 /// One entity's components, read and ready to insert.
 struct Decoded {
+    /// World-unit half extents of a converted `BodyInfo` box.
+    legacy_half: Option<Vec3>,
     components: Vec<Box<dyn PartialReflect>>,
     kept: BTreeMap<String, Box<RawValue>>,
 }
@@ -249,21 +249,13 @@ fn decode_entity(
         (None, Some(raw)) => Some(read_body_info(&raw.trim_boxed())?),
         (None, None) => None,
     };
+    let mut legacy_half = None;
     if let Some(info) = body_info {
-        let transform_path = <Transform as melon_core::bevy_reflect::TypePath>::type_path();
-        let scale = saved
-            .get(transform_path)
-            .and_then(|raw| {
-                decode(registry, transform_path, &raw.clone().trim_boxed())
-                    .ok()
-                    .flatten()
-            })
-            .and_then(|v| v.try_downcast_ref::<Transform>().map(|t| t.scale))
-            .unwrap_or(Vec3::ONE);
-        convert_body_info(info, scale, entity, registry, &mut saved)?;
+        legacy_half = convert_body_info(info, entity, registry, &mut saved)?;
     }
 
     let mut decoded = Decoded {
+        legacy_half,
         components: Vec::new(),
         kept: BTreeMap::new(),
     };
@@ -433,6 +425,7 @@ pub fn apply_scene(world: &mut World, physics: &mut PhysicsWorld, data: &SceneDa
 
     // Spawn everything, attach parents, then create bodies from world poses
     // (which need the parents in place).
+    let legacy_half: Vec<Option<Vec3>> = decoded.iter().map(|d| d.legacy_half).collect();
     let ids: Vec<Entity> = data
         .entities
         .iter()
@@ -442,6 +435,18 @@ pub fn apply_scene(world: &mut World, physics: &mut PhysicsWorld, data: &SceneDa
     for (entity, &id) in data.entities.iter().zip(&ids) {
         if let Some(p) = entity.parent {
             world.entity_mut(id).insert(ChildOf(ids[p as usize]));
+        }
+    }
+    // Converted `BodyInfo` boxes: world-unit extents become local ones under
+    // the entity's world scale (its parents' included).
+    for (&id, half) in ids.iter().zip(&legacy_half) {
+        if let Some(half) = half {
+            let scale = world_matrix(world, id).to_scale_rotation_translation().0;
+            if let Some(mut c) = world.get_mut::<Collider>(id) {
+                c.shape = ColliderShape::Box {
+                    half_extents: *half / scale.abs().max(Vec3::splat(1e-6)),
+                };
+            }
         }
     }
     // A hand-copied block can repeat a uid; steps would find the wrong entity.
@@ -1851,6 +1856,47 @@ mod tests {
             .unwrap()
             .half_extents;
         assert!((half - Vec3::new(1.0, 2.0, 3.0)).length() < 1e-5, "{half}");
+    }
+
+    #[test]
+    fn v5_body_info_keeps_its_world_size_under_a_scaled_parent() {
+        let mut local = TypeRegistry::default();
+        local.register::<BodyInfo>();
+        let info = BodyInfo {
+            body_type: BodyKind::Fixed,
+            half_extents: Vec3::new(1.0, 2.0, 3.0),
+        };
+        let mut parent = entity("Parent", None);
+        parent.transform = Some(Transform {
+            scale: Vec3::splat(2.0),
+            ..Default::default()
+        });
+        let mut child = entity("Child", Some(0));
+        child.transform = Some(Transform {
+            scale: Vec3::new(1.0, 0.5, 1.0),
+            ..Default::default()
+        });
+        child.components.insert(
+            BODY_INFO_PATH.to_string(),
+            component_ron(&info, &local).unwrap(),
+        );
+        let data = SceneData {
+            version: 5,
+            entities: vec![parent, child],
+            name_counter: 0,
+        };
+        let mut world = reg_world();
+        let mut physics = PhysicsWorld::new();
+        apply_scene(&mut world, &mut physics, &data).unwrap();
+        let e = named(&mut world, "Child");
+        // World scale (2, 1, 2): local half = world half / scale.
+        let ColliderShape::Box { half_extents } = world.get::<Collider>(e).unwrap().shape else {
+            panic!("a box");
+        };
+        assert!(
+            (half_extents - Vec3::new(0.5, 2.0, 1.5)).length() < 1e-5,
+            "{half_extents}"
+        );
     }
 
     #[test]

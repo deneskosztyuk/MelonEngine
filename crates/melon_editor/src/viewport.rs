@@ -45,6 +45,15 @@ const SELECTION_COLOR: [f32; 3] = [1.0, 0.55, 0.0];
 /// Collider outlines, green like Unity and Godot.
 const COLLIDER_COLOR: [f32; 3] = [0.2, 0.9, 0.3];
 
+fn collider_rgb(sensor: bool) -> [f32; 3] {
+    let c = if sensor {
+        crate::theme::colors::COLLIDER_SENSOR
+    } else {
+        crate::theme::colors::COLLIDER
+    };
+    [c.r(), c.g(), c.b()].map(|v| v as f32 / 255.0)
+}
+
 /// Pressed fly-mode keys (only used while the right button is held).
 #[derive(Default, Clone, Copy, Debug)]
 pub struct FlyKeys {
@@ -374,6 +383,7 @@ pub fn collider_lines(world: &World, entity: Entity) -> Vec<LineVertex> {
         let (scale, rotation, translation) = world_matrix(world, e).to_scale_rotation_translation();
         let m = Mat4::from_rotation_translation(rotation, translation);
         let s = scale.abs();
+        let start = vertices.len();
         match c.shape {
             ColliderShape::Box { half_extents } => {
                 vertices.extend(box_lines(m, -half_extents * s, half_extents * s))
@@ -419,6 +429,10 @@ pub fn collider_lines(world: &World, entity: Entity) -> Vec<LineVertex> {
                 vertices.extend(box_lines(m, min * s, max * s));
             }
         }
+        let color = collider_rgb(c.sensor);
+        for v in &mut vertices[start..] {
+            v.color = color;
+        }
     }
     vertices
 }
@@ -448,6 +462,7 @@ fn arc(m: Mat4, center: Vec3, a: Vec3, b: Vec3, from: f32, to: f32) -> Vec<LineV
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme;
     use melon_core::Name;
     use melon_core::glam::Quat;
 
@@ -823,10 +838,36 @@ mod tests {
         );
         let lines = collider_lines(&world, e);
         assert_eq!(lines.len(), 24);
-        assert!(lines.iter().all(|v| v.color == COLLIDER_COLOR));
+        assert!(lines.iter().all(|v| v.color == collider_rgb(false)));
         let max_x = lines.iter().map(|v| v.position[0]).fold(f32::MIN, f32::max);
         let max_z = lines.iter().map(|v| v.position[2]).fold(f32::MIN, f32::max);
         assert!((max_x - 7.0).abs() < 1e-4 && (max_z - 6.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn sensor_outlines_use_their_own_colour() {
+        let rgb = |c: egui::Color32| [c.r(), c.g(), c.b()].map(|v| v as f32 / 255.0);
+        let solid = collider_world(Collider::default(), Transform::default());
+        let sensor = collider_world(
+            Collider {
+                sensor: true,
+                ..Default::default()
+            },
+            Transform::default(),
+        );
+        let solid = collider_lines(&solid.0, solid.1);
+        let sensor = collider_lines(&sensor.0, sensor.1);
+        assert!(
+            solid
+                .iter()
+                .all(|v| v.color == rgb(theme::colors::COLLIDER))
+        );
+        assert!(
+            sensor
+                .iter()
+                .all(|v| v.color == rgb(theme::colors::COLLIDER_SENSOR))
+        );
+        assert_ne!(theme::colors::COLLIDER, theme::colors::COLLIDER_SENSOR);
     }
 
     #[test]
