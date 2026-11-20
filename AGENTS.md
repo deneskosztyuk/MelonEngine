@@ -58,8 +58,15 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
   loaded). The dylib needs Rust's `std` dll, so start dev builds through
   cargo (`cargo run` puts it on `PATH`). Game state lives in
   resources added with `init_resource` (`insert_resource` replaces the value
-  on every reload). Game-defined component layouts must not change across a
-  live reload; restart instead. Plugin `FixedUpdate` systems run after the
+  on every reload). Changing the fields of any game component **or
+  resource** type needs a restart (resources are checked and the plugin
+  stops with an error; components are not checked). `build` must be
+  idempotent: only `add_systems`, `init_resource`, `insert_resource`.
+  Spawning entities, observers or component hooks from `build` repeats on
+  every reload (a second hook registration panics). `cargo test` / `just test`
+  while a dev-run is open rewrites `target/debug/melon_game.dll` with other
+  features; the running host refuses that reload (fingerprint error). Run
+  `just game` again. Plugin `FixedUpdate` systems run after the
   physics chain. Release builds call `core.add_plugin(&GamePlugin)`.
 - **Stages.** Register systems with `core.add_systems(Stage, ...)`:
   `FixedUpdate` (1/60 s, 0..N times per frame, not while paused), `Update`

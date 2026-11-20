@@ -33,6 +33,16 @@ reloaded"; the scene stays as it is.
 just game      # cargo build -p melon_host --lib
 ```
 
+Changing the fields of any game component **or resource** type needs a
+restart (resources are checked and the plugin stops with an error; components
+are not checked). `build` must be idempotent: only `add_systems`,
+`init_resource`, `insert_resource`. Spawning entities, observers or component
+hooks from `build` repeats on every reload (a second hook registration panics).
+
+`cargo test` / `just test` while a dev-run is open rewrites
+`target/debug/melon_game.dll` with other features; the running host refuses
+that reload (fingerprint error). Run `just game` again.
+
 Or via the justfile:
 
 ```sh
