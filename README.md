@@ -99,6 +99,12 @@ Editor:
   an item onto a folder to move it; drag files from Explorer onto the window
   to copy them into the current folder. Each `.meta` moves with its file. Favorites, size, folder and tree width are saved to
   `.melon/content_browser.ron`.
+- **Ctrl+Space** (or the status bar's **Content Drawer** button) — the
+  Content Browser in a drawer that slides up over the panels, when its tab
+  is not in front (otherwise it brings the tab to the front). It hides on
+  Esc, Ctrl+Space, a click outside it, or dragging an item out of it (the
+  item drops on the Scene or Hierarchy below). **Dock in Layout** moves it
+  back to its tab.
 - **Models:** drag a `.glb` / `.gltf` from the Content Browser into the Scene
   (lands on the ground under the cursor) or the Hierarchy (at the origin, or
   under the row you drop it on). It unpacks into an entity per glTF node. Or

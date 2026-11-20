@@ -45,6 +45,10 @@ impl Editor {
         if self.drawer.open && self.drawer_should_close(&ctx) {
             self.drawer.open = false;
         }
+        // A closed (or sliding out) drawer does not own the keyboard.
+        if !self.drawer.open && !self.content_tab_shown {
+            self.content.focused = false;
+        }
         let shown = ctx.animate_bool_with_time(
             egui::Id::new("content_drawer"),
             self.drawer.open,

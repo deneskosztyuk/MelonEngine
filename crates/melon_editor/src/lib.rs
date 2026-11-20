@@ -4626,4 +4626,62 @@ mod tests {
         assert!(editor.content_tab_shown, "the tab was drawn");
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn drawer_takes_dropped_files() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_drop");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("crate.glb"), b"x").unwrap();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 900.0),
+            )),
+            time: Some(t + 0.1),
+            dropped_files: vec![egui::DroppedFile {
+                path: Some(outside.join("crate.glb")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| editor.build_ui(&mut world, ui));
+        let imported = root.join("assets/crate.glb");
+        assert!(imported.exists(), "the drawer's folder took the drop");
+        assert!(melon_core::meta_path(&imported).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn closing_the_drawer_drops_browser_focus() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_focus");
+        let none = egui::Modifiers::NONE;
+        editor.content.focused = true;
+        drawer_frame(&ctx, &mut editor, &mut world, t + 0.1, none, Vec::new());
+        assert!(editor.content.has_focus(), "the drawer keeps the focus");
+        let esc = vec![key_event(egui::Key::Escape, none)];
+        drawer_frame(&ctx, &mut editor, &mut world, t + 0.2, none, esc);
+        assert!(!editor.drawer.open);
+        assert!(!editor.content.has_focus());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drawer_tiles_want_thumbnails() {
+        let (mut editor, mut world, root, ctx, t) = open_drawer("drawer_thumbs");
+        editor.content.open(root.join("assets/models"));
+        drawer_frame(
+            &ctx,
+            &mut editor,
+            &mut world,
+            t + 0.1,
+            egui::Modifiers::NONE,
+            Vec::new(),
+        );
+        assert_eq!(
+            editor.content.thumbnails.wanted(),
+            ["assets/models/x.glb".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
