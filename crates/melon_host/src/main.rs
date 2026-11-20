@@ -560,7 +560,14 @@ impl App {
         {
             let view = {
                 let mut server = self.core.world.resource_mut::<melon_core::AssetServer>();
-                renderer.render_thumbnail(&mut server, request.handle, target)
+                match request.subject {
+                    melon_editor::thumbnails::ThumbnailSubject::Model(handle) => {
+                        renderer.render_thumbnail(&mut server, handle, target)
+                    }
+                    melon_editor::thumbnails::ThumbnailSubject::Material(handle) => {
+                        renderer.render_material_thumbnail(&mut server, handle, target)
+                    }
+                }
             };
             let id = view
                 .map(|view| editor.register_thumbnail(renderer.device(), &view, request.existing));

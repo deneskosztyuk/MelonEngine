@@ -1243,19 +1243,65 @@ impl Renderer {
         let frame = FrameData {
             view_proj,
             eye,
-            light: melon_core::Light::default(),
-            environment: melon_core::Environment::default(),
-            quality: melon_core::RenderQuality::default(),
             models: vec![(glam::Mat4::IDENTITY, handle)],
-            overrides: Default::default(),
-            lights: Default::default(),
+            ..Default::default()
         };
+        let texture = self.thumbnail_of(&frame, server, target);
+        if !was_cached {
+            self.model_cache.evict(handle);
+        }
+        Some(texture)
+    }
+
+    /// A material on a sphere (`builtin:sphere`), for the Content Browser:
+    /// the same auxiliary view and own submission as a model thumbnail.
+    pub fn render_material_thumbnail(
+        &mut self,
+        server: &mut melon_core::AssetServer,
+        material: melon_core::Handle<melon_core::Material>,
+        target: &mut ViewportTarget,
+    ) -> Option<wgpu::TextureView> {
+        let texture = self.render_material_thumbnail_texture(server, material, target)?;
+        Some(texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(texture.format().remove_srgb_suffix()),
+            ..Default::default()
+        }))
+    }
+
+    fn render_material_thumbnail_texture(
+        &mut self,
+        server: &mut melon_core::AssetServer,
+        material: melon_core::Handle<melon_core::Material>,
+        target: &mut ViewportTarget,
+    ) -> Option<wgpu::Texture> {
+        let sphere: melon_core::Handle<melon_core::Model> = server.load("builtin:sphere");
+        self.model_cache.prepare(&self.scene, server, sphere);
+        let (min, max) = server.bounds(sphere)?;
+        let (view_proj, eye) = thumbnail_camera(min, max);
+        let mut frame = FrameData {
+            view_proj,
+            eye,
+            models: vec![(glam::Mat4::IDENTITY, sphere)],
+            ..Default::default()
+        };
+        frame.overrides.insert(0, vec![Some(material)]);
+        Some(self.thumbnail_of(&frame, server, target))
+    }
+
+    /// Record `frame` as an auxiliary view into `target`, copy the result
+    /// and submit it on its own.
+    fn thumbnail_of(
+        &mut self,
+        frame: &FrameData,
+        server: &mut melon_core::AssetServer,
+        target: &mut ViewportTarget,
+    ) -> wgpu::Texture {
         let mut encoder = self
             .device()
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("thumbnail"),
             });
-        self.record_view(&mut encoder, &frame, server, target, View::Auxiliary);
+        self.record_view(&mut encoder, frame, server, target, View::Auxiliary);
         let source = target.color_texture();
         let format = source.format();
         let texture = self.device().create_texture(&wgpu::TextureDescriptor {
@@ -1276,10 +1322,7 @@ impl Renderer {
             source.size(),
         );
         self.queue().submit([encoder.finish()]);
-        if !was_cached {
-            self.model_cache.evict(handle);
-        }
-        Some(texture)
+        texture
     }
 
     /// Record one view of `frame` into `target`: shadow pass, SSAO passes, 3D
@@ -4212,6 +4255,67 @@ impl SceneRenderer {
         self.build_model(&document, &buffers, &images)
     }
 
+    /// A UV sphere of radius 0.5 (`builtin:sphere`, material thumbnails),
+    /// in the checkerboard material.
+    pub fn builtin_sphere_model(&self) -> LoadedModel {
+        const SEGMENTS: u32 = 32;
+        const RINGS: u32 = 16;
+        let mut vertices = Vec::new();
+        for ring in 0..=RINGS {
+            let v = ring as f32 / RINGS as f32;
+            let theta = v * std::f32::consts::PI;
+            for seg in 0..=SEGMENTS {
+                let u = seg as f32 / SEGMENTS as f32;
+                let phi = u * std::f32::consts::TAU;
+                let normal = glam::Vec3::new(
+                    theta.sin() * phi.cos(),
+                    theta.cos(),
+                    theta.sin() * phi.sin(),
+                );
+                let tangent = glam::Vec3::new(-phi.sin(), 0.0, phi.cos());
+                vertices.push(Vertex {
+                    position: (normal * 0.5).to_array(),
+                    normal: normal.to_array(),
+                    uv: [u, v],
+                    tangent: tangent.extend(1.0).to_array(),
+                });
+            }
+        }
+        let mut indices: Vec<u32> = Vec::new();
+        for ring in 0..RINGS {
+            for seg in 0..SEGMENTS {
+                let a = ring * (SEGMENTS + 1) + seg;
+                let b = a + SEGMENTS + 1;
+                indices.extend([a, a + 1, b, a + 1, b + 1, b]);
+            }
+        }
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("sphere vertex buffer"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("sphere index buffer"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        LoadedModel {
+            meshes: vec![Mesh {
+                vertex_buffer,
+                index_buffer,
+                index_count: indices.len() as u32,
+                index_format: wgpu::IndexFormat::Uint32,
+            }],
+            material_bind_groups: vec![self.checker_material.clone()],
+            surfaces: vec![Surface::default()],
+            bounds: (glam::Vec3::splat(-0.5), glam::Vec3::splat(0.5)),
+        }
+    }
+
     /// The procedural unit cube with the checkerboard (`builtin:cube`).
     pub fn builtin_cube_model(&self) -> LoadedModel {
         LoadedModel {
@@ -6757,6 +6861,49 @@ mod tests {
         Ok(())
     }
 
+    fn check_material_thumbnail(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("mat_thumb");
+        write_mat(
+            &root,
+            "red",
+            "(base_color: (0.9, 0.05, 0.05, 1.0), metallic: 0.0, roughness: 0.5)",
+        );
+        let mut server = fresh_ids_server(root.clone(), 7600);
+        r.materials = Default::default();
+        r.model_cache = ModelCache::new(&r.scene);
+        let handle: melon_core::Handle<melon_core::Material> =
+            server.load("assets/materials/red.mat");
+        let mut target = r.create_viewport_target(winit::dpi::PhysicalSize::new(
+            THUMBNAIL_SIZE,
+            THUMBNAIL_SIZE,
+        ));
+        let texture = r
+            .render_material_thumbnail_texture(&mut server, handle, &mut target)
+            .ok_or("no material thumbnail")?;
+        let encoder = r
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let pixels = read_back(r.device(), r.queue(), encoder, &texture);
+        let _ = std::fs::remove_dir_all(&root);
+        let at = |x: u32, y: u32| {
+            let i = ((y * THUMBNAIL_SIZE + x) * 4) as usize;
+            if r.surface_format().remove_srgb_suffix() == wgpu::TextureFormat::Bgra8Unorm {
+                [pixels[i + 2], pixels[i + 1], pixels[i]]
+            } else {
+                [pixels[i], pixels[i + 1], pixels[i + 2]]
+            }
+        };
+        let centre = at(THUMBNAIL_SIZE / 2, THUMBNAIL_SIZE / 2);
+        let corner = at(2, 2);
+        if centre[0] < centre[1].saturating_add(60) {
+            return Err(format!("the sphere should be red: {centre:?}"));
+        }
+        if corner[0] > corner[1].saturating_add(30) {
+            return Err(format!("the corner should be background: {corner:?}"));
+        }
+        Ok(())
+    }
+
     #[test]
     fn gpu_tests() {
         let assertions: Vec<GpuAssertion> = vec![
@@ -8535,6 +8682,7 @@ mod tests {
             Box::new(check_far_cascade_shadow),
             Box::new(check_local_light_shadows),
             Box::new(check_hdr_sky_is_drawn),
+            Box::new(check_material_thumbnail),
         ];
 
         #[cfg(target_os = "windows")]
