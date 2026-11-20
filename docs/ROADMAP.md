@@ -11,7 +11,7 @@ missing for a core 3D engine. Update this file when an item lands.
 | `melon_render` | wgpu forward renderer. Frame: sun shadow pass (directional shadow map, 3x3 PCF), 3D pass into an HDR target, ACES tonemap pass onto the display. Textured Lambert + ambient mesh pipeline, line pipeline (gizmos), depth buffer, dynamic-offset model uniforms, checkerboard fallback texture, glTF loader (positions, normals, uv0, indices, base color texture), offscreen `ViewportTarget`, surface lost/outdated recovery. |
 | `melon_physics` | rapier3d wrapper: dynamic and fixed cuboids, ECS to rapier sync both ways, `PendingDelete` cleanup. |
 | `melon_editor` | egui editor with dockable panels (Hierarchy, Scene, Inspector, Content Browser, Console), menu bar, toolbar, status bar, Move/Rotate/Scale gizmos with snapping, Play/Pause/Step/Stop, RON scene save/load (versioned, atomic write, validated). |
-| `melon_game` | Hot-reloadable dylib with two demo systems. |
+| `melon_game` | Game plugin with two demo systems, live-reloaded in dev builds. |
 | `melon_host` | winit event loop that wires all crates together. |
 
 Tooling: `just gate` (fmt + clippy `-D warnings` + check), `unsafe_code` denied
@@ -35,8 +35,8 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
    extracts the world (`extract` → `FrameData`) and records the scene passes
    (`render_scene`, `ui_pass`); the editor runs File Save / Load / Exit. The
    host is the winit loop, input mapping and frame order.
-8. **Game systems hardcoded in host.** `melon_game` cannot register its own
-   systems; signatures are duplicated in the host `hot_module` imports.
+8. ~~**Game systems hardcoded in host.**~~ Fixed: `GamePlugin` registers
+   the game's systems; dev builds live-reload the whole plugin.
 9. **README is stale.** Links deleted LICENSE files, says "v0.1 — released",
    lists only egui as the editor.
 10. ~~**Scene load crashes the engine.**~~ Fixed: `load_scene` despawns scene
@@ -60,7 +60,7 @@ workspace-wide, unit tests plus GPU tests (including shadow and tonemap).
 - [x] Render extraction moved from `melon_host` into `melon_render`. Fixes bug 7.
 - [x] Full input: all keys, `just_pressed` / `just_released`, mouse buttons and
       wheel, action mapping (`Actions` / `InputMap`, Project Settings, Esc / click focus).
-- [ ] Plugin API so `melon_game` registers its own systems. Fixes bug 8.
+- [x] Plugin API so `melon_game` registers its own systems. Fixes bug 8.
 - [x] Decide on one editor UI: egui + `egui_dock` (ADR-0001); others removed.
 
 ### Tier 1: looks like a 3D game

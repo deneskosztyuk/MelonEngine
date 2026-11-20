@@ -14,8 +14,8 @@ v0.1 — released.
 | `melon_render` | wgpu device/swapchain, pipelines, meshes, glTF loading, WGSL shaders. Frame: sun shadow pass, 3D pass into an HDR target, then a tonemap pass onto the display, then an overlay pass (solid editor shapes such as the gizmo) |
 | `melon_physics` | rapier3d wrapper + transform sync systems |
 | `melon_editor` | egui-wgpu debug overlay (FPS, inspector, gizmos) |
-| `melon_host` | Binary crate: winit event loop, wires all systems, owns hot-reloader |
-| `melon_game` | Dylib crate: game logic, hot-reloadable |
+| `melon_host` | Binary crate: winit event loop, wires all systems, loads the game plugin |
+| `melon_game` | Game plugin (`GamePlugin`): game logic, live-reloaded in dev builds |
 
 ## Run
 
@@ -23,6 +23,14 @@ Dev build with hot reload:
 
 ```sh
 cargo run -p melon_host
+```
+
+Hot reload: while it runs, edit `crates/melon_game` and rebuild only the game
+crate. The editor reloads the game plugin and the Console shows "Game plugin
+reloaded"; the scene stays as it is.
+
+```sh
+just game      # cargo build -p melon_host --lib
 ```
 
 Or via the justfile:
@@ -103,7 +111,7 @@ entity. See `assets/README.md` for details.
 - **Window**: winit 0.30
 - **Physics**: rapier3d 0.34
 - **Editor UI**: egui 0.35 + egui-wgpu + egui-winit
-- **Hot reload**: hot-lib-reloader 0.8
+- **Game reload**: libloading 0.8
 - **Assets**: gltf 1.4, image 0.25
 - **Math**: glam 0.33
 

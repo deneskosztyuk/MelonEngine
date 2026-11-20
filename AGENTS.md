@@ -24,7 +24,8 @@ Dependency direction: `core` <- `render`, `physics` <- `editor` <- `host`.
 ```powershell
 just gate        # fmt-check + clippy -D warnings + check. Run before every commit.
 just test        # gate, then cargo test --workspace
-just dev-run     # debug build with melon_game hot reload
+just dev-run     # debug build with melon_game live reload
+just game        # rebuild only melon_game; a running dev-run reloads it
 just fast-run    # release run, no gate, no hot reload
 ```
 
@@ -35,8 +36,10 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 - Edition 2024. Add dependencies to `[workspace.dependencies]` in the root
   `Cargo.toml`, then reference them with `.workspace = true`.
 - Every crate uses `[lints] workspace = true`. Clippy warnings fail the gate.
-- `unsafe_code` is denied. The only exception is `#[unsafe(no_mangle)]` on hot
-  reload entry points in `melon_game`, with `#[allow(unsafe_code)]`.
+- `unsafe_code` is denied. Two exceptions, each with `#[allow(unsafe_code)]`:
+  `#[unsafe(no_mangle)]` on the plugin entry points in `melon_game`, and the
+  host's `game_loader` module (loading the game dylib), with a safety comment
+  on each `unsafe` block.
 - Tests live in `#[cfg(test)] mod tests` at the bottom of each file. ECS
   systems are tested by building a `World`, running a one-system `Schedule`,
   and asserting on components.
@@ -45,10 +48,19 @@ First build is slow (wgpu, rapier, egui). Run long builds in the background.
 
 ## Gotchas
 
-- **Hot reload signatures.** A new system in `melon_game/src/lib.rs` needs
-  `#[unsafe(no_mangle)]`, and every type it uses must be imported in the
-  `hot_game` module in `melon_host/src/main.rs`. Then register it in
-  `App::new`.
+- **Game plugin.** `melon_game::GamePlugin::build` registers the game's
+  systems and resources; the host never names a game function. Dev builds
+  (`hot-reload` feature) load `melon_game.dll` from beside the host exe,
+  check `melon_game_abi()` against `melon_core::abi_fingerprint()` and call
+  `melon_game_build`; `just game` rebuilds it (`cargo build -p melon_host --lib`;
+  `cargo build -p melon_game` alone resolves other features and fails the
+  check) and the running host reloads the whole plugin (old libraries stay
+  loaded). The dylib needs Rust's `std` dll, so start dev builds through
+  cargo (`cargo run` puts it on `PATH`). Game state lives in
+  resources added with `init_resource` (`insert_resource` replaces the value
+  on every reload). Game-defined component layouts must not change across a
+  live reload; restart instead. Plugin `FixedUpdate` systems run after the
+  physics chain. Release builds call `core.add_plugin(&GamePlugin)`.
 - **Stages.** Register systems with `core.add_systems(Stage, ...)`:
   `FixedUpdate` (1/60 s, 0..N times per frame, not while paused), `Update`
   (once per frame, read `Time::delta_seconds`), `PostUpdate`. `PreUpdate`
