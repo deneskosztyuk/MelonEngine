@@ -7064,7 +7064,10 @@ mod tests {
             ao_strength: 1.0,
             ..plain_environment()
         };
-        let probe = screen_px(top_down_camera().view_proj(), glam::Vec3::new(1.7, 0.0, 0.0));
+        let probe = screen_px(
+            top_down_camera().view_proj(),
+            glam::Vec3::new(1.7, 0.0, 0.0),
+        );
         let mut px = |slabs: &[_]| {
             let pixels = render_slabs_in(r, &mut server, slabs, environment);
             pixel_at(r, &pixels, probe)
@@ -7084,9 +7087,7 @@ mod tests {
     fn check_blend_sorted_far_to_near(r: &mut Renderer) -> Result<(), String> {
         let root = material_project("mat_blend_sort");
         let glass = |rgb: &str| {
-            format!(
-                "(base_color: ({rgb}, 0.5), metallic: 0.0, roughness: 0.8, alpha_mode: Blend)"
-            )
+            format!("(base_color: ({rgb}, 0.5), metallic: 0.0, roughness: 0.8, alpha_mode: Blend)")
         };
         write_mat(&root, "blue", &glass("0.0, 0.0, 0.8"));
         write_mat(&root, "red", &glass("0.8, 0.0, 0.0"));
@@ -7129,6 +7130,166 @@ mod tests {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// Edge frames in one target: cascade count, shadow distance, light caps
+    /// switched live, a shadow-casting light inside a mesh, a NaN light and
+    /// a zero-range one. No validation error, and the scene still draws.
+    fn check_edge_quality_and_lights(r: &mut Renderer) -> Result<(), String> {
+        let mut server = repo_server();
+        let cube: melon_core::Handle<melon_core::Model> = server.load("builtin:cube");
+        r.model_cache = ModelCache::new(&r.scene);
+        let slab = |size: glam::Vec3, at: glam::Vec3| {
+            glam::Mat4::from_scale_rotation_translation(size, glam::Quat::IDENTITY, at)
+        };
+        let models = vec![
+            (
+                slab(
+                    glam::Vec3::new(12.0, 0.2, 12.0),
+                    glam::Vec3::new(0.0, -0.1, 0.0),
+                ),
+                cube,
+            ),
+            (
+                slab(glam::Vec3::splat(2.0), glam::Vec3::new(0.0, 1.0, 0.0)),
+                cube,
+            ),
+        ];
+        let mut nan = point_light(glam::Vec3::new(2.0, 1.0, 2.0), 5.0, 4.0);
+        nan.color = glam::Vec3::splat(f32::NAN);
+        let lights = vec![
+            // Inside the 2 m cube, shadowed.
+            lights::LocalLight {
+                cast_shadows: true,
+                ..point_light(glam::Vec3::new(0.0, 1.0, 0.0), 20.0, 6.0)
+            },
+            nan,
+            point_light(glam::Vec3::new(-2.0, 1.0, 2.0), 5.0, 0.0),
+        ];
+        let base = melon_core::RenderQuality::default();
+        let scope = r.device().push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut target =
+            r.create_viewport_target(winit::dpi::PhysicalSize::new(TEST_SIZE, TEST_SIZE));
+        let mut centres = Vec::new();
+        for (cascades, distance, shadowed, max) in [
+            (1, 1, 1, 256),
+            (4, 200, 4, 256),
+            (2, 1, 0, 0),
+            (3, 50, 8, 1),
+            (4, 200, 4, 256),
+        ] {
+            let frame = FrameData {
+                view_proj: top_down_camera().view_proj(),
+                eye: top_down_camera().eye,
+                light: test_light(),
+                environment: plain_environment(),
+                quality: melon_core::RenderQuality {
+                    cascades,
+                    shadow_distance: distance,
+                    shadowed_lights: shadowed,
+                    max_lights: max,
+                    ..base
+                },
+                models: models.clone(),
+                overrides: Default::default(),
+                lights: lights.clone(),
+            };
+            let mut encoder = r
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            r.render_scene(&mut encoder, &frame, &mut server, &mut target, &[], &[]);
+            let pixels = read_back(r.device(), r.queue(), encoder, &target.color_texture);
+            centres.push(value_at(&pixels, CENTRE_PX));
+        }
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            return Err(format!("wgpu validation error: {e}"));
+        }
+        if centres.contains(&0) {
+            return Err(format!("the cube top went black: {centres:?}"));
+        }
+        Ok(())
+    }
+
+    /// A Blend material still gives a thumbnail.
+    fn check_blend_material_thumbnail(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("mat_thumb_blend");
+        write_mat(
+            &root,
+            "glass",
+            "(base_color: (0.9, 0.05, 0.05, 0.5), metallic: 0.0, roughness: 0.5, alpha_mode: Blend)",
+        );
+        let mut server = fresh_ids_server(root.clone(), 8000);
+        r.materials = Default::default();
+        r.model_cache = ModelCache::new(&r.scene);
+        let handle: melon_core::Handle<melon_core::Material> =
+            server.load("assets/materials/glass.mat");
+        let mut target = r.create_viewport_target(winit::dpi::PhysicalSize::new(
+            THUMBNAIL_SIZE,
+            THUMBNAIL_SIZE,
+        ));
+        let texture = r
+            .render_material_thumbnail_texture(&mut server, handle, &mut target)
+            .ok_or("no thumbnail for a Blend material")?;
+        let encoder = r
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let pixels = read_back(r.device(), r.queue(), encoder, &texture);
+        let _ = std::fs::remove_dir_all(&root);
+        let i = (((THUMBNAIL_SIZE / 2) * THUMBNAIL_SIZE + THUMBNAIL_SIZE / 2) * 4) as usize;
+        let bgra = r.surface_format().remove_srgb_suffix() == wgpu::TextureFormat::Bgra8Unorm;
+        let (red, green) = (pixels[i + if bgra { 2 } else { 0 }], pixels[i + 1]);
+        if red < green.saturating_add(12) {
+            return Err(format!(
+                "the Blend sphere should show its red: {:?}",
+                &pixels[i..i + 4]
+            ));
+        }
+        Ok(())
+    }
+
+    /// A texture slot naming an unknown GUID with no path, or a file that is
+    /// not an image, behaves like a missing texture: the factors alone.
+    fn check_material_bad_texture_refs(r: &mut Renderer) -> Result<(), String> {
+        let root = material_project("mat_bad_refs");
+        std::fs::write(root.join("assets/textures/notimage.png"), b"not a png").unwrap();
+        let plain = "(base_color: (0.2, 0.6, 0.2, 1.0), metallic: 0.0, roughness: 0.8";
+        write_mat(&root, "plain", &format!("{plain})"));
+        let refs = [
+            (
+                "guid_only",
+                "(guid: Some(\"00000000-0000-0000-0000-000000000000\"), path: \"\")",
+            ),
+            (
+                "garbage",
+                "(guid: None, path: \"assets/textures/notimage.png\")",
+            ),
+            (
+                "normal_slot",
+                "(guid: None, path: \"assets/materials/plain.mat\")",
+            ),
+        ];
+        for (name, tex) in refs {
+            write_mat(
+                &root,
+                name,
+                &format!("{plain}, base_color_texture: Some({tex}), normal_texture: Some({tex}))"),
+            );
+        }
+        let mut server = fresh_ids_server(root.clone(), 8100);
+        let base = render_slabs(r, &mut server, &floor_slab("plain"));
+        let base = pixel_at(r, &base, CENTRE_PX);
+        for (name, _) in refs {
+            let pixels = render_slabs(r, &mut server, &floor_slab(name));
+            let got = pixel_at(r, &pixels, CENTRE_PX);
+            if got != base {
+                let _ = std::fs::remove_dir_all(&root);
+                return Err(format!(
+                    "{name}: {got:?} differs from the factors alone {base:?}"
+                ));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
         Ok(())
     }
 
@@ -8944,6 +9105,9 @@ mod tests {
             Box::new(check_masked_out_leaves_no_ao),
             Box::new(check_blend_sorted_far_to_near),
             Box::new(check_off_centre_light_lights_its_own_floor),
+            Box::new(check_edge_quality_and_lights),
+            Box::new(check_blend_material_thumbnail),
+            Box::new(check_material_bad_texture_refs),
         ];
 
         #[cfg(target_os = "windows")]

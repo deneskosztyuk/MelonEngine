@@ -183,4 +183,15 @@ mod tests {
         assert!((near / far - 2.0).abs() < 0.05, "{near} {far}");
         assert!(near > 0.0 && near < 1.0);
     }
+
+    #[test]
+    fn odd_thresholds_and_heights_never_panic() {
+        for t in [&[0.05, 0.5, 0.2][..], &[0.5][..], &[0.0, 0.0][..]] {
+            for h in [0.0, 0.3, 5.0, f32::NAN, f32::INFINITY, -1.0] {
+                for cur in [None, Some(0), Some(t.len()), Some(99)] {
+                    let _ = select_level(t, 0.1, h, cur);
+                }
+            }
+        }
+    }
 }

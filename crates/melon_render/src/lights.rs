@@ -537,14 +537,19 @@ mod tests {
         assert_eq!(l.spot[2], 1.0);
     }
 
-
     #[test]
     fn tiles_follow_the_screen_right_is_high_x_up_is_low_y() {
         let g = grid();
         let at = |p: Vec3| g.range_of(p, 0.5).unwrap();
-        let (right, left) = (at(Vec3::new(5.0, 0.0, -10.0)), at(Vec3::new(-5.0, 0.0, -10.0)));
+        let (right, left) = (
+            at(Vec3::new(5.0, 0.0, -10.0)),
+            at(Vec3::new(-5.0, 0.0, -10.0)),
+        );
         assert!(left[1] < right[0], "left {left:?} right {right:?}");
-        let (up, down) = (at(Vec3::new(0.0, 3.0, -10.0)), at(Vec3::new(0.0, -3.0, -10.0)));
+        let (up, down) = (
+            at(Vec3::new(0.0, 3.0, -10.0)),
+            at(Vec3::new(0.0, -3.0, -10.0)),
+        );
         assert!(up[3] < down[2], "up {up:?} down {down:?}");
     }
 
@@ -554,7 +559,10 @@ mod tests {
         // Depth where slice 3 starts: near * exp(3 / depth_scale).
         let boundary = g.near * (3.0 / g.depth_scale).exp();
         let [.., z0, z1] = g.range_of(Vec3::new(0.0, 0.0, -boundary), 0.2).unwrap();
-        assert!(z0 <= 2 && z1 >= 3, "{z0}..{z1} at boundary depth {boundary}");
+        assert!(
+            z0 <= 2 && z1 >= 3,
+            "{z0}..{z1} at boundary depth {boundary}"
+        );
     }
 
     #[test]
@@ -562,17 +570,36 @@ mod tests {
         let g = grid();
         let good = point(Vec3::new(0.0, 0.0, -10.0), 3.0);
         let bad = [
-            LocalLight { color: Vec3::splat(f32::NAN), ..good },
-            LocalLight { color: Vec3::splat(f32::INFINITY), ..good },
-            LocalLight { position: Vec3::new(f32::NAN, 0.0, -10.0), ..good },
-            LocalLight { range: f32::NAN, ..good },
-            LocalLight { range: f32::INFINITY, ..good },
+            LocalLight {
+                color: Vec3::splat(f32::NAN),
+                ..good
+            },
+            LocalLight {
+                color: Vec3::splat(f32::INFINITY),
+                ..good
+            },
+            LocalLight {
+                position: Vec3::new(f32::NAN, 0.0, -10.0),
+                ..good
+            },
+            LocalLight {
+                range: f32::NAN,
+                ..good
+            },
+            LocalLight {
+                range: f32::INFINITY,
+                ..good
+            },
             LocalLight { range: 0.0, ..good },
         ];
         for l in bad {
             let data = build(&g, &[l, good], 16, 4);
             assert_eq!(data.source, [1], "{l:?}");
-            assert!(data.lights.iter().all(|l| l.color.iter().all(|c| c.is_finite())));
+            assert!(
+                data.lights
+                    .iter()
+                    .all(|l| l.color.iter().all(|c| c.is_finite()))
+            );
         }
     }
 
@@ -585,7 +612,11 @@ mod tests {
                 ..point(Vec3::new(0.0, 0.0, -10.0), 5.0)
             };
             let l = build(&g, &[spot], 4, 0).lights[0];
-            assert!(l.spot.iter().all(|v| v.is_finite()), "{inner} {outer}: {:?}", l.spot);
+            assert!(
+                l.spot.iter().all(|v| v.is_finite()),
+                "{inner} {outer}: {:?}",
+                l.spot
+            );
         }
     }
 

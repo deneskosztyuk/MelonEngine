@@ -260,4 +260,24 @@ mod tests {
         assert_eq!(set.view_proj.len(), 1);
         assert!((set.far[0] - 50.0).abs() < 1e-2);
     }
+
+    #[test]
+    fn degenerate_cameras_and_distances_give_finite_matrices() {
+        let down = camera(Vec3::new(0.0, 20.0, 0.0), Vec3::new(0.0, 19.0, 0.001));
+        let ahead = camera(Vec3::ZERO, Vec3::new(0.0, 0.0, -10.0));
+        for (view_proj, eye) in [down, ahead] {
+            for sun in [sun(), Vec3::Y, Vec3::X, -Vec3::Y] {
+                for distance in [0.0, 0.01, 0.5, 5000.0] {
+                    for count in [1, 4, 9] {
+                        let set = fit(view_proj, eye, sun, count, distance, 1024);
+                        assert!((1..=4).contains(&set.view_proj.len()));
+                        for m in &set.view_proj {
+                            assert!(m.to_cols_array().iter().all(|v| v.is_finite()));
+                        }
+                        assert!(set.far.iter().all(|f| f.is_finite()));
+                    }
+                }
+            }
+        }
+    }
 }
