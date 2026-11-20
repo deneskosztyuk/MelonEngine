@@ -4,11 +4,13 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem::{align_of, size_of};
 
 use bevy_ecs::{
+    component::Component,
     resource::Resource,
     schedule::{IntoScheduleConfigs, ScheduleLabel, Schedules},
     system::ScheduleSystem,
     world::{FromWorld, World},
 };
+use bevy_reflect::{GetTypeRegistration, Reflect, TypePath};
 
 use crate::{Actions, Input, SimulationState, Time, Transform};
 
@@ -73,6 +75,33 @@ impl App<'_> {
             ));
         }
         !changed
+    }
+
+    /// Make `T` saved and editable (scene files, Inspector). Safe to call on
+    /// every reload: the same type is registered again only if its size and
+    /// alignment are unchanged, otherwise an error says to restart.
+    pub fn register_component<T>(&mut self) -> &mut Self
+    where
+        T: Component + Reflect + TypePath + GetTypeRegistration,
+    {
+        self.register_component_with_layout::<T>(Layout::new::<T>())
+    }
+
+    /// `register_component` with the layout passed in, so tests can fake a
+    /// reloaded type whose fields changed.
+    pub(crate) fn register_component_with_layout<T>(&mut self, layout: Layout) -> &mut Self
+    where
+        T: Component + Reflect + TypePath + GetTypeRegistration,
+    {
+        if changed_layout(self.world, TypeId::of::<T>(), layout) {
+            self.errors.push(format!(
+                "component `{}` changed its fields; restart the editor",
+                type_name::<T>()
+            ));
+        } else {
+            crate::reflect::register::<T>(self.world);
+        }
+        self
     }
 
     pub fn world(&mut self) -> &mut World {

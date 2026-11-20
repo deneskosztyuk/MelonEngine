@@ -193,4 +193,27 @@ mod tests {
         schedule.run(&mut world);
         assert_eq!(world.get::<Transform>(e).unwrap().translation, Vec3::ZERO);
     }
+
+    /// The game derives and registers components through melon_core alone.
+    mod reflected {
+        use melon_core::prelude::*;
+
+        #[derive(Component, Reflect, Default)]
+        #[reflect(Component, Default)]
+        struct GameSpeed(f32);
+
+        #[test]
+        fn game_component_registers_through_app() {
+            let mut core = Core::new();
+            core.rebuild_plugins(|app| {
+                app.register_component::<GameSpeed>();
+            })
+            .unwrap();
+            let names: Vec<String> = melon_core::registered_components(&core.world)
+                .into_iter()
+                .map(|c| c.display_name)
+                .collect();
+            assert!(names.contains(&"Game Speed".to_string()), "{names:?}");
+        }
+    }
 }
