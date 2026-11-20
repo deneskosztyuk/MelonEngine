@@ -51,8 +51,8 @@ pub use quality::{
     SsgiResolution,
 };
 pub use reflect::{
-    ComponentInfo, QuatReflect, RegistryGeneration, Vec2Reflect, Vec3Reflect, Vec4Reflect,
-    display_name, registered_components,
+    ComponentInfo, QuatReflect, ReflectVariantDefaults, RegistryGeneration, VariantDefaults,
+    Vec2Reflect, Vec3Reflect, Vec4Reflect, display_name, registered_components,
 };
 pub use resources::{Camera, Environment, Light, NameCounter, SimulationState, Time};
 pub use stages::{FixedUpdate, PostUpdate, PreUpdate, Update};

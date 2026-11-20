@@ -12,7 +12,7 @@ use bevy_ecs::resource::Resource;
 use bevy_reflect::{Reflect, std_traits::ReflectDefault};
 use glam::{Quat, Vec3};
 
-use crate::reflect::Vec3Reflect;
+use crate::reflect::{ReflectVariantDefaults, VariantDefaults, Vec3Reflect};
 
 #[derive(Reflect, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[reflect(Default)]
@@ -60,7 +60,7 @@ impl Default for RigidBody {
 }
 
 #[derive(Reflect, Debug, Clone, Copy, PartialEq)]
-#[reflect(Default)]
+#[reflect(Default, VariantDefaults)]
 pub enum ColliderShape {
     /// Scaled by the entity's world scale.
     Box {
@@ -84,6 +84,21 @@ impl Default for ColliderShape {
         Self::Box {
             half_extents: Vec3::splat(0.5),
         }
+    }
+}
+
+impl VariantDefaults for ColliderShape {
+    fn variant_default(name: &str) -> Option<Self> {
+        Some(match name {
+            "Box" => Self::default(),
+            "Sphere" => Self::Sphere { radius: 0.5 },
+            "Capsule" => Self::Capsule {
+                half_height: 0.5,
+                radius: 0.25,
+            },
+            "Mesh" => Self::Mesh,
+            _ => return None,
+        })
     }
 }
 
@@ -174,7 +189,7 @@ impl CharacterController {
 }
 
 #[derive(Reflect, Debug, Clone, Copy, PartialEq, Default)]
-#[reflect(Default)]
+#[reflect(Default, VariantDefaults)]
 pub enum JointKind {
     /// No relative motion.
     #[default]
@@ -200,6 +215,31 @@ pub enum JointKind {
         min: f32,
         max: f32,
     },
+}
+
+impl VariantDefaults for JointKind {
+    fn variant_default(name: &str) -> Option<Self> {
+        Some(match name {
+            "Fixed" => Self::Fixed,
+            "Hinge" => Self::Hinge {
+                axis: Vec3::Y,
+                limited: false,
+                min: -std::f32::consts::FRAC_PI_2,
+                max: std::f32::consts::FRAC_PI_2,
+            },
+            "Ball" => Self::Ball {
+                limited: false,
+                cone_limit: std::f32::consts::FRAC_PI_4,
+            },
+            "Slider" => Self::Slider {
+                axis: Vec3::X,
+                limited: false,
+                min: -1.0,
+                max: 1.0,
+            },
+            _ => return None,
+        })
+    }
 }
 
 /// Connects this entity's body to its nearest ancestor body (or the world
@@ -364,6 +404,7 @@ impl PhysicsQueries {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy_reflect::ReflectRef;
 
     #[test]
     fn queries_without_backend_find_nothing() {
@@ -379,5 +420,52 @@ mod tests {
         c.move_by(Vec3::X);
         assert_eq!(c.take_desired(), Vec3::X);
         assert_eq!(c.desired(), Vec3::ZERO);
+    }
+
+    #[test]
+    fn every_collider_and_joint_variant_has_usable_defaults_in_the_registry() {
+        use bevy_reflect::{TypeInfo, TypeRegistry, Typed};
+        let mut registry = TypeRegistry::new();
+        registry.register::<Collider>();
+        registry.register::<Joint>();
+        for (id, info) in [
+            (
+                std::any::TypeId::of::<ColliderShape>(),
+                ColliderShape::type_info(),
+            ),
+            (std::any::TypeId::of::<JointKind>(), JointKind::type_info()),
+        ] {
+            let data = registry
+                .get_type_data::<ReflectVariantDefaults>(id)
+                .expect("registered with the type");
+            let TypeInfo::Enum(e) = info else { panic!() };
+            for name in e.variant_names() {
+                let v = data.variant_default(name).expect(name);
+                let ReflectRef::Enum(en) = v.as_partial_reflect().reflect_ref() else {
+                    panic!()
+                };
+                assert_eq!(en.variant_name(), *name);
+            }
+        }
+        // No zero-size shape comes out.
+        for (name, ok) in [
+            ("Box", true),
+            ("Sphere", true),
+            ("Capsule", true),
+            ("Mesh", true),
+        ] {
+            let s = ColliderShape::variant_default(name).unwrap();
+            let sized = match s {
+                ColliderShape::Box { half_extents } => half_extents.min_element() > 0.0,
+                ColliderShape::Sphere { radius } => radius > 0.0,
+                ColliderShape::Capsule {
+                    half_height,
+                    radius,
+                } => half_height > 0.0 && radius > 0.0,
+                ColliderShape::Mesh => true,
+            };
+            assert_eq!(sized, ok, "{name}");
+        }
+        assert!(ColliderShape::variant_default("Nope").is_none());
     }
 }

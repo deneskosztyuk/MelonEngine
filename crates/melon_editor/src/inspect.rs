@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 use melon_core::glam::{EulerRot, Quat, Vec2, Vec3, Vec4};
 
+use melon_core::ReflectVariantDefaults;
+
 use crate::content::{self, AssetDrag};
 use crate::content_view::id_label;
 use crate::{inspector_value, theme};
@@ -355,8 +357,8 @@ fn unit_enum_ui(ui: &mut egui::Ui, id: egui::Id, e: &mut dyn Enum, names: &[&str
 
 /// Variant dropdown (the combo carries the fixed id `id.with("variant")`,
 /// options `id.with(variant)`), then only the active variant's fields, each
-/// with the id `id.with(field)`. Switching inserts the new variant with
-/// default field values.
+/// with the id `id.with(field)`. Switching inserts the new variant with the
+/// values `ReflectVariantDefaults` supplies, else default field values.
 fn payload_enum_ui(
     ui: &mut egui::Ui,
     id: egui::Id,
@@ -389,8 +391,16 @@ fn payload_enum_ui(
     if let Some(name) = picked
         && let Some(variant) = info.variant(name)
     {
-        let new = DynamicEnum::new(name, default_variant(variant, registry));
-        return e.try_apply(&new).is_ok();
+        // The type's own values for the variant, else every field at its default.
+        let supplied = registry
+            .get_type_data::<ReflectVariantDefaults>(info.type_id())
+            .and_then(|d| d.variant_default(name));
+        return match supplied {
+            Some(value) => e.try_apply(&*value).is_ok(),
+            None => e
+                .try_apply(&DynamicEnum::new(name, default_variant(variant, registry)))
+                .is_ok(),
+        };
     }
     let mut changed = false;
     let count = e.field_len();
@@ -555,7 +565,7 @@ mod tests {
     use super::*;
     use melon_core::bevy_reflect::{self, Reflect, std_traits::ReflectDefault};
     use melon_core::glam::{EulerRot, Quat, Vec3};
-    use melon_core::{QuatReflect, Vec3Reflect};
+    use melon_core::{QuatReflect, ReflectVariantDefaults, VariantDefaults, Vec3Reflect};
 
     #[derive(Reflect, Debug, Clone, PartialEq, Default)]
     #[reflect(Default)]
@@ -572,6 +582,7 @@ mod tests {
         weight: f32,
     }
     #[derive(Reflect, Debug, Clone, PartialEq)]
+    #[reflect(VariantDefaults)]
     enum Shape {
         Ball {
             radius: f32,
@@ -582,6 +593,18 @@ mod tests {
             offset: Vec3,
         },
         Point,
+    }
+
+    impl VariantDefaults for Shape {
+        fn variant_default(name: &str) -> Option<Self> {
+            match name {
+                "Cube" => Some(Self::Cube {
+                    side: 2.0,
+                    offset: Vec3::new(0.0, 1.0, 0.0),
+                }),
+                _ => None,
+            }
+        }
     }
 
     #[derive(Reflect, Debug, Clone, PartialEq)]
@@ -828,8 +851,8 @@ mod tests {
         assert_eq!(
             value.shape,
             Shape::Cube {
-                side: 0.0,
-                offset: Vec3::ZERO
+                side: 2.0,
+                offset: Vec3::new(0.0, 1.0, 0.0)
             }
         );
         assert!(h.ctx.read_response(shape.with("side")).is_some());
