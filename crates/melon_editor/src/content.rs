@@ -149,6 +149,9 @@ pub struct ContentBrowser {
     root: PathBuf,
     current: PathBuf,
     search: String,
+    back: Vec<PathBuf>,
+    forward: Vec<PathBuf>,
+    selected: Option<PathBuf>,
     /// File kinds shown; folders are always shown outside search.
     filter: HashSet<AssetKind>,
     /// What the asset view shows, rebuilt only when the folder, search or
@@ -162,6 +165,9 @@ impl ContentBrowser {
             current: root.clone(),
             root,
             search: String::new(),
+            back: Vec::new(),
+            forward: Vec::new(),
+            selected: None,
             filter: AssetKind::FILE_KINDS.into_iter().collect(),
             visible: Vec::new(),
         };
@@ -199,12 +205,31 @@ impl ContentBrowser {
         &self.current
     }
 
-    /// Open a folder (ignored if it is outside the root).
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Inside the root, with no `..` that could climb out of it.
+    fn inside_root(&self, dir: &Path) -> bool {
+        dir.starts_with(&self.root)
+            && !dir.strip_prefix(&self.root).is_ok_and(|rel| {
+                rel.components()
+                    .any(|c| c == std::path::Component::ParentDir)
+            })
+    }
+
+    /// Open a folder: ignored outside the root or if already open; otherwise
+    /// recorded in history, and the search and selection are cleared.
     pub fn open(&mut self, dir: PathBuf) {
-        if dir.starts_with(&self.root) {
-            self.current = dir;
-            self.refresh();
+        if !self.inside_root(&dir) || dir == self.current {
+            return;
         }
+        let previous = std::mem::replace(&mut self.current, dir);
+        self.back.push(previous);
+        self.forward.clear();
+        self.search.clear();
+        self.selected = None;
+        self.refresh();
     }
 
     /// Go to the parent folder, never above the root.
@@ -212,14 +237,76 @@ impl ContentBrowser {
         if self.current != self.root
             && let Some(parent) = self.current.parent()
         {
-            self.current = parent.to_path_buf();
-            self.refresh();
+            self.open(parent.to_path_buf());
         }
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        !self.back.is_empty()
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        !self.forward.is_empty()
+    }
+
+    /// Previous folder in history, skipping folders deleted since.
+    pub fn go_back(&mut self) {
+        Self::step(&mut self.back, &mut self.forward, &mut self.current);
+        self.refresh();
+    }
+
+    pub fn go_forward(&mut self) {
+        Self::step(&mut self.forward, &mut self.back, &mut self.current);
+        self.refresh();
+    }
+
+    /// Pop `from` until an existing folder; the old current goes onto `to`.
+    fn step(from: &mut Vec<PathBuf>, to: &mut Vec<PathBuf>, current: &mut PathBuf) {
+        while let Some(dir) = from.pop() {
+            if dir.is_dir() {
+                to.push(std::mem::replace(current, dir));
+                return;
+            }
+        }
+    }
+
+    /// `(name, folder)` from the root down to the current folder.
+    pub fn path_segments(&self) -> Vec<(String, PathBuf)> {
+        let name = |p: &Path| {
+            p.file_name().map_or_else(
+                || p.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            )
+        };
+        let mut segments = vec![(name(&self.root), self.root.clone())];
+        let mut path = self.root.clone();
+        if let Ok(rel) = self.current.strip_prefix(&self.root) {
+            for part in rel.components() {
+                path.push(part);
+                segments.push((name(&path), path.clone()));
+            }
+        }
+        segments
+    }
+
+    pub fn select(&mut self, path: Option<PathBuf>) {
+        self.selected = path;
+    }
+
+    pub fn selected(&self) -> Option<&Path> {
+        self.selected.as_deref()
     }
 
     /// Re-read the disk: the current folder, or with a search every file
     /// below it whose name contains the search (case-insensitive).
     pub fn refresh(&mut self) {
+        // The folder may have been deleted or renamed outside the editor.
+        while !self.current.is_dir() && self.current != self.root {
+            match self.current.parent() {
+                Some(parent) => self.current = parent.to_path_buf(),
+                None => break,
+            }
+        }
         let shown = |e: &ContentEntry| e.is_dir || self.filter.contains(&e.kind);
         self.visible = if self.search.is_empty() {
             list_dir(&self.current).into_iter().filter(shown).collect()
@@ -495,6 +582,95 @@ mod tests {
         }
         browser.set_search("a".into());
         assert!(browser.visible_entries().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn back_and_forward_walk_history() {
+        let dir = temp_dir("history");
+        touch(&dir, "a/b/");
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.open(dir.join("a"));
+        browser.open(dir.join("a/b"));
+        browser.go_back();
+        assert_eq!(browser.current(), dir.join("a"));
+        browser.go_back();
+        assert_eq!(browser.current(), dir);
+        assert!(!browser.can_go_back());
+        browser.go_forward();
+        assert_eq!(browser.current(), dir.join("a"));
+        assert!(browser.can_go_forward());
+        browser.open(dir.clone());
+        assert!(!browser.can_go_forward());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_same_folder_adds_no_history() {
+        let dir = temp_dir("same");
+        touch(&dir, "a/");
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.open(dir.join("a"));
+        browser.open(dir.join("a"));
+        browser.go_back();
+        assert_eq!(browser.current(), dir);
+        assert!(!browser.can_go_back());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn back_skips_missing_folders() {
+        let dir = temp_dir("skip");
+        for rel in ["a/", "b/", "c/"] {
+            touch(&dir, rel);
+        }
+        let mut browser = ContentBrowser::new(dir.clone());
+        for name in ["a", "b", "c"] {
+            browser.open(dir.join(name));
+        }
+        std::fs::remove_dir_all(dir.join("a")).unwrap();
+        std::fs::remove_dir_all(dir.join("b")).unwrap();
+        browser.go_back();
+        assert_eq!(browser.current(), dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_falls_back_to_existing_ancestor() {
+        let dir = temp_dir("ancestor");
+        touch(&dir, "a/b/c/");
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.open(dir.join("a/b/c"));
+        std::fs::remove_dir_all(dir.join("a/b")).unwrap();
+        browser.refresh();
+        assert_eq!(browser.current(), dir.join("a"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_segments_from_root_to_current() {
+        let dir = temp_dir("crumbs");
+        touch(&dir, "a/b/");
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.open(dir.join("a/b"));
+        let segments = browser.path_segments();
+        let names: Vec<String> = segments.iter().map(|(n, _)| n.clone()).collect();
+        let root_name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(names, [root_name, "a".to_string(), "b".to_string()]);
+        assert_eq!(segments[1].1, dir.join("a"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_clears_search_and_selection() {
+        let dir = temp_dir("open_clears");
+        touch(&dir, "a/x.glb");
+        let mut browser = ContentBrowser::new(dir.clone());
+        browser.set_search("x".into());
+        browser.select(Some(dir.join("a/x.glb")));
+        browser.open(dir.join("a"));
+        assert_eq!(browser.search(), "");
+        assert_eq!(browser.selected(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
