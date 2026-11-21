@@ -2,6 +2,16 @@
 
 A from-scratch 3D game engine written in Rust.
 
+![Sich village at golden hour: volumetric clouds over thatched houses, low sun](docs/images/sich_sun_rooftops.jpg)
+
+| | |
+|---|---|
+| ![The village from above, backlit by the setting sun](docs/images/sich_high_backlit.jpg) | ![The pond under a willow, clouds lit from behind](docs/images/sich_pond.jpg) |
+
+*The Sich village demo scene (`assets/scenes/sich_demo.ron`): DDGI, cascaded
+sun shadows, SSAO, bloom and volumetric clouds, rendered with the snapshot
+example.*
+
 ## Status
 
 v0.1 — released.
